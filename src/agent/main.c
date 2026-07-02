@@ -108,8 +108,7 @@ int main(void)
 
     while (!exiting) {
         err = ring_buffer__poll(rb, 100 /* ms */);
-        if (err == -EINTR)
-        {
+        if (err == -EINTR) {
             err = 0;
             continue;
         }
