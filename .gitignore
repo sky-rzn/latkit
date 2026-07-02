@@ -1,0 +1,6 @@
+build*/
+/src/bpf/vmlinux.h
+
+# IDE
+.kdev4/
+*.kdev4

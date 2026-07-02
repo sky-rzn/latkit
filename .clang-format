@@ -1,0 +1,10 @@
+# LLVM base with kernel-ish tweaks; fixed for the whole project.
+BasedOnStyle: LLVM
+IndentWidth: 4
+ColumnLimit: 100
+BreakBeforeBraces: Linux
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+PointerAlignment: Right
+AlignConsecutiveMacros: Consecutive
+IncludeBlocks: Preserve
