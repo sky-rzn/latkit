@@ -26,6 +26,22 @@
 #define LK_MAX_SEGS 8
 #define LK_MAX_CHUNKS 8
 
+/* Global loss/volume statistics (design decision Р5): indices into the
+ * `stats` PERCPU_ARRAY map, one __u64 per CPU per counter. The agent sums
+ * across CPUs and reports periodically; stage 4 turns these into metrics
+ * (latkit_ringbuf_dropped_total etc.). */
+enum lk_stat_id {
+    LK_ST_EVENTS = 0,        /* records submitted to the ringbuf */
+    LK_ST_RESERVE_FAIL_DATA, /* bpf_ringbuf_reserve failures, by event type */
+    LK_ST_RESERVE_FAIL_OPEN,
+    LK_ST_RESERVE_FAIL_CLOSE,
+    LK_ST_BYTES_TOTAL,      /* sum of total_len over data calls, incl. lost */
+    LK_ST_BYTES_CAPTURED,   /* payload bytes actually submitted */
+    LK_ST_ITER_UNSUPPORTED, /* iter_snapshot rejected the iterator type */
+    LK_ST_RECV_STATE_MISS,  /* fexit(tcp_recvmsg) found no fentry snapshot */
+    LK_ST_MAX,
+};
+
 enum lk_ev_type { LK_EV_DATA = 0, LK_EV_CONN_OPEN = 1, LK_EV_CONN_CLOSE = 2 };
 enum lk_dir { LK_DIR_SEND = 0, LK_DIR_RECV = 1 };
 
@@ -78,7 +94,8 @@ enum lk_cap_mode { LK_CAP_FULL = 0, LK_CAP_HEADERS = 1 }; /* policy is stage 3 *
 struct lk_conn_state {
     struct lk_tuple tuple; /* for synthetic CONN_OPEN and debugging */
     __u32 seq;             /* event counter (design decision Р5) */
-    __u32 dropped;         /* events lost on reserve failure (task 1.5) */
+    __u32 dropped;         /* events lost on reserve failure */
+    __u32 gap_pending;     /* loss recorded; next event carries LK_F_GAP */
     __u8 flags;            /* LK_CS_* */
     __u8 capture_mode;     /* enum lk_cap_mode (task 1.6) */
 };

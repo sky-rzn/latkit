@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
 /* latkit agent: configure filters (ports map, .rodata), load skeleton,
  * attach, poll ringbuf, decode events by hdr.type. One line per event;
- * payload hexdump behind --hexdump. */
+ * payload hexdump behind --hexdump. Loss accounting (task 1.5): global
+ * `stats` counters are summed and printed every 10 s, per-connection seq
+ * holes are detected and logged as they arrive. */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
@@ -12,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <bpf/libbpf.h>
@@ -31,6 +34,108 @@ static void sig_handler(int sig)
 {
     (void)sig;
     exiting = 1;
+}
+
+/* --- seq-hole detector (task 1.5) ----------------------------------------
+ * cookie -> last seen seq, a chained hash table. This is the stub of the
+ * stage-2 "dirty connection" flag, not a full conn table: entries appear on
+ * the first event of a connection and are freed on CONN_CLOSE. Connections
+ * whose CLOSE was lost leave their entry behind — bounded cleanup is a
+ * stage-2 concern, stated in STAGE1.md. */
+struct seq_track {
+    struct seq_track *next;
+    __u64 cookie;
+    __u32 last_seq;
+};
+
+#define SEQ_BUCKETS 4096 /* power of two; matches the conns map scale /16 */
+
+static struct seq_track *seq_tab[SEQ_BUCKETS];
+
+static struct seq_track **seq_bucket(__u64 cookie)
+{
+    /* Fibonacci hash: cookies are sequential, spread them. */
+    return &seq_tab[(cookie * 0x9E3779B97F4A7C15ULL) >> 32 & (SEQ_BUCKETS - 1)];
+}
+
+/* Feed one event through the detector; logs when seq jumps forward.
+ * A backward step is not loss: seq assignment (fetch_add in the kernel) and
+ * ringbuf reserve are not one atomic step, so two CPUs can submit adjacent
+ * seqs out of order. Such a pair first logs a spurious 1-event gap, then the
+ * straggler arrives — rare enough to tolerate in stage 1. */
+static void seq_check(__u64 cookie, __u32 seq, bool closing)
+{
+    struct seq_track **slot = seq_bucket(cookie), *t;
+
+    for (t = *slot; t; t = t->next)
+        if (t->cookie == cookie)
+            break;
+
+    if (!t) {
+        if (closing)
+            return;
+        t = malloc(sizeof(*t));
+        if (!t)
+            return; /* degrade to no detection, not to exit */
+        t->cookie = cookie;
+        t->last_seq = seq;
+        t->next = *slot;
+        *slot = t;
+        return;
+    }
+
+    if (seq > t->last_seq + 1)
+        fprintf(stderr, "latkit: conn=%llx gap detected (lost %u events)\n",
+                (unsigned long long)cookie, seq - (t->last_seq + 1));
+    if (seq > t->last_seq)
+        t->last_seq = seq;
+
+    if (closing) {
+        for (; *slot != t; slot = &(*slot)->next)
+            ;
+        *slot = t->next;
+        free(t);
+    }
+}
+
+/* --- global stats (task 1.5) ---------------------------------------------
+ * Sum the per-CPU `stats` counters and print one line to stderr; called
+ * every LK_STATS_INTERVAL_SEC from the poll loop and once on exit. */
+#define LK_STATS_INTERVAL_SEC 10
+
+static void print_stats(struct bpf_map *map)
+{
+    __u64 sum[LK_ST_MAX] = {0}, drops;
+    int ncpus = libbpf_num_possible_cpus();
+    __u64 *vals;
+
+    if (ncpus < 1)
+        return;
+    vals = calloc(ncpus, sizeof(*vals));
+    if (!vals)
+        return;
+
+    for (__u32 id = 0; id < LK_ST_MAX; id++) {
+        if (bpf_map__lookup_elem(map, &id, sizeof(id), vals, ncpus * sizeof(*vals), 0))
+            continue; /* leaves the counter at 0 rather than aborting */
+        for (int cpu = 0; cpu < ncpus; cpu++)
+            sum[id] += vals[cpu];
+    }
+    free(vals);
+
+    drops = sum[LK_ST_RESERVE_FAIL_DATA] + sum[LK_ST_RESERVE_FAIL_OPEN] +
+            sum[LK_ST_RESERVE_FAIL_CLOSE];
+    fprintf(stderr,
+            "latkit: stats events=%llu drops=%llu (data %llu, open %llu, close %llu) "
+            "bytes=%llu/%llu captured/total iter_unsupported=%llu recv_miss=%llu\n",
+            (unsigned long long)sum[LK_ST_EVENTS], (unsigned long long)drops,
+            (unsigned long long)sum[LK_ST_RESERVE_FAIL_DATA],
+            (unsigned long long)sum[LK_ST_RESERVE_FAIL_OPEN],
+            (unsigned long long)sum[LK_ST_RESERVE_FAIL_CLOSE],
+            (unsigned long long)sum[LK_ST_BYTES_CAPTURED],
+            (unsigned long long)sum[LK_ST_BYTES_TOTAL],
+            (unsigned long long)sum[LK_ST_ITER_UNSUPPORTED],
+            (unsigned long long)sum[LK_ST_RECV_STATE_MISS]);
 }
 
 /* xxd-style: offset, 16 hex bytes, ASCII column. */
@@ -76,6 +181,8 @@ static void print_conn_event(const struct lk_ev_conn *ev)
            tuple_addr(&ev->tuple, ev->tuple.daddr, dst, sizeof(dst)), ev->tuple.dport);
     if (ev->hdr.flags & LK_F_SYNTHETIC)
         printf(" synthetic");
+    if (ev->hdr.flags & LK_F_GAP)
+        printf(" gap");
     if (ev->hdr.type == LK_EV_CONN_CLOSE)
         printf(" dropped=%u", ev->conn_dropped);
     printf("\n");
@@ -104,6 +211,8 @@ static int handle_event(void *ctx, void *data, size_t size)
     (void)ctx;
     if (size < sizeof(*hdr))
         return 0;
+
+    seq_check(hdr->conn_id, hdr->seq, hdr->type == LK_EV_CONN_CLOSE);
 
     switch (hdr->type) {
     case LK_EV_CONN_OPEN:
@@ -311,17 +420,27 @@ int main(int argc, char **argv)
         fprintf(stderr, ", comm=%s", opt_comm);
     fprintf(stderr, " (Ctrl-C to exit)\n");
 
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    time_t next_stats = now.tv_sec + LK_STATS_INTERVAL_SEC;
+
     while (!exiting) {
         err = ring_buffer__poll(rb, 100 /* ms */);
-        if (err == -EINTR) {
-            err = 0;
-            continue;
-        }
-        if (err < 0) {
+        if (err < 0 && err != -EINTR) {
             fprintf(stderr, "ring_buffer__poll: %d\n", err);
             break;
         }
+        err = 0;
+
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec >= next_stats) {
+            print_stats(skel->maps.stats);
+            next_stats = now.tv_sec + LK_STATS_INTERVAL_SEC;
+        }
     }
+    if (!err)
+        print_stats(skel->maps.stats); /* final totals on shutdown */
 
 cleanup:
     ring_buffer__free(rb);

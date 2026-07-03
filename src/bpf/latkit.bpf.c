@@ -109,6 +109,43 @@ struct {
     __type(value, struct lk_cursor);
 } cursor SEC(".maps");
 
+/* Global loss/volume statistics (design decision Р5), indexed by enum
+ * lk_stat_id; the agent sums across CPUs and reports periodically. Per-CPU,
+ * so a plain += suffices: a preempting BPF program on the same CPU can in
+ * theory lose one increment, which is acceptable for statistics. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, LK_ST_MAX);
+    __type(key, __u32);
+    __type(value, __u64);
+} stats SEC(".maps");
+
+static __always_inline void stat_add(__u32 id, __u64 n)
+{
+    __u64 *v = bpf_map_lookup_elem(&stats, &id);
+
+    if (v)
+        *v += n;
+}
+
+/* Account one lost event of this connection (Р5): the seq number was already
+ * consumed by the caller, so userspace sees a hole; gap_pending additionally
+ * makes the next successful event carry LK_F_GAP. A plain store is enough —
+ * against a concurrent gap_take() either order leaves the loss flagged. */
+static __always_inline void conn_mark_loss(struct lk_conn_state *st, __u32 stat_id)
+{
+    __sync_fetch_and_add(&st->dropped, 1);
+    st->gap_pending = 1;
+    stat_add(stat_id, 1);
+}
+
+/* Atomically claim the pending-gap marker: exactly one of the events racing
+ * past a loss gets LK_F_GAP. */
+static __always_inline __u16 gap_take(struct lk_conn_state *st)
+{
+    return __sync_lock_test_and_set(&st->gap_pending, 0) ? LK_F_GAP : 0;
+}
+
 /* Port filter, filled by the agent from --port after load, before attach.
  * Keys are host-order local ports. */
 struct {
@@ -178,21 +215,29 @@ static __always_inline void emit_conn_event(__u8 type, __u64 cookie, struct lk_c
                                             __u16 flags, __u32 pid)
 {
     struct lk_ev_conn *ev;
+    /* seq is consumed before reserve so that a failed reserve leaves a hole
+     * in the sequence — one of the two loss signals of Р5. */
+    __u32 seq = __sync_fetch_and_add(&st->seq, 1);
 
     ev = bpf_ringbuf_reserve(&events, sizeof(*ev), 0);
-    if (!ev)
-        return; /* loss accounting is task 1.5 */
+    if (!ev) {
+        conn_mark_loss(st, type == LK_EV_CONN_OPEN ? LK_ST_RESERVE_FAIL_OPEN
+                                                   : LK_ST_RESERVE_FAIL_CLOSE);
+        return;
+    }
+    flags |= gap_take(st);
 
     __builtin_memset(ev, 0, sizeof(*ev)); /* ringbuf memory is not zeroed */
     ev->hdr.conn_id = cookie;
     ev->hdr.ts_ns = bpf_ktime_get_ns();
-    ev->hdr.seq = __sync_fetch_and_add(&st->seq, 1);
+    ev->hdr.seq = seq;
     ev->hdr.type = type;
     ev->hdr.flags = flags;
     ev->tuple = st->tuple;
     ev->pid = pid;
     ev->conn_dropped = st->dropped;
     bpf_ringbuf_submit(ev, 0);
+    stat_add(LK_ST_EVENTS, 1);
 }
 
 /* Look the connection up in `conns`, lazily registering it when absent:
@@ -344,14 +389,19 @@ static __always_inline int emit_chunk(__u64 cookie, struct lk_conn_state *st, __
                                       __u16 flags, __u32 chunk_sz)
 {
     struct lk_ev_data *ev;
+    /* Consumed before reserve — a lost chunk must leave a seq hole (Р5). */
+    __u32 seq = __sync_fetch_and_add(&st->seq, 1);
 
     ev = bpf_ringbuf_reserve(&events, sizeof(*ev) + chunk_sz, 0);
-    if (!ev)
-        return -1; /* loss accounting is task 1.5 */
+    if (!ev) {
+        conn_mark_loss(st, LK_ST_RESERVE_FAIL_DATA);
+        return -1;
+    }
+    flags |= gap_take(st);
 
     ev->hdr.conn_id = cookie;
     ev->hdr.ts_ns = bpf_ktime_get_ns();
-    ev->hdr.seq = __sync_fetch_and_add(&st->seq, 1);
+    ev->hdr.seq = seq;
     ev->hdr.type = LK_EV_DATA;
     ev->hdr.dir = dir;
     ev->total_len = total_len;
@@ -377,6 +427,8 @@ static __always_inline int emit_chunk(__u64 cookie, struct lk_conn_state *st, __
     ev->hdr.flags = flags;
 
     bpf_ringbuf_submit(ev, 0);
+    stat_add(LK_ST_EVENTS, 1);
+    stat_add(LK_ST_BYTES_CAPTURED, cap);
     return cap;
 }
 
@@ -396,6 +448,10 @@ static __always_inline void emit_data_chunks(__u64 cookie, struct lk_conn_state 
     __u32 zero = 0, budget;
     struct lk_cursor *cur;
     __u16 flags = 0;
+
+    /* The honest denominator: every data call counts its full size, captured
+     * or not — bytes_captured/bytes_total is the capture ratio for free. */
+    stat_add(LK_ST_BYTES_TOTAL, total_len);
 
     for (__u32 i = 0; i < LK_MAX_SEGS; i++) {
         if (i >= segs->nr)
@@ -513,7 +569,8 @@ int BPF_PROG(lk_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
      * msg->msg_iter and read straight from userspace. On an unsupported
      * iterator segs.nr stays 0 and a single cap_len=0 event is emitted —
      * total_len must stay honest. */
-    iter_snapshot(msg, &segs);
+    if (iter_snapshot(msg, &segs))
+        stat_add(LK_ST_ITER_UNSUPPORTED, 1);
     emit_data_chunks(cookie, st, LK_DIR_SEND, size, &segs);
     return 0;
 }
@@ -534,8 +591,10 @@ int BPF_PROG(lk_tcp_recvmsg_entry, struct sock *sk, struct msghdr *msg, size_t l
      * points at them. By fexit iov_iter has been advanced past the copied
      * bytes, so snapshot the segment list here; fexit reads from it.
      * Recording the entry (even with nr 0) also lets fexit recognise this
-     * recv as ours. */
-    iter_snapshot(msg, &segs);
+     * recv as ours. An update failure (recv_state full) is not counted here:
+     * fexit will see the miss and count it once. */
+    if (iter_snapshot(msg, &segs))
+        stat_add(LK_ST_ITER_UNSUPPORTED, 1);
     bpf_map_update_elem(&recv_state, &pid_tgid, &segs, BPF_ANY);
     return 0;
 }
@@ -549,8 +608,14 @@ int BPF_PROG(lk_tcp_recvmsg_exit, struct sock *sk, struct msghdr *msg, size_t le
     struct lk_segs *segs;
 
     segs = bpf_map_lookup_elem(&recv_state, &pid_tgid);
-    if (!segs)
+    if (!segs) {
+        /* No fentry snapshot: usually the call was filtered out (no miss),
+         * but a recv that passes the same filters here lost its entry —
+         * recv_state overflow or attach mid-call — and its bytes with it. */
+        if (ret > 0 && sk_port_match(sk) && comm_allowed())
+            stat_add(LK_ST_RECV_STATE_MISS, 1);
         return 0;
+    }
 
     if (ret > 0) {
         __u64 cookie = bpf_get_socket_cookie(sk);

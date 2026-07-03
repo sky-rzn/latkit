@@ -279,17 +279,17 @@ payload — ровно одно событие).
 
 ### 1.5 Учёт потерь (~1–2 дня)
 
-- [ ] Карта `stats` (PERCPU_ARRAY) со счётчиками из Р5; инкременты во всех
+- [x] Карта `stats` (PERCPU_ARRAY) со счётчиками из Р5; инкременты во всех
       точках отказа (reserve fail по типам событий, `iter_first_seg` == -1,
       промах `recv_state`).
-- [ ] Per-conn `seq`/`dropped`/`LK_F_GAP` (Р5, механика в BPF).
-- [ ] Userspace: периодический (раз в 10 с) вывод статистики — events, drops,
+- [x] Per-conn `seq`/`dropped`/`LK_F_GAP` (Р5, механика в BPF).
+- [x] Userspace: периодический (раз в 10 с) вывод статистики — events, drops,
       захваченные/полные байты; детектор дыр в `seq` по соединению (простая
       hash-таблица cookie → last_seq в агенте) с логом
       `conn=... gap detected (lost N events)`. Это заготовка «грязного» флага
       для этапа 2, не полноценная conn-table.
-- [ ] `--ringbuf-bytes` (степень двойки, дефолт 8 МиБ) через
-      `bpf_map__set_max_entries` до load.
+- [x] `--ringbuf-bytes` (степень двойки, дефолт 8 МиБ) через
+      `bpf_map__set_max_entries` до load (сделано в 1.3 вместе с CLI).
 
 **Готово, когда:** на дефолтном ringbuf `pgbench -c 8 -T 15` идёт с нулём
 потерь; с искусственно крошечным ringbuf (256 КиБ) потери (а) видны в
