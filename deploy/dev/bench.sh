@@ -61,13 +61,27 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if ! command -v pgbench >/dev/null 2>&1; then
-    echo "bench.sh: pgbench не найден в PATH (нужен postgresql-client)" >&2
-    exit 1
+# Нативный pgbench, если он реально есть (в Ubuntu /usr/bin/pgbench — обёртка
+# из postgresql-client-common, которая без серверного пакета postgresql-NN
+# падает: pgbench упакован там, а не в postgresql-client-NN). Иначе — pgbench
+# из образа postgres:16 в netns хоста, чтобы трафик шёл через 127.0.0.1 как и
+# нативный.
+if pgbench --version >/dev/null 2>&1; then
+    set -x
+    exec pgbench \
+        -h "$HOST" -p "$PORT" -U "$DB_USER" \
+        ${SELECT_ONLY:+$SELECT_ONLY} \
+        -c "$CLIENTS" -T "$DURATION" \
+        "${PASSTHROUGH[@]}" \
+        "$DB_NAME"
 fi
 
+echo "bench.sh: нативный pgbench не найден, запускаю из образа postgres:16" >&2
+DOCKER=(docker)
+docker info >/dev/null 2>&1 || DOCKER=(sudo docker)
 set -x
-exec pgbench \
+exec "${DOCKER[@]}" run --rm --network host -e PGPASSWORD="$PGPASSWORD" postgres:16 \
+    pgbench \
     -h "$HOST" -p "$PORT" -U "$DB_USER" \
     ${SELECT_ONLY:+$SELECT_ONLY} \
     -c "$CLIENTS" -T "$DURATION" \
