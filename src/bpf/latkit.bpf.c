@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Stage 1 capture layer: TCP traffic on the PostgreSQL port in both
+/* Stage 1 capture layer: TCP traffic of sockets whose LOCAL port is in the
+ * `ports` map — the server side only (design decision Р7) — in both
  * directions, keyed by connection.
  *
  * SEND is observed on entry to tcp_sendmsg; RECV uses the paired fentry/fexit
@@ -24,12 +25,21 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-/* Hardcoded for now; the configurable port map is task 1.3. */
-#define LK_PG_PORT 5432
-
 /* Not exposed as macros by vmlinux.h. */
 #define AF_INET 2
 #define AF_INET6 10
+
+/* Capture budget in bytes per send/recv call (design decision Р6). Affects
+ * cap_len only — total_len always reports the real call size, so the stage 2
+ * reassembler knows the exact size of the hole. Per-connection capture_mode
+ * and multi-chunk emission are tasks 1.4/1.6. */
+const volatile __u32 cfg_capture_limit = LK_CAPTURE_LIMIT;
+
+/* Optional comm filter (task 1.3), off when the first byte is 0. Checked on
+ * the send/recv path only: fentry/fexit of tcp_sendmsg/tcp_recvmsg run in the
+ * calling task's context, while the lifecycle tracepoint may fire in softirq
+ * where comm is garbage. */
+const volatile char cfg_comm_filter[16];
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -61,15 +71,44 @@ struct {
     __type(value, struct lk_recv_state);
 } recv_state SEC(".maps");
 
-/* Event is interesting if either endpoint is the PostgreSQL port. skc_num is
- * already host order; skc_dport is network order. Local-port-only filtering
- * (loopback dedup) is task 1.3. */
-static __always_inline int sk_is_pg(struct sock *sk)
-{
-    __u16 sport = BPF_CORE_READ(sk, __sk_common.skc_num);
-    __u16 dport = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
+/* Port filter, filled by the agent from --port after load, before attach.
+ * Keys are host-order local ports. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, LK_MAX_PORTS);
+    __type(key, __u16);
+    __type(value, __u8);
+} ports SEC(".maps");
 
-    return sport == LK_PG_PORT || dport == LK_PG_PORT;
+/* Capture predicate (design decision Р7): the LOCAL port must be in `ports`,
+ * i.e. only the server-side socket is captured. This dedups loopback traffic
+ * (client SEND + server RECV of the same payload) for free and pins direction
+ * semantics: RECV = frontend->backend, SEND = backend->frontend. skc_num is
+ * already host order. */
+static __always_inline int sk_port_match(struct sock *sk)
+{
+    __u16 lport = BPF_CORE_READ(sk, __sk_common.skc_num);
+
+    return bpf_map_lookup_elem(&ports, &lport) != NULL;
+}
+
+/* Exact-match comm filter; a no-op unless cfg_comm_filter is set. Send/recv
+ * path only, see cfg_comm_filter above. */
+static __always_inline int comm_allowed(void)
+{
+    char comm[sizeof(cfg_comm_filter)];
+
+    if (!cfg_comm_filter[0])
+        return 1;
+    if (bpf_get_current_comm(comm, sizeof(comm)))
+        return 0;
+    for (unsigned i = 0; i < sizeof(comm); i++) {
+        if (comm[i] != cfg_comm_filter[i])
+            return 0;
+        if (!comm[i])
+            break;
+    }
+    return 1;
 }
 
 /* Fill *t (must be zeroed by the caller) from the socket. tcp_sendmsg and
@@ -160,7 +199,7 @@ int BPF_PROG(lk_inet_sock_set_state, struct sock *sk, int oldstate, int newstate
     if (newstate == TCP_ESTABLISHED) {
         struct lk_conn_state init = {};
 
-        if (!sk_is_pg(sk))
+        if (!sk_port_match(sk))
             return 0;
         cookie = bpf_get_socket_cookie(sk);
 
@@ -262,6 +301,8 @@ static __always_inline void emit_data_event(__u64 cookie, struct lk_conn_state *
     ev->off = 0;
     ev->_pad = 0;
 
+    if (cap > cfg_capture_limit)
+        cap = cfg_capture_limit;
     if (cap > total_len)
         cap = total_len;
     if (cap > LK_CHUNK_SMALL)
@@ -288,7 +329,7 @@ int BPF_PROG(lk_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
     __u64 base = 0;
     __u32 avail = 0;
 
-    if (!sk_is_pg(sk))
+    if (!sk_port_match(sk) || !comm_allowed())
         return 0;
 
     __u64 cookie = bpf_get_socket_cookie(sk);
@@ -316,7 +357,9 @@ int BPF_PROG(lk_tcp_recvmsg_entry, struct sock *sk, struct msghdr *msg, size_t l
     __u64 base = 0;
     __u32 avail = 0;
 
-    if (!sk_is_pg(sk))
+    /* Filtering here also covers fexit: without a recv_state entry the exit
+     * program bails out before emitting anything. */
+    if (!sk_port_match(sk) || !comm_allowed())
         return 0;
 
     /* The destination buffer is empty now, but msg->msg_iter already points

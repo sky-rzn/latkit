@@ -117,5 +117,7 @@ verify clean; `dmesg` showed no verifier output during load or under load.
   probing with a marker; this is the known PLAN.md §5 gap.
 - **Loopback double-count**: for a loopback connection both the sender's
   `tcp_sendmsg` and the receiver's `tcp_recvmsg` fire on the same host, so each
-  payload appears twice (one SEND, one RECV, tuple swapped). Expected;
-  de-duplication/directionality is a later concern.
+  payload appears twice (one SEND, one RECV, tuple swapped). *Resolved in stage
+  1.3*: the capture predicate matches the local port only (STAGE1.md, Р7), so
+  only the server-side socket is captured and each payload is seen once, with
+  fixed direction semantics (RECV = frontend→backend, SEND = backend→frontend).

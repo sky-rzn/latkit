@@ -141,6 +141,7 @@ latkit/
 - [ ] Дашборды (JSON в `dashboards/`): обзор (QPS, p50/p95/p99, error rate, соединения), top-N запросов по p99/времени/частоте, детализация по db/user, health агента. Datasource — переменная (Prometheus/Mimir).
 - [ ] `docker-compose` demo-стек: postgres + pgbench + latkit + prometheus + grafana с provisioned-дашбордами — «увидеть ценность за 5 минут».
 - [ ] Упаковка: статический бинарник (musl или glibc + static libbpf/libelf/zlib); Dockerfile (privileged либо `CAP_BPF+CAP_PERFMON+CAP_SYS_RESOURCE`, hostPID для uprobes); systemd unit; k8s DaemonSet.
+- [ ] Фильтр захвата по cgroup — отложен из этапа 1 (задача 1.3): нужен для k8s (несколько postgres на хосте, порты совпадают); в v1 фильтр — локальный порт + опционально comm.
 - [ ] README: требования к ядру, capabilities, конфигурация, ограничения, security-замечание (агент видит текст SQL — маскирование литералов включено по умолчанию).
 
 ### Этап 8 — hardening и производительность (~1–2 недели)

@@ -13,14 +13,17 @@
 # Всё, что после `--`, прокидывается в pgbench как есть:
 #   ./bench.sh -- -P 5
 #
+# Нестандартный порт (стек поднят с PGPORT=5433, см. docker-compose.yml):
+#   ./bench.sh -p 5433        # или PGPORT=5433 ./bench.sh
+#
 # Предполагает поднятый стек (docker compose ... up -d) и проброшенный
-# порт 5432 на 127.0.0.1. Набор данных инициализирует pgbench-init из
-# docker-compose.yml.
+# порт (по умолчанию 5432) на 127.0.0.1. Набор данных инициализирует
+# pgbench-init из docker-compose.yml.
 
 set -euo pipefail
 
 HOST=127.0.0.1
-PORT=5432
+PORT=${PGPORT:-5432}
 DB_USER=latkit
 DB_NAME=latkit
 export PGPASSWORD=latkit
@@ -44,13 +47,17 @@ while [[ $# -gt 0 ]]; do
             DURATION="$2"
             shift 2
             ;;
+        -p|--port)
+            PORT="$2"
+            shift 2
+            ;;
         --)
             shift
             PASSTHROUGH+=("$@")
             break
             ;;
         -h|--help)
-            sed -n '2,20p' "$0"
+            sed -n '2,21p' "$0"
             exit 0
             ;;
         *)

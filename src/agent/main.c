@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-/* latkit agent: load skeleton, attach, poll ringbuf, decode events by
- * hdr.type. One line per event; payload hexdump behind --hexdump. */
+/* latkit agent: configure filters (ports map, .rodata), load skeleton,
+ * attach, poll ringbuf, decode events by hdr.type. One line per event;
+ * payload hexdump behind --hexdump. */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
@@ -8,6 +9,7 @@
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -19,6 +21,11 @@
 
 static volatile sig_atomic_t exiting;
 static bool opt_hexdump;
+static __u16 opt_ports[LK_MAX_PORTS];
+static int opt_nports;
+static __u64 opt_ringbuf_bytes = LK_RINGBUF_SZ;
+static __u32 opt_capture_limit = LK_CAPTURE_LIMIT;
+static char opt_comm[16];
 
 static void sig_handler(int sig)
 {
@@ -122,22 +129,115 @@ static int libbpf_print(enum libbpf_print_level level, const char *fmt, va_list 
     return vfprintf(stderr, fmt, args);
 }
 
+static void usage(const char *argv0)
+{
+    fprintf(stderr,
+            "usage: %s [options]\n"
+            "  -p, --port PORT       local (server) port to capture; repeatable,\n"
+            "                        up to %d ports (default: %d)\n"
+            "      --ringbuf-bytes N ringbuf size, power-of-two bytes (default: %d)\n"
+            "      --capture-limit N capture budget per send/recv call, bytes\n"
+            "                        (default: %d; total_len stays honest)\n"
+            "      --comm NAME       only capture send/recv from processes with\n"
+            "                        this exact comm, e.g. postgres (default: off)\n"
+            "  -x, --hexdump         dump payload of data events\n",
+            argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT);
+}
+
+/* Strict decimal parse into [min, max]; -1 on any trailing garbage. */
+static int parse_num(const char *s, __u64 min, __u64 max, __u64 *out)
+{
+    char *end;
+    __u64 v;
+
+    errno = 0;
+    v = strtoull(s, &end, 10);
+    if (errno || end == s || *end || v < min || v > max)
+        return -1;
+    *out = v;
+    return 0;
+}
+
 static int parse_args(int argc, char **argv)
 {
+    enum { OPT_RINGBUF_BYTES = 256, OPT_CAPTURE_LIMIT, OPT_COMM };
     static const struct option opts[] = {
+        {"port", required_argument, NULL, 'p'},
+        {"ringbuf-bytes", required_argument, NULL, OPT_RINGBUF_BYTES},
+        {"capture-limit", required_argument, NULL, OPT_CAPTURE_LIMIT},
+        {"comm", required_argument, NULL, OPT_COMM},
         {"hexdump", no_argument, NULL, 'x'},
         {},
     };
+    __u64 v;
     int c;
 
-    while ((c = getopt_long(argc, argv, "x", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "p:x", opts, NULL)) != -1) {
         switch (c) {
+        case 'p':
+            if (opt_nports == LK_MAX_PORTS) {
+                fprintf(stderr, "--port: at most %d ports\n", LK_MAX_PORTS);
+                return -1;
+            }
+            if (parse_num(optarg, 1, 65535, &v)) {
+                fprintf(stderr, "--port: bad port '%s'\n", optarg);
+                return -1;
+            }
+            opt_ports[opt_nports++] = v;
+            break;
+        case OPT_RINGBUF_BYTES:
+            /* Kernel-side constraint: power of two and page-aligned. */
+            if (parse_num(optarg, 4096, 1ULL << 30, &v) || (v & (v - 1))) {
+                fprintf(stderr, "--ringbuf-bytes: expected a power of two in [4096, 1G]\n");
+                return -1;
+            }
+            opt_ringbuf_bytes = v;
+            break;
+        case OPT_CAPTURE_LIMIT:
+            if (parse_num(optarg, 1, 1 << 30, &v)) {
+                fprintf(stderr, "--capture-limit: bad value '%s'\n", optarg);
+                return -1;
+            }
+            opt_capture_limit = v;
+            break;
+        case OPT_COMM:
+            if (strlen(optarg) >= sizeof(opt_comm)) {
+                fprintf(stderr, "--comm: name longer than %zu chars\n", sizeof(opt_comm) - 1);
+                return -1;
+            }
+            strncpy(opt_comm, optarg, sizeof(opt_comm) - 1);
+            break;
         case 'x':
             opt_hexdump = true;
             break;
         default:
-            fprintf(stderr, "usage: %s [--hexdump]\n", argv[0]);
+            usage(argv[0]);
             return -1;
+        }
+    }
+    if (optind < argc) {
+        fprintf(stderr, "unexpected argument '%s'\n", argv[optind]);
+        usage(argv[0]);
+        return -1;
+    }
+
+    if (opt_nports == 0)
+        opt_ports[opt_nports++] = LK_DEFAULT_PORT;
+    return 0;
+}
+
+/* The `ports` map exists only after load; attach happens after this, so the
+ * filter is in place before the first event can fire. */
+static int fill_ports(struct latkit_bpf *skel)
+{
+    for (int i = 0; i < opt_nports; i++) {
+        __u8 one = 1;
+        int err = bpf_map__update_elem(skel->maps.ports, &opt_ports[i], sizeof(opt_ports[i]), &one,
+                                       sizeof(one), BPF_ANY);
+
+        if (err) {
+            fprintf(stderr, "failed to add port %u to filter: %d\n", opt_ports[i], err);
+            return err;
         }
     }
     return 0;
@@ -159,11 +259,30 @@ int main(int argc, char **argv)
     if (setrlimit(RLIMIT_MEMLOCK, &rlim))
         fprintf(stderr, "warn: setrlimit(MEMLOCK): %s\n", strerror(errno));
 
-    skel = latkit_bpf__open_and_load();
+    skel = latkit_bpf__open();
     if (!skel) {
-        fprintf(stderr, "failed to open/load BPF skeleton\n");
+        fprintf(stderr, "failed to open BPF skeleton\n");
         return 1;
     }
+
+    /* .rodata and map sizes are frozen at load time. */
+    skel->rodata->cfg_capture_limit = opt_capture_limit;
+    memcpy((char *)skel->rodata->cfg_comm_filter, opt_comm, sizeof(opt_comm));
+    err = bpf_map__set_max_entries(skel->maps.events, opt_ringbuf_bytes);
+    if (err) {
+        fprintf(stderr, "failed to size ringbuf: %d\n", err);
+        goto cleanup;
+    }
+
+    err = latkit_bpf__load(skel);
+    if (err) {
+        fprintf(stderr, "failed to load BPF skeleton: %d\n", err);
+        goto cleanup;
+    }
+
+    err = fill_ports(skel);
+    if (err)
+        goto cleanup;
 
     err = latkit_bpf__attach(skel);
     if (err) {
@@ -180,7 +299,12 @@ int main(int argc, char **argv)
 
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
-    fprintf(stderr, "latkit: attached, polling events (Ctrl-C to exit)\n");
+    fprintf(stderr, "latkit: attached, capturing local port(s)");
+    for (int i = 0; i < opt_nports; i++)
+        fprintf(stderr, " %u", opt_ports[i]);
+    if (opt_comm[0])
+        fprintf(stderr, ", comm=%s", opt_comm);
+    fprintf(stderr, " (Ctrl-C to exit)\n");
 
     while (!exiting) {
         err = ring_buffer__poll(rb, 100 /* ms */);

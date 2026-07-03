@@ -4,7 +4,13 @@
 #ifndef LATKIT_H
 #define LATKIT_H
 
-#define LK_RINGBUF_SZ (1024 * 1024) /* --ringbuf-bytes is task 1.5 */
+#define LK_RINGBUF_SZ (8 * 1024 * 1024) /* default; --ringbuf-bytes overrides */
+
+#define LK_MAX_PORTS 16      /* capacity of the `ports` filter map */
+#define LK_DEFAULT_PORT 5432 /* used when no --port is given */
+
+/* Default --capture-limit: capture budget in bytes per send/recv call (Р6). */
+#define LK_CAPTURE_LIMIT 8192
 
 /* Data-event payload size classes (design decision Р4): the reserve size is
  * picked per event from the actual capture size, so small control messages do

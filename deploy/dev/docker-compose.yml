@@ -20,7 +20,11 @@ services:
     # TLS выключен явно — этап 6. Без этого libpq может согласовать TLS и в
     # socket-канале будет шифрованный мусор (STAGE0.md, 0.4).
     command: ["postgres", "-c", "ssl=off"]
-    ports: ["5432:5432"]
+    # Хостовый порт можно сменить для теста фильтра (задача 1.3):
+    #   PGPORT=5433 docker compose -f deploy/dev/docker-compose.yml up -d
+    #   sudo ./build/latkit -p 5433
+    # Внутри compose-сети postgres остаётся на 5432 (pgbench-init не трогаем).
+    ports: ["${PGPORT:-5432}:5432"]
     # pgbench-init стартует только когда postgres реально принимает соединения,
     # иначе `pgbench -i` падает на гонке при первом запуске.
     healthcheck:
