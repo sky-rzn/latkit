@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Smoke test: invariants of the kernel<->userspace event ABI.
- * Real unit tests (protocol parser etc.) arrive in stage 3. */
+/* Smoke test: invariants of the kernel<->userspace event ABI (format v1).
+ * Real unit tests (event decoder, seq-gap detector) arrive in task 1.7. */
 #include <linux/types.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -17,16 +17,24 @@
 
 int main(void)
 {
-    /* Verifier-friendly length clipping (len & (POC_CHUNK - 1)) requires a
-     * power of two. */
-    CHECK(POC_CHUNK > 0 && (POC_CHUNK & (POC_CHUNK - 1)) == 0);
+    /* Verifier-friendly length clipping requires powers of two. */
+    CHECK(LK_CHUNK_SMALL > 0 && (LK_CHUNK_SMALL & (LK_CHUNK_SMALL - 1)) == 0);
+    CHECK(LK_CHUNK_FULL > 0 && (LK_CHUNK_FULL & (LK_CHUNK_FULL - 1)) == 0);
+    CHECK(LK_CHUNK_SMALL < LK_CHUNK_FULL);
 
-    /* Fixed header before payload; catches accidental ABI drift. */
-    CHECK(offsetof(struct lk_event, payload) == 36);
-    /* header + payload, plus trailing padding to 8-byte struct alignment */
-    CHECK(sizeof(struct lk_event) == 36 + POC_CHUNK + 4);
+    /* Every ringbuf record starts with lk_ev_hdr; userspace discriminates on
+     * hdr.type, so the header must sit at offset 0 with no compiler holes. */
+    CHECK(sizeof(struct lk_ev_hdr) == 24);
+    CHECK(offsetof(struct lk_ev_conn, hdr) == 0);
+    CHECK(offsetof(struct lk_ev_data, hdr) == 0);
+
+    /* Fixed layouts; catches accidental ABI drift. */
+    CHECK(sizeof(struct lk_tuple) == 44);
+    CHECK(offsetof(struct lk_ev_data, payload) == 40);
+    CHECK(sizeof(struct lk_ev_conn) == 80);
 
     CHECK(LK_DIR_SEND == 0 && LK_DIR_RECV == 1);
+    CHECK(LK_EV_DATA == 0 && LK_EV_CONN_OPEN == 1 && LK_EV_CONN_CLOSE == 2);
 
     printf("ok\n");
     return 0;

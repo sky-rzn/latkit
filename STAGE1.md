@@ -205,14 +205,14 @@ data-событий с общим `total_len`, возрастающими `off` 
 
 ### 1.1 Новый формат событий, conn_id, IPv6 (~1–2 дня)
 
-- [ ] Переписать `src/bpf/latkit.h` под структуры выше; выделить общий
+- [x] Переписать `src/bpf/latkit.h` под структуры выше; выделить общий
       `lk_ev_hdr`, два size-класса data-события.
-- [ ] В BPF: `bpf_get_socket_cookie(sk)` как `conn_id`; заполнение
+- [x] В BPF: `bpf_get_socket_cookie(sk)` как `conn_id`; заполнение
       `lk_tuple` с поддержкой AF_INET6 (`skc_v6_rcv_saddr`/`skc_v6_daddr`
       через CO-RE, для v4 — как сейчас) и `netns` (`skc_net.net->ns.inum`).
-- [ ] Карта `conns` (LRU_HASH, 65536) + ленивое создание записи на data-пути
+- [x] Карта `conns` (LRU_HASH, 65536) + ленивое создание записи на data-пути
       с эмиссией синтетического `CONN_OPEN` (`LK_F_SYNTHETIC`).
-- [ ] Userspace (`main.c`): декодирование по `hdr.type`, вывод open/close и
+- [x] Userspace (`main.c`): декодирование по `hdr.type`, вывод open/close и
       data (hexdump оставить за флагом `--hexdump`, по умолчанию — однострочный
       лог).
 

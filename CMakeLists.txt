@@ -107,7 +107,8 @@ set(BPF_OBJ ${CMAKE_CURRENT_BINARY_DIR}/latkit.bpf.o)
 set(SKEL_H ${CMAKE_CURRENT_BINARY_DIR}/latkit.skel.h)
 
 add_custom_command(OUTPUT ${BPF_OBJ}
-    COMMAND ${CLANG_BPF} -g -O2 -target bpf -D__TARGET_ARCH_${BPF_ARCH}
+    # -mcpu=v3: atomic fetch-add (per-conn seq) needs BPF_ATOMIC ops, kernel >= 5.12.
+    COMMAND ${CLANG_BPF} -g -O2 -target bpf -mcpu=v3 -D__TARGET_ARCH_${BPF_ARCH}
             -Wall -Werror
             -I${VMLINUX_INCLUDE_DIR} -I${CMAKE_CURRENT_SOURCE_DIR}/src/bpf
             -I${LIBBPF_INCLUDE_DIR}
