@@ -39,8 +39,8 @@ char LICENSE[] SEC("license") = "GPL";
 
 /* Capture budget in bytes per send/recv call (design decision Р6). Affects
  * cap_len only — total_len always reports the real call size, so the stage 2
- * reassembler knows the exact size of the hole. Per-connection capture_mode
- * is task 1.6. */
+ * reassembler knows the exact size of the hole. The per-connection
+ * capture_mode in `conns` can tighten it further (LK_CAP_HEADERS). */
 const volatile __u32 cfg_capture_limit = LK_CAPTURE_LIMIT;
 
 /* Optional comm filter (task 1.3), off when the first byte is 0. Checked on
@@ -461,9 +461,14 @@ static __always_inline void emit_data_chunks(__u64 cookie, struct lk_conn_state 
 
     /* The capture plan for the whole call, known before the first reserve:
      * budget < total_len means the chain is truncated (by --capture-limit,
-     * an unsupported iterator, or segments beyond LK_MAX_SEGS), and every
-     * chunk of the chain carries LK_F_TRUNC. */
+     * the HEADERS mode, an unsupported iterator, or segments beyond
+     * LK_MAX_SEGS), and every chunk of the chain carries LK_F_TRUNC. */
     budget = cfg_capture_limit;
+    /* capture_mode is written by userspace into the live map entry (task
+     * 1.6), so it can flip mid-connection; each call reads the current value.
+     * Whatever the mode, only cap_len is affected — total_len stays honest. */
+    if (st->capture_mode == LK_CAP_HEADERS && budget > LK_CAP_HEADERS_LIMIT)
+        budget = LK_CAP_HEADERS_LIMIT;
     if (budget > total_len)
         budget = total_len;
     if (budget > avail_total)

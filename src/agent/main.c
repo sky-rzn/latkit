@@ -3,7 +3,9 @@
  * attach, poll ringbuf, decode events by hdr.type. One line per event;
  * payload hexdump behind --hexdump. Loss accounting (task 1.5): global
  * `stats` counters are summed and printed every 10 s, per-connection seq
- * holes are detected and logged as they arrive. */
+ * holes are detected and logged as they arrive. Capture budget (task 1.6):
+ * --capture-limit is frozen into .rodata; --cap-headers exercises the
+ * per-connection capture_mode control surface. */
 #include <arpa/inet.h>
 #include <errno.h>
 #include <getopt.h>
@@ -24,6 +26,7 @@
 
 static volatile sig_atomic_t exiting;
 static bool opt_hexdump;
+static bool opt_cap_headers;
 static __u16 opt_ports[LK_MAX_PORTS];
 static int opt_nports;
 static __u64 opt_ringbuf_bytes = LK_RINGBUF_SZ;
@@ -204,11 +207,29 @@ static void print_data_event(const struct lk_ev_data *ev, size_t size)
         hexdump(ev->payload, cap);
 }
 
+/* --cap-headers test hook (task 1.6): flip the connection into HEADERS mode
+ * by writing capture_mode into its live `conns` entry — the same control
+ * surface the stage-3 parser will use, just with a trivial policy (every
+ * connection, right at OPEN). The read-modify-write races with kernel-side
+ * seq/dropped updates and can lose an increment (a spurious one-event "gap"
+ * in the log); acceptable for a test hook, revisit with the real policy. */
+static void set_cap_headers(struct bpf_map *conns, __u64 cookie)
+{
+    struct lk_conn_state st;
+
+    if (bpf_map__lookup_elem(conns, &cookie, sizeof(cookie), &st, sizeof(st), 0))
+        return; /* already closed or LRU-evicted */
+    st.capture_mode = LK_CAP_HEADERS;
+    if (bpf_map__update_elem(conns, &cookie, sizeof(cookie), &st, sizeof(st), BPF_EXIST))
+        fprintf(stderr, "warn: conn=%llx: failed to set HEADERS mode\n",
+                (unsigned long long)cookie);
+}
+
 static int handle_event(void *ctx, void *data, size_t size)
 {
+    struct latkit_bpf *skel = ctx;
     const struct lk_ev_hdr *hdr = data;
 
-    (void)ctx;
     if (size < sizeof(*hdr))
         return 0;
 
@@ -216,6 +237,9 @@ static int handle_event(void *ctx, void *data, size_t size)
 
     switch (hdr->type) {
     case LK_EV_CONN_OPEN:
+        if (opt_cap_headers)
+            set_cap_headers(skel->maps.conns, hdr->conn_id);
+        /* fallthrough */
     case LK_EV_CONN_CLOSE:
         if (size >= sizeof(struct lk_ev_conn))
             print_conn_event(data);
@@ -249,9 +273,11 @@ static void usage(const char *argv0)
             "                        (default: %d, max: %d; total_len stays honest)\n"
             "      --comm NAME       only capture send/recv from processes with\n"
             "                        this exact comm, e.g. postgres (default: off)\n"
+            "      --cap-headers     test hook: switch every connection to HEADERS\n"
+            "                        capture mode (%d bytes per call) at OPEN\n"
             "  -x, --hexdump         dump payload of data events\n",
             argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT,
-            LK_MAX_CHUNKS * LK_CHUNK_FULL);
+            LK_MAX_CHUNKS * LK_CHUNK_FULL, LK_CAP_HEADERS_LIMIT);
 }
 
 /* Strict decimal parse into [min, max]; -1 on any trailing garbage. */
@@ -270,12 +296,13 @@ static int parse_num(const char *s, __u64 min, __u64 max, __u64 *out)
 
 static int parse_args(int argc, char **argv)
 {
-    enum { OPT_RINGBUF_BYTES = 256, OPT_CAPTURE_LIMIT, OPT_COMM };
+    enum { OPT_RINGBUF_BYTES = 256, OPT_CAPTURE_LIMIT, OPT_COMM, OPT_CAP_HEADERS };
     static const struct option opts[] = {
         {"port", required_argument, NULL, 'p'},
         {"ringbuf-bytes", required_argument, NULL, OPT_RINGBUF_BYTES},
         {"capture-limit", required_argument, NULL, OPT_CAPTURE_LIMIT},
         {"comm", required_argument, NULL, OPT_COMM},
+        {"cap-headers", no_argument, NULL, OPT_CAP_HEADERS},
         {"hexdump", no_argument, NULL, 'x'},
         {},
     };
@@ -320,6 +347,9 @@ static int parse_args(int argc, char **argv)
                 return -1;
             }
             strncpy(opt_comm, optarg, sizeof(opt_comm) - 1);
+            break;
+        case OPT_CAP_HEADERS:
+            opt_cap_headers = true;
             break;
         case 'x':
             opt_hexdump = true;
@@ -404,7 +434,7 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    rb = ring_buffer__new(bpf_map__fd(skel->maps.events), handle_event, NULL, NULL);
+    rb = ring_buffer__new(bpf_map__fd(skel->maps.events), handle_event, skel, NULL);
     if (!rb) {
         err = -errno;
         fprintf(stderr, "failed to create ring buffer\n");

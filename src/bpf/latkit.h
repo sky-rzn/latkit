@@ -9,7 +9,10 @@
 #define LK_MAX_PORTS 16      /* capacity of the `ports` filter map */
 #define LK_DEFAULT_PORT 5432 /* used when no --port is given */
 
-/* Default --capture-limit: capture budget in bytes per send/recv call (Р6). */
+/* Default --capture-limit: capture budget in bytes per send/recv call (Р6).
+ * Invariant of every budget mechanism (this, LK_CAP_HEADERS, LK_MAX_SEGS,
+ * LK_MAX_CHUNKS): total_len always reports the real call size — budgets cut
+ * cap_len only, so the stage-2 reassembler knows the exact size of the hole. */
 #define LK_CAPTURE_LIMIT 8192
 
 /* Data-event payload size classes (design decision Р4): the reserve size is
@@ -89,7 +92,13 @@ struct lk_ev_data { /* payload is LK_CHUNK_SMALL or LK_CHUNK_FULL */
 
 #define LK_CS_OPEN_SENT (1 << 0) /* CONN_OPEN already emitted for this conn */
 
-enum lk_cap_mode { LK_CAP_FULL = 0, LK_CAP_HEADERS = 1 }; /* policy is stage 3 */
+/* Per-connection capture budget override (task 1.6, mechanism only — the
+ * policy that flips connections between modes is the stage-3 parser; stage 1
+ * has just the --cap-headers test hook). HEADERS caps the capture at
+ * LK_CAP_HEADERS_LIMIT bytes per send/recv call; total_len stays honest. */
+enum lk_cap_mode { LK_CAP_FULL = 0, LK_CAP_HEADERS = 1 };
+
+#define LK_CAP_HEADERS_LIMIT 64 /* HEADERS budget, bytes per call */
 
 struct lk_conn_state {
     struct lk_tuple tuple; /* for synthetic CONN_OPEN and debugging */
