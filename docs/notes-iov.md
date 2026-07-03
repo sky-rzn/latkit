@@ -133,6 +133,34 @@ With all three in place the programs verify in well under the insn budget and
 - **Clean detach**: on SIGINT the 3 tracing links and 3 programs disappear from
   `bpftool link/prog show`.
 
+### Stage 1.7 (M1) verification, 2026-07-03, 6.17.0-35-generic
+
+Full checklist run against the dev stack (`deploy/dev`), agent at defaults
+unless noted; `dmesg` stayed empty across all loads.
+
+- **pgbench v4 + v6** (`-c 8 -T 15` tpcb, `-c 4 -T 10` over `::1`): every
+  connection got exactly one OPEN and one CLOSE (18/18 v4 incl. the
+  docker-proxy legs, 6/6 v6), tuples correct for both families, 0 drops,
+  0 seq holes over ~1.3M events.
+- **Payload seen exactly once**: a marker query on the server-side
+  connection shows one RECV (`Q`) and one SEND (`T/D/C/Z`) — the loopback
+  SEND+RECV duplication of stage 0 is gone (local-port predicate, Р7).
+- **Synthetic OPEN**: a psql session opened before the agent started got
+  `OPEN ... synthetic` (with a real pid, data path) on its first query, in
+  both the host and container netns.
+- **Overload** (`--ringbuf-bytes 65536`, select-only `-c 20`, ~47k tps):
+  877 reserve failures counted in `stats`, 360 seq-gap events flagged
+  `LK_F_GAP` and detected by the agent's tracker, per-connection totals in
+  CLOSE (`dropped=31` etc.); agent and DB unaffected (0 failed txns).
+- **Churn long-run** (`pgbench -c 20 -T 600 -C`, one reconnect per txn):
+  144076 OPEN = 144076 CLOSE, 0 drops and 0 holes over 2.74M events; agent
+  RSS constant at 19.5 MiB for the whole 11 min; `conns` oscillated 31–42
+  during the run and drained to **0** after the clients left, `recv_state`
+  stayed empty throughout.
+- **Overhead, by eye** (formal budget is stage 8): tpcb `-c 8` ≈ 3200 tps
+  with the agent vs ≈ 3440 without on this host; stage 0 measured ≈ 3070
+  with the agent on the same benchmark.
+
 ## Known limitations (carried forward, not deferred discoveries)
 
 - **Multi-segment iterators**: *resolved in stage 1.4* — `iter_snapshot`

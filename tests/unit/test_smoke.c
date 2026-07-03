@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Smoke test: invariants of the kernel<->userspace event ABI (format v1).
- * Real unit tests (event decoder, seq-gap detector) arrive in task 1.7. */
+ * Behavioral tests live next door: test_decode.c, test_seqtrack.c. */
 #include <linux/types.h>
 #include <stddef.h>
 #include <stdio.h>

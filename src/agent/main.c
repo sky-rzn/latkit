@@ -21,8 +21,10 @@
 
 #include <bpf/libbpf.h>
 
+#include "decode.h"
 #include "latkit.h"
 #include "latkit.skel.h"
+#include "seqtrack.h"
 
 static volatile sig_atomic_t exiting;
 static bool opt_hexdump;
@@ -39,67 +41,9 @@ static void sig_handler(int sig)
     exiting = 1;
 }
 
-/* --- seq-hole detector (task 1.5) ----------------------------------------
- * cookie -> last seen seq, a chained hash table. This is the stub of the
- * stage-2 "dirty connection" flag, not a full conn table: entries appear on
- * the first event of a connection and are freed on CONN_CLOSE. Connections
- * whose CLOSE was lost leave their entry behind — bounded cleanup is a
- * stage-2 concern, stated in STAGE1.md. */
-struct seq_track {
-    struct seq_track *next;
-    __u64 cookie;
-    __u32 last_seq;
-};
-
-#define SEQ_BUCKETS 4096 /* power of two; matches the conns map scale /16 */
-
-static struct seq_track *seq_tab[SEQ_BUCKETS];
-
-static struct seq_track **seq_bucket(__u64 cookie)
-{
-    /* Fibonacci hash: cookies are sequential, spread them. */
-    return &seq_tab[(cookie * 0x9E3779B97F4A7C15ULL) >> 32 & (SEQ_BUCKETS - 1)];
-}
-
-/* Feed one event through the detector; logs when seq jumps forward.
- * A backward step is not loss: seq assignment (fetch_add in the kernel) and
- * ringbuf reserve are not one atomic step, so two CPUs can submit adjacent
- * seqs out of order. Such a pair first logs a spurious 1-event gap, then the
- * straggler arrives — rare enough to tolerate in stage 1. */
-static void seq_check(__u64 cookie, __u32 seq, bool closing)
-{
-    struct seq_track **slot = seq_bucket(cookie), *t;
-
-    for (t = *slot; t; t = t->next)
-        if (t->cookie == cookie)
-            break;
-
-    if (!t) {
-        if (closing)
-            return;
-        t = malloc(sizeof(*t));
-        if (!t)
-            return; /* degrade to no detection, not to exit */
-        t->cookie = cookie;
-        t->last_seq = seq;
-        t->next = *slot;
-        *slot = t;
-        return;
-    }
-
-    if (seq > t->last_seq + 1)
-        fprintf(stderr, "latkit: conn=%llx gap detected (lost %u events)\n",
-                (unsigned long long)cookie, seq - (t->last_seq + 1));
-    if (seq > t->last_seq)
-        t->last_seq = seq;
-
-    if (closing) {
-        for (; *slot != t; slot = &(*slot)->next)
-            ;
-        *slot = t->next;
-        free(t);
-    }
-}
+/* seq-hole detector state (task 1.5); the machinery lives in seqtrack.c so
+ * tests/unit can exercise it. */
+static struct lk_seqtrack seq_tab;
 
 /* --- global stats (task 1.5) ---------------------------------------------
  * Sum the per-CPU `stats` counters and print one line to stderr; called
@@ -126,8 +70,8 @@ static void print_stats(struct bpf_map *map)
     }
     free(vals);
 
-    drops = sum[LK_ST_RESERVE_FAIL_DATA] + sum[LK_ST_RESERVE_FAIL_OPEN] +
-            sum[LK_ST_RESERVE_FAIL_CLOSE];
+    drops =
+        sum[LK_ST_RESERVE_FAIL_DATA] + sum[LK_ST_RESERVE_FAIL_OPEN] + sum[LK_ST_RESERVE_FAIL_CLOSE];
     fprintf(stderr,
             "latkit: stats events=%llu drops=%llu (data %llu, open %llu, close %llu) "
             "bytes=%llu/%llu captured/total iter_unsupported=%llu recv_miss=%llu\n",
@@ -177,8 +121,7 @@ static void print_conn_event(const struct lk_ev_conn *ev)
     char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
 
     printf("%llu %s conn=%llx seq=%u pid=%u netns=%u %s:%u -> %s:%u",
-           (unsigned long long)ev->hdr.ts_ns,
-           ev->hdr.type == LK_EV_CONN_OPEN ? "OPEN " : "CLOSE",
+           (unsigned long long)ev->hdr.ts_ns, ev->hdr.type == LK_EV_CONN_OPEN ? "OPEN " : "CLOSE",
            (unsigned long long)ev->hdr.conn_id, ev->hdr.seq, ev->pid, ev->tuple.netns,
            tuple_addr(&ev->tuple, ev->tuple.saddr, src, sizeof(src)), ev->tuple.sport,
            tuple_addr(&ev->tuple, ev->tuple.daddr, dst, sizeof(dst)), ev->tuple.dport);
@@ -191,14 +134,8 @@ static void print_conn_event(const struct lk_ev_conn *ev)
     printf("\n");
 }
 
-static void print_data_event(const struct lk_ev_data *ev, size_t size)
+static void print_data_event(const struct lk_ev_data *ev, __u32 cap)
 {
-    __u32 cap = ev->cap_len;
-
-    /* Trust the record boundary over the kernel-written length. */
-    if (cap > size - sizeof(*ev))
-        cap = size - sizeof(*ev);
-
     printf("%llu %s conn=%llx seq=%u total=%u cap=%u off=%u%s%s\n",
            (unsigned long long)ev->hdr.ts_ns, ev->hdr.dir == LK_DIR_SEND ? "SEND " : "RECV ",
            (unsigned long long)ev->hdr.conn_id, ev->hdr.seq, ev->total_len, cap, ev->off,
@@ -228,30 +165,33 @@ static void set_cap_headers(struct bpf_map *conns, __u64 cookie)
 static int handle_event(void *ctx, void *data, size_t size)
 {
     struct latkit_bpf *skel = ctx;
-    const struct lk_ev_hdr *hdr = data;
+    struct lk_ev_view v;
+    __u32 lost;
 
-    if (size < sizeof(*hdr))
+    switch (lk_ev_decode(data, size, &v)) {
+    case LK_DEC_CONN:
+        lost = lk_seqtrack_check(&seq_tab, v.hdr->conn_id, v.hdr->seq,
+                                 v.hdr->type == LK_EV_CONN_CLOSE);
+        if (v.hdr->type == LK_EV_CONN_OPEN && opt_cap_headers)
+            set_cap_headers(skel->maps.conns, v.hdr->conn_id);
+        print_conn_event(v.conn);
+        break;
+    case LK_DEC_DATA:
+        lost = lk_seqtrack_check(&seq_tab, v.hdr->conn_id, v.hdr->seq, false);
+        print_data_event(v.data, v.cap_len);
+        break;
+    case LK_DEC_UNKNOWN:
+        fprintf(stderr, "warn: unknown event type %u (size %zu)\n",
+                ((const struct lk_ev_hdr *)data)->type, size);
         return 0;
-
-    seq_check(hdr->conn_id, hdr->seq, hdr->type == LK_EV_CONN_CLOSE);
-
-    switch (hdr->type) {
-    case LK_EV_CONN_OPEN:
-        if (opt_cap_headers)
-            set_cap_headers(skel->maps.conns, hdr->conn_id);
-        /* fallthrough */
-    case LK_EV_CONN_CLOSE:
-        if (size >= sizeof(struct lk_ev_conn))
-            print_conn_event(data);
-        break;
-    case LK_EV_DATA:
-        if (size >= sizeof(struct lk_ev_data))
-            print_data_event(data, size);
-        break;
+    case LK_DEC_SHORT:
     default:
-        fprintf(stderr, "warn: unknown event type %u (size %zu)\n", hdr->type, size);
-        break;
+        return 0;
     }
+
+    if (lost)
+        fprintf(stderr, "latkit: conn=%llx gap detected (lost %u events)\n",
+                (unsigned long long)v.hdr->conn_id, lost);
     return 0;
 }
 
