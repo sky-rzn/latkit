@@ -108,6 +108,7 @@ latkit/
 - [ ] Reassembly: на соединение — по буферу на направление; склейка фрагментов, выделение целых сообщений `тип(1) + len(4) + body`. Ресинхронизация после потерь: ждать `ReadyForQuery`-границу / новое соединение.
 
 ### Этап 3 — парсер протокола PostgreSQL v3 (~1–2 недели)
+- [ ] Выделение кода парсинга протокола PostgreSQL в отдельный модуль: в дальнейшем предполагается парсить и другие протоколы, код работы с ними должен лежать в отдельном каталоге.
 - [ ] Startup-фаза: `StartupMessage` (без байта типа!), `SSLRequest`/`GSSENCRequest` (ответ 'S' → соединение помечается TLS, socket-события по нему игнорируем — ждём uprobe-канал), `AuthenticationOk`, параметры `user`/`database` → лейблы.
 - [ ] Frontend: `Q` (simple), `P` (Parse: имя стейтмента + SQL), `B` (Bind), `E` (Execute), `S` (Sync), `X` (Terminate), `C` (Close), `D` (Describe), `F` (FunctionCall), `d/c/f` (COPY).
 - [ ] Backend: `Z` (ReadyForQuery + статус транзакции), `C` (CommandComplete + тег → число строк), `T`, `D` (считаем, не парсим), `E` (ErrorResponse → SQLSTATE), `N`, `A` (NOTIFY), `s` (portal suspended).
