@@ -8,10 +8,12 @@
  * directions; see iter_first_seg() and docs/notes-iov.md.
  *
  * Connections are identified by the socket cookie (design decision Р1) and
- * registered in the `conns` LRU map (Р2). Connections first seen on the data
- * path (opened before the agent started, or whose lifecycle event was lost)
- * get a lazily created entry plus a synthetic CONN_OPEN. The
- * tp_btf/inet_sock_set_state lifecycle path is task 1.2. */
+ * registered in the `conns` LRU map (Р2). The lifecycle path is
+ * tp_btf/inet_sock_set_state (Р3): TCP_ESTABLISHED registers the connection
+ * and emits CONN_OPEN, TCP_CLOSE emits CONN_CLOSE and drops the entry.
+ * Connections first seen on the data path (opened before the agent started,
+ * or whose lifecycle event was lost) get a lazily created entry plus a
+ * synthetic CONN_OPEN. */
 #include "vmlinux.h"
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_endian.h>
@@ -139,6 +141,56 @@ static __always_inline struct lk_conn_state *conn_get(struct sock *sk, __u64 coo
         emit_conn_event(LK_EV_CONN_OPEN, cookie, st, LK_F_SYNTHETIC,
                         bpf_get_current_pid_tgid() >> 32);
     return st;
+}
+
+/* Lifecycle path (task 1.2, design decision Р3). inet_sock_set_state fires on
+ * every TCP state transition host-wide, possibly in softirq context, where
+ * pid/comm belong to whatever task was interrupted — never read them here;
+ * lk_ev_conn.pid stays 0 on this path. The tracepoint is shared with DCCP and
+ * others, hence the protocol check. */
+SEC("tp_btf/inet_sock_set_state")
+int BPF_PROG(lk_inet_sock_set_state, struct sock *sk, int oldstate, int newstate)
+{
+    struct lk_conn_state *st;
+    __u64 cookie;
+
+    if (BPF_CORE_READ(sk, sk_protocol) != IPPROTO_TCP)
+        return 0;
+
+    if (newstate == TCP_ESTABLISHED) {
+        struct lk_conn_state init = {};
+
+        if (!sk_is_pg(sk))
+            return 0;
+        cookie = bpf_get_socket_cookie(sk);
+
+        /* BPF_NOEXIST: if the data path won the race and already emitted a
+         * synthetic OPEN (LK_CS_OPEN_SENT), do not emit a second one. */
+        fill_tuple(&init.tuple, sk);
+        init.flags = LK_CS_OPEN_SENT;
+        if (bpf_map_update_elem(&conns, &cookie, &init, BPF_NOEXIST))
+            return 0;
+
+        st = bpf_map_lookup_elem(&conns, &cookie);
+        if (st)
+            emit_conn_event(LK_EV_CONN_OPEN, cookie, st, 0, 0);
+        return 0;
+    }
+
+    if (newstate != TCP_CLOSE)
+        return 0;
+
+    /* CLOSE: presence in `conns` is the filter — the entry exists only if
+     * this connection matched the port on ESTABLISHED or on the data path.
+     * Covers failed connects too: they never got an entry, so no event. */
+    cookie = bpf_get_socket_cookie(sk);
+    st = bpf_map_lookup_elem(&conns, &cookie);
+    if (!st)
+        return 0;
+
+    emit_conn_event(LK_EV_CONN_CLOSE, cookie, st, 0, 0);
+    bpf_map_delete_elem(&conns, &cookie);
+    return 0;
 }
 
 /* Resolve the userspace base pointer and remaining length of the FIRST
