@@ -13,11 +13,18 @@
 #define LK_CAPTURE_LIMIT 8192
 
 /* Data-event payload size classes (design decision Р4): the reserve size is
- * picked per event from the actual capture size, so small control messages do
- * not burn 4 KiB of ringbuf each. Class selection and multi-chunk emission are
- * task 1.4; until then the data path reserves LK_CHUNK_SMALL only. */
+ * picked per chunk from the actual capture size, so small control messages do
+ * not burn 4 KiB of ringbuf each. */
 #define LK_CHUNK_SMALL 256
 #define LK_CHUNK_FULL 4096
+
+/* Hard per-call bounds of the data path (task 1.4). Both are verifier loop
+ * bounds, so they must be compile-time constants: at most LK_MAX_SEGS iovec
+ * segments are captured per send/recv call, and at most LK_MAX_CHUNKS data
+ * events emitted. The effective --capture-limit ceiling is therefore
+ * LK_MAX_CHUNKS * LK_CHUNK_FULL; the CLI rejects larger values. */
+#define LK_MAX_SEGS 8
+#define LK_MAX_CHUNKS 8
 
 enum lk_ev_type { LK_EV_DATA = 0, LK_EV_CONN_OPEN = 1, LK_EV_CONN_CLOSE = 2 };
 enum lk_dir { LK_DIR_SEND = 0, LK_DIR_RECV = 1 };

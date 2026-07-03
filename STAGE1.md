@@ -255,24 +255,21 @@ payload — ровно одно событие).
 
 ### 1.4 Чанки 4 КиБ, multi-chunk, multi-segment iovec (~2–3 дня)
 
-Самая верифицируемо-опасная задача этапа — закладывать день на борьбу с
-verifier.
-
-- [ ] `LK_CHUNK_FULL = 4096`, `LK_CHUNK_SMALL = 256`; выбор класса по объёму
+- [x] `LK_CHUNK_FULL = 4096`, `LK_CHUNK_SMALL = 256`; выбор класса по объёму
       до reserve.
-- [ ] Multi-chunk: ограниченный цикл до `capture_limit / LK_CHUNK_FULL`
+- [x] Multi-chunk: ограниченный цикл до `capture_limit / LK_CHUNK_FULL`
       итераций (дефолт — 2), каждый чанк — отдельный reserve/submit со своим
       `seq` и `off`. Каждый чанк пишет в начало собственного `payload[]` —
       это сохраняет фиксированное смещение назначения и не злит verifier
       (перенос из notes-iov: «verifier cost of a variable-offset destination
       write»).
-- [ ] Multi-segment `ITER_IOVEC`: обобщить `iter_first_seg` →
+- [x] Multi-segment `ITER_IOVEC`: обобщить `iter_first_seg` →
       `iter_read(msg, off, dst, len)`: ограниченный проход по `__iov[0..7]`
       (`nr_segs` через CO-RE), суммарно до capture-limit. Для RECV — сохранять
       в `recv_state` до 8 пар `{base, len}` на fentry (расширить
       `struct lk_recv_state`).
-- [ ] `LK_F_TRUNC`, если суммарно захвачено меньше `total_len`.
-- [ ] Обновить `docs/notes-iov.md`: снять «Known limitations» по 256 байтам и
+- [x] `LK_F_TRUNC`, если суммарно захвачено меньше `total_len`.
+- [x] Обновить `docs/notes-iov.md`: снять «Known limitations» по 256 байтам и
       первому сегменту.
 
 **Готово, когда:** `select repeat('x', 100000)` даёт цепочки событий с

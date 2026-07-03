@@ -1,8 +1,10 @@
 # notes-iov: reading socket payload out of `iov_iter` (task 0.3)
 
 Research notes backing the payload-capture code in `src/bpf/latkit.bpf.c`
-(`iter_first_seg`, `capture_payload`). These are the inputs to stage 1
-(per-connection capture, larger chunks) and to the stage 8 kernel matrix.
+(stage 0: `iter_first_seg`, `capture_payload`; renamed/generalized in stage
+1.4 to `iter_snapshot`, `emit_data_chunks`, `emit_chunk`). These are the
+inputs to stage 1 (per-connection capture, larger chunks) and to the stage 8
+kernel matrix.
 
 Validated on **6.17.0-35-generic, x86_64** (2026-07-02) against `postgres:16`
 in docker, psql over loopback inside the container netns. Both directions read
@@ -12,21 +14,22 @@ to happen.
 ## The two paths
 
 SEND (`fentry/tcp_sendmsg`) and RECV (`fentry`+`fexit/tcp_recvmsg`) both funnel
-through `iter_first_seg(msg, &base, &len)`, which resolves the userspace base
-pointer and remaining length of the **first** iterator segment. The data lives
-in userspace in both cases, so the copy is always `bpf_probe_read_user`.
+through `iter_snapshot(msg, &segs)` (stage 0: `iter_first_seg`), which resolves
+the userspace `{base, len}` pairs of up to `LK_MAX_SEGS` iterator segments. The
+data lives in userspace in both cases, so the copy is always
+`bpf_probe_read_user`.
 
 - **SEND** — on entry to `tcp_sendmsg` the data has not been copied into the
   kernel yet; `msg->msg_iter` still points at the caller's buffer, `iov_offset`
   is 0 and `count == size`. Read straight through.
 - **RECV** — on entry the destination buffer is empty. By the time `tcp_recvmsg`
   returns, `iov_iter` has been advanced past the copied bytes
-  (`iov_iter_advance` during `copy_to_user`), so the base pointer is no longer
-  at the start of the data. We therefore stash the base pointer on `fentry`
-  (hash map keyed by `pid_tgid` — the syscall does not switch task between entry
-  and exit) and read `min(ret, POC_CHUNK)` bytes from it on `fexit`. The map
-  entry is deleted on **every** `fexit`, including the `ret <= 0` path, or it
-  leaks (verified empty after a 46k-transaction pgbench run — see below).
+  (`iov_iter_advance` during `copy_to_user`), so the base pointers no longer
+  point at the start of the data. We therefore snapshot the segment list on
+  `fentry` (hash map keyed by `pid_tgid` — the syscall does not switch task
+  between entry and exit) and read the first `ret` bytes out of it on `fexit`.
+  The map entry is deleted on **every** `fexit`, including the `ret <= 0` path,
+  or it leaks (verified empty after a 46k-transaction pgbench run — see below).
 
 ## iter_type observed
 
@@ -83,6 +86,37 @@ size against the 256-byte `payload[]` in the ringbuf record. All three programs
 (`lk_tcp_sendmsg`, `lk_tcp_recvmsg_entry`, `lk_tcp_recvmsg_exit`) load and
 verify clean; `dmesg` showed no verifier output during load or under load.
 
+### Stage 1.4: the chunk loop vs the verifier (6.17)
+
+The multi-chunk loop (up to `LK_MAX_CHUNKS` reserve/submit per call, cursor
+walking up to `LK_MAX_SEGS` segments) needed three tricks to verify; all are
+commented in the code, recorded here with symptoms so they aren't undone:
+
+- **Loop-carried state must round-trip through a map.** With the cursor
+  (`si`/`soff`/`pos`/`budget`) on the stack, every branch outcome leaves the
+  verifier with different *precise* scalar values, iteration states never
+  merge, and verification dies at `-E2BIG` (1M insns processed, the log shows
+  narrowing ranges like `off ∈ [517, 5883]` deep in the loop). Reloading the
+  cursor from a per-CPU map each iteration turns the values into
+  bounds-checked unknowns, states converge and prune. Plain map accesses are
+  NOT enough — clang forwards the stored values and elides the loads — hence
+  the `ONCE()` volatile wrapper.
+- **Segment indexing needs `idx = si & (LK_MAX_SEGS - 1)` plus
+  `barrier_var(idx)`.** Without the barrier clang strength-reduces the
+  indexing into a walking pointer (`p += 4` per iteration) whose accumulated
+  var_off the verifier can't tie back to the `si < LK_MAX_SEGS` loop bound —
+  rejected with `invalid access to map value, off=104` (i.e. one element past
+  the 104-byte `lk_segs`).
+- **The two size classes verify as separate `bpf_ringbuf_reserve` call
+  sites.** `emit_chunk` is `__always_inline` and takes the class as a
+  parameter; each call site passes a literal (`LK_CHUNK_SMALL`/`LK_CHUNK_FULL`),
+  so each inlined copy reserves a constant size, which is what the helper
+  demands. The stage-0 tricks (64-bit `cap`, `barrier_var(cap)` before
+  `bpf_probe_read_user`) carry over unchanged.
+
+With all three in place the programs verify in well under the insn budget and
+`dmesg` stays clean under pgbench load.
+
 ## Experiments run
 
 - **Marker query** `select 'latkit_poc_marker', 42`: frontend `Q` query and
@@ -101,15 +135,30 @@ verify clean; `dmesg` showed no verifier output during load or under load.
 
 ## Known limitations (carried forward, not deferred discoveries)
 
-- **Multi-segment iterators**: only the first segment is captured, for both
-  directions. psql/libpq is single-segment `ITER_UBUF`, so this was never hit,
-  but a multi-`iovec` send or a recv scattered across segments would capture
-  only its first segment. Stage 1 TODO: iterate/concatenate up to N segments
-  (the verifier cost of a variable-offset destination write is why it is not
-  done in the PoC).
-- **256-byte cap** (`POC_CHUNK`): payloads are truncated to 256 bytes;
-  `total_len` still reports the true size. 4 KiB chunks and length-based slicing
-  are stage 1.
+- **Multi-segment iterators**: *resolved in stage 1.4* — `iter_snapshot`
+  captures up to `LK_MAX_SEGS` (8) `{base, len}` pairs and the chunk loop
+  walks them; segments beyond the 8th are not captured (`LK_F_TRUNC`).
+  Chunks are sliced at segment boundaries, so every
+  `bpf_probe_read_user` still writes to the start of its own record's
+  `payload[]` — the variable-offset destination write that scared the PoC
+  never materializes. Verified byte-exact against a 3-segment `writev` and a
+  3-buffer `readv` on a captured port.
+- **256-byte cap** (`POC_CHUNK`): *resolved in stage 1.4* — two record size
+  classes (`LK_CHUNK_SMALL` 256 / `LK_CHUNK_FULL` 4096) picked per chunk
+  before reserve, and one send/recv call emits up to `LK_MAX_CHUNKS` (8)
+  chunked events with shared `total_len`, increasing `off` and consecutive
+  `seq`, up to `--capture-limit` bytes (default 8192). A fragmented iovec
+  (many sub-4KiB segments) spends one chunk slot per segment and can exhaust
+  the slots before the byte budget; such calls under-capture without
+  `LK_F_TRUNC`, which stage 2 still detects from `off`/`cap_len` vs
+  `total_len`.
+- **splice() traffic is invisible or empty** (observed via docker-proxy,
+  which relays with splice): the send side arrives at `tcp_sendmsg` with an
+  `ITER_BVEC` iterator (kernel pages, not the application buffer) and
+  degrades to honest `cap_len=0` + `LK_F_TRUNC` events; the receive side goes
+  through `tcp_splice_read`, never enters `tcp_recvmsg`, and produces no
+  events at all. Same class of gap as unix sockets (PLAN.md §5); irrelevant
+  for the direct agent-on-PG-host deployment.
 - **Old kernels**: UBUF/`__iov`/`iov` rename branches are framed but only the
   6.x spellings are compiled and tested; 5.15 validation is stage 8.
 - **Unix sockets invisible**: psql over the local socket (no `-h`) produced zero

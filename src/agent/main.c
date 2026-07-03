@@ -137,11 +137,12 @@ static void usage(const char *argv0)
             "                        up to %d ports (default: %d)\n"
             "      --ringbuf-bytes N ringbuf size, power-of-two bytes (default: %d)\n"
             "      --capture-limit N capture budget per send/recv call, bytes\n"
-            "                        (default: %d; total_len stays honest)\n"
+            "                        (default: %d, max: %d; total_len stays honest)\n"
             "      --comm NAME       only capture send/recv from processes with\n"
             "                        this exact comm, e.g. postgres (default: off)\n"
             "  -x, --hexdump         dump payload of data events\n",
-            argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT);
+            argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT,
+            LK_MAX_CHUNKS * LK_CHUNK_FULL);
 }
 
 /* Strict decimal parse into [min, max]; -1 on any trailing garbage. */
@@ -194,8 +195,12 @@ static int parse_args(int argc, char **argv)
             opt_ringbuf_bytes = v;
             break;
         case OPT_CAPTURE_LIMIT:
-            if (parse_num(optarg, 1, 1 << 30, &v)) {
-                fprintf(stderr, "--capture-limit: bad value '%s'\n", optarg);
+            /* The BPF data path emits at most LK_MAX_CHUNKS chunks per call
+             * (a verifier loop bound), so a larger limit could not be
+             * honored anyway. */
+            if (parse_num(optarg, 1, LK_MAX_CHUNKS * LK_CHUNK_FULL, &v)) {
+                fprintf(stderr, "--capture-limit: expected 1..%d, got '%s'\n",
+                        LK_MAX_CHUNKS * LK_CHUNK_FULL, optarg);
                 return -1;
             }
             opt_capture_limit = v;
