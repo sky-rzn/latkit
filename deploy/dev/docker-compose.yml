@@ -1,0 +1,40 @@
+# Dev-окружение для этапа 0 (задача 0.4).
+#
+# Поднимает postgres без TLS (ssl=off — шифрование появится на этапе 6) и
+# один раз инициализирует pgbench-набор (scale 10). Агент здесь НЕ
+# контейнеризуем — он запускается на хосте под sudo (см. STAGE0.md, 0.4).
+#
+#   docker compose -f deploy/dev/docker-compose.yml up -d
+#   psql "host=127.0.0.1 port=5432 user=latkit dbname=latkit sslmode=disable" \
+#        -c "select 'latkit_poc_marker', 42"
+#
+# Нагрузка по требованию — через ./bench.sh (см. соседний скрипт).
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: latkit
+      POSTGRES_PASSWORD: latkit
+      POSTGRES_DB: latkit
+    # TLS выключен явно — этап 6. Без этого libpq может согласовать TLS и в
+    # socket-канале будет шифрованный мусор (STAGE0.md, 0.4).
+    command: ["postgres", "-c", "ssl=off"]
+    ports: ["5432:5432"]
+    # pgbench-init стартует только когда postgres реально принимает соединения,
+    # иначе `pgbench -i` падает на гонке при первом запуске.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U latkit -d latkit"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  pgbench-init:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["pgbench", "-h", "postgres", "-U", "latkit", "-i", "-s", "10", "latkit"]
+    environment:
+      PGPASSWORD: latkit
+    restart: "no"
