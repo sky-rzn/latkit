@@ -127,7 +127,8 @@ add_custom_command(OUTPUT ${SKEL_H}
 add_custom_target(latkit_skel DEPENDS ${SKEL_H})
 
 # --- agent -----------------------------------------------------------------
-add_executable(latkit src/agent/main.c src/agent/decode.c src/agent/seqtrack.c)
+add_executable(latkit src/agent/main.c src/agent/loop.c src/agent/events.c
+               src/agent/decode.c src/agent/seqtrack.c)
 add_dependencies(latkit latkit_skel)
 set_source_files_properties(src/agent/main.c PROPERTIES OBJECT_DEPENDS ${SKEL_H})
 target_include_directories(latkit PRIVATE

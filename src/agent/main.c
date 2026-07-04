@@ -1,32 +1,24 @@
 // SPDX-License-Identifier: GPL-2.0
-/* latkit agent: configure filters (ports map, .rodata), load skeleton,
- * attach, poll ringbuf, decode events by hdr.type. One line per event;
- * payload hexdump behind --hexdump. Loss accounting (task 1.5): global
- * `stats` counters are summed and printed every 10 s, per-connection seq
- * holes are detected and logged as they arrive. Capture budget (task 1.6):
- * --capture-limit is frozen into .rodata; --cap-headers exercises the
- * per-connection capture_mode control surface. */
-#include <arpa/inet.h>
+/* latkit agent entry point: parse CLI, configure filters (ports map,
+ * .rodata), load and attach the skeleton, then hand control to the epoll
+ * loop (loop.c); event decoding, printing and stats live in events.c
+ * (task 2.1). */
 #include <errno.h>
 #include <getopt.h>
 #include <linux/types.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
-#include <time.h>
-#include <unistd.h>
 
 #include <bpf/libbpf.h>
 
-#include "decode.h"
+#include "events.h"
 #include "latkit.h"
 #include "latkit.skel.h"
-#include "seqtrack.h"
+#include "loop.h"
 
-static volatile sig_atomic_t exiting;
 static bool opt_hexdump;
 static bool opt_cap_headers;
 static __u16 opt_ports[LK_MAX_PORTS];
@@ -34,166 +26,6 @@ static int opt_nports;
 static __u64 opt_ringbuf_bytes = LK_RINGBUF_SZ;
 static __u32 opt_capture_limit = LK_CAPTURE_LIMIT;
 static char opt_comm[16];
-
-static void sig_handler(int sig)
-{
-    (void)sig;
-    exiting = 1;
-}
-
-/* seq-hole detector state (task 1.5); the machinery lives in seqtrack.c so
- * tests/unit can exercise it. */
-static struct lk_seqtrack seq_tab;
-
-/* --- global stats (task 1.5) ---------------------------------------------
- * Sum the per-CPU `stats` counters and print one line to stderr; called
- * every LK_STATS_INTERVAL_SEC from the poll loop and once on exit. */
-#define LK_STATS_INTERVAL_SEC 10
-
-static void print_stats(struct bpf_map *map)
-{
-    __u64 sum[LK_ST_MAX] = {0}, drops;
-    int ncpus = libbpf_num_possible_cpus();
-    __u64 *vals;
-
-    if (ncpus < 1)
-        return;
-    vals = calloc(ncpus, sizeof(*vals));
-    if (!vals)
-        return;
-
-    for (__u32 id = 0; id < LK_ST_MAX; id++) {
-        if (bpf_map__lookup_elem(map, &id, sizeof(id), vals, ncpus * sizeof(*vals), 0))
-            continue; /* leaves the counter at 0 rather than aborting */
-        for (int cpu = 0; cpu < ncpus; cpu++)
-            sum[id] += vals[cpu];
-    }
-    free(vals);
-
-    drops =
-        sum[LK_ST_RESERVE_FAIL_DATA] + sum[LK_ST_RESERVE_FAIL_OPEN] + sum[LK_ST_RESERVE_FAIL_CLOSE];
-    fprintf(stderr,
-            "latkit: stats events=%llu drops=%llu (data %llu, open %llu, close %llu) "
-            "bytes=%llu/%llu captured/total iter_unsupported=%llu recv_miss=%llu\n",
-            (unsigned long long)sum[LK_ST_EVENTS], (unsigned long long)drops,
-            (unsigned long long)sum[LK_ST_RESERVE_FAIL_DATA],
-            (unsigned long long)sum[LK_ST_RESERVE_FAIL_OPEN],
-            (unsigned long long)sum[LK_ST_RESERVE_FAIL_CLOSE],
-            (unsigned long long)sum[LK_ST_BYTES_CAPTURED],
-            (unsigned long long)sum[LK_ST_BYTES_TOTAL],
-            (unsigned long long)sum[LK_ST_ITER_UNSUPPORTED],
-            (unsigned long long)sum[LK_ST_RECV_STATE_MISS]);
-}
-
-/* xxd-style: offset, 16 hex bytes, ASCII column. */
-static void hexdump(const __u8 *buf, __u32 len)
-{
-    for (__u32 off = 0; off < len; off += 16) {
-        printf("  %08x: ", off);
-        for (__u32 i = 0; i < 16; i++) {
-            if (off + i < len)
-                printf("%02x", buf[off + i]);
-            else
-                printf("  ");
-            if (i % 2 == 1)
-                printf(" ");
-        }
-        printf(" ");
-        for (__u32 i = 0; i < 16 && off + i < len; i++) {
-            __u8 c = buf[off + i];
-            putchar(c >= 0x20 && c < 0x7f ? c : '.');
-        }
-        printf("\n");
-    }
-}
-
-/* v4 addresses live in the first 4 bytes of the 16-byte array; tuple.family
- * carries the kernel AF_* value, which matches userspace. */
-static const char *tuple_addr(const struct lk_tuple *t, const __u8 *addr, char *buf, size_t len)
-{
-    if (!inet_ntop(t->family, addr, buf, len))
-        snprintf(buf, len, "?");
-    return buf;
-}
-
-static void print_conn_event(const struct lk_ev_conn *ev)
-{
-    char src[INET6_ADDRSTRLEN], dst[INET6_ADDRSTRLEN];
-
-    printf("%llu %s conn=%llx seq=%u pid=%u netns=%u %s:%u -> %s:%u",
-           (unsigned long long)ev->hdr.ts_ns, ev->hdr.type == LK_EV_CONN_OPEN ? "OPEN " : "CLOSE",
-           (unsigned long long)ev->hdr.conn_id, ev->hdr.seq, ev->pid, ev->tuple.netns,
-           tuple_addr(&ev->tuple, ev->tuple.saddr, src, sizeof(src)), ev->tuple.sport,
-           tuple_addr(&ev->tuple, ev->tuple.daddr, dst, sizeof(dst)), ev->tuple.dport);
-    if (ev->hdr.flags & LK_F_SYNTHETIC)
-        printf(" synthetic");
-    if (ev->hdr.flags & LK_F_GAP)
-        printf(" gap");
-    if (ev->hdr.type == LK_EV_CONN_CLOSE)
-        printf(" dropped=%u", ev->conn_dropped);
-    printf("\n");
-}
-
-static void print_data_event(const struct lk_ev_data *ev, __u32 cap)
-{
-    printf("%llu %s conn=%llx seq=%u total=%u cap=%u off=%u%s%s\n",
-           (unsigned long long)ev->hdr.ts_ns, ev->hdr.dir == LK_DIR_SEND ? "SEND " : "RECV ",
-           (unsigned long long)ev->hdr.conn_id, ev->hdr.seq, ev->total_len, cap, ev->off,
-           ev->hdr.flags & LK_F_TRUNC ? " trunc" : "", ev->hdr.flags & LK_F_GAP ? " gap" : "");
-    if (opt_hexdump && cap > 0)
-        hexdump(ev->payload, cap);
-}
-
-/* --cap-headers test hook (task 1.6): flip the connection into HEADERS mode
- * by writing capture_mode into its live `conns` entry — the same control
- * surface the stage-3 parser will use, just with a trivial policy (every
- * connection, right at OPEN). The read-modify-write races with kernel-side
- * seq/dropped updates and can lose an increment (a spurious one-event "gap"
- * in the log); acceptable for a test hook, revisit with the real policy. */
-static void set_cap_headers(struct bpf_map *conns, __u64 cookie)
-{
-    struct lk_conn_state st;
-
-    if (bpf_map__lookup_elem(conns, &cookie, sizeof(cookie), &st, sizeof(st), 0))
-        return; /* already closed or LRU-evicted */
-    st.capture_mode = LK_CAP_HEADERS;
-    if (bpf_map__update_elem(conns, &cookie, sizeof(cookie), &st, sizeof(st), BPF_EXIST))
-        fprintf(stderr, "warn: conn=%llx: failed to set HEADERS mode\n",
-                (unsigned long long)cookie);
-}
-
-static int handle_event(void *ctx, void *data, size_t size)
-{
-    struct latkit_bpf *skel = ctx;
-    struct lk_ev_view v;
-    __u32 lost;
-
-    switch (lk_ev_decode(data, size, &v)) {
-    case LK_DEC_CONN:
-        lost = lk_seqtrack_check(&seq_tab, v.hdr->conn_id, v.hdr->seq,
-                                 v.hdr->type == LK_EV_CONN_CLOSE);
-        if (v.hdr->type == LK_EV_CONN_OPEN && opt_cap_headers)
-            set_cap_headers(skel->maps.conns, v.hdr->conn_id);
-        print_conn_event(v.conn);
-        break;
-    case LK_DEC_DATA:
-        lost = lk_seqtrack_check(&seq_tab, v.hdr->conn_id, v.hdr->seq, false);
-        print_data_event(v.data, v.cap_len);
-        break;
-    case LK_DEC_UNKNOWN:
-        fprintf(stderr, "warn: unknown event type %u (size %zu)\n",
-                ((const struct lk_ev_hdr *)data)->type, size);
-        return 0;
-    case LK_DEC_SHORT:
-    default:
-        return 0;
-    }
-
-    if (lost)
-        fprintf(stderr, "latkit: conn=%llx gap detected (lost %u events)\n",
-                (unsigned long long)v.hdr->conn_id, lost);
-    return 0;
-}
 
 static int libbpf_print(enum libbpf_print_level level, const char *fmt, va_list args)
 {
@@ -330,7 +162,8 @@ static int fill_ports(struct latkit_bpf *skel)
 int main(int argc, char **argv)
 {
     struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
-    struct ring_buffer *rb = NULL;
+    struct lk_events *events = NULL;
+    struct lk_loop *loop = NULL;
     struct latkit_bpf *skel;
     int err;
 
@@ -374,15 +207,29 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    rb = ring_buffer__new(bpf_map__fd(skel->maps.events), handle_event, skel, NULL);
-    if (!rb) {
-        err = -errno;
-        fprintf(stderr, "failed to create ring buffer\n");
+    struct lk_events_cfg ecfg = {
+        .ringbuf = skel->maps.events,
+        .stats = skel->maps.stats,
+        .conns = skel->maps.conns,
+        .hexdump = opt_hexdump,
+        .cap_headers = opt_cap_headers,
+    };
+
+    events = lk_events_new(&ecfg);
+    if (!events) {
+        err = -1;
         goto cleanup;
     }
 
-    signal(SIGINT, sig_handler);
-    signal(SIGTERM, sig_handler);
+    loop = lk_loop_new();
+    if (!loop) {
+        err = -1;
+        goto cleanup;
+    }
+    err = lk_events_register(events, loop);
+    if (err)
+        goto cleanup;
+
     fprintf(stderr, "latkit: attached, capturing local port(s)");
     for (int i = 0; i < opt_nports; i++)
         fprintf(stderr, " %u", opt_ports[i]);
@@ -390,30 +237,13 @@ int main(int argc, char **argv)
         fprintf(stderr, ", comm=%s", opt_comm);
     fprintf(stderr, " (Ctrl-C to exit)\n");
 
-    struct timespec now;
-
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    time_t next_stats = now.tv_sec + LK_STATS_INTERVAL_SEC;
-
-    while (!exiting) {
-        err = ring_buffer__poll(rb, 100 /* ms */);
-        if (err < 0 && err != -EINTR) {
-            fprintf(stderr, "ring_buffer__poll: %d\n", err);
-            break;
-        }
-        err = 0;
-
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        if (now.tv_sec >= next_stats) {
-            print_stats(skel->maps.stats);
-            next_stats = now.tv_sec + LK_STATS_INTERVAL_SEC;
-        }
-    }
+    err = lk_loop_run(loop);
     if (!err)
-        print_stats(skel->maps.stats); /* final totals on shutdown */
+        lk_events_print_stats(events); /* final totals on shutdown */
 
 cleanup:
-    ring_buffer__free(rb);
+    lk_loop_free(loop);
+    lk_events_free(events);
     latkit_bpf__destroy(skel);
     return err < 0 ? 1 : 0;
 }
