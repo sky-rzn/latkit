@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /* Ringbuf consumer: decode records, feed the connection table (task 2.2 —
- * seq-hole detection, idle sweep, LRU ceiling), print events and the
- * periodic stats line (moved out of main.c, task 2.1). Talks to the BPF side
- * through bpf_map handles only, so it does not depend on the skeleton;
- * stage 2.3+ routes data events into the framer here. */
+ * seq-hole detection, idle sweep, LRU ceiling) and route data events into
+ * the streaming framer (task 2.3). Output is opt-in: --events prints the raw
+ * per-event lines of stage 1, --messages prints one line per reassembled PG
+ * message. Talks to the BPF side through bpf_map handles only, so it does
+ * not depend on the skeleton. */
 #ifndef LATKIT_EVENTS_H
 #define LATKIT_EVENTS_H
 
@@ -19,8 +20,10 @@ struct lk_events_cfg {
     struct bpf_map *conns;   /* kernel conn registry, for --cap-headers */
     __u32 max_conns;         /* userspace conn table ceiling (LRU past it) */
     __u32 conn_idle_timeout_sec; /* idle sweep threshold */
-    bool hexdump;
+    bool hexdump;     /* dump event payload / message body prefix */
     bool cap_headers;
+    bool events;   /* per-event log lines (the stage-1 output) */
+    bool messages; /* one line per reassembled protocol message */
 };
 
 struct lk_events;

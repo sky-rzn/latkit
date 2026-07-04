@@ -30,18 +30,26 @@
 #define LK_MAX_CONNS_DEFAULT 65536
 #define LK_CONN_IDLE_TIMEOUT_SEC 600
 
-/* Per-direction framer state (Р9-Р11). The state machine itself is task 2.3
- * (reassembly.c); it is declared here because it is embedded in lk_conn and
- * the table owns its lifetime (buf freed when the entry goes away). Until
- * the framer lands, the table only flips st to LK_FR_DIRTY on seq holes. */
+/* Per-direction framer state (Р9-Р11). The state machine lives in
+ * reassembly.c (task 2.3); it is declared here because it is embedded in
+ * lk_conn and the table owns its lifetime (buf freed when the entry goes
+ * away). The table itself only flips st to LK_FR_DIRTY on seq holes. */
 enum lk_frame_state { LK_FR_HEADER = 0, LK_FR_BODY, LK_FR_SKIP, LK_FR_DIRTY };
 
 struct lk_frame {
     enum lk_frame_state st;
-    __u32 need;                 /* bytes to finish the header / to BODY_MAX */
-    __u64 skip_left;            /* SKIP: body remainder advanced by len */
-    __u32 call_pos, call_total; /* chunk off-arithmetic within one call */
-    __u8 *buf;                  /* lazy, <= 5 + LK_MSG_BODY_MAX (Р11) */
+    __u64 skip_left;            /* SKIP: wire bytes of the body left to discard */
+    __u32 call_pos, call_total; /* chunk off-arithmetic within one call;
+                                   call_total == 0: no call in progress */
+    /* Message being assembled (valid in BODY/SKIP, hdr[] while in HEADER). */
+    __u64 msg_ts;      /* ts of the event with the first header byte (Р13) */
+    __u32 msg_len;     /* protocol len field of the current message */
+    __u8 msg_type;     /* 0 while in startup framing */
+    __u8 startup_done; /* frontend: StartupMessage seen, normal framing on */
+    __u8 hdr_len;      /* bytes accumulated in hdr */
+    __u8 hdr[8];       /* header accumulator: 5 (normal) / 4 (startup) */
+    __u8 *buf;         /* lazy body-prefix buffer, <= LK_MSG_BODY_MAX; used
+                          only when a message spans chunks (Р11) */
     __u32 buf_len;
 };
 

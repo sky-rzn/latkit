@@ -1,0 +1,107 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/* Streaming framer (Р9-Р11, STAGE2.md): turns the per-direction stream of
+ * stage-1 data events into whole PG protocol messages. A direction is a
+ * sequence of exactly two primitives, derived deterministically from
+ * off/cap_len/total_len of the events (total_len is always honest, budgets
+ * cut cap_len only — the stage-1 invariant this module is built on):
+ *
+ *   bytes(p, n) — captured payload;
+ *   hole(n)     — a gap of known size: the uncaptured tail of a call and
+ *                 missing off-intervals between chunks.
+ *
+ * A hole over a message *body* does not desynchronise framing — the header
+ * carries len, so the tail is skipped arithmetically. A hole over a header
+ * loses sync: the direction goes LK_FR_DIRTY and stays there until the
+ * resynchronisation of task 2.4. Unknown holes (lost ringbuf events) are the
+ * connection table's job: it dirties both directions on a seq gap before
+ * events reach this module.
+ *
+ * Framing knowledge is deliberately minimal (Р10): normal messages are
+ * type(1) + len(4, BE, includes itself, excludes the type) + body(len-4);
+ * the frontend direction starts in startup framing — len(4) + body, no type
+ * byte — and switches to normal framing once a StartupMessage
+ * (code 0x00030000) is seen, so the SSLRequest -> StartupMessage prelude
+ * frames correctly. Startup *semantics* (the one-byte SSL reply on the
+ * backend side, TLS detection, CancelRequest) are task 2.4; message
+ * semantics are stage 3.
+ *
+ * Memory is bounded by construction (Р11): at most the body prefix of one
+ * unfinished message is buffered per direction (<= LK_MSG_BODY_MAX,
+ * allocated lazily when a message spans chunks, freed at the message
+ * boundary); the body tail beyond the prefix is skipped by len.
+ *
+ * Pure state manipulation, no I/O: unit tests feed synthetic events, the
+ * agent feeds decoded ringbuf records (events.c). */
+#ifndef LATKIT_REASSEMBLY_H
+#define LATKIT_REASSEMBLY_H
+
+#include <linux/types.h>
+
+#include "conn_table.h"
+#include "latkit.h"
+
+/* Body prefix kept per message (Р11): larger than the stage-4 fingerprint
+ * needs and than the default per-call capture budget. */
+#define LK_MSG_BODY_MAX (16 * 1024)
+
+/* PG v3 protocol version code in a StartupMessage (Р10). */
+#define LK_PG_PROTO_V3 0x00030000u
+
+/* lk_msg.flags */
+#define LK_MSG_BODY_TRUNC (1 << 0)   /* body_cap < len-4: prefix only */
+#define LK_MSG_AFTER_RESYNC (1 << 1) /* first message after a resync (2.4) */
+#define LK_MSG_STARTUP (1 << 2)      /* startup framing: type=0, body has code */
+
+struct lk_msg {
+    __u64 ts_ns;    /* event of the first header byte (Р13) */
+    char type;      /* 'Q','Z',...; 0 for startup messages */
+    __u16 flags;    /* LK_MSG_* */
+    __u32 len;      /* protocol len field (excludes the type byte) */
+    __u32 body_cap; /* body bytes actually available (prefix) */
+    const __u8 *body; /* valid only for the duration of on_msg */
+};
+
+/* Framer -> consumer contract (stage 2: the --messages logger; stage 3:
+ * pgproto.c). on_msg is called by the framer; the open/close/resync hooks
+ * are for the event router and task 2.4. Any callback may be NULL. */
+struct lk_msg_sink {
+    void *ctx;
+    void (*on_msg)(void *ctx, struct lk_conn *c, enum lk_dir dir,
+                   const struct lk_msg *m);
+    void (*on_conn_open)(void *ctx, struct lk_conn *c);
+    void (*on_conn_close)(void *ctx, struct lk_conn *c);
+    void (*on_resync)(void *ctx, struct lk_conn *c, enum lk_dir dir);
+};
+
+/* Cumulative framer counters, reported in the 10 s stats line. Each of
+ * bad_len/hdr_holes/off_anomalies dirtied one direction when incremented. */
+struct lk_reasm_stats {
+    __u64 msgs;          /* messages emitted */
+    __u64 msgs_trunc;    /* ... of them with LK_MSG_BODY_TRUNC */
+    __u64 holes;         /* known holes generated */
+    __u64 hole_bytes;    /* ... their total size */
+    __u64 bad_len;       /* len sanity failure (< min or > 2^30) */
+    __u64 hdr_holes;     /* hole landed on a message header */
+    __u64 off_anomalies; /* off went backwards / past total_len */
+};
+
+struct lk_reasm {
+    struct lk_msg_sink sink;
+    struct lk_reasm_stats st;
+};
+
+void lk_reasm_init(struct lk_reasm *r, const struct lk_msg_sink *sink);
+
+/* Chunk layer: derive bytes()/hole() from one decoded data event and feed
+ * the framer. cap_len must be the decode-clamped value (lk_ev_view.cap_len),
+ * not the raw field. Anomalous off (backwards, past total_len, total_len
+ * changing mid-call) dirties the direction and bumps off_anomalies. */
+void lk_reasm_data(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir,
+                   const struct lk_ev_data *ev, __u32 cap_len);
+
+/* The two stream primitives (Р9), exposed for unit tests and task 2.4. */
+void lk_frame_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, const __u8 *p, __u32 n,
+                    __u64 ts_ns);
+void lk_frame_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64 n);
+
+#endif /* LATKIT_REASSEMBLY_H */

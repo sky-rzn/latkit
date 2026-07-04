@@ -11,3 +11,8 @@ add_executable(test_conn_table test_conn_table.c ${CMAKE_SOURCE_DIR}/src/agent/c
 target_include_directories(test_conn_table PRIVATE
     ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
 add_test(NAME conn_table COMMAND test_conn_table)
+
+add_executable(test_reassembly test_reassembly.c ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
+target_include_directories(test_reassembly PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
+add_test(NAME reassembly COMMAND test_reassembly)

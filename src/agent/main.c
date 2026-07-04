@@ -22,6 +22,8 @@
 
 static bool opt_hexdump;
 static bool opt_cap_headers;
+static bool opt_events;
+static bool opt_messages;
 static __u16 opt_ports[LK_MAX_PORTS];
 static int opt_nports;
 static __u64 opt_ringbuf_bytes = LK_RINGBUF_SZ;
@@ -56,7 +58,11 @@ static void usage(const char *argv0)
             "      --conn-idle-timeout SEC\n"
             "                        evict connections without events for SEC\n"
             "                        seconds (default: %d)\n"
-            "  -x, --hexdump         dump payload of data events\n",
+            "      --events          print one line per raw ringbuf event\n"
+            "      --messages        print one line per reassembled protocol\n"
+            "                        message\n"
+            "  -x, --hexdump         dump payload of events (--events) and the\n"
+            "                        captured body prefix (--messages)\n",
             argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT,
             LK_MAX_CHUNKS * LK_CHUNK_FULL, LK_CAP_HEADERS_LIMIT, LK_MAX_CONNS_DEFAULT,
             LK_CONN_IDLE_TIMEOUT_SEC);
@@ -85,6 +91,8 @@ static int parse_args(int argc, char **argv)
         OPT_CAP_HEADERS,
         OPT_MAX_CONNS,
         OPT_CONN_IDLE_TIMEOUT,
+        OPT_EVENTS,
+        OPT_MESSAGES,
     };
     static const struct option opts[] = {
         {"port", required_argument, NULL, 'p'},
@@ -94,6 +102,8 @@ static int parse_args(int argc, char **argv)
         {"cap-headers", no_argument, NULL, OPT_CAP_HEADERS},
         {"max-conns", required_argument, NULL, OPT_MAX_CONNS},
         {"conn-idle-timeout", required_argument, NULL, OPT_CONN_IDLE_TIMEOUT},
+        {"events", no_argument, NULL, OPT_EVENTS},
+        {"messages", no_argument, NULL, OPT_MESSAGES},
         {"hexdump", no_argument, NULL, 'x'},
         {},
     };
@@ -157,6 +167,12 @@ static int parse_args(int argc, char **argv)
                 return -1;
             }
             opt_conn_idle_timeout = v;
+            break;
+        case OPT_EVENTS:
+            opt_events = true;
+            break;
+        case OPT_MESSAGES:
+            opt_messages = true;
             break;
         case 'x':
             opt_hexdump = true;
@@ -250,6 +266,8 @@ int main(int argc, char **argv)
         .conn_idle_timeout_sec = opt_conn_idle_timeout,
         .hexdump = opt_hexdump,
         .cap_headers = opt_cap_headers,
+        .events = opt_events,
+        .messages = opt_messages,
     };
 
     events = lk_events_new(&ecfg);

@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
-/* See events.h. Decode by hdr.type, one line per event, payload hexdump
- * behind --hexdump, global stats summed from the per-CPU map. Decoded events
- * feed the connection table (task 2.2): it detects per-conn seq holes
- * (logged as they arrive, both directions dirtied) and is kept bounded by
- * CONN_CLOSE, the 60 s idle sweep and the --max-conns LRU ceiling. Capture
- * budget (task 1.6): --cap-headers exercises the per-connection capture_mode
+/* See events.h. Decoded events feed the connection table (task 2.2): it
+ * detects per-conn seq holes (logged as they arrive, both directions
+ * dirtied) and is kept bounded by CONN_CLOSE, the 60 s idle sweep and the
+ * --max-conns LRU ceiling. Data events then go through the streaming framer
+ * (task 2.3), whose sink here is the --messages logger. Capture budget
+ * (task 1.6): --cap-headers exercises the per-connection capture_mode
  * control surface. */
 #include "events.h"
 
@@ -19,6 +19,7 @@
 #include "decode.h"
 #include "latkit.h"
 #include "loop.h"
+#include "reassembly.h"
 
 #define LK_STATS_INTERVAL_SEC 10
 #define LK_SWEEP_INTERVAL_SEC 60
@@ -27,6 +28,7 @@ struct lk_events {
     struct lk_events_cfg cfg;
     struct ring_buffer *rb;
     struct lk_conn_table *conns; /* userspace conn table (task 2.2) */
+    struct lk_reasm reasm;       /* streaming framer (task 2.3) */
 };
 
 /* --- global stats (task 1.5) ---------------------------------------------
@@ -75,6 +77,16 @@ void lk_events_print_stats(struct lk_events *e)
             (unsigned long long)(cs->evicted_lru + cs->evicted_idle),
             (unsigned long long)cs->evicted_lru, (unsigned long long)cs->evicted_idle,
             (unsigned long long)cs->seq_gaps, (unsigned long long)cs->lost_events);
+
+    const struct lk_reasm_stats *rs = &e->reasm.st;
+
+    fprintf(stderr,
+            "latkit: msgs total=%llu trunc=%llu holes=%llu (%llu bytes) "
+            "dirty: badlen=%llu hdr-hole=%llu off-anomaly=%llu\n",
+            (unsigned long long)rs->msgs, (unsigned long long)rs->msgs_trunc,
+            (unsigned long long)rs->holes, (unsigned long long)rs->hole_bytes,
+            (unsigned long long)rs->bad_len, (unsigned long long)rs->hdr_holes,
+            (unsigned long long)rs->off_anomalies);
 }
 
 /* xxd-style: offset, 16 hex bytes, ASCII column. */
@@ -136,6 +148,31 @@ static void print_data_event(const struct lk_ev_data *ev, __u32 cap, bool dump)
         hexdump(ev->payload, cap);
 }
 
+/* --messages logger: the framer sink for stage 2 (stage 3 replaces it with
+ * the parser). One line per reassembled message; --hexdump adds the captured
+ * body prefix. fe> is the frontend->backend stream (RECV on the server
+ * socket), <be the reverse. */
+static void on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struct lk_msg *m)
+{
+    struct lk_events *e = ctx;
+    char type[8];
+
+    if (!e->cfg.messages)
+        return;
+    if (m->flags & LK_MSG_STARTUP)
+        snprintf(type, sizeof(type), "startup");
+    else if (m->type >= 0x20 && m->type < 0x7f)
+        snprintf(type, sizeof(type), "%c", m->type);
+    else
+        snprintf(type, sizeof(type), "0x%02x", (unsigned char)m->type);
+    printf("%llu %s conn=%llx %s len=%u cap=%u%s%s\n", (unsigned long long)m->ts_ns,
+           dir == LK_DIR_RECV ? "fe>" : "<be", (unsigned long long)c->cookie, type, m->len,
+           m->body_cap, m->flags & LK_MSG_BODY_TRUNC ? " trunc" : "",
+           m->flags & LK_MSG_AFTER_RESYNC ? " resync" : "");
+    if (e->cfg.hexdump && m->body_cap)
+        hexdump(m->body, m->body_cap);
+}
+
 /* --cap-headers test hook (task 1.6): flip the connection into HEADERS mode
  * by writing capture_mode into its live `conns` entry — the same control
  * surface the stage-3 parser will use, just with a trivial policy (every
@@ -170,12 +207,19 @@ static int handle_event(void *ctx, void *data, size_t size)
             if (e->cfg.cap_headers)
                 set_cap_headers(e->cfg.conns, v.hdr->conn_id);
         }
-        print_conn_event(v.conn);
+        if (e->cfg.events)
+            print_conn_event(v.conn);
         break;
-    case LK_DEC_DATA:
-        lk_conn_table_data(e->conns, v.hdr->conn_id, v.hdr->seq, v.hdr->ts_ns, &lost);
-        print_data_event(v.data, v.cap_len, e->cfg.hexdump);
+    case LK_DEC_DATA: {
+        struct lk_conn *conn =
+            lk_conn_table_data(e->conns, v.hdr->conn_id, v.hdr->seq, v.hdr->ts_ns, &lost);
+
+        if (e->cfg.events)
+            print_data_event(v.data, v.cap_len, e->cfg.hexdump);
+        if (conn) /* NULL only on alloc failure: degrade to no framing */
+            lk_reasm_data(&e->reasm, conn, v.hdr->dir, v.data, v.cap_len);
         break;
+    }
     case LK_DEC_UNKNOWN:
         fprintf(stderr, "warn: unknown event type %u (size %zu)\n",
                 ((const struct lk_ev_hdr *)data)->type, size);
@@ -233,6 +277,7 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
     if (!e)
         return NULL;
     e->cfg = *cfg;
+    lk_reasm_init(&e->reasm, &(struct lk_msg_sink){.ctx = e, .on_msg = on_msg});
     e->conns = lk_conn_table_new(cfg->max_conns, cfg->conn_idle_timeout_sec * 1000000000ULL);
     if (!e->conns) {
         free(e);
