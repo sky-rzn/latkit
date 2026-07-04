@@ -14,6 +14,7 @@
 
 #include <bpf/libbpf.h>
 
+#include "conn_table.h"
 #include "events.h"
 #include "latkit.h"
 #include "latkit.skel.h"
@@ -25,6 +26,8 @@ static __u16 opt_ports[LK_MAX_PORTS];
 static int opt_nports;
 static __u64 opt_ringbuf_bytes = LK_RINGBUF_SZ;
 static __u32 opt_capture_limit = LK_CAPTURE_LIMIT;
+static __u32 opt_max_conns = LK_MAX_CONNS_DEFAULT;
+static __u32 opt_conn_idle_timeout = LK_CONN_IDLE_TIMEOUT_SEC;
 static char opt_comm[16];
 
 static int libbpf_print(enum libbpf_print_level level, const char *fmt, va_list args)
@@ -47,9 +50,16 @@ static void usage(const char *argv0)
             "                        this exact comm, e.g. postgres (default: off)\n"
             "      --cap-headers     test hook: switch every connection to HEADERS\n"
             "                        capture mode (%d bytes per call) at OPEN\n"
+            "      --max-conns N     userspace conn table ceiling; the least\n"
+            "                        recently active entry is evicted past it\n"
+            "                        (default: %d)\n"
+            "      --conn-idle-timeout SEC\n"
+            "                        evict connections without events for SEC\n"
+            "                        seconds (default: %d)\n"
             "  -x, --hexdump         dump payload of data events\n",
             argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT,
-            LK_MAX_CHUNKS * LK_CHUNK_FULL, LK_CAP_HEADERS_LIMIT);
+            LK_MAX_CHUNKS * LK_CHUNK_FULL, LK_CAP_HEADERS_LIMIT, LK_MAX_CONNS_DEFAULT,
+            LK_CONN_IDLE_TIMEOUT_SEC);
 }
 
 /* Strict decimal parse into [min, max]; -1 on any trailing garbage. */
@@ -68,13 +78,22 @@ static int parse_num(const char *s, __u64 min, __u64 max, __u64 *out)
 
 static int parse_args(int argc, char **argv)
 {
-    enum { OPT_RINGBUF_BYTES = 256, OPT_CAPTURE_LIMIT, OPT_COMM, OPT_CAP_HEADERS };
+    enum {
+        OPT_RINGBUF_BYTES = 256,
+        OPT_CAPTURE_LIMIT,
+        OPT_COMM,
+        OPT_CAP_HEADERS,
+        OPT_MAX_CONNS,
+        OPT_CONN_IDLE_TIMEOUT,
+    };
     static const struct option opts[] = {
         {"port", required_argument, NULL, 'p'},
         {"ringbuf-bytes", required_argument, NULL, OPT_RINGBUF_BYTES},
         {"capture-limit", required_argument, NULL, OPT_CAPTURE_LIMIT},
         {"comm", required_argument, NULL, OPT_COMM},
         {"cap-headers", no_argument, NULL, OPT_CAP_HEADERS},
+        {"max-conns", required_argument, NULL, OPT_MAX_CONNS},
+        {"conn-idle-timeout", required_argument, NULL, OPT_CONN_IDLE_TIMEOUT},
         {"hexdump", no_argument, NULL, 'x'},
         {},
     };
@@ -122,6 +141,22 @@ static int parse_args(int argc, char **argv)
             break;
         case OPT_CAP_HEADERS:
             opt_cap_headers = true;
+            break;
+        case OPT_MAX_CONNS:
+            if (parse_num(optarg, 1, 1 << 24, &v)) {
+                fprintf(stderr, "--max-conns: expected 1..%d, got '%s'\n", 1 << 24, optarg);
+                return -1;
+            }
+            opt_max_conns = v;
+            break;
+        case OPT_CONN_IDLE_TIMEOUT:
+            /* Upper bound keeps sec -> ns conversions far from overflow. */
+            if (parse_num(optarg, 1, 86400 * 365, &v)) {
+                fprintf(stderr, "--conn-idle-timeout: expected seconds 1..%d, got '%s'\n",
+                        86400 * 365, optarg);
+                return -1;
+            }
+            opt_conn_idle_timeout = v;
             break;
         case 'x':
             opt_hexdump = true;
@@ -211,6 +246,8 @@ int main(int argc, char **argv)
         .ringbuf = skel->maps.events,
         .stats = skel->maps.stats,
         .conns = skel->maps.conns,
+        .max_conns = opt_max_conns,
+        .conn_idle_timeout_sec = opt_conn_idle_timeout,
         .hexdump = opt_hexdump,
         .cap_headers = opt_cap_headers,
     };

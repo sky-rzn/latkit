@@ -1,0 +1,107 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+/* Userspace connection table (Р12, STAGE2.md): cookie -> struct lk_conn,
+ * chained hash + LRU list. Absorbs the stage-1 seqtrack stub: the seq-hole
+ * detector is now a table method, and a detected hole marks both directions
+ * dirty (Р9: seq is per-connection, attribution to a direction is deferred).
+ *
+ * Lifecycle:
+ *   - created on CONN_OPEN (regular or synthetic), or lazily on the first
+ *     data event with an unknown cookie — the latter starts dirty, because
+ *     it means the entry was evicted (or its OPEN lost) mid-stream and the
+ *     kernel will not resend a synthetic OPEN (LK_CS_OPEN_SENT is still set
+ *     in the kernel map);
+ *   - removed on CONN_CLOSE (frame buffers freed, partial messages dropped);
+ *   - leak insurance: lk_conn_table_sweep evicts entries idle longer than
+ *     the timeout, and creation past max_conns evicts the LRU tail.
+ *
+ * Pure state manipulation, no I/O: the caller (events.c) does the logging,
+ * unit tests feed synthetic events. */
+#ifndef LATKIT_CONN_TABLE_H
+#define LATKIT_CONN_TABLE_H
+
+#include <linux/types.h>
+#include <stdbool.h>
+
+#include "latkit.h"
+
+/* Userspace defaults for the CLI knobs. max_conns matches the kernel `conns`
+ * map capacity; the idle timeout is deliberately conservative (a pooled
+ * connection idling minutes between transactions must survive). */
+#define LK_MAX_CONNS_DEFAULT 65536
+#define LK_CONN_IDLE_TIMEOUT_SEC 600
+
+/* Per-direction framer state (Р9-Р11). The state machine itself is task 2.3
+ * (reassembly.c); it is declared here because it is embedded in lk_conn and
+ * the table owns its lifetime (buf freed when the entry goes away). Until
+ * the framer lands, the table only flips st to LK_FR_DIRTY on seq holes. */
+enum lk_frame_state { LK_FR_HEADER = 0, LK_FR_BODY, LK_FR_SKIP, LK_FR_DIRTY };
+
+struct lk_frame {
+    enum lk_frame_state st;
+    __u32 need;                 /* bytes to finish the header / to BODY_MAX */
+    __u64 skip_left;            /* SKIP: body remainder advanced by len */
+    __u32 call_pos, call_total; /* chunk off-arithmetic within one call */
+    __u8 *buf;                  /* lazy, <= 5 + LK_MSG_BODY_MAX (Р11) */
+    __u32 buf_len;
+};
+
+/* lk_conn.flags */
+#define LK_CONN_SYNTHETIC (1 << 0) /* kernel synthetic OPEN: startup not seen */
+#define LK_CONN_TLS (1 << 1)       /* SSLRequest answered 'S' (task 2.4) */
+
+struct lk_conn {
+    struct lk_conn *hnext; /* hash chain */
+    struct lk_conn *lru_prev, *lru_next;
+    __u64 cookie;
+    struct lk_tuple tuple; /* zeroed for lazily created entries */
+    __u16 flags;           /* LK_CONN_* */
+    __u32 last_seq;
+    __u32 dropped; /* events lost on this connection (userspace-detected) */
+    __u64 last_activity_ns;
+    struct lk_frame frame[2]; /* index: enum lk_dir */
+};
+
+/* Cumulative counters; `active` is the current entry count. Reported in the
+ * 10 s stats line; stage 4 turns them into metrics. */
+struct lk_conn_table_stats {
+    __u64 created;
+    __u64 closed;       /* removed by CONN_CLOSE */
+    __u64 evicted_lru;  /* pushed out by the max_conns ceiling */
+    __u64 evicted_idle; /* collected by the idle sweep */
+    __u64 seq_gaps;     /* holes detected (connections dirtied) */
+    __u64 lost_events;  /* events lost in those holes, summed */
+    __u32 active;
+};
+
+struct lk_conn_table;
+
+struct lk_conn_table *lk_conn_table_new(__u32 max_conns, __u64 idle_timeout_ns);
+void lk_conn_table_free(struct lk_conn_table *t);
+
+/* Event entry points. Each runs the seq-hole detector and stores the number
+ * of events lost before this one into *lost (0 if none); a hole marks both
+ * directions dirty. A backward seq step is not loss: seq assignment
+ * (fetch_add in the kernel) and ringbuf reserve are not one atomic step, so
+ * two CPUs can submit adjacent seqs out of order — such a pair first reports
+ * a spurious 1-event gap, then the straggler arrives (tolerated, see the
+ * STAGE2.md risk table).
+ *
+ * open/data return the entry (NULL only on allocation failure — degrade to
+ * no tracking, not to exit); close removes it. data on an unknown cookie
+ * creates the entry dirty (see the header comment). */
+struct lk_conn *lk_conn_table_open(struct lk_conn_table *t, __u64 cookie, __u32 seq, __u64 ts_ns,
+                                   const struct lk_tuple *tuple, bool synthetic, __u32 *lost);
+struct lk_conn *lk_conn_table_data(struct lk_conn_table *t, __u64 cookie, __u32 seq, __u64 ts_ns,
+                                   __u32 *lost);
+void lk_conn_table_close(struct lk_conn_table *t, __u64 cookie, __u32 seq, __u64 ts_ns,
+                         __u32 *lost);
+
+/* Evict entries with last_activity_ns + idle_timeout <= now_ns; returns how
+ * many were evicted. The LRU order makes this a tail walk, not a full scan.
+ * Call every 60 s (events.c) with CLOCK_MONOTONIC now — the same clock as
+ * event timestamps (bpf_ktime_get_ns). */
+unsigned int lk_conn_table_sweep(struct lk_conn_table *t, __u64 now_ns);
+
+const struct lk_conn_table_stats *lk_conn_table_stats(const struct lk_conn_table *t);
+
+#endif /* LATKIT_CONN_TABLE_H */

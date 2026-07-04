@@ -1,11 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Ringbuf consumer: decode records, run the seq-hole detector, print events
- * and the periodic stats line (moved out of main.c, task 2.1). Talks to the
- * BPF side through bpf_map handles only, so it does not depend on the
- * skeleton; stage 2.2+ routes decoded events into conn_table/framer here. */
+/* Ringbuf consumer: decode records, feed the connection table (task 2.2 —
+ * seq-hole detection, idle sweep, LRU ceiling), print events and the
+ * periodic stats line (moved out of main.c, task 2.1). Talks to the BPF side
+ * through bpf_map handles only, so it does not depend on the skeleton;
+ * stage 2.3+ routes data events into the framer here. */
 #ifndef LATKIT_EVENTS_H
 #define LATKIT_EVENTS_H
 
+#include <linux/types.h>
 #include <stdbool.h>
 
 struct bpf_map;
@@ -15,6 +17,8 @@ struct lk_events_cfg {
     struct bpf_map *ringbuf; /* `events` map */
     struct bpf_map *stats;   /* `stats` per-CPU counters */
     struct bpf_map *conns;   /* kernel conn registry, for --cap-headers */
+    __u32 max_conns;         /* userspace conn table ceiling (LRU past it) */
+    __u32 conn_idle_timeout_sec; /* idle sweep threshold */
     bool hexdump;
     bool cap_headers;
 };

@@ -7,6 +7,7 @@ target_include_directories(test_decode PRIVATE
     ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
 add_test(NAME decode COMMAND test_decode)
 
-add_executable(test_seqtrack test_seqtrack.c ${CMAKE_SOURCE_DIR}/src/agent/seqtrack.c)
-target_include_directories(test_seqtrack PRIVATE ${CMAKE_SOURCE_DIR}/src/agent)
-add_test(NAME seqtrack COMMAND test_seqtrack)
+add_executable(test_conn_table test_conn_table.c ${CMAKE_SOURCE_DIR}/src/agent/conn_table.c)
+target_include_directories(test_conn_table PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
+add_test(NAME conn_table COMMAND test_conn_table)

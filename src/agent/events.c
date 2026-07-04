@@ -1,30 +1,32 @@
 // SPDX-License-Identifier: GPL-2.0
-/* See events.h. Event handling is verbatim from stage-1 main.c: decode by
- * hdr.type, one line per event, payload hexdump behind --hexdump, per-conn
- * seq holes logged as they arrive, global stats summed from the per-CPU map.
- * Capture budget (task 1.6): --cap-headers exercises the per-connection
- * capture_mode control surface. */
+/* See events.h. Decode by hdr.type, one line per event, payload hexdump
+ * behind --hexdump, global stats summed from the per-CPU map. Decoded events
+ * feed the connection table (task 2.2): it detects per-conn seq holes
+ * (logged as they arrive, both directions dirtied) and is kept bounded by
+ * CONN_CLOSE, the 60 s idle sweep and the --max-conns LRU ceiling. Capture
+ * budget (task 1.6): --cap-headers exercises the per-connection capture_mode
+ * control surface. */
 #include "events.h"
 
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 
 #include <bpf/libbpf.h>
 
+#include "conn_table.h"
 #include "decode.h"
 #include "latkit.h"
 #include "loop.h"
-#include "seqtrack.h"
 
 #define LK_STATS_INTERVAL_SEC 10
+#define LK_SWEEP_INTERVAL_SEC 60
 
 struct lk_events {
     struct lk_events_cfg cfg;
     struct ring_buffer *rb;
-    /* seq-hole detector state (task 1.5); the machinery lives in seqtrack.c
-     * so tests/unit can exercise it. */
-    struct lk_seqtrack seq_tab;
+    struct lk_conn_table *conns; /* userspace conn table (task 2.2) */
 };
 
 /* --- global stats (task 1.5) ---------------------------------------------
@@ -63,6 +65,16 @@ void lk_events_print_stats(struct lk_events *e)
             (unsigned long long)sum[LK_ST_BYTES_TOTAL],
             (unsigned long long)sum[LK_ST_ITER_UNSUPPORTED],
             (unsigned long long)sum[LK_ST_RECV_STATE_MISS]);
+
+    const struct lk_conn_table_stats *cs = lk_conn_table_stats(e->conns);
+
+    fprintf(stderr,
+            "latkit: conns active=%u created=%llu closed=%llu "
+            "evicted=%llu (lru %llu, idle %llu) gaps=%llu lost=%llu\n",
+            cs->active, (unsigned long long)cs->created, (unsigned long long)cs->closed,
+            (unsigned long long)(cs->evicted_lru + cs->evicted_idle),
+            (unsigned long long)cs->evicted_lru, (unsigned long long)cs->evicted_idle,
+            (unsigned long long)cs->seq_gaps, (unsigned long long)cs->lost_events);
 }
 
 /* xxd-style: offset, 16 hex bytes, ASCII column. */
@@ -150,14 +162,18 @@ static int handle_event(void *ctx, void *data, size_t size)
 
     switch (lk_ev_decode(data, size, &v)) {
     case LK_DEC_CONN:
-        lost = lk_seqtrack_check(&e->seq_tab, v.hdr->conn_id, v.hdr->seq,
-                                 v.hdr->type == LK_EV_CONN_CLOSE);
-        if (v.hdr->type == LK_EV_CONN_OPEN && e->cfg.cap_headers)
-            set_cap_headers(e->cfg.conns, v.hdr->conn_id);
+        if (v.hdr->type == LK_EV_CONN_CLOSE) {
+            lk_conn_table_close(e->conns, v.hdr->conn_id, v.hdr->seq, v.hdr->ts_ns, &lost);
+        } else {
+            lk_conn_table_open(e->conns, v.hdr->conn_id, v.hdr->seq, v.hdr->ts_ns, &v.conn->tuple,
+                               v.hdr->flags & LK_F_SYNTHETIC, &lost);
+            if (e->cfg.cap_headers)
+                set_cap_headers(e->cfg.conns, v.hdr->conn_id);
+        }
         print_conn_event(v.conn);
         break;
     case LK_DEC_DATA:
-        lost = lk_seqtrack_check(&e->seq_tab, v.hdr->conn_id, v.hdr->seq, false);
+        lk_conn_table_data(e->conns, v.hdr->conn_id, v.hdr->seq, v.hdr->ts_ns, &lost);
         print_data_event(v.data, v.cap_len, e->cfg.hexdump);
         break;
     case LK_DEC_UNKNOWN:
@@ -170,7 +186,7 @@ static int handle_event(void *ctx, void *data, size_t size)
     }
 
     if (lost)
-        fprintf(stderr, "latkit: conn=%llx gap detected (lost %u events)\n",
+        fprintf(stderr, "latkit: conn=%llx gap detected (lost %u events), both directions dirty\n",
                 (unsigned long long)v.hdr->conn_id, lost);
     return 0;
 }
@@ -194,6 +210,22 @@ static void on_stats_tick(void *ctx)
     lk_events_print_stats(ctx);
 }
 
+/* Idle sweep (Р12): the leak insurance for connections whose CLOSE was lost.
+ * The sweep clock is CLOCK_MONOTONIC — the same clock as event timestamps
+ * (bpf_ktime_get_ns), so last_activity_ns compares directly. */
+static void on_sweep_tick(void *ctx)
+{
+    struct lk_events *e = ctx;
+    struct timespec ts;
+    unsigned int n;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts))
+        return;
+    n = lk_conn_table_sweep(e->conns, (__u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec);
+    if (n)
+        fprintf(stderr, "latkit: idle sweep evicted %u connection(s)\n", n);
+}
+
 struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
 {
     struct lk_events *e = calloc(1, sizeof(*e));
@@ -201,9 +233,15 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
     if (!e)
         return NULL;
     e->cfg = *cfg;
+    e->conns = lk_conn_table_new(cfg->max_conns, cfg->conn_idle_timeout_sec * 1000000000ULL);
+    if (!e->conns) {
+        free(e);
+        return NULL;
+    }
     e->rb = ring_buffer__new(bpf_map__fd(cfg->ringbuf), handle_event, e, NULL);
     if (!e->rb) {
         fprintf(stderr, "failed to create ring buffer\n");
+        lk_conn_table_free(e->conns);
         free(e);
         return NULL;
     }
@@ -215,7 +253,7 @@ void lk_events_free(struct lk_events *e)
     if (!e)
         return;
     ring_buffer__free(e->rb);
-    lk_seqtrack_clear(&e->seq_tab);
+    lk_conn_table_free(e->conns);
     free(e);
 }
 
@@ -225,5 +263,8 @@ int lk_events_register(struct lk_events *e, struct lk_loop *loop)
 
     if (err)
         return err;
-    return lk_loop_every(loop, LK_STATS_INTERVAL_SEC, on_stats_tick, e);
+    err = lk_loop_every(loop, LK_STATS_INTERVAL_SEC, on_stats_tick, e);
+    if (err)
+        return err;
+    return lk_loop_every(loop, LK_SWEEP_INTERVAL_SEC, on_sweep_tick, e);
 }
