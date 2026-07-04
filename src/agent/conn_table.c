@@ -72,8 +72,10 @@ static void destroy(struct lk_conn_table *t, struct lk_conn *c)
 
 static void mark_dirty(struct lk_conn *c)
 {
-    c->frame[0].st = LK_FR_DIRTY;
-    c->frame[1].st = LK_FR_DIRTY;
+    for (int i = 0; i < 2; i++) {
+        c->frame[i].st = LK_FR_DIRTY;
+        c->frame[i].resync_matched = 0; /* the resync scan starts fresh */
+    }
 }
 
 /* Seq-hole check + activity bookkeeping, common to every event. */
@@ -168,7 +170,7 @@ void lk_conn_table_close(struct lk_conn_table *t, __u64 cookie, __u32 seq, __u64
 
     *lost = 0;
     if (!c)
-        return; /* whole life predates the agent or was lost */
+        return;                    /* whole life predates the agent or was lost */
     touch(t, c, seq, ts_ns, lost); /* the gap check runs on CLOSE itself */
     destroy(t, c);
     t->st.closed++;

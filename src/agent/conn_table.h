@@ -27,7 +27,7 @@
 /* Userspace defaults for the CLI knobs. max_conns matches the kernel `conns`
  * map capacity; the idle timeout is deliberately conservative (a pooled
  * connection idling minutes between transactions must survive). */
-#define LK_MAX_CONNS_DEFAULT 65536
+#define LK_MAX_CONNS_DEFAULT     65536
 #define LK_CONN_IDLE_TIMEOUT_SEC 600
 
 /* Per-direction framer state (Р9-Р11). The state machine lives in
@@ -42,20 +42,36 @@ struct lk_frame {
     __u32 call_pos, call_total; /* chunk off-arithmetic within one call;
                                    call_total == 0: no call in progress */
     /* Message being assembled (valid in BODY/SKIP, hdr[] while in HEADER). */
-    __u64 msg_ts;      /* ts of the event with the first header byte (Р13) */
-    __u32 msg_len;     /* protocol len field of the current message */
-    __u8 msg_type;     /* 0 while in startup framing */
-    __u8 startup_done; /* frontend: StartupMessage seen, normal framing on */
-    __u8 hdr_len;      /* bytes accumulated in hdr */
-    __u8 hdr[8];       /* header accumulator: 5 (normal) / 4 (startup) */
-    __u8 *buf;         /* lazy body-prefix buffer, <= LK_MSG_BODY_MAX; used
-                          only when a message spans chunks (Р11) */
+    __u64 msg_ts;        /* ts of the event with the first header byte (Р13) */
+    __u32 msg_len;       /* protocol len field of the current message */
+    __u8 msg_type;       /* 0 while in startup framing */
+    __u8 startup_done;   /* frontend: StartupMessage seen, normal framing on */
+    __u8 after_resync;   /* next emitted message gets LK_MSG_AFTER_RESYNC */
+    __u8 resync_matched; /* DIRTY backend: bytes of the 'Z' anchor matched so
+                            far — the sliding window surviving event borders */
+    __u8 hdr_len;        /* bytes accumulated in hdr */
+    __u8 hdr[8];         /* header accumulator: 5 (normal) / 4 (startup) */
+    __u8 *buf;           /* lazy body-prefix buffer, <= LK_MSG_BODY_MAX; used
+                            only when a message spans chunks (Р11) */
     __u32 buf_len;
 };
 
 /* lk_conn.flags */
 #define LK_CONN_SYNTHETIC (1 << 0) /* kernel synthetic OPEN: startup not seen */
-#define LK_CONN_TLS (1 << 1)       /* SSLRequest answered 'S' (task 2.4) */
+#define LK_CONN_TLS                                                                                \
+    (1 << 1) /* SSL/GSSENC request answered 'S'/'G': the                                           \
+                stream is encrypted, framing is off and                                            \
+                socket events are silently discarded                                               \
+                (plaintext source: stage-6 uprobes) */
+#define LK_CONN_SSL_REPLY                                                                          \
+    (1 << 2) /* SSLRequest/GSSENCRequest seen: the next                                            \
+                backend byte is the one-byte reply (Р10;                                          \
+                cross-direction flag is sound — ringbuf                                          \
+                order is global, recv(SSLRequest) in the                                           \
+                kernel happens-before send of the reply) */
+#define LK_CONN_CANCEL                                                                             \
+    (1 << 3) /* CancelRequest seen: nothing else travels                                           \
+                on this connection, discard until CLOSE */
 
 struct lk_conn {
     struct lk_conn *hnext; /* hash chain */

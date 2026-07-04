@@ -3,9 +3,11 @@
  * detects per-conn seq holes (logged as they arrive, both directions
  * dirtied) and is kept bounded by CONN_CLOSE, the 60 s idle sweep and the
  * --max-conns LRU ceiling. Data events then go through the streaming framer
- * (task 2.3), whose sink here is the --messages logger. Capture budget
- * (task 1.6): --cap-headers exercises the per-connection capture_mode
- * control surface. */
+ * (tasks 2.3/2.4), whose sink here is the --messages logger; resyncs are
+ * logged to stderr, and a connection going TLS is switched to HEADERS
+ * capture — no point shipping ciphertext through the ringbuf. Capture
+ * budget (task 1.6): --cap-headers exercises the per-connection
+ * capture_mode control surface. */
 #include "events.h"
 
 #include <arpa/inet.h>
@@ -82,11 +84,13 @@ void lk_events_print_stats(struct lk_events *e)
 
     fprintf(stderr,
             "latkit: msgs total=%llu trunc=%llu holes=%llu (%llu bytes) "
-            "dirty: badlen=%llu hdr-hole=%llu off-anomaly=%llu\n",
+            "dirty: badlen=%llu hdr-hole=%llu off-anomaly=%llu "
+            "resync=%llu tls=%llu\n",
             (unsigned long long)rs->msgs, (unsigned long long)rs->msgs_trunc,
             (unsigned long long)rs->holes, (unsigned long long)rs->hole_bytes,
             (unsigned long long)rs->bad_len, (unsigned long long)rs->hdr_holes,
-            (unsigned long long)rs->off_anomalies);
+            (unsigned long long)rs->off_anomalies, (unsigned long long)rs->resyncs,
+            (unsigned long long)rs->tls_conns);
 }
 
 /* xxd-style: offset, 16 hex bytes, ASCII column. */
@@ -173,6 +177,15 @@ static void on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struct l
         hexdump(m->body, m->body_cap);
 }
 
+/* Resync log pairs with the gap/dirty messages on stderr: "gap -> resync" in
+ * the log is the loss-recovery cycle working as designed (Р10). */
+static void on_resync(void *ctx, struct lk_conn *c, enum lk_dir dir)
+{
+    (void)ctx;
+    fprintf(stderr, "latkit: conn=%llx resync (%s)\n", (unsigned long long)c->cookie,
+            dir == LK_DIR_RECV ? "fe>" : "<be");
+}
+
 /* --cap-headers test hook (task 1.6): flip the connection into HEADERS mode
  * by writing capture_mode into its live `conns` entry — the same control
  * surface the stage-3 parser will use, just with a trivial policy (every
@@ -216,8 +229,19 @@ static int handle_event(void *ctx, void *data, size_t size)
 
         if (e->cfg.events)
             print_data_event(v.data, v.cap_len, e->cfg.hexdump);
-        if (conn) /* NULL only on alloc failure: degrade to no framing */
+        if (conn) { /* NULL only on alloc failure: degrade to no framing */
+            bool was_tls = conn->flags & LK_CONN_TLS;
+
             lk_reasm_data(&e->reasm, conn, v.hdr->dir, v.data, v.cap_len);
+            if (!was_tls && (conn->flags & LK_CONN_TLS)) {
+                /* TLS accepted: the ciphertext is useless to the framer, so
+                 * shrink what the kernel captures for this connection (the
+                 * plaintext source will be the stage-6 uprobe channel). */
+                fprintf(stderr, "latkit: conn=%llx TLS detected, framing off\n",
+                        (unsigned long long)v.hdr->conn_id);
+                set_cap_headers(e->cfg.conns, v.hdr->conn_id);
+            }
+        }
         break;
     }
     case LK_DEC_UNKNOWN:
@@ -277,7 +301,8 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
     if (!e)
         return NULL;
     e->cfg = *cfg;
-    lk_reasm_init(&e->reasm, &(struct lk_msg_sink){.ctx = e, .on_msg = on_msg});
+    lk_reasm_init(&e->reasm,
+                  &(struct lk_msg_sink){.ctx = e, .on_msg = on_msg, .on_resync = on_resync});
     e->conns = lk_conn_table_new(cfg->max_conns, cfg->conn_idle_timeout_sec * 1000000000ULL);
     if (!e->conns) {
         free(e);
