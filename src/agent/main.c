@@ -30,6 +30,7 @@ static __u64 opt_ringbuf_bytes = LK_RINGBUF_SZ;
 static __u32 opt_capture_limit = LK_CAPTURE_LIMIT;
 static __u32 opt_max_conns = LK_MAX_CONNS_DEFAULT;
 static __u32 opt_conn_idle_timeout = LK_CONN_IDLE_TIMEOUT_SEC;
+static const char *opt_record;
 static char opt_comm[16];
 
 static int libbpf_print(enum libbpf_print_level level, const char *fmt, va_list args)
@@ -58,6 +59,8 @@ static void usage(const char *argv0)
             "      --conn-idle-timeout SEC\n"
             "                        evict connections without events for SEC\n"
             "                        seconds (default: %d)\n"
+            "      --record FILE     append every raw ringbuf record to FILE for\n"
+            "                        offline replay (LKT1 trace, see record.h)\n"
             "      --events          print one line per raw ringbuf event\n"
             "      --messages        print one line per reassembled protocol\n"
             "                        message\n"
@@ -91,6 +94,7 @@ static int parse_args(int argc, char **argv)
         OPT_CAP_HEADERS,
         OPT_MAX_CONNS,
         OPT_CONN_IDLE_TIMEOUT,
+        OPT_RECORD,
         OPT_EVENTS,
         OPT_MESSAGES,
     };
@@ -102,6 +106,7 @@ static int parse_args(int argc, char **argv)
         {"cap-headers", no_argument, NULL, OPT_CAP_HEADERS},
         {"max-conns", required_argument, NULL, OPT_MAX_CONNS},
         {"conn-idle-timeout", required_argument, NULL, OPT_CONN_IDLE_TIMEOUT},
+        {"record", required_argument, NULL, OPT_RECORD},
         {"events", no_argument, NULL, OPT_EVENTS},
         {"messages", no_argument, NULL, OPT_MESSAGES},
         {"hexdump", no_argument, NULL, 'x'},
@@ -167,6 +172,9 @@ static int parse_args(int argc, char **argv)
                 return -1;
             }
             opt_conn_idle_timeout = v;
+            break;
+        case OPT_RECORD:
+            opt_record = optarg;
             break;
         case OPT_EVENTS:
             opt_events = true;
@@ -264,6 +272,7 @@ int main(int argc, char **argv)
         .conns = skel->maps.conns,
         .max_conns = opt_max_conns,
         .conn_idle_timeout_sec = opt_conn_idle_timeout,
+        .record_path = opt_record,
         .hexdump = opt_hexdump,
         .cap_headers = opt_cap_headers,
         .events = opt_events,

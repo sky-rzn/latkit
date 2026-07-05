@@ -48,6 +48,8 @@ jobs:
       - name: Configure
         run: cmake -B build
       - name: Build tests
-        run: cmake --build build --target test_smoke test_decode test_seqtrack -j"$(nproc)"
+        run: |
+          cmake --build build --target test_smoke test_decode test_conn_table \
+              test_reassembly test_replay -j"$(nproc)"
       - name: Run tests
         run: ctest --test-dir build --output-on-failure

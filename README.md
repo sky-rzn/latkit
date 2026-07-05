@@ -6,12 +6,19 @@ protocol into per-query latency metrics exported to Prometheus and
 OpenTelemetry. No backend of its own — Grafana reads the data from
 Prometheus / an OTel-compatible store.
 
-**Status: capture layer done (milestone M1).** The agent attaches to a live
-kernel, captures both directions of traffic on configured server ports as a
-stream of connection-scoped events, accounts for every lost event, and
-survives overload without touching the database. Protocol parsing, metrics
-and exporters are the next stages — see [PLAN.md](PLAN.md) (Russian) for the
-roadmap and [STAGE1.md](STAGE1.md) for the capture-layer design decisions.
+**Status: capture layer done (milestone M1); userspace framing in place.**
+The agent attaches to a live kernel, captures both directions of traffic on
+configured server ports as a stream of connection-scoped events, accounts for
+every lost event, and survives overload without touching the database. On top
+of that it now runs the stage-2 userspace pipeline: an epoll event loop, a
+connection table, and a streaming framer that reassembles the event stream
+into whole PostgreSQL v3 protocol messages (type + length + body), honestly
+flagging the stretches made dirty by loss. Message *semantics* (query/response
+matching, latency), metrics and exporters are the next stages — see
+[PLAN.md](PLAN.md) (Russian) for the roadmap, [STAGE1.md](STAGE1.md) for the
+capture-layer design decisions and [STAGE2.md](STAGE2.md) for the framing
+model (a per-direction stream of bytes and known-size holes,
+[docs/notes-reassembly.md](docs/notes-reassembly.md)).
 
 ## How it works
 
@@ -34,9 +41,15 @@ Kernel side (`src/bpf/latkit.bpf.c`):
   `total_len` always reports the real call size — budgets only cut
   `cap_len`, so the future reassembler knows the exact size of every hole.
 
-Userspace (`src/agent/`) loads the skeleton, fills the filter maps, polls the
-ringbuf and prints one line per event (payload hexdump behind `--hexdump`),
-plus a stats line every 10 s.
+Userspace (`src/agent/`) loads the skeleton, fills the filter maps and runs an
+epoll loop over the ringbuf, a timerfd (10 s stats, 60 s connection sweep) and
+a signalfd for clean shutdown. Decoded records feed a connection table (seq-gap
+detection, LRU ceiling, idle sweep) and a streaming framer that emits whole
+protocol messages. Output is opt-in: `--events` prints one line per raw event,
+`--messages` one line per reassembled message (`--hexdump` adds the body
+prefix); a stats line goes to stderr every 10 s. `--record` dumps the raw
+event stream to a file that replays offline through the same pipeline (used by
+the test fixtures — see `tests/replay`).
 
 ## Requirements
 
@@ -75,7 +88,12 @@ sudo ./build/latkit                    # captures local port 5432
 | `--capture-limit N` | 8192 | capture budget in bytes per send/recv call; `total_len` stays honest |
 | `--comm NAME` | off | only capture send/recv from processes with this exact comm |
 | `--cap-headers` | off | test hook: switch every connection to HEADERS mode (64 B/call) at OPEN |
-| `-x, --hexdump` | off | dump payload of data events |
+| `--max-conns N` | 65536 | userspace connection table ceiling; the least recently active entry is evicted past it |
+| `--conn-idle-timeout SEC` | 600 | evict connections with no events for this long (leak insurance for lost CLOSEs) |
+| `--record FILE` | off | append every raw ringbuf record to FILE for offline replay (LKT1 trace) |
+| `--events` | off | print one line per raw ringbuf event (the stage-1 output) |
+| `--messages` | off | print one line per reassembled protocol message |
+| `-x, --hexdump` | off | dump event payload (`--events`) and the captured message body prefix (`--messages`) |
 
 Dev environment (PostgreSQL 16 in docker + pgbench load):
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Smoke test: invariants of the kernel<->userspace event ABI (format v1).
- * Behavioral tests live next door: test_decode.c, test_seqtrack.c. */
+ * Behavioral tests live next door: test_decode.c, test_conn_table.c,
+ * test_reassembly.c, and tests/replay. */
 #include <linux/types.h>
 #include <stddef.h>
 #include <stdio.h>

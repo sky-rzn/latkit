@@ -11,8 +11,10 @@
 #include "events.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 
 #include <bpf/libbpf.h>
@@ -21,7 +23,9 @@
 #include "decode.h"
 #include "latkit.h"
 #include "loop.h"
+#include "pipeline.h"
 #include "reassembly.h"
+#include "record.h"
 
 #define LK_STATS_INTERVAL_SEC 10
 #define LK_SWEEP_INTERVAL_SEC 60
@@ -29,8 +33,8 @@
 struct lk_events {
     struct lk_events_cfg cfg;
     struct ring_buffer *rb;
-    struct lk_conn_table *conns; /* userspace conn table (task 2.2) */
-    struct lk_reasm reasm;       /* streaming framer (task 2.3) */
+    struct lk_pipeline pipe; /* decode -> conn table -> framer (Р14) */
+    struct lk_recorder *rec; /* --record trace writer, NULL when off */
 };
 
 /* --- global stats (task 1.5) ---------------------------------------------
@@ -70,7 +74,7 @@ void lk_events_print_stats(struct lk_events *e)
             (unsigned long long)sum[LK_ST_ITER_UNSUPPORTED],
             (unsigned long long)sum[LK_ST_RECV_STATE_MISS]);
 
-    const struct lk_conn_table_stats *cs = lk_conn_table_stats(e->conns);
+    const struct lk_conn_table_stats *cs = lk_conn_table_stats(e->pipe.conns);
 
     fprintf(stderr,
             "latkit: conns active=%u created=%llu closed=%llu "
@@ -80,7 +84,7 @@ void lk_events_print_stats(struct lk_events *e)
             (unsigned long long)cs->evicted_lru, (unsigned long long)cs->evicted_idle,
             (unsigned long long)cs->seq_gaps, (unsigned long long)cs->lost_events);
 
-    const struct lk_reasm_stats *rs = &e->reasm.st;
+    const struct lk_reasm_stats *rs = &e->pipe.reasm.st;
 
     fprintf(stderr,
             "latkit: msgs total=%llu trunc=%llu holes=%llu (%llu bytes) "
@@ -207,43 +211,32 @@ static void set_cap_headers(struct bpf_map *conns, __u64 cookie)
 static int handle_event(void *ctx, void *data, size_t size)
 {
     struct lk_events *e = ctx;
-    struct lk_ev_view v;
-    __u32 lost;
+    struct lk_pipeline_ev ev;
 
-    switch (lk_ev_decode(data, size, &v)) {
+    /* --record (Р14): dump the record verbatim before decoding, so the trace
+     * is exactly what the kernel emitted and replays through this same path. */
+    lk_recorder_write(e->rec, data, size);
+
+    lk_pipeline_feed(&e->pipe, data, size, &ev);
+    switch (ev.status) {
     case LK_DEC_CONN:
-        if (v.hdr->type == LK_EV_CONN_CLOSE) {
-            lk_conn_table_close(e->conns, v.hdr->conn_id, v.hdr->seq, v.hdr->ts_ns, &lost);
-        } else {
-            lk_conn_table_open(e->conns, v.hdr->conn_id, v.hdr->seq, v.hdr->ts_ns, &v.conn->tuple,
-                               v.hdr->flags & LK_F_SYNTHETIC, &lost);
-            if (e->cfg.cap_headers)
-                set_cap_headers(e->cfg.conns, v.hdr->conn_id);
-        }
+        if (ev.view.hdr->type == LK_EV_CONN_OPEN && e->cfg.cap_headers)
+            set_cap_headers(e->cfg.conns, ev.view.hdr->conn_id);
         if (e->cfg.events)
-            print_conn_event(v.conn);
+            print_conn_event(ev.view.conn);
         break;
-    case LK_DEC_DATA: {
-        struct lk_conn *conn =
-            lk_conn_table_data(e->conns, v.hdr->conn_id, v.hdr->seq, v.hdr->ts_ns, &lost);
-
+    case LK_DEC_DATA:
         if (e->cfg.events)
-            print_data_event(v.data, v.cap_len, e->cfg.hexdump);
-        if (conn) { /* NULL only on alloc failure: degrade to no framing */
-            bool was_tls = conn->flags & LK_CONN_TLS;
-
-            lk_reasm_data(&e->reasm, conn, v.hdr->dir, v.data, v.cap_len);
-            if (!was_tls && (conn->flags & LK_CONN_TLS)) {
-                /* TLS accepted: the ciphertext is useless to the framer, so
-                 * shrink what the kernel captures for this connection (the
-                 * plaintext source will be the stage-6 uprobe channel). */
-                fprintf(stderr, "latkit: conn=%llx TLS detected, framing off\n",
-                        (unsigned long long)v.hdr->conn_id);
-                set_cap_headers(e->cfg.conns, v.hdr->conn_id);
-            }
+            print_data_event(ev.view.data, ev.view.cap_len, e->cfg.hexdump);
+        if (ev.tls_now) {
+            /* TLS accepted: the ciphertext is useless to the framer, so
+             * shrink what the kernel captures for this connection (the
+             * plaintext source will be the stage-6 uprobe channel). */
+            fprintf(stderr, "latkit: conn=%llx TLS detected, framing off\n",
+                    (unsigned long long)ev.view.hdr->conn_id);
+            set_cap_headers(e->cfg.conns, ev.view.hdr->conn_id);
         }
         break;
-    }
     case LK_DEC_UNKNOWN:
         fprintf(stderr, "warn: unknown event type %u (size %zu)\n",
                 ((const struct lk_ev_hdr *)data)->type, size);
@@ -253,9 +246,9 @@ static int handle_event(void *ctx, void *data, size_t size)
         return 0;
     }
 
-    if (lost)
+    if (ev.lost)
         fprintf(stderr, "latkit: conn=%llx gap detected (lost %u events), both directions dirty\n",
-                (unsigned long long)v.hdr->conn_id, lost);
+                (unsigned long long)ev.view.hdr->conn_id, ev.lost);
     return 0;
 }
 
@@ -289,7 +282,7 @@ static void on_sweep_tick(void *ctx)
 
     if (clock_gettime(CLOCK_MONOTONIC, &ts))
         return;
-    n = lk_conn_table_sweep(e->conns, (__u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec);
+    n = lk_conn_table_sweep(e->pipe.conns, (__u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec);
     if (n)
         fprintf(stderr, "latkit: idle sweep evicted %u connection(s)\n", n);
 }
@@ -297,21 +290,31 @@ static void on_sweep_tick(void *ctx)
 struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
 {
     struct lk_events *e = calloc(1, sizeof(*e));
+    struct lk_msg_sink sink = {.ctx = e, .on_msg = on_msg, .on_resync = on_resync};
 
     if (!e)
         return NULL;
     e->cfg = *cfg;
-    lk_reasm_init(&e->reasm,
-                  &(struct lk_msg_sink){.ctx = e, .on_msg = on_msg, .on_resync = on_resync});
-    e->conns = lk_conn_table_new(cfg->max_conns, cfg->conn_idle_timeout_sec * 1000000000ULL);
-    if (!e->conns) {
+    if (lk_pipeline_init(&e->pipe, cfg->max_conns, cfg->conn_idle_timeout_sec * 1000000000ULL,
+                         &sink)) {
         free(e);
         return NULL;
+    }
+    if (cfg->record_path) {
+        e->rec = lk_recorder_open(cfg->record_path);
+        if (!e->rec) {
+            fprintf(stderr, "failed to open --record file '%s': %s\n", cfg->record_path,
+                    strerror(errno));
+            lk_pipeline_fini(&e->pipe);
+            free(e);
+            return NULL;
+        }
     }
     e->rb = ring_buffer__new(bpf_map__fd(cfg->ringbuf), handle_event, e, NULL);
     if (!e->rb) {
         fprintf(stderr, "failed to create ring buffer\n");
-        lk_conn_table_free(e->conns);
+        lk_recorder_close(e->rec);
+        lk_pipeline_fini(&e->pipe);
         free(e);
         return NULL;
     }
@@ -323,7 +326,9 @@ void lk_events_free(struct lk_events *e)
     if (!e)
         return;
     ring_buffer__free(e->rb);
-    lk_conn_table_free(e->conns);
+    if (lk_recorder_close(e->rec))
+        fprintf(stderr, "warn: --record file may be incomplete (write error)\n");
+    lk_pipeline_fini(&e->pipe);
     free(e);
 }
 

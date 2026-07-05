@@ -15,12 +15,13 @@ struct bpf_map;
 struct lk_loop;
 
 struct lk_events_cfg {
-    struct bpf_map *ringbuf; /* `events` map */
-    struct bpf_map *stats;   /* `stats` per-CPU counters */
-    struct bpf_map *conns;   /* kernel conn registry, for --cap-headers */
-    __u32 max_conns;         /* userspace conn table ceiling (LRU past it) */
+    struct bpf_map *ringbuf;     /* `events` map */
+    struct bpf_map *stats;       /* `stats` per-CPU counters */
+    struct bpf_map *conns;       /* kernel conn registry, for --cap-headers */
+    __u32 max_conns;             /* userspace conn table ceiling (LRU past it) */
     __u32 conn_idle_timeout_sec; /* idle sweep threshold */
-    bool hexdump;     /* dump event payload / message body prefix */
+    const char *record_path;     /* --record: raw trace file, NULL when off (Р14) */
+    bool hexdump;                /* dump event payload / message body prefix */
     bool cap_headers;
     bool events;   /* per-event log lines (the stage-1 output) */
     bool messages; /* one line per reassembled protocol message */
