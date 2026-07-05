@@ -5,13 +5,28 @@
 
 #include "latkit.h"
 
+/* Bridge the connection table's removal hook to the framer sink's close
+ * callback, so the protocol handler frees lk_conn.proto_state on every path an
+ * entry can leave the table — CONN_CLOSE, LRU eviction, idle sweep, teardown
+ * (Р15). The sink is the framer's own copy, valid for the pipeline's life. */
+static void pipeline_on_destroy(void *ctx, struct lk_conn *c)
+{
+    struct lk_pipeline *p = ctx;
+
+    if (p->reasm.sink.on_conn_close)
+        p->reasm.sink.on_conn_close(p->reasm.sink.ctx, c);
+}
+
 int lk_pipeline_init(struct lk_pipeline *p, __u32 max_conns, __u64 idle_timeout_ns,
                      const struct lk_msg_sink *sink)
 {
     memset(p, 0, sizeof(*p));
     lk_reasm_init(&p->reasm, sink);
     p->conns = lk_conn_table_new(max_conns, idle_timeout_ns);
-    return p->conns ? 0 : -1;
+    if (!p->conns)
+        return -1;
+    lk_conn_table_on_destroy(p->conns, pipeline_on_destroy, p);
+    return 0;
 }
 
 void lk_pipeline_fini(struct lk_pipeline *p)

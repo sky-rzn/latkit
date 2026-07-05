@@ -7,6 +7,7 @@
  * idle sweep evict, an entry re-created after eviction starts dirty. */
 #include <linux/types.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "conn_table.h"
@@ -212,9 +213,61 @@ static int test_stats(void)
     return 0;
 }
 
+/* The destroy hook must fire on every path an entry can leave the table so the
+ * protocol handler frees lk_conn.proto_state (Р15): CONN_CLOSE, LRU eviction,
+ * idle sweep, and table teardown. Each entry here carries a heap proto_state
+ * that the hook frees — under ASAN a missed path leaks (or a double hit
+ * double-frees), so this exercises correctness beyond the call count. */
+static void on_destroy_free(void *ctx, struct lk_conn *c)
+{
+    (*(int *)ctx)++;
+    free(c->proto_state); /* free(NULL) is fine for hookless-state entries */
+    c->proto_state = NULL;
+}
+
+static int test_proto_state_hook(void)
+{
+    const __u64 timeout = 600ULL * 1000000000;
+    struct lk_conn_table *t = lk_conn_table_new(2, timeout); /* small: force LRU */
+    int calls = 0;
+    struct lk_conn *c;
+    __u32 lost;
+
+    CHECK(t);
+    lk_conn_table_on_destroy(t, on_destroy_free, &calls);
+
+    /* CONN_CLOSE frees proto_state. */
+    c = lk_conn_table_open(t, 1, 0, 100, &tuple, false, &lost);
+    CHECK(c);
+    CHECK((c->proto_state = calloc(1, 32)));
+    lk_conn_table_close(t, 1, 1, 110, &lost);
+    CHECK(calls == 1);
+
+    /* LRU eviction (past max_conns=2) frees the coldest entry's proto_state. */
+    c = lk_conn_table_open(t, 10, 0, 200, &tuple, false, &lost);
+    CHECK((c->proto_state = calloc(1, 32)));
+    c = lk_conn_table_open(t, 11, 0, 210, &tuple, false, &lost);
+    CHECK((c->proto_state = calloc(1, 32)));
+    c = lk_conn_table_open(t, 12, 0, 220, &tuple, false, &lost); /* evicts cookie 10 */
+    CHECK((c->proto_state = calloc(1, 32)));
+    CHECK(calls == 2);
+
+    /* Idle sweep frees proto_state of everything past the deadline (11 and 12). */
+    CHECK(lk_conn_table_sweep(t, 220 + timeout) == 2);
+    CHECK(calls == 4);
+
+    /* Table teardown frees proto_state of every survivor. */
+    c = lk_conn_table_open(t, 20, 0, 300, &tuple, false, &lost);
+    CHECK((c->proto_state = calloc(1, 32)));
+    lk_conn_table_free(t);
+    CHECK(calls == 5);
+    return 0;
+}
+
 int main(void)
 {
-    if (test_seq_holes() || test_lru_eviction() || test_idle_sweep() || test_stats())
+    if (test_seq_holes() || test_lru_eviction() || test_idle_sweep() || test_stats() ||
+        test_proto_state_hook())
         return 1;
     printf("ok\n");
     return 0;

@@ -24,6 +24,7 @@
 #include "latkit.h"
 #include "loop.h"
 #include "pipeline.h"
+#include "proto.h"
 #include "reassembly.h"
 #include "record.h"
 
@@ -33,9 +34,43 @@
 struct lk_events {
     struct lk_events_cfg cfg;
     struct ring_buffer *rb;
-    struct lk_pipeline pipe; /* decode -> conn table -> framer (Р14) */
-    struct lk_recorder *rec; /* --record trace writer, NULL when off */
+    struct lk_pipeline pipe;              /* decode -> conn table -> framer (Р14) */
+    struct lk_proto *proto;               /* PG handler: the standard framer sink */
+    const struct lk_msg_sink *proto_sink; /* = lk_proto_sink(proto) */
+    struct lk_recorder *rec;              /* --record trace writer, NULL when off */
 };
+
+/* PG parser counters (stage 3). The skeleton (task 3.1) only tallies messages,
+ * so print the totals plus the per-type breakdown its stubs produce — the
+ * proof that live traffic is reaching the handler. Printable types show as the
+ * PG letter, others as 0xNN; startup-framed messages have type 0. */
+static void append_type_counts(char *buf, size_t n, const __u64 *by_type)
+{
+    size_t off = 0;
+
+    for (unsigned t = 0; t < 256 && off < n; t++) {
+        if (!by_type[t])
+            continue;
+        if (t >= 0x20 && t < 0x7f)
+            off += snprintf(buf + off, off < n ? n - off : 0, " %c=%llu", (char)t,
+                            (unsigned long long)by_type[t]);
+        else
+            off += snprintf(buf + off, off < n ? n - off : 0, " 0x%02x=%llu", t,
+                            (unsigned long long)by_type[t]);
+    }
+}
+
+static void print_proto_stats(const struct lk_proto_stats *ps)
+{
+    char fe[256] = {0}, be[256] = {0};
+
+    fprintf(stderr, "latkit: pg msgs=%llu startup=%llu resyncs=%llu conns=%llu\n",
+            (unsigned long long)ps->msgs, (unsigned long long)ps->startup_msgs,
+            (unsigned long long)ps->resyncs, (unsigned long long)ps->conns);
+    append_type_counts(fe, sizeof(fe), ps->by_type[LK_DIR_RECV]);
+    append_type_counts(be, sizeof(be), ps->by_type[LK_DIR_SEND]);
+    fprintf(stderr, "latkit: pg types fe:%s | be:%s\n", fe, be);
+}
 
 /* --- global stats (task 1.5) ---------------------------------------------
  * Sum the per-CPU `stats` counters and print one line to stderr; called
@@ -95,6 +130,8 @@ void lk_events_print_stats(struct lk_events *e)
             (unsigned long long)rs->bad_len, (unsigned long long)rs->hdr_holes,
             (unsigned long long)rs->off_anomalies, (unsigned long long)rs->resyncs,
             (unsigned long long)rs->tls_conns);
+
+    print_proto_stats(lk_proto_stats(e->proto));
 }
 
 /* xxd-style: offset, 16 hex bytes, ASCII column. */
@@ -156,14 +193,18 @@ static void print_data_event(const struct lk_ev_data *ev, __u32 cap, bool dump)
         hexdump(ev->payload, cap);
 }
 
-/* --messages logger: the framer sink for stage 2 (stage 3 replaces it with
- * the parser). One line per reassembled message; --hexdump adds the captured
- * body prefix. fe> is the frontend->backend stream (RECV on the server
- * socket), <be the reverse. */
+/* Framer sink installed by events.c: it tees every message into the PG parser
+ * (the standard consumer since stage 3) and, when --messages is on, also logs
+ * it. The stage-2 logger thus survives as a debug mirror alongside the parser
+ * (STAGE3.md task 3.1). --hexdump adds the captured body prefix. fe> is the
+ * frontend->backend stream (RECV on the server socket), <be the reverse. */
 static void on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struct lk_msg *m)
 {
     struct lk_events *e = ctx;
     char type[8];
+
+    if (e->proto_sink->on_msg)
+        e->proto_sink->on_msg(e->proto_sink->ctx, c, dir, m);
 
     if (!e->cfg.messages)
         return;
@@ -185,9 +226,23 @@ static void on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struct l
  * the log is the loss-recovery cycle working as designed (Р10). */
 static void on_resync(void *ctx, struct lk_conn *c, enum lk_dir dir)
 {
-    (void)ctx;
+    struct lk_events *e = ctx;
+
     fprintf(stderr, "latkit: conn=%llx resync (%s)\n", (unsigned long long)c->cookie,
             dir == LK_DIR_RECV ? "fe>" : "<be");
+    if (e->proto_sink->on_resync)
+        e->proto_sink->on_resync(e->proto_sink->ctx, c, dir);
+}
+
+/* Connection removed from the table (any path): let the parser free its
+ * per-connection state (Р15). The pipeline routes the conn-table destroy hook
+ * here through the framer sink. */
+static void on_conn_close(void *ctx, struct lk_conn *c)
+{
+    struct lk_events *e = ctx;
+
+    if (e->proto_sink->on_conn_close)
+        e->proto_sink->on_conn_close(e->proto_sink->ctx, c);
 }
 
 /* --cap-headers test hook (task 1.6): flip the connection into HEADERS mode
@@ -290,13 +345,25 @@ static void on_sweep_tick(void *ctx)
 struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
 {
     struct lk_events *e = calloc(1, sizeof(*e));
-    struct lk_msg_sink sink = {.ctx = e, .on_msg = on_msg, .on_resync = on_resync};
+    struct lk_msg_sink sink = {
+        .ctx = e, .on_msg = on_msg, .on_resync = on_resync, .on_conn_close = on_conn_close};
 
     if (!e)
         return NULL;
     e->cfg = *cfg;
+    /* The PG handler is the standard consumer of the framer (Р15). No query
+     * sink yet — the --queries logger arrives in task 3.3; the skeleton only
+     * counts. events.c's own sink (above) tees messages into it and mirrors
+     * to the --messages logger. */
+    e->proto = lk_proto_pg_new(NULL);
+    if (!e->proto) {
+        free(e);
+        return NULL;
+    }
+    e->proto_sink = lk_proto_sink(e->proto);
     if (lk_pipeline_init(&e->pipe, cfg->max_conns, cfg->conn_idle_timeout_sec * 1000000000ULL,
                          &sink)) {
+        lk_proto_free(e->proto);
         free(e);
         return NULL;
     }
@@ -306,6 +373,7 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
             fprintf(stderr, "failed to open --record file '%s': %s\n", cfg->record_path,
                     strerror(errno));
             lk_pipeline_fini(&e->pipe);
+            lk_proto_free(e->proto);
             free(e);
             return NULL;
         }
@@ -315,6 +383,7 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
         fprintf(stderr, "failed to create ring buffer\n");
         lk_recorder_close(e->rec);
         lk_pipeline_fini(&e->pipe);
+        lk_proto_free(e->proto);
         free(e);
         return NULL;
     }
@@ -328,7 +397,10 @@ void lk_events_free(struct lk_events *e)
     ring_buffer__free(e->rb);
     if (lk_recorder_close(e->rec))
         fprintf(stderr, "warn: --record file may be incomplete (write error)\n");
+    /* Tear the table down first: its destroy hooks free every connection's
+     * proto_state through the parser, which must still be alive here. */
     lk_pipeline_fini(&e->pipe);
+    lk_proto_free(e->proto);
     free(e);
 }
 

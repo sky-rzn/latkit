@@ -126,6 +126,19 @@ add_custom_command(OUTPUT ${SKEL_H}
 
 add_custom_target(latkit_skel DEPENDS ${SKEL_H})
 
+# --- protocol handlers (stage 3) -------------------------------------------
+# src/proto/** is the "core <-> protocol" layer (Р15): pure state machines, no
+# libbpf and no I/O, so it links unchanged into both the agent and the offline
+# unit/replay harnesses. It speaks to the core through the contract headers
+# only (proto.h re-exports conn_table.h / reassembly.h).
+set(PROTO_SRC src/proto/pg/pg.c)
+set(PROTO_INC ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/pg
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/agent
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf)
+add_library(latkit_proto STATIC ${PROTO_SRC})
+target_include_directories(latkit_proto PUBLIC ${PROTO_INC})
+
 # --- agent -----------------------------------------------------------------
 add_executable(latkit src/agent/main.c src/agent/loop.c src/agent/events.c
                src/agent/decode.c src/agent/conn_table.c src/agent/reassembly.c
@@ -133,8 +146,9 @@ add_executable(latkit src/agent/main.c src/agent/loop.c src/agent/events.c
 add_dependencies(latkit latkit_skel)
 set_source_files_properties(src/agent/main.c PROPERTIES OBJECT_DEPENDS ${SKEL_H})
 target_include_directories(latkit PRIVATE
-    ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf ${LIBBPF_INCLUDE_DIR})
-target_link_libraries(latkit ${LATKIT_LIBBPF_LIBS})
+    ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/proto ${LIBBPF_INCLUDE_DIR})
+target_link_libraries(latkit latkit_proto ${LATKIT_LIBBPF_LIBS})
 
 # --- tests -----------------------------------------------------------------
 enable_testing()

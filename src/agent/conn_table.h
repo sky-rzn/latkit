@@ -83,6 +83,9 @@ struct lk_conn {
     __u32 dropped; /* events lost on this connection (userspace-detected) */
     __u64 last_activity_ns;
     struct lk_frame frame[2]; /* index: enum lk_dir */
+    void *proto_state;        /* owned by the protocol handler (Р15, STAGE3):
+                                 allocated lazily on the first message, released
+                                 by the destroy hook on every removal path */
 };
 
 /* Cumulative counters; `active` is the current entry count. Reported in the
@@ -101,6 +104,16 @@ struct lk_conn_table;
 
 struct lk_conn_table *lk_conn_table_new(__u32 max_conns, __u64 idle_timeout_ns);
 void lk_conn_table_free(struct lk_conn_table *t);
+
+/* Register a hook fired for every entry removal — CONN_CLOSE, LRU eviction,
+ * idle sweep, and lk_conn_table_free teardown — while the entry is still fully
+ * valid, right before its memory is released. This is how the owner of
+ * lk_conn.proto_state frees it on *all* paths (Р15, STAGE3): a partial parser
+ * state must not outlive the connection it belongs to. At most one hook; NULL
+ * ctx/fn clears it. Set it once, immediately after lk_conn_table_new, before
+ * any event is fed. */
+void lk_conn_table_on_destroy(struct lk_conn_table *t, void (*fn)(void *ctx, struct lk_conn *c),
+                              void *ctx);
 
 /* Event entry points. Each runs the seq-hole detector and stores the number
  * of events lost before this one into *lost (0 if none); a hole marks both

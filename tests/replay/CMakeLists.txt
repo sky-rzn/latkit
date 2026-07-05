@@ -11,8 +11,11 @@ set(REPLAY_SRC
 
 set(REPLAY_INC ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
 
+# The protocol layer links libbpf-free into the offline harness too (Р15), so
+# replay tests drive the PG parser over fixtures from task 3.2 on.
 add_executable(test_replay test_replay.c ${REPLAY_SRC})
 target_include_directories(test_replay PRIVATE ${REPLAY_INC})
+target_link_libraries(test_replay latkit_proto)
 target_compile_definitions(test_replay PRIVATE
     LK_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 add_test(NAME replay COMMAND test_replay)
@@ -20,3 +23,4 @@ add_test(NAME replay COMMAND test_replay)
 # Dev tool: regenerate the committed fixtures (not run by ctest).
 add_executable(gen_fixtures gen_fixtures.c ${REPLAY_SRC})
 target_include_directories(gen_fixtures PRIVATE ${REPLAY_INC})
+target_link_libraries(gen_fixtures latkit_proto)

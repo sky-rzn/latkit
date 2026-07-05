@@ -11,6 +11,10 @@ struct lk_conn_table {
     __u64 idle_timeout_ns;
     /* LRU list: head = most recently touched, tail = eviction candidate. */
     struct lk_conn *lru_head, *lru_tail;
+    /* Fired for every entry removal, before the memory is freed (Р15): the
+     * protocol handler frees lk_conn.proto_state here on all paths. */
+    void (*on_destroy)(void *ctx, struct lk_conn *c);
+    void *on_destroy_ctx;
     struct lk_conn_table_stats st;
 };
 
@@ -60,6 +64,11 @@ static void destroy(struct lk_conn_table *t, struct lk_conn *c)
 {
     struct lk_conn **slot;
 
+    /* Release protocol state while the entry is still whole (Р15). This is the
+     * single choke point for CONN_CLOSE, LRU eviction, the idle sweep and
+     * teardown, so the hook covers all removal paths by construction. */
+    if (t->on_destroy)
+        t->on_destroy(t->on_destroy_ctx, c);
     for (slot = hash_bucket(t, c->cookie); *slot != c; slot = &(*slot)->hnext)
         ;
     *slot = c->hnext;
@@ -211,6 +220,13 @@ struct lk_conn_table *lk_conn_table_new(__u32 max_conns, __u64 idle_timeout_ns)
         return NULL;
     }
     return t;
+}
+
+void lk_conn_table_on_destroy(struct lk_conn_table *t, void (*fn)(void *ctx, struct lk_conn *c),
+                              void *ctx)
+{
+    t->on_destroy = fn;
+    t->on_destroy_ctx = ctx;
 }
 
 void lk_conn_table_free(struct lk_conn_table *t)
