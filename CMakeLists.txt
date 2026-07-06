@@ -131,7 +131,8 @@ add_custom_target(latkit_skel DEPENDS ${SKEL_H})
 # libbpf and no I/O, so it links unchanged into both the agent and the offline
 # unit/replay harnesses. It speaks to the core through the contract headers
 # only (proto.h re-exports conn_table.h / reassembly.h).
-set(PROTO_SRC src/proto/pg/pg.c src/proto/pg/pg_session.c src/proto/pg/pg_query.c)
+set(PROTO_SRC src/proto/pg/pg.c src/proto/pg/pg_session.c src/proto/pg/pg_query.c
+              src/proto/pg/pg_prep.c)
 set(PROTO_INC ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
               ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/pg
               ${CMAKE_CURRENT_SOURCE_DIR}/src/agent

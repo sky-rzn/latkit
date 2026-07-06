@@ -306,6 +306,199 @@ static void build_extended(struct fx *x)
     call(&b, LK_DIR_RECV, w, n);
     expect(&b, LK_DIR_RECV, 'X', 4, 0);
     ev_close(&b);
+
+    /* Parse caches the unnamed statement "select 1"; Bind opens one EXTENDED
+     * unit that resolves its text from the cache and closes on CommandComplete. */
+    b.x->queries = 1;
+    b.x->obs_kind = LK_Q_EXTENDED;
+    b.x->obs_rows = 1;
+    b.x->obs_flags = 0;
+    b.x->obs_text = "select 1";
+}
+
+/* pgbench -M prepared: a named statement is Parsed once, then reused by two
+ * Bind/Execute/Sync round-trips — both observations carry the cached text, no
+ * NO_TEXT (the checklist's "prepared without NO_TEXT"). */
+static void build_prepared(struct fx *x)
+{
+    struct bld b;
+    __u8 w[256];
+    __u32 n;
+
+    bld_init(&b, x);
+    prelude(&b);
+
+    /* Parse a named statement "s1" -> "select 2". */
+    n = pgmsg(w, 'P', "s1\0select 2\0\0\0", 14); /* name\0 query\0 nparams(2) */
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'P', 18, 0);
+    n = pgmsg(w, '1', NULL, 0); /* ParseComplete */
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, '1', 4, 0);
+
+    /* Two executions of s1, each Bind/Execute/Sync -> BindComplete, DataRow,
+     * CommandComplete, ReadyForQuery. */
+    for (int i = 0; i < 2; i++) {
+        n = pgmsg(w, 'B', "\0s1\0\0\0\0\0", 8); /* portal\0 stmt "s1"\0 formats/values */
+        call(&b, LK_DIR_RECV, w, n);
+        expect(&b, LK_DIR_RECV, 'B', 12, 0);
+        n = pgmsg(w, 'E', "\0\0\0\0\0", 5); /* portal\0 maxrows(4) */
+        call(&b, LK_DIR_RECV, w, n);
+        expect(&b, LK_DIR_RECV, 'E', 9, 0);
+        n = pgmsg(w, 'S', NULL, 0); /* Sync */
+        call(&b, LK_DIR_RECV, w, n);
+        expect(&b, LK_DIR_RECV, 'S', 4, 0);
+
+        n = pgmsg(w, '2', NULL, 0); /* BindComplete */
+        call(&b, LK_DIR_SEND, w, n);
+        expect(&b, LK_DIR_SEND, '2', 4, 0);
+        n = data_row(w, "2");
+        call(&b, LK_DIR_SEND, w, n);
+        expect(&b, LK_DIR_SEND, 'D', n - 1, 0);
+        n = pgmsg(w, 'C', "SELECT 1", 9);
+        call(&b, LK_DIR_SEND, w, n);
+        expect(&b, LK_DIR_SEND, 'C', 13, 0);
+        n = pgmsg(w, 'Z', "I", 1);
+        call(&b, LK_DIR_SEND, w, n);
+        expect(&b, LK_DIR_SEND, 'Z', 5, 0);
+    }
+
+    n = pgmsg(w, 'X', NULL, 0);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'X', 4, 0);
+    ev_close(&b);
+
+    /* Two EXTENDED observations, both with the cached text and one row. */
+    b.x->queries = 2;
+    b.x->obs_kind = LK_Q_EXTENDED;
+    b.x->obs_rows = 1;
+    b.x->obs_flags = 0;
+    b.x->obs_text = "select 2";
+}
+
+/* Pipelined batch with an error in the middle: three unnamed-statement units
+ * Bound before any reply (each Parse overwrites the unnamed slot, exercising the
+ * eviction-rescue of live references, Р17). The backend completes unit 1, errors
+ * on unit 2, and skips to Sync — unit 3 is ABORTED. Exactly one ERROR + a tail
+ * of ABORTED, all flagged PIPELINED. */
+static void build_pipeline_error(struct fx *x)
+{
+    struct bld b;
+    __u8 w[512];
+    __u32 n = 0;
+    const char *texts[3] = {"select 1", "select 2", "select 3"};
+
+    bld_init(&b, x);
+    prelude(&b);
+
+    /* Frontend: P1 B1 E1  P2 B2 E2  P3 B3 E3  Sync — one call. */
+    for (int i = 0; i < 3; i++) {
+        __u8 parse[32];
+        __u32 pn = 0;
+
+        parse[pn++] = '\0'; /* unnamed statement */
+        memcpy(parse + pn, texts[i], 9); /* "select N\0" */
+        pn += 9;
+        parse[pn++] = '\0';
+        parse[pn++] = '\0'; /* nparams = 0 */
+        n += pgmsg(w + n, 'P', parse, pn);
+        expect(&b, LK_DIR_RECV, 'P', pn + 4, 0);
+        n += pgmsg(w + n, 'B', "\0\0\0\0\0\0\0\0", 8); /* bind unnamed portal+stmt */
+        expect(&b, LK_DIR_RECV, 'B', 12, 0);
+        n += pgmsg(w + n, 'E', "\0\0\0\0\0", 5);
+        expect(&b, LK_DIR_RECV, 'E', 9, 0);
+    }
+    n += pgmsg(w + n, 'S', NULL, 0);
+    expect(&b, LK_DIR_RECV, 'S', 4, 0);
+    call(&b, LK_DIR_RECV, w, n);
+
+    /* Backend: unit 1 completes, unit 2 errors, then skip to the Sync's Z. */
+    n = 0;
+    n += pgmsg(w + n, '1', NULL, 0); /* ParseComplete (P1) */
+    expect(&b, LK_DIR_SEND, '1', 4, 0);
+    n += pgmsg(w + n, '2', NULL, 0); /* BindComplete (B1) */
+    expect(&b, LK_DIR_SEND, '2', 4, 0);
+    n += pgmsg(w + n, 'C', "SELECT 1", 9);
+    expect(&b, LK_DIR_SEND, 'C', 13, 0);
+    n += pgmsg(w + n, '1', NULL, 0); /* ParseComplete (P2) */
+    expect(&b, LK_DIR_SEND, '1', 4, 0);
+    {
+        /* ErrorResponse for unit 2: S(everity)\0 C(ode) 42P01\0 end. */
+        __u8 err[32];
+        __u32 en = 0;
+
+        err[en++] = 'S';
+        memcpy(err + en, "ERROR", 6);
+        en += 6;
+        err[en++] = 'C';
+        memcpy(err + en, "42P01", 6);
+        en += 6;
+        err[en++] = 0;
+        n += pgmsg(w + n, 'E', err, en);
+        expect(&b, LK_DIR_SEND, 'E', en + 4, 0);
+    }
+    n += pgmsg(w + n, 'Z', "I", 1);
+    expect(&b, LK_DIR_SEND, 'Z', 5, 0);
+    call(&b, LK_DIR_SEND, w, n);
+
+    n = pgmsg(w, 'X', NULL, 0);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'X', 4, 0);
+    ev_close(&b);
+
+    /* Three observations: unit 1 EXTENDED (rows 1), unit 2 ERROR, unit 3
+     * ABORTED. The last emitted is unit 3 — ABORTED | PIPELINED, its text still
+     * "select 3" (rescued when P3 overwrote the unnamed slot). */
+    b.x->queries = 3;
+    b.x->errors_sql = 1;
+    b.x->obs_kind = LK_Q_EXTENDED;
+    b.x->obs_rows = 0;
+    b.x->obs_flags = LK_QO_ABORTED | LK_QO_PIPELINED;
+    b.x->obs_text = "select 3";
+}
+
+/* Bind on a statement name never Parsed (agent started late, eviction): the unit
+ * is EXTENDED with LK_QO_NO_TEXT — honest latency, unknown text. */
+static void build_bind_unknown(struct fx *x)
+{
+    struct bld b;
+    __u8 w[128];
+    __u32 n;
+
+    bld_init(&b, x);
+    prelude(&b);
+
+    n = pgmsg(w, 'B', "\0nope\0\0\0\0\0", 10); /* portal\0 stmt "nope"\0 formats/values */
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'B', 14, 0);
+    n = pgmsg(w, 'E', "\0\0\0\0\0", 5);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'E', 9, 0);
+    n = pgmsg(w, 'S', NULL, 0);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'S', 4, 0);
+
+    n = pgmsg(w, '2', NULL, 0); /* BindComplete */
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, '2', 4, 0);
+    n = pgmsg(w, 'C', "SELECT 5", 9);
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'C', 13, 0);
+    n = pgmsg(w, 'Z', "I", 1);
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'Z', 5, 0);
+
+    n = pgmsg(w, 'X', NULL, 0);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'X', 4, 0);
+    ev_close(&b);
+
+    /* One EXTENDED observation, no text, rows from the tag. */
+    b.x->queries = 1;
+    b.x->obs_kind = LK_Q_EXTENDED;
+    b.x->obs_rows = 5;
+    b.x->obs_flags = LK_QO_NO_TEXT;
+    b.x->obs_text = NULL; /* NO_TEXT: nothing to compare */
 }
 
 /* Session with a break: a clean query, then a lost-event seq gap dirties both
@@ -489,8 +682,14 @@ static void build_synthetic_midsession(struct fx *x)
 }
 
 const struct fixture lk_fixtures[] = {
-    {"simple_query", build_simple_query}, {"extended", build_extended},
-    {"session_gap", build_session_gap},   {"ssl_plain", build_ssl_plain},
-    {"ssl_tls", build_ssl_tls},           {"synthetic_midsession", build_synthetic_midsession},
+    {"simple_query", build_simple_query},
+    {"extended", build_extended},
+    {"prepared", build_prepared},
+    {"pipeline_error", build_pipeline_error},
+    {"bind_unknown", build_bind_unknown},
+    {"session_gap", build_session_gap},
+    {"ssl_plain", build_ssl_plain},
+    {"ssl_tls", build_ssl_tls},
+    {"synthetic_midsession", build_synthetic_midsession},
 };
 const size_t lk_nfixtures = sizeof(lk_fixtures) / sizeof(lk_fixtures[0]);

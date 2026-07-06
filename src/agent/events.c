@@ -129,9 +129,11 @@ static void print_proto_stats(const struct lk_proto_stats *ps)
             (unsigned long long)ps->sessions, (unsigned long long)ps->queries,
             (unsigned long long)ps->errors_sql, (unsigned long long)ps->parse_errors,
             (unsigned long long)ps->unknown_msgs, (unsigned long long)ps->replication_conns);
-    fprintf(stderr, "latkit: pg units_dropped resync=%llu close=%llu overflow=%llu\n",
-            (unsigned long long)ps->units_dropped_resync, (unsigned long long)ps->units_dropped_close,
-            (unsigned long long)ps->units_dropped_overflow);
+    fprintf(stderr,
+            "latkit: pg units_dropped resync=%llu close=%llu overflow=%llu prep_evictions=%llu\n",
+            (unsigned long long)ps->units_dropped_resync,
+            (unsigned long long)ps->units_dropped_close,
+            (unsigned long long)ps->units_dropped_overflow, (unsigned long long)ps->prep_evictions);
     append_type_counts(fe, sizeof(fe), ps->by_type[LK_DIR_RECV]);
     append_type_counts(be, sizeof(be), ps->by_type[LK_DIR_SEND]);
     fprintf(stderr, "latkit: pg types fe:%s | be:%s\n", fe, be);

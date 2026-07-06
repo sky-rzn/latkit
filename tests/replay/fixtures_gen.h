@@ -52,6 +52,9 @@ struct fx {
     __u8 obs_kind;            /* expected lk_query_obs.kind */
     const char *obs_text;     /* expected SQL text; NULL = do not check */
     const char *obs_sqlstate; /* expected SQLSTATE; NULL = do not check */
+
+    /* Parser counters (task 3.4), always checked against lk_proto_stats. */
+    __u64 errors_sql; /* expected LK_QO_ERROR observations */
 };
 
 struct fixture {

@@ -41,9 +41,12 @@ static struct pg_conn *pg_conn_get(struct lk_proto *p, struct lk_conn *c)
     return pc;
 }
 
-/* --- per-direction dispatch (grows in 3.3-3.5) ---------------------------- */
+/* --- per-direction dispatch (grows in 3.5) -------------------------------- */
 
-/* frontend -> backend (RECV on the server socket): startup, Q, P, B, E, S, X. */
+/* frontend -> backend (RECV on the server socket). The extended-protocol types
+ * (P/B/E/D/C/S/H/F) share letters with backend types, so direction is what
+ * disambiguates them (e.g. frontend 'E' is Execute, backend 'E' is
+ * ErrorResponse). */
 static void pg_frontend_msg(struct lk_proto *p, struct lk_conn *c, struct pg_conn *pc,
                             const struct lk_msg *m)
 {
@@ -52,15 +55,42 @@ static void pg_frontend_msg(struct lk_proto *p, struct lk_conn *c, struct pg_con
         return;
     }
     switch (m->type) {
-    case 'Q': /* simple Query: open a unit (3.3) */
-        pg_query_simple(pc, m);
+    case 'Q': /* simple Query: open a SIMPLE unit (3.3) */
+        pg_query_simple(p, pc, m);
+        break;
+    case 'P': /* Parse: cache {name -> SQL} (Р17); opens no unit */
+        pg_prep_parse(p, pc, m);
+        break;
+    case 'B': /* Bind: open an EXTENDED unit, text from the cache */
+        pg_query_bind(p, pc, m);
+        break;
+    case 'F': /* FunctionCall: open a FUNCTION unit, no text */
+        pg_query_function(p, pc, m);
+        break;
+    case 'C': /* Close: drop a prepared statement (kind 'S') from the cache */
+        pg_prep_close(pc, m);
         break;
     case 'p':
         /* PasswordMessage / SASL: the body is the password. It is never read
          * or copied — a security invariant, not an optimisation (Р16). */
         break;
+    case 'E':
+        /* Execute: marks execution start. ts_start is already the Bind time
+         * (Р16) and the observation has no separate execute timestamp, so there
+         * is nothing to record here — the SUSPENDED re-execute continuation is
+         * the documented simplification. Tallied via by_type. */
+        break;
+    case 'D': /* Describe (statement/portal): produces no observation */
+    case 'S': /* Sync: batch boundary; the following Z does the closing */
+    case 'H': /* Flush: forces backend output, no query semantics */
+    case 'X': /* Terminate: teardown, handled by the framer / close hook */
+        break;
+    case 'd': /* CopyData */
+    case 'c': /* CopyDone */
+    case 'f': /* CopyFail: COPY arrives with task 3.5 */
+        break;
     default:
-        /* P/B/E/S extended (3.4); d/c/f COPY (3.5). */
+        p->st.unknown_msgs++; /* an unknown frontend type (Р18) */
         break;
     }
 }
@@ -81,21 +111,43 @@ static void pg_backend_msg(struct lk_proto *p, struct lk_conn *c, struct pg_conn
     case 'D': /* DataRow: first-row timing (3.3) */
         pg_query_data_row(pc, m);
         break;
-    case 'C': /* CommandComplete: rows + statement count (3.3) */
+    case 'C': /* CommandComplete: rows + statement count (3.3/3.4) */
         pg_query_complete(p, pc, m);
         break;
     case 'I': /* EmptyQueryResponse: an empty statement (3.3) */
         pg_query_empty(pc, m);
         break;
-    case 'E': /* ErrorResponse: SQLSTATE onto the open unit (3.3) */
+    case 's': /* PortalSuspended: Execute hit its row limit (3.4) */
+        pg_query_suspended(pc, m);
+        break;
+    case 'E': /* ErrorResponse: SQLSTATE onto the head unit; aborts an extended
+               * batch (3.3/3.4) */
         pg_query_error(pc, m);
+        break;
+    case 'V': /* FunctionCallResponse: closes a FUNCTION unit at the next Z */
+        pg_query_func_response(pc, m);
         break;
     case 'Z': /* ReadyForQuery: close the unit, track the transaction (3.3) */
         pg_query_ready(p, c, pc, m);
         break;
+    /* Types that carry no latency signal are tallied (by_type) and skipped
+     * (Р18): they neither open nor close a unit. */
+    case 'T': /* RowDescription */
+    case 't': /* ParameterDescription */
+    case 'n': /* NoData */
+    case '1': /* ParseComplete */
+    case '2': /* BindComplete */
+    case '3': /* CloseComplete */
+    case 'N': /* NoticeResponse */
+    case 'A': /* NotificationResponse */
+    case 'K': /* BackendKeyData */
+        break;
+    case 'G': /* CopyInResponse */
+    case 'H': /* CopyOutResponse */
+    case 'W': /* CopyBothResponse: COPY/replication arrive with task 3.5 */
+        break;
     default:
-        /* RowDescription 'T' and the other noise types are counted and skipped
-         * (Р18); COPY responses arrive with task 3.5. */
+        p->st.unknown_msgs++; /* an unknown backend type (Р18) */
         break;
     }
 }
@@ -132,14 +184,17 @@ static void pg_on_resync(void *ctx, struct lk_conn *c, enum lk_dir dir)
     p->st.resyncs++;
     if (!pc)
         return; /* alloc failed: keep counting, skip semantics */
-    /* The stream broke here (Р19): drop an in-flight unit — an observation must
-     * never span a gap — and go READY-degraded until the next clean Z. Fires
-     * once per direction; the second call finds nothing to drop. The
-     * transaction state is abandoned too (set unknown), so no on_txn is ever
-     * emitted across the break; the next Z re-establishes it. */
-    pg_query_drop(pc, &p->st.units_dropped_resync);
+    /* The stream broke here (Р19): drop the whole in-flight queue — an
+     * observation must never span a gap — and go READY-degraded until the next
+     * clean Z. Fires once per direction; the second call finds nothing to drop.
+     * An extended batch mid-skip goes back to READY-degraded. The transaction
+     * state is abandoned too (set unknown), so no on_txn is emitted across the
+     * break; the next Z re-establishes it. */
+    pg_query_drop_all(pc, &p->st.units_dropped_resync);
     pc->degraded = true;
     pc->txn_status = 0;
+    if (pc->phase == PG_PH_SKIP_TO_SYNC)
+        pc->phase = PG_PH_READY;
 }
 
 /* Fired by the connection table on *every* removal path (CONN_CLOSE, LRU
@@ -154,8 +209,10 @@ static void pg_on_conn_close(void *ctx, struct lk_conn *c)
         /* A query still in flight when the connection dies is dropped, never
          * emitted: a request cut off by a disconnect is not an observation
          * (Р19, a known blind spot of the model). */
-        pg_query_drop(pc, &p->st.units_dropped_close);
-        free(pc->text);
+        pg_query_drop_all(pc, &p->st.units_dropped_close);
+        for (int i = 0; i < LK_PG_MAX_INFLIGHT; i++)
+            free(pc->ring[i].own_text);
+        pg_prep_free(pc);
     }
     free(c->proto_state);
     c->proto_state = NULL;

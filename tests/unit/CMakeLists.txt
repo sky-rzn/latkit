@@ -39,3 +39,12 @@ target_include_directories(test_pg_query PRIVATE
     ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf)
 target_link_libraries(test_pg_query latkit_proto)
 add_test(NAME pg_query COMMAND test_pg_query)
+
+# Prepared-statement cache: LRU, unnamed overwrite, Close, eviction rescue
+# (task 3.4). Same white-box setup as the query test.
+add_executable(test_pg_prep test_pg_prep.c)
+target_include_directories(test_pg_prep PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/pg
+    ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf)
+target_link_libraries(test_pg_prep latkit_proto)
+add_test(NAME pg_prep COMMAND test_pg_prep)

@@ -37,6 +37,7 @@
 struct rec {
     int nqueries;
     int ntxn;
+    int npipelined, nerror, naborted; /* observations carrying each flag */
     struct lk_query_obs last;
     char last_text[256];
     /* last on_txn */
@@ -52,6 +53,12 @@ static void rec_on_query(void *ctx, const struct lk_conn *c, const struct lk_ses
     (void)c;
     (void)s;
     r->nqueries++;
+    if (o->flags & LK_QO_PIPELINED)
+        r->npipelined++;
+    if (o->flags & LK_QO_ERROR)
+        r->nerror++;
+    if (o->flags & LK_QO_ABORTED)
+        r->naborted++;
     r->last = *o;
     r->last_text[0] = '\0';
     if (o->text && o->text_len < sizeof(r->last_text)) {
@@ -122,6 +129,66 @@ static void handshake(const struct lk_msg_sink *sink, struct lk_conn *c)
     feed_ts(sink, c, LK_DIR_RECV, 0, LK_MSG_STARTUP, startup, sizeof(startup), 100);
     feed_ts(sink, c, LK_DIR_SEND, 'R', 0, auth_ok, sizeof(auth_ok), 110);
     ready(sink, c, 'I', 120); /* first ReadyForQuery: idle, no unit */
+}
+
+/* --- extended-protocol helpers -------------------------------------------- */
+
+/* Parse: statement name\0 query\0 int16 nparams(=0). */
+static void parse_stmt(const struct lk_msg_sink *sink, struct lk_conn *c, const char *name,
+                       const char *query, __u64 ts)
+{
+    __u8 body[256];
+    __u32 n = 0, nl = (__u32)strlen(name), ql = (__u32)strlen(query);
+
+    memcpy(body + n, name, nl + 1);
+    n += nl + 1;
+    memcpy(body + n, query, ql + 1);
+    n += ql + 1;
+    body[n++] = 0;
+    body[n++] = 0;
+    feed_ts(sink, c, LK_DIR_RECV, 'P', 0, body, n, ts);
+}
+
+/* Bind: portal ""\0 statement name\0 zeroed format/value counts. */
+static void bind_stmt(const struct lk_msg_sink *sink, struct lk_conn *c, const char *name, __u64 ts)
+{
+    __u8 body[128];
+    __u32 n = 0, nl = (__u32)strlen(name);
+
+    body[n++] = 0;
+    memcpy(body + n, name, nl + 1);
+    n += nl + 1;
+    body[n++] = 0;
+    body[n++] = 0;
+    body[n++] = 0;
+    body[n++] = 0;
+    feed_ts(sink, c, LK_DIR_RECV, 'B', 0, body, n, ts);
+}
+
+static void execute(const struct lk_msg_sink *sink, struct lk_conn *c, __u64 ts)
+{
+    static const __u8 body[5] = {0}; /* portal ""\0 maxrows(4) */
+
+    feed_ts(sink, c, LK_DIR_RECV, 'E', 0, body, sizeof(body), ts);
+}
+
+static void sync_msg(const struct lk_msg_sink *sink, struct lk_conn *c, __u64 ts)
+{
+    feed_ts(sink, c, LK_DIR_RECV, 'S', 0, "", 0, ts);
+}
+
+/* A backend ErrorResponse carrying just the SQLSTATE (field 'C'). */
+static void error_resp(const struct lk_msg_sink *sink, struct lk_conn *c, const char *sqlstate,
+                       __u64 ts)
+{
+    __u8 body[16];
+    __u32 n = 0;
+
+    body[n++] = 'C';
+    memcpy(body + n, sqlstate, strlen(sqlstate) + 1);
+    n += (__u32)strlen(sqlstate) + 1;
+    body[n++] = 0; /* field-list terminator */
+    feed_ts(sink, c, LK_DIR_SEND, 'E', 0, body, n, ts);
 }
 
 /* --- tests ---------------------------------------------------------------- */
@@ -456,11 +523,271 @@ static int test_truncated_text(void)
     return 0;
 }
 
+/* Extended protocol happy path: Parse/Bind/Execute/Sync, backend closes the unit
+ * on CommandComplete (not Z). One EXTENDED observation with the cached text. */
+static int test_extended_basic(void)
+{
+    struct rec r = {0};
+    struct lk_query_sink qs = {.ctx = &r, .on_query = rec_on_query, .on_txn = rec_on_txn};
+    struct lk_proto *p = lk_proto_pg_new(&qs);
+    const struct lk_msg_sink *sink = lk_proto_sink(p);
+    struct lk_conn c = {0};
+
+    CHECK(p);
+    handshake(sink, &c);
+
+    parse_stmt(sink, &c, "s1", "select $1", 1000);
+    bind_stmt(sink, &c, "s1", 1010);
+    execute(sink, &c, 1020);
+    feed_ts(sink, &c, LK_DIR_SEND, 'D', 0, "", 0, 1030); /* DataRow */
+    complete(sink, &c, "SELECT 1", 1040);                /* closes the EXTENDED unit */
+    CHECK(r.nqueries == 0);                              /* batch emits at its Z */
+    sync_msg(sink, &c, 1050);
+    ready(sink, &c, 'I', 1060);
+
+    CHECK(r.nqueries == 1);
+    CHECK(r.last.kind == LK_Q_EXTENDED);
+    CHECK(strcmp(r.last_text, "select $1") == 0);
+    CHECK(r.last.rows == 1);
+    CHECK(r.last.flags == 0); /* not pipelined, no error */
+    CHECK(r.last.ts_start_ns == 1010); /* the Bind, not the Parse */
+    CHECK(r.last.ts_first_row_ns == 1030);
+    CHECK(r.last.ts_complete_ns == 1040);
+    CHECK(r.last.ts_ready_ns == 1060); /* the batch's Z (Р16) */
+
+    sink->on_conn_close(sink->ctx, &c);
+    lk_proto_free(p);
+    printf("ok extended-basic\n");
+    return 0;
+}
+
+/* Bind on a name never Parsed: EXTENDED unit with LK_QO_NO_TEXT, honest timings. */
+static int test_bind_no_text(void)
+{
+    struct rec r = {0};
+    struct lk_query_sink qs = {.ctx = &r, .on_query = rec_on_query};
+    struct lk_proto *p = lk_proto_pg_new(&qs);
+    const struct lk_msg_sink *sink = lk_proto_sink(p);
+    struct lk_conn c = {0};
+
+    CHECK(p);
+    handshake(sink, &c);
+
+    bind_stmt(sink, &c, "ghost", 2000); /* no prior Parse */
+    execute(sink, &c, 2010);
+    complete(sink, &c, "SELECT 7", 2020);
+    sync_msg(sink, &c, 2030);
+    ready(sink, &c, 'I', 2040);
+
+    CHECK(r.nqueries == 1);
+    CHECK(r.last.kind == LK_Q_EXTENDED);
+    CHECK(r.last.flags & LK_QO_NO_TEXT);
+    CHECK(r.last_text[0] == '\0');
+    CHECK(r.last.rows == 7);
+
+    sink->on_conn_close(sink->ctx, &c);
+    lk_proto_free(p);
+    printf("ok bind-no-text\n");
+    return 0;
+}
+
+/* Pipelining: two Binds before any reply. Both observations are flagged
+ * LK_QO_PIPELINED and closed FIFO by their CommandCompletes. */
+static int test_pipelining(void)
+{
+    struct rec r = {0};
+    struct lk_query_sink qs = {.ctx = &r, .on_query = rec_on_query};
+    struct lk_proto *p = lk_proto_pg_new(&qs);
+    const struct lk_msg_sink *sink = lk_proto_sink(p);
+    struct lk_conn c = {0};
+
+    CHECK(p);
+    handshake(sink, &c);
+
+    parse_stmt(sink, &c, "a", "select 1", 3000);
+    parse_stmt(sink, &c, "b", "select 2", 3010);
+    bind_stmt(sink, &c, "a", 3020);
+    execute(sink, &c, 3030);
+    bind_stmt(sink, &c, "b", 3040); /* second unit in flight -> pipelined */
+    execute(sink, &c, 3050);
+    sync_msg(sink, &c, 3060);
+
+    complete(sink, &c, "SELECT 10", 3070); /* closes unit a (head) */
+    complete(sink, &c, "SELECT 20", 3080); /* closes unit b */
+    CHECK(r.nqueries == 0);                 /* both wait for the batch's Z */
+
+    ready(sink, &c, 'I', 3090); /* emits the whole batch, FIFO */
+    CHECK(r.nqueries == 2);
+    CHECK(r.npipelined == 2); /* both units flagged pipelined */
+    CHECK(r.last.flags & LK_QO_PIPELINED); /* unit b, last emitted */
+    CHECK(strcmp(r.last_text, "select 2") == 0);
+    CHECK(r.last.rows == 20);
+    CHECK(r.last.ts_ready_ns == 3090); /* the shared Z */
+
+    sink->on_conn_close(sink->ctx, &c);
+    lk_proto_free(p);
+    printf("ok pipelining\n");
+    return 0;
+}
+
+/* An error mid-batch: the erroring unit gets LK_QO_ERROR, every later unit of
+ * the batch gets LK_QO_ABORTED, and the phase skips to the Sync's Z (Р16). */
+static int test_batch_error_abort(void)
+{
+    struct rec r = {0};
+    struct lk_query_sink qs = {.ctx = &r, .on_query = rec_on_query};
+    struct lk_proto *p = lk_proto_pg_new(&qs);
+    const struct lk_msg_sink *sink = lk_proto_sink(p);
+    struct lk_conn c = {0};
+
+    CHECK(p);
+    handshake(sink, &c);
+
+    /* Three pipelined units; the backend errors on the first reply. */
+    parse_stmt(sink, &c, "a", "select 1", 4000);
+    bind_stmt(sink, &c, "a", 4010);
+    execute(sink, &c, 4020);
+    bind_stmt(sink, &c, "a", 4030);
+    execute(sink, &c, 4040);
+    bind_stmt(sink, &c, "a", 4050);
+    execute(sink, &c, 4060);
+    sync_msg(sink, &c, 4070);
+
+    error_resp(sink, &c, "23505", 4080); /* unit 1 errors -> aborts 2 and 3 */
+    CHECK(r.nqueries == 0);              /* nothing emitted until the batch's Z */
+
+    ready(sink, &c, 'I', 4090); /* the Sync's Z emits the whole batch */
+    CHECK(r.nqueries == 3);
+
+    /* Exactly one ERROR (with the SQLSTATE) and a tail of two ABORTED. */
+    CHECK(r.nerror == 1);
+    CHECK(r.naborted == 2);
+    CHECK(strcmp(r.last.sqlstate, "") == 0); /* the aborted tail carries no state */
+    CHECK(lk_proto_stats(p)->errors_sql == 1);
+    CHECK(r.last.flags & LK_QO_ABORTED); /* last emitted is the tail */
+    CHECK(!(r.last.flags & LK_QO_ERROR));
+
+    sink->on_conn_close(sink->ctx, &c);
+    lk_proto_free(p);
+    printf("ok batch-error-abort\n");
+    return 0;
+}
+
+/* Overflowing the in-flight ring makes the connection LOSSY: no observation is
+ * emitted until the next clean Z, and units_dropped_overflow is bumped (Р16). */
+static int test_overflow_lossy(void)
+{
+    struct rec r = {0};
+    struct lk_query_sink qs = {.ctx = &r, .on_query = rec_on_query};
+    struct lk_proto *p = lk_proto_pg_new(&qs);
+    const struct lk_msg_sink *sink = lk_proto_sink(p);
+    struct lk_conn c = {0};
+    __u64 ts = 5000;
+
+    CHECK(p);
+    handshake(sink, &c);
+
+    parse_stmt(sink, &c, "a", "select 1", ts++);
+    /* Bind more units than the ring holds, all before any reply. */
+    for (int i = 0; i < LK_PG_MAX_INFLIGHT + 5; i++) {
+        bind_stmt(sink, &c, "a", ts++);
+        execute(sink, &c, ts++);
+    }
+    CHECK(lk_proto_stats(p)->units_dropped_overflow == 5);
+
+    /* Replies now arrive; while LOSSY nothing is emitted. */
+    for (int i = 0; i < LK_PG_MAX_INFLIGHT; i++)
+        complete(sink, &c, "SELECT 1", ts++);
+    CHECK(r.nqueries == 0);
+
+    ready(sink, &c, 'I', ts++); /* clean Z ends the LOSSY window */
+    CHECK(r.nqueries == 0);     /* the overflowed batch emitted nothing */
+
+    /* After the Z, tracking resumes cleanly. */
+    parse_stmt(sink, &c, "b", "select 2", ts++);
+    bind_stmt(sink, &c, "b", ts++);
+    execute(sink, &c, ts++);
+    complete(sink, &c, "SELECT 2", ts++);
+    ready(sink, &c, 'I', ts++);
+    CHECK(r.nqueries == 1);
+    CHECK(strcmp(r.last_text, "select 2") == 0);
+
+    sink->on_conn_close(sink->ctx, &c);
+    lk_proto_free(p);
+    printf("ok overflow-lossy\n");
+    return 0;
+}
+
+/* PortalSuspended closes an extended unit with LK_QO_SUSPENDED (Execute hit its
+ * row limit). */
+static int test_suspended(void)
+{
+    struct rec r = {0};
+    struct lk_query_sink qs = {.ctx = &r, .on_query = rec_on_query};
+    struct lk_proto *p = lk_proto_pg_new(&qs);
+    const struct lk_msg_sink *sink = lk_proto_sink(p);
+    struct lk_conn c = {0};
+
+    CHECK(p);
+    handshake(sink, &c);
+
+    parse_stmt(sink, &c, "s", "select * from big", 6000);
+    bind_stmt(sink, &c, "s", 6010);
+    execute(sink, &c, 6020);
+    feed_ts(sink, &c, LK_DIR_SEND, 'D', 0, "", 0, 6030); /* a row */
+    feed_ts(sink, &c, LK_DIR_SEND, 's', 0, "", 0, 6040); /* PortalSuspended */
+    CHECK(r.nqueries == 0);                              /* still waits for the Z */
+    sync_msg(sink, &c, 6050);
+    ready(sink, &c, 'I', 6060);
+
+    CHECK(r.nqueries == 1);
+    CHECK(r.last.flags & LK_QO_SUSPENDED);
+    CHECK(strcmp(r.last_text, "select * from big") == 0);
+    CHECK(r.last.ts_complete_ns == 6040); /* PortalSuspended, not the Z */
+    CHECK(r.last.ts_ready_ns == 6060);
+
+    sink->on_conn_close(sink->ctx, &c);
+    lk_proto_free(p);
+    printf("ok suspended\n");
+    return 0;
+}
+
+/* FunctionCall: a FUNCTION unit with no text, closed by the following Z like a
+ * simple query (FunctionCallResponse then ReadyForQuery, no CommandComplete). */
+static int test_function_call(void)
+{
+    struct rec r = {0};
+    struct lk_query_sink qs = {.ctx = &r, .on_query = rec_on_query};
+    struct lk_proto *p = lk_proto_pg_new(&qs);
+    const struct lk_msg_sink *sink = lk_proto_sink(p);
+    struct lk_conn c = {0};
+
+    CHECK(p);
+    handshake(sink, &c);
+
+    feed_ts(sink, &c, LK_DIR_RECV, 'F', 0, "\0\0\0\1\0\0", 6, 7000); /* FunctionCall */
+    feed_ts(sink, &c, LK_DIR_SEND, 'V', 0, "", 0, 7010);            /* FunctionCallResponse */
+    CHECK(r.nqueries == 0);                                         /* waits for Z */
+    ready(sink, &c, 'I', 7020);
+
+    CHECK(r.nqueries == 1);
+    CHECK(r.last.kind == LK_Q_FUNCTION);
+    CHECK(r.last.flags & LK_QO_NO_TEXT);
+    CHECK(r.last.ts_ready_ns == 7020);
+
+    sink->on_conn_close(sink->ctx, &c);
+    lk_proto_free(p);
+    printf("ok function-call\n");
+    return 0;
+}
+
 int main(void)
 {
     if (test_happy_path() || test_error() || test_multi_stmt() || test_empty_query() ||
         test_transaction() || test_resync_drops_unit() || test_synthetic_degraded() ||
-        test_tag_table() || test_truncated_text())
+        test_tag_table() || test_truncated_text() || test_extended_basic() || test_bind_no_text() ||
+        test_pipelining() || test_batch_error_abort() || test_overflow_lossy() || test_suspended() ||
+        test_function_call())
         return 1;
     printf("ok\n");
     return 0;

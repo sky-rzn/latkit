@@ -277,6 +277,12 @@ static int run_fixture(const struct fixture *fix)
                 (unsigned long long)x.queries, col.nqueries);
         goto fail;
     }
+    if (lk_proto_stats(col.proto)->errors_sql != x.errors_sql) {
+        fprintf(stderr, "FAIL %s: expected %llu errors_sql, got %llu\n", fix->name,
+                (unsigned long long)x.errors_sql,
+                (unsigned long long)lk_proto_stats(col.proto)->errors_sql);
+        goto fail;
+    }
     /* Last observation's fields (task 3.3): kind/rows/flags always, text and
      * SQLSTATE only when the fixture pins them. */
     if (x.queries) {
