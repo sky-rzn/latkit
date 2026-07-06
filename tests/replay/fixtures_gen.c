@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "latkit.h"
+#include "proto.h"      /* LK_Q_* kinds, LK_QO_* flags */
 #include "reassembly.h" /* LK_MSG_*, LK_PG_* codes */
 #include "record.h"
 
@@ -248,6 +249,13 @@ static void build_simple_query(struct fx *x)
     call(&b, LK_DIR_RECV, w, n);
     expect(&b, LK_DIR_RECV, 'X', 4, 0);
     ev_close(&b);
+
+    /* Q .. Z closes one SIMPLE unit: text "select 1", one row from "SELECT 1". */
+    b.x->queries = 1;
+    b.x->obs_kind = LK_Q_SIMPLE;
+    b.x->obs_rows = 1;
+    b.x->obs_flags = 0;
+    b.x->obs_text = "select 1";
 }
 
 /* pgbench-style extended protocol: a P/B/D/E/S batch in one call, the reply
@@ -398,6 +406,13 @@ static void build_ssl_plain(struct fx *x)
     call(&b, LK_DIR_RECV, w, n);
     expect(&b, LK_DIR_RECV, 'X', 4, 0);
     ev_close(&b);
+
+    /* One SIMPLE unit over the plaintext-negotiated connection. */
+    b.x->queries = 1;
+    b.x->obs_kind = LK_Q_SIMPLE;
+    b.x->obs_rows = 1;
+    b.x->obs_flags = 0;
+    b.x->obs_text = "select 1";
 }
 
 /* SSL accepted: SSLRequest -> 'S' -> the connection goes TLS, and every later

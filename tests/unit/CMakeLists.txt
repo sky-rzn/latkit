@@ -30,3 +30,12 @@ target_include_directories(test_pg_session PRIVATE
     ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf)
 target_link_libraries(test_pg_session latkit_proto)
 add_test(NAME pg_session COMMAND test_pg_session)
+
+# Simple query: units, rows, errors, transactions (task 3.3). Same white-box
+# setup: synthetic lk_msg in, observations out.
+add_executable(test_pg_query test_pg_query.c)
+target_include_directories(test_pg_query PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/pg
+    ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf)
+target_link_libraries(test_pg_query latkit_proto)
+add_test(NAME pg_query COMMAND test_pg_query)

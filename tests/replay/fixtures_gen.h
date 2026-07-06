@@ -39,12 +39,19 @@ struct fx {
     __u64 tls_conns; /* expected reasm tls_conns count */
 
     /* Stage-3 parser expectations (task 3.2): the sessions the PG handler
-     * emits and their labels; the observation count (0 until 3.3, non-zero
-     * only for CANCEL). */
-    __u64 sessions;         /* expected on_session count */
-    __u64 queries;          /* expected on_query count */
-    const char *sess_user;  /* last session's user     (when sessions > 0) */
-    const char *sess_db;    /* last session's database (when sessions > 0) */
+     * emits and their labels; the observation count (task 3.3 makes it non-zero
+     * for the simple-query fixtures). */
+    __u64 sessions;        /* expected on_session count */
+    __u64 queries;         /* expected on_query count */
+    const char *sess_user; /* last session's user     (when sessions > 0) */
+    const char *sess_db;   /* last session's database (when sessions > 0) */
+
+    /* Last observation's fields (task 3.3), checked when queries > 0. */
+    __u64 obs_rows;           /* expected lk_query_obs.rows */
+    __u16 obs_flags;          /* expected lk_query_obs.flags (LK_QO_*) */
+    __u8 obs_kind;            /* expected lk_query_obs.kind */
+    const char *obs_text;     /* expected SQL text; NULL = do not check */
+    const char *obs_sqlstate; /* expected SQLSTATE; NULL = do not check */
 };
 
 struct fixture {

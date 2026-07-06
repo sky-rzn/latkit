@@ -75,18 +75,25 @@ static void on_session(void *ctx, const struct lk_conn *c, const struct lk_sessi
            s->complete ? "" : " (incomplete)");
 }
 
+/* One line per observation (task 3.3). Duration is the honest per-query span
+ * ts_complete - ts_start (Р16); the SQL text is truncated to 120 chars *in the
+ * output only* — the observation still carries the full captured prefix. */
+#define LK_QUERY_TEXT_LOG_MAX 120
+
 static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session *s,
                      const struct lk_query_obs *o)
 {
     __u64 dur = o->ts_complete_ns > o->ts_start_ns ? o->ts_complete_ns - o->ts_start_ns : 0;
+    int tlen = o->text_len > LK_QUERY_TEXT_LOG_MAX ? LK_QUERY_TEXT_LOG_MAX : (int)o->text_len;
 
     (void)ctx;
-    /* Full line (text, rows, sqlstate) lands with task 3.3; for now the fields
-     * task 3.2 fills — kind, session, timings when present. */
-    printf("%llu query conn=%llx dur=%lluns kind=%s db=%s user=%s flags=0x%x\n",
+    printf("%llu query conn=%llx dur=%lluns kind=%s db=%s user=%s rows=%llu "
+           "sqlstate=%s txn=%c flags=0x%x text=%.*s%s\n",
            (unsigned long long)o->ts_start_ns, (unsigned long long)c->cookie,
            (unsigned long long)dur, kind_str(o->kind), s->database[0] ? s->database : "?",
-           s->user[0] ? s->user : "?", o->flags);
+           s->user[0] ? s->user : "?", (unsigned long long)o->rows,
+           (o->flags & LK_QO_ERROR) ? o->sqlstate : "-", o->txn_status ? o->txn_status : '?',
+           o->flags, tlen, o->text ? o->text : "", o->text_len > LK_QUERY_TEXT_LOG_MAX ? "..." : "");
 }
 
 /* PG parser counters (stage 3). The skeleton (task 3.1) only tallies messages,
@@ -122,6 +129,9 @@ static void print_proto_stats(const struct lk_proto_stats *ps)
             (unsigned long long)ps->sessions, (unsigned long long)ps->queries,
             (unsigned long long)ps->errors_sql, (unsigned long long)ps->parse_errors,
             (unsigned long long)ps->unknown_msgs, (unsigned long long)ps->replication_conns);
+    fprintf(stderr, "latkit: pg units_dropped resync=%llu close=%llu overflow=%llu\n",
+            (unsigned long long)ps->units_dropped_resync, (unsigned long long)ps->units_dropped_close,
+            (unsigned long long)ps->units_dropped_overflow);
     append_type_counts(fe, sizeof(fe), ps->by_type[LK_DIR_RECV]);
     append_type_counts(be, sizeof(be), ps->by_type[LK_DIR_SEND]);
     fprintf(stderr, "latkit: pg types fe:%s | be:%s\n", fe, be);

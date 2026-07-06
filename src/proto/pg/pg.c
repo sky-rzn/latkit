@@ -28,8 +28,14 @@ static struct pg_conn *pg_conn_get(struct lk_proto *p, struct lk_conn *c)
     if (!pc)
         return NULL;
     /* Startup is only ever seen on a fresh frontend stream; a synthetic or
-     * mid-session entry joins in READY-degraded (Р19, refined in task 3.5). */
-    pc->phase = (c->flags & LK_CONN_SYNTHETIC) ? PG_PH_READY : PG_PH_STARTUP;
+     * mid-session entry joins in READY-degraded (Р19): no unit opens until the
+     * first clean Z proves a "between queries" boundary. */
+    if (c->flags & LK_CONN_SYNTHETIC) {
+        pc->phase = PG_PH_READY;
+        pc->degraded = true;
+    } else {
+        pc->phase = PG_PH_STARTUP;
+    }
     c->proto_state = pc;
     p->st.conns++;
     return pc;
@@ -46,12 +52,15 @@ static void pg_frontend_msg(struct lk_proto *p, struct lk_conn *c, struct pg_con
         return;
     }
     switch (m->type) {
+    case 'Q': /* simple Query: open a unit (3.3) */
+        pg_query_simple(pc, m);
+        break;
     case 'p':
         /* PasswordMessage / SASL: the body is the password. It is never read
          * or copied — a security invariant, not an optimisation (Р16). */
         break;
     default:
-        /* Q simple query (3.3); P/B/E/S extended (3.4); d/c/f COPY (3.5). */
+        /* P/B/E/S extended (3.4); d/c/f COPY (3.5). */
         break;
     }
 }
@@ -69,8 +78,24 @@ static void pg_backend_msg(struct lk_proto *p, struct lk_conn *c, struct pg_conn
                * empty ParameterStatus, i.e. harmlessly ignored. */
         pg_session_param_status(pc, m);
         break;
+    case 'D': /* DataRow: first-row timing (3.3) */
+        pg_query_data_row(pc, m);
+        break;
+    case 'C': /* CommandComplete: rows + statement count (3.3) */
+        pg_query_complete(p, pc, m);
+        break;
+    case 'I': /* EmptyQueryResponse: an empty statement (3.3) */
+        pg_query_empty(pc, m);
+        break;
+    case 'E': /* ErrorResponse: SQLSTATE onto the open unit (3.3) */
+        pg_query_error(pc, m);
+        break;
+    case 'Z': /* ReadyForQuery: close the unit, track the transaction (3.3) */
+        pg_query_ready(p, c, pc, m);
+        break;
     default:
-        /* rows / CommandComplete / ErrorResponse / txn (3.3); COPY (3.5). */
+        /* RowDescription 'T' and the other noise types are counted and skipped
+         * (Р18); COPY responses arrive with task 3.5. */
         break;
     }
 }
@@ -101,11 +126,20 @@ static void pg_on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struc
 static void pg_on_resync(void *ctx, struct lk_conn *c, enum lk_dir dir)
 {
     struct lk_proto *p = ctx;
+    struct pg_conn *pc = pg_conn_get(p, c);
 
-    (void)c;
     (void)dir;
     p->st.resyncs++;
-    /* task 3.5: drop the in-flight queue, go READY-degraded (Р19). */
+    if (!pc)
+        return; /* alloc failed: keep counting, skip semantics */
+    /* The stream broke here (Р19): drop an in-flight unit — an observation must
+     * never span a gap — and go READY-degraded until the next clean Z. Fires
+     * once per direction; the second call finds nothing to drop. The
+     * transaction state is abandoned too (set unknown), so no on_txn is ever
+     * emitted across the break; the next Z re-establishes it. */
+    pg_query_drop(pc, &p->st.units_dropped_resync);
+    pc->degraded = true;
+    pc->txn_status = 0;
 }
 
 /* Fired by the connection table on *every* removal path (CONN_CLOSE, LRU
@@ -113,9 +147,16 @@ static void pg_on_resync(void *ctx, struct lk_conn *c, enum lk_dir dir)
  * one place proto_state is released (Р15). Idempotent and NULL-safe. */
 static void pg_on_conn_close(void *ctx, struct lk_conn *c)
 {
-    (void)ctx;
-    /* task 3.5: drop a non-empty in-flight queue (units_dropped_close) before
-     * freeing; the skeleton has no queue yet. */
+    struct lk_proto *p = ctx;
+    struct pg_conn *pc = c->proto_state;
+
+    if (pc) {
+        /* A query still in flight when the connection dies is dropped, never
+         * emitted: a request cut off by a disconnect is not an observation
+         * (Р19, a known blind spot of the model). */
+        pg_query_drop(pc, &p->st.units_dropped_close);
+        free(pc->text);
+    }
     free(c->proto_state);
     c->proto_state = NULL;
 }

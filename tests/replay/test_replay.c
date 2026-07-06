@@ -53,6 +53,8 @@ struct collector {
     size_t nsessions;
     size_t nqueries;
     struct lk_session last_session;
+    struct lk_query_obs last_obs; /* text pointer nulled; see last_text */
+    char last_text[256];          /* last_obs.text copied out (it dangles) */
 };
 
 static void on_session(void *ctx, const struct lk_conn *c, const struct lk_session *s)
@@ -71,8 +73,15 @@ static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session
 
     (void)c;
     (void)s;
-    (void)o;
     col->nqueries++;
+    col->last_obs = *o;
+    /* o->text is only valid during this call; copy it out for the assertions. */
+    col->last_text[0] = '\0';
+    if (o->text && o->text_len < sizeof(col->last_text)) {
+        memcpy(col->last_text, o->text, o->text_len);
+        col->last_text[o->text_len] = '\0';
+    }
+    col->last_obs.text = NULL;
 }
 
 static void on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struct lk_msg *m)
@@ -267,6 +276,29 @@ static int run_fixture(const struct fixture *fix)
         fprintf(stderr, "FAIL %s: expected %llu observations, got %zu\n", fix->name,
                 (unsigned long long)x.queries, col.nqueries);
         goto fail;
+    }
+    /* Last observation's fields (task 3.3): kind/rows/flags always, text and
+     * SQLSTATE only when the fixture pins them. */
+    if (x.queries) {
+        if (col.last_obs.kind != x.obs_kind || col.last_obs.rows != x.obs_rows ||
+            col.last_obs.flags != x.obs_flags) {
+            fprintf(stderr,
+                    "FAIL %s: obs expected kind=%u rows=%llu flags=0x%x, "
+                    "got kind=%u rows=%llu flags=0x%x\n",
+                    fix->name, x.obs_kind, (unsigned long long)x.obs_rows, x.obs_flags,
+                    col.last_obs.kind, (unsigned long long)col.last_obs.rows, col.last_obs.flags);
+            goto fail;
+        }
+        if (x.obs_text && strcmp(col.last_text, x.obs_text)) {
+            fprintf(stderr, "FAIL %s: obs text expected \"%s\", got \"%s\"\n", fix->name,
+                    x.obs_text, col.last_text);
+            goto fail;
+        }
+        if (x.obs_sqlstate && strcmp(col.last_obs.sqlstate, x.obs_sqlstate)) {
+            fprintf(stderr, "FAIL %s: obs sqlstate expected \"%s\", got \"%s\"\n", fix->name,
+                    x.obs_sqlstate, col.last_obs.sqlstate);
+            goto fail;
+        }
     }
 
     /* Tear the table down first (its destroy hooks free proto_state through the
