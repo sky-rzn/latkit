@@ -150,6 +150,16 @@ target_include_directories(latkit_norm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/no
 target_include_directories(latkit_norm SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xxhash)
 
+# --- metrics registry (stage 4) --------------------------------------------
+# src/metrics/** is pure like src/norm/**: histograms, the top-K series registry
+# and the text-format dump, no libbpf and no I/O beyond the caller's FILE. The
+# aggregator (lk_query_sink) and the self-metric providers wire in at tasks
+# 4.3/4.4; the histogram needs libm (frexp/ldexp).
+add_library(latkit_metrics STATIC
+    src/metrics/hist.c src/metrics/registry.c src/metrics/metrics.c)
+target_include_directories(latkit_metrics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics)
+target_link_libraries(latkit_metrics PUBLIC m)
+
 # --- agent -----------------------------------------------------------------
 add_executable(latkit src/agent/main.c src/agent/loop.c src/agent/events.c
                src/agent/decode.c src/agent/conn_table.c src/agent/reassembly.c

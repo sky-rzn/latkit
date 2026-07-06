@@ -54,3 +54,15 @@ add_test(NAME pg_prep COMMAND test_pg_prep)
 add_executable(test_norm_sql test_norm_sql.c)
 target_link_libraries(test_norm_sql latkit_norm)
 add_test(NAME norm_sql COMMAND test_norm_sql)
+
+# Exponential histogram (task 4.2): grid boundaries vs the ldexp reference,
+# clamping, merge, classic-bucket text export. Links the pure metrics lib.
+add_executable(test_hist test_hist.c)
+target_link_libraries(test_hist latkit_metrics)
+add_test(NAME hist COMMAND test_hist)
+
+# Series registry (task 4.2): top-K LRU + doorkeeper + other-fold, dimension
+# limit, dump format. Same pure metrics lib, driven white-box via registry.h.
+add_executable(test_registry test_registry.c)
+target_link_libraries(test_registry latkit_metrics)
+add_test(NAME registry COMMAND test_registry)
