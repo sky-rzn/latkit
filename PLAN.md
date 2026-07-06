@@ -67,11 +67,18 @@ latkit/
 │   │   ├── events.c            # чтение ringbuf, диспетчеризация
 │   │   ├── conn_table.c        # таблица соединений, LRU, таймауты
 │   │   ├── reassembly.c        # сборка потока сообщений из фрагментов
-│   │   ├── pgproto.c           # парсер протокола PostgreSQL v3
 │   │   ├── normalize.c         # фингерпринт SQL (литералы → $N)
 │   │   ├── metrics.c           # гистограммы, счётчики, top-N
 │   │   ├── prom.c              # HTTP /metrics
 │   │   └── otlp.c              # экспорт OTLP
+│   ├── proto/                  # код протоколов, единый API «ядро↔обработчик»
+│   │   ├── proto.h             # оба контракта: вниз lk_msg_sink, вверх lk_query_sink
+│   │   └── pg/                 # обработчик PostgreSQL v3 (был agent/pgproto.c)
+│   │       ├── pg.c            # диспетчер по (направление, фаза, тип)
+│   │       ├── pg_session.c    # startup, auth, лейблы сессии
+│   │       ├── pg_query.c      # фазовая машина, in-flight очередь, тайминги
+│   │       ├── pg_prep.c       # кэш prepared statements
+│   │       └── pg_wire.h       # bounded cursor (недоверенный вход)
 │   └── common/                 # лог, конфиг, утилиты
 ├── tests/
 │   ├── unit/                   # парсер, нормализация, reassembly
@@ -107,14 +114,14 @@ latkit/
 - [ ] Таблица соединений: hash map conn_id → state; LRU-вытеснение, таймаут неактивных, корректная очистка по `CONN_CLOSE`.
 - [ ] Reassembly: на соединение — по буферу на направление; склейка фрагментов, выделение целых сообщений `тип(1) + len(4) + body`. Ресинхронизация после потерь: ждать `ReadyForQuery`-границу / новое соединение.
 
-### Этап 3 — парсер протокола PostgreSQL v3 (~1–2 недели)
-- [ ] Выделение кода парсинга протокола PostgreSQL в отдельный модуль: в дальнейшем предполагается парсить и другие протоколы, код работы с ними должен лежать в отдельном каталоге, а API между ядром и обработчиками протоколов единым и четким.
-- [ ] Startup-фаза: `StartupMessage` (без байта типа!), `SSLRequest`/`GSSENCRequest` (ответ 'S' → соединение помечается TLS, socket-события по нему игнорируем — ждём uprobe-канал), `AuthenticationOk`, параметры `user`/`database` → лейблы.
-- [ ] Frontend: `Q` (simple), `P` (Parse: имя стейтмента + SQL), `B` (Bind), `E` (Execute), `S` (Sync), `X` (Terminate), `C` (Close), `D` (Describe), `F` (FunctionCall), `d/c/f` (COPY).
-- [ ] Backend: `Z` (ReadyForQuery + статус транзакции), `C` (CommandComplete + тег → число строк), `T`, `D` (считаем, не парсим), `E` (ErrorResponse → SQLSTATE), `N`, `A` (NOTIFY), `s` (portal suspended).
-- [ ] State machine per connection: очередь in-flight запросов (extended protocol с pipelining), сопоставление ответов запросам, привязка prepared statement name → SQL из `Parse` (кэш на соединение + учёт unnamed statement).
-- [ ] Крайние случаи: COPY-режим, длинные запросы (обрезанные по бюджету захвата — фингерпринт по префиксу с пометкой), multi-statement `Q` (`select 1; select 2`), отмена запроса (CancelRequest — отдельное соединение).
-- [ ] Unit-тесты на дампах: снять fixtures через `tcpdump`/`pgproto`-генератор; покрыть simple, extended, pipeline, ошибки, COPY, обрыв соединения.
+### Этап 3 — парсер протокола PostgreSQL v3 (~1–2 недели) — детализация в [STAGE3.md](STAGE3.md)
+- [x] Выделение кода парсинга протокола PostgreSQL в отдельный модуль: в дальнейшем предполагается парсить и другие протоколы, код работы с ними должен лежать в отдельном каталоге, а API между ядром и обработчиками протоколов единым и четким. → `src/proto/` (контракты в `proto.h`), обработчик PG — `src/proto/pg/`.
+- [x] Startup-фаза: `StartupMessage` (без байта типа!), `SSLRequest`/`GSSENCRequest` (ответ 'S' → соединение помечается TLS, socket-события по нему игнорируем — ждём uprobe-канал), `AuthenticationOk`, параметры `user`/`database` → лейблы.
+- [x] Frontend: `Q` (simple), `P` (Parse: имя стейтмента + SQL), `B` (Bind), `E` (Execute), `S` (Sync), `X` (Terminate), `C` (Close), `D` (Describe), `F` (FunctionCall), `d/c/f` (COPY).
+- [x] Backend: `Z` (ReadyForQuery + статус транзакции), `C` (CommandComplete + тег → число строк), `T`, `D` (считаем, не парсим), `E` (ErrorResponse → SQLSTATE), `N`, `A` (NOTIFY), `s` (portal suspended).
+- [x] State machine per connection: очередь in-flight запросов (extended protocol с pipelining), сопоставление ответов запросам, привязка prepared statement name → SQL из `Parse` (кэш на соединение + учёт unnamed statement).
+- [x] Крайние случаи: COPY-режим, длинные запросы (обрезанные по бюджету захвата — фингерпринт по префиксу с пометкой), multi-statement `Q` (`select 1; select 2`), отмена запроса (CancelRequest — отдельное соединение).
+- [x] Unit-тесты на дампах: детерминированные фикстуры из `tests/replay/fixtures_gen.c` (`tests/fixtures/*.lkt`); покрыты simple, extended, pipeline, ошибки, COPY, multi-statement, cancel, обрыв соединения; fuzz-харнесс `bytes → lk_msg → парсер` (`tests/fuzz`, ASAN/UBSAN).
 
 ### Этап 4 — нормализация запросов и метрики (~1 неделя)
 - [ ] Нормализация SQL (как pg_stat_statements, но без парсера PG): лексер-токенизатор — литералы/числа → `?`, схлопывание списков `IN (...)`, нижний регистр ключевых слов, схлопывание whitespace; fingerprint = 64-bit hash (xxhash).
@@ -147,7 +154,7 @@ latkit/
 ### Этап 8 — hardening и производительность (~1–2 недели)
 - [ ] Нагрузочное тестирование: pgbench (TPC-B и select-only, 100+ соединений), измерить overhead на TPS/латентность БД с агентом и без. Бюджет: <3% TPS, <1 CPU core на ~50k qps.
 - [ ] Валидация точности: сравнить p50/p95 агента с `pg_stat_statements.mean_exec_time` и `log_min_duration_statement` на контролируемой нагрузке; расхождение задокументировать (агент видит время «сеть-до-сети», PG — только execute).
-- [ ] Fuzzing парсера (libFuzzer на `pgproto.c` + `normalize.c`) — вход недоверенный.
+- [ ] Fuzzing парсера (libFuzzer на `src/proto/pg/` + `normalize.c`) — вход недоверенный; харнесс и корпус заложены в этапе 3 (`tests/fuzz`, `lk_pg_fuzz_one`).
 - [ ] Матрица ядер: проверка на 5.15 / 6.1 / 6.8+ (vmtest или qemu в CI); graceful degradation без BTF.
 - [ ] Утечки: valgrind/ASAN в CI; long-run тест 24h с чурном соединений.
 

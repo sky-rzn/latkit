@@ -54,25 +54,50 @@ int lk_replay_mem(const void *buf, size_t len, lk_replay_fn fn, void *ctx)
 {
     const __u8 *p = buf;
     size_t pos = LK_RECORD_MAGIC_LEN;
+    void *rec = NULL; /* reusable aligned bounce buffer (see below) */
+    size_t rec_cap = 0;
+    int rc = 0;
 
     if (len < LK_RECORD_MAGIC_LEN || memcmp(p, LK_RECORD_MAGIC, LK_RECORD_MAGIC_LEN))
         return -1;
     while (pos < len) {
         __u32 size;
-        int rc;
 
-        if (len - pos < sizeof(size))
-            return -1; /* truncated length prefix */
+        if (len - pos < sizeof(size)) {
+            rc = -1; /* truncated length prefix */
+            break;
+        }
         memcpy(&size, p + pos, sizeof(size));
         pos += sizeof(size);
-        if (len - pos < size)
-            return -1; /* truncated record */
-        rc = fn(ctx, p + pos, size);
+        if (len - pos < size) {
+            rc = -1; /* truncated record */
+            break;
+        }
+        /* Records are byte-packed in the file, so `p + pos` is unaligned, but the
+         * live ringbuf always hands the decoder 8-byte-aligned records (and
+         * lk_ev_decode dereferences the record as a struct). Honour the same
+         * invariant offline by copying each record into a malloc'd buffer
+         * (guaranteed max_align_t-aligned) before decoding — otherwise a struct
+         * field access is undefined behaviour (flagged by UBSAN -fsanitize=alignment). */
+        if (size > rec_cap) {
+            void *nb = realloc(rec, size);
+
+            if (!nb) {
+                rc = -1;
+                break;
+            }
+            rec = nb;
+            rec_cap = size;
+        }
+        if (size)
+            memcpy(rec, p + pos, size);
+        rc = fn(ctx, rec, size);
         if (rc)
-            return rc;
+            break;
         pos += size;
     }
-    return 0;
+    free(rec);
+    return rc;
 }
 
 int lk_replay_file(const char *path, lk_replay_fn fn, void *ctx)

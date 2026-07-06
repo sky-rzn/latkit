@@ -51,7 +51,9 @@ static void on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struct l
     r->flags = m->flags;
     r->len = m->len;
     r->cap = m->body_cap;
-    memcpy(r->body, m->body, m->body_cap < sizeof(r->body) ? m->body_cap : sizeof(r->body));
+    __u32 nbody = m->body_cap < sizeof(r->body) ? m->body_cap : sizeof(r->body);
+    if (nbody) /* an empty-body message has m->body == NULL; memcpy(,NULL,0) is UB */
+        memcpy(r->body, m->body, nbody);
 }
 
 static int nresyncs;

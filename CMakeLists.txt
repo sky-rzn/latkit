@@ -155,3 +155,11 @@ target_link_libraries(latkit latkit_proto ${LATKIT_LIBBPF_LIBS})
 enable_testing()
 add_subdirectory(tests/unit)
 add_subdirectory(tests/replay)
+
+# Fuzz harness (task 3.6, stage-8 groundwork): off by default, built behind a
+# flag. See tests/fuzz/CMakeLists.txt for the sanitizer invocation CI uses.
+option(LATKIT_FUZZ "Build the PostgreSQL parser fuzz harness (stage-8 groundwork)" OFF)
+option(LATKIT_FUZZER "Also build the libFuzzer target (implies LATKIT_FUZZ; needs clang)" OFF)
+if(LATKIT_FUZZ OR LATKIT_FUZZER)
+    add_subdirectory(tests/fuzz)
+endif()

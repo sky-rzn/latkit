@@ -804,8 +804,150 @@ static void build_synthetic_midsession(struct fx *x)
     b.x->resyncs = 2;
 }
 
+/* A failing simple query: Q "select 1/0" -> ErrorResponse (SQLSTATE 22012,
+ * division by zero) -> Z. The unit closes on Z carrying LK_QO_ERROR and the
+ * SQLSTATE; errors_sql ticks. The mirror of build_simple_query's happy path. */
+static void build_error(struct fx *x)
+{
+    struct bld b;
+    __u8 w[128];
+    __u32 n;
+
+    bld_init(&b, x);
+    prelude(&b);
+
+    n = pgmsg(w, 'Q', "select 1/0", 11); /* "select 1/0\0" */
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'Q', 15, 0);
+
+    {
+        /* ErrorResponse: S(everity) ERROR\0 C(ode) 22012\0 terminator. */
+        __u8 err[32];
+        __u32 en = 0;
+
+        err[en++] = 'S';
+        memcpy(err + en, "ERROR", 6);
+        en += 6;
+        err[en++] = 'C';
+        memcpy(err + en, "22012", 6);
+        en += 6;
+        err[en++] = 0;
+        n = pgmsg(w, 'E', err, en);
+        call(&b, LK_DIR_SEND, w, n);
+        expect(&b, LK_DIR_SEND, 'E', en + 4, 0);
+    }
+    n = pgmsg(w, 'Z', "I", 1);
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'Z', 5, 0);
+
+    n = pgmsg(w, 'X', NULL, 0);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'X', 4, 0);
+    ev_close(&b);
+
+    /* One SIMPLE observation, closed by the error: no rows, LK_QO_ERROR, and
+     * the SQLSTATE extracted from the 'C' field. */
+    b.x->queries = 1;
+    b.x->errors_sql = 1;
+    b.x->obs_kind = LK_Q_SIMPLE;
+    b.x->obs_rows = 0;
+    b.x->obs_flags = LK_QO_ERROR;
+    b.x->obs_text = "select 1/0";
+    b.x->obs_sqlstate = "22012";
+}
+
+/* A multi-statement simple query: Q "select 1; select 2" replies with two
+ * result sets and two CommandCompletes before the single Z. It stays one unit
+ * (the client blocks on Z), flagged LK_QO_MULTI_STMT, with the row counts of
+ * both tags summed (1 + 2 = 3). */
+static void build_multi_statement(struct fx *x)
+{
+    struct bld b;
+    __u8 w[128];
+    __u32 n;
+
+    bld_init(&b, x);
+    prelude(&b);
+
+    n = pgmsg(w, 'Q', "select 1; select 2", 19); /* "...\0" */
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'Q', 23, 0);
+
+    /* First statement: T, D, C "SELECT 1". */
+    n = row_desc(w);
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'T', n - 1, 0);
+    n = data_row(w, "1");
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'D', n - 1, 0);
+    n = pgmsg(w, 'C', "SELECT 1", 9);
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'C', 13, 0);
+
+    /* Second statement: T, D, C "SELECT 2". */
+    n = row_desc(w);
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'T', n - 1, 0);
+    n = data_row(w, "2");
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'D', n - 1, 0);
+    n = pgmsg(w, 'C', "SELECT 2", 9);
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'C', 13, 0);
+
+    n = pgmsg(w, 'Z', "I", 1);
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'Z', 5, 0);
+
+    n = pgmsg(w, 'X', NULL, 0);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'X', 4, 0);
+    ev_close(&b);
+
+    /* One SIMPLE observation: two CommandCompletes -> MULTI_STMT, rows summed. */
+    b.x->queries = 1;
+    b.x->obs_kind = LK_Q_SIMPLE;
+    b.x->obs_rows = 3;
+    b.x->obs_flags = LK_QO_MULTI_STMT;
+    b.x->obs_text = "select 1; select 2";
+}
+
+/* A query cancellation: a fresh connection sends only a CancelRequest (a
+ * startup-framed packet with the cancel code, carrying the target's backend PID
+ * and secret key) and closes. The framer emits the one startup message and marks
+ * the connection LK_CONN_CANCEL; the parser turns it into a CANCEL observation
+ * with no session, no text and no timings (Р16). */
+static void build_cancel(struct fx *x)
+{
+    struct bld b;
+    __u8 w[32];
+    __u32 n;
+    /* CancelRequest body after the length+code framing: backend PID + secret
+     * key (8 bytes); their contents are irrelevant, the parser never reads them. */
+    static const __u8 pid_key[8] = {0, 0, 0x30, 0x39, 0xde, 0xad, 0xbe, 0xef};
+
+    bld_init(&b, x);
+    ev_open(&b, false);
+
+    n = pgstartup(w, LK_PG_CANCEL_REQUEST, pid_key, sizeof(pid_key));
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0, sizeof(pid_key) + 8, LK_MSG_STARTUP);
+
+    ev_close(&b);
+
+    /* One CANCEL observation; no AuthenticationOk means no session. */
+    b.x->queries = 1;
+    b.x->obs_kind = LK_Q_CANCEL;
+    b.x->obs_rows = 0;
+    b.x->obs_flags = 0;
+    b.x->obs_text = NULL; /* CANCEL carries no text */
+}
+
 const struct fixture lk_fixtures[] = {
     {"simple_query", build_simple_query},
+    {"error", build_error},
+    {"multi_statement", build_multi_statement},
+    {"cancel", build_cancel},
     {"extended", build_extended},
     {"prepared", build_prepared},
     {"pipeline_error", build_pipeline_error},

@@ -6,19 +6,22 @@ protocol into per-query latency metrics exported to Prometheus and
 OpenTelemetry. No backend of its own — Grafana reads the data from
 Prometheus / an OTel-compatible store.
 
-**Status: capture layer done (milestone M1); userspace framing in place.**
-The agent attaches to a live kernel, captures both directions of traffic on
-configured server ports as a stream of connection-scoped events, accounts for
-every lost event, and survives overload without touching the database. On top
-of that it now runs the stage-2 userspace pipeline: an epoll event loop, a
-connection table, and a streaming framer that reassembles the event stream
-into whole PostgreSQL v3 protocol messages (type + length + body), honestly
-flagging the stretches made dirty by loss. Message *semantics* (query/response
-matching, latency), metrics and exporters are the next stages — see
-[PLAN.md](PLAN.md) (Russian) for the roadmap, [STAGE1.md](STAGE1.md) for the
-capture-layer design decisions and [STAGE2.md](STAGE2.md) for the framing
-model (a per-direction stream of bytes and known-size holes,
-[docs/notes-reassembly.md](docs/notes-reassembly.md)).
+**Status: capture layer done (milestone M1); framing + PostgreSQL v3 parser in
+place.** The agent attaches to a live kernel, captures both directions of
+traffic on configured server ports as a stream of connection-scoped events,
+accounts for every lost event, and survives overload without touching the
+database. On top of that it runs the stage-2 userspace pipeline (an epoll event
+loop, a connection table, and a streaming framer that reassembles the event
+stream into whole PostgreSQL v3 messages) and the stage-3 protocol handler,
+which turns those messages into protocol-independent **query observations** —
+timings, the SQL-text prefix, row counts, SQLSTATE, and session labels — for
+simple, extended (prepared / pipelined) and COPY traffic, honestly dropping
+anything that spans a loss. Query normalisation, metrics and exporters are the
+next stages — see [PLAN.md](PLAN.md) (Russian) for the roadmap,
+[STAGE1.md](STAGE1.md) for the capture-layer decisions, [STAGE2.md](STAGE2.md) /
+[docs/notes-reassembly.md](docs/notes-reassembly.md) for the framing model, and
+[STAGE3.md](STAGE3.md) / [docs/notes-pgproto.md](docs/notes-pgproto.md) for the
+parser (phase machine, message table, timing model, blind spots).
 
 ## How it works
 
@@ -93,6 +96,7 @@ sudo ./build/latkit                    # captures local port 5432
 | `--record FILE` | off | append every raw ringbuf record to FILE for offline replay (LKT1 trace) |
 | `--events` | off | print one line per raw ringbuf event (the stage-1 output) |
 | `--messages` | off | print one line per reassembled protocol message |
+| `--queries` | off | print one line per session and per parsed query observation |
 | `-x, --hexdump` | off | dump event payload (`--events`) and the captured message body prefix (`--messages`) |
 
 Dev environment (PostgreSQL 16 in docker + pgbench load):
@@ -102,6 +106,42 @@ docker compose -f deploy/dev/docker-compose.yml up -d
 sudo ./build/latkit &
 ./deploy/dev/bench.sh -c 8 -T 15
 ```
+
+### Reading `--queries`
+
+`--queries` prints the stage-3 parser output: one line when a session
+authenticates and one per query observation. It is the debug view of what stage
+4 will aggregate into metrics — the parser does no normalisation, so the text is
+the raw captured SQL prefix.
+
+```
+<ts> session conn=<cookie> user=<u> db=<d> app=<a> ver=<v>[ (incomplete)]
+<ts> query conn=<cookie> dur=<n>ns kind=<k> db=<d> user=<u> rows=<n> \
+     sqlstate=<s> txn=<c> flags=0x<f> text=<sql>
+```
+
+- `kind` — `simple` / `extended` / `function` / `copy_in` / `copy_out` /
+  `cancel`.
+- `dur` — the honest per-query span `ts_complete − ts_start` (see the timing
+  model below). `rows` comes from the `CommandComplete` tag; `sqlstate` is `-`
+  unless the query failed; `txn` is the `I`/`T`/`E` status from the closing
+  `ReadyForQuery`.
+- `flags` — the `LK_QO_*` bitset: `ERROR`, `TEXT_TRUNC` (text is a
+  budget-truncated prefix), `NO_TEXT` (prepared statement not in cache, or a
+  function call), `MULTI_STMT`, `EMPTY`, `SUSPENDED`, `ABORTED` (killed by an
+  earlier error in a pipelined batch), `PIPELINED`.
+- `text` is truncated to 120 chars **in the output only** — the observation
+  carries the full captured prefix.
+
+**Timing model.** All timestamps are `bpf_ktime_get_ns` at *syscall* granularity
+(the framer's limit — messages packed into one `send`/`recv` share a timestamp,
+[docs/notes-reassembly.md](docs/notes-reassembly.md)). Each observation carries
+four: `ts_start` (query arrives), `ts_first_row`, `ts_complete` (reply done),
+`ts_ready` (following `ReadyForQuery`). `--queries` reports `ts_complete −
+ts_start`; a pipelined batch shares one `ReadyForQuery`, so this per-unit span is
+more honest than `ts_ready − ts_start`. The full rationale and the parser's blind
+spots (query cut off by a disconnect, `NO_TEXT`, TLS) are in
+[docs/notes-pgproto.md](docs/notes-pgproto.md).
 
 ## Known limitations (v1 scope)
 
