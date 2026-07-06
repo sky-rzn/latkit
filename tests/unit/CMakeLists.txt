@@ -21,3 +21,12 @@ add_test(NAME reassembly COMMAND test_reassembly)
 add_executable(test_pg_wire test_pg_wire.c)
 target_include_directories(test_pg_wire PRIVATE ${CMAKE_SOURCE_DIR}/src/proto/pg)
 add_test(NAME pg_wire COMMAND test_pg_wire)
+
+# Startup/auth/session (task 3.2): white-box over the PG handler (links the
+# libbpf-free proto lib; includes the internal pg.h for state assertions).
+add_executable(test_pg_session test_pg_session.c)
+target_include_directories(test_pg_session PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/pg
+    ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf)
+target_link_libraries(test_pg_session latkit_proto)
+add_test(NAME pg_session COMMAND test_pg_session)

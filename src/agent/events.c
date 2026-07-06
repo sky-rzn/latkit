@@ -40,6 +40,55 @@ struct lk_events {
     struct lk_recorder *rec;              /* --record trace writer, NULL when off */
 };
 
+/* --- --queries logger (stage 3): the standard consumer of the parser -------
+ * Prints one line per session (AuthenticationOk) and per observation. Stage 4
+ * replaces this consumer with the aggregator; the parser does not change. Task
+ * 3.2 emits sessions and CANCEL observations — the full query line (timings,
+ * rows, SQL) fills in with task 3.3. */
+static const char *kind_str(__u8 kind)
+{
+    switch (kind) {
+    case LK_Q_SIMPLE:
+        return "simple";
+    case LK_Q_EXTENDED:
+        return "extended";
+    case LK_Q_FUNCTION:
+        return "function";
+    case LK_Q_COPY_IN:
+        return "copy_in";
+    case LK_Q_COPY_OUT:
+        return "copy_out";
+    case LK_Q_CANCEL:
+        return "cancel";
+    default:
+        return "?";
+    }
+}
+
+static void on_session(void *ctx, const struct lk_conn *c, const struct lk_session *s)
+{
+    (void)ctx;
+    printf("%llu session conn=%llx user=%s db=%s app=%s ver=%s%s\n",
+           (unsigned long long)c->last_activity_ns, (unsigned long long)c->cookie,
+           s->user[0] ? s->user : "?", s->database[0] ? s->database : "?",
+           s->app[0] ? s->app : "?", s->server_version[0] ? s->server_version : "?",
+           s->complete ? "" : " (incomplete)");
+}
+
+static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session *s,
+                     const struct lk_query_obs *o)
+{
+    __u64 dur = o->ts_complete_ns > o->ts_start_ns ? o->ts_complete_ns - o->ts_start_ns : 0;
+
+    (void)ctx;
+    /* Full line (text, rows, sqlstate) lands with task 3.3; for now the fields
+     * task 3.2 fills — kind, session, timings when present. */
+    printf("%llu query conn=%llx dur=%lluns kind=%s db=%s user=%s flags=0x%x\n",
+           (unsigned long long)o->ts_start_ns, (unsigned long long)c->cookie,
+           (unsigned long long)dur, kind_str(o->kind), s->database[0] ? s->database : "?",
+           s->user[0] ? s->user : "?", o->flags);
+}
+
 /* PG parser counters (stage 3). The skeleton (task 3.1) only tallies messages,
  * so print the totals plus the per-type breakdown its stubs produce — the
  * proof that live traffic is reaching the handler. Printable types show as the
@@ -67,6 +116,12 @@ static void print_proto_stats(const struct lk_proto_stats *ps)
     fprintf(stderr, "latkit: pg msgs=%llu startup=%llu resyncs=%llu conns=%llu\n",
             (unsigned long long)ps->msgs, (unsigned long long)ps->startup_msgs,
             (unsigned long long)ps->resyncs, (unsigned long long)ps->conns);
+    fprintf(stderr,
+            "latkit: pg sessions=%llu queries=%llu errors_sql=%llu "
+            "parse_errors=%llu unknown=%llu replication=%llu\n",
+            (unsigned long long)ps->sessions, (unsigned long long)ps->queries,
+            (unsigned long long)ps->errors_sql, (unsigned long long)ps->parse_errors,
+            (unsigned long long)ps->unknown_msgs, (unsigned long long)ps->replication_conns);
     append_type_counts(fe, sizeof(fe), ps->by_type[LK_DIR_RECV]);
     append_type_counts(be, sizeof(be), ps->by_type[LK_DIR_SEND]);
     fprintf(stderr, "latkit: pg types fe:%s | be:%s\n", fe, be);
@@ -351,11 +406,15 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
     if (!e)
         return NULL;
     e->cfg = *cfg;
-    /* The PG handler is the standard consumer of the framer (Р15). No query
-     * sink yet — the --queries logger arrives in task 3.3; the skeleton only
-     * counts. events.c's own sink (above) tees messages into it and mirrors
-     * to the --messages logger. */
-    e->proto = lk_proto_pg_new(NULL);
+    /* The PG handler is the standard consumer of the framer (Р15). With
+     * --queries its upward sink is the logger below (task 3.2: sessions +
+     * CANCEL; the full query line arrives with 3.3); without it the parser
+     * still runs and its counters still accrue, just with no per-observation
+     * output. events.c's own message sink (above) tees messages into the parser
+     * and mirrors them to the --messages logger. */
+    e->proto = lk_proto_pg_new(cfg->queries ? &(struct lk_query_sink){.on_session = on_session,
+                                                                       .on_query = on_query}
+                                            : NULL);
     if (!e->proto) {
         free(e);
         return NULL;

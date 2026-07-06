@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0
-/* PostgreSQL v3 handler (STAGE3.md). Task 3.1 is the skeleton: it owns the
- * per-connection parser state through lk_conn.proto_state, mirrors the
- * lk_msg_sink contract, tallies messages by (direction, type), and routes each
- * message to a per-direction stub. The stubs — and the observations they will
- * emit up through lk_query_sink — fill in over tasks 3.2-3.5.
+/* PostgreSQL v3 handler (STAGE3.md). Owns the per-connection parser state
+ * through lk_conn.proto_state, mirrors the lk_msg_sink contract, tallies
+ * messages by (direction, type), and dispatches each message by (direction,
+ * phase, type). Task 3.2 wires the startup handshake (pg_session.c); the query
+ * phases (simple/extended/COPY) fill in over tasks 3.3-3.5.
  *
  * No I/O, no libbpf: a pure state machine fed synthetic lk_msg by unit tests
  * and .lkt fixtures by the replay harness. */
@@ -12,13 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "pg_wire.h" /* task 3.1 deliverable; used from 3.2 on */
+#include "pg_wire.h"
 
-struct lk_proto {
-    struct lk_msg_sink msink; /* down: installed as the framer's sink */
-    struct lk_query_sink out; /* up: borrowed from the assembler */
-    struct lk_proto_stats st;
-};
+/* struct lk_proto lives in pg.h so the pg_*.c helpers reach the sink/counters. */
 
 /* Lazily attach per-connection state on the first message (Р15). Returns NULL
  * only on allocation failure — the caller degrades to counting, never crashes. */
@@ -39,28 +35,44 @@ static struct pg_conn *pg_conn_get(struct lk_proto *p, struct lk_conn *c)
     return pc;
 }
 
-/* --- per-direction dispatch stubs (grow in 3.2-3.5) ----------------------- */
+/* --- per-direction dispatch (grows in 3.3-3.5) ---------------------------- */
 
-/* frontend -> backend (RECV on the server socket): Q, P, B, E, S, X, ... */
+/* frontend -> backend (RECV on the server socket): startup, Q, P, B, E, S, X. */
 static void pg_frontend_msg(struct lk_proto *p, struct lk_conn *c, struct pg_conn *pc,
                             const struct lk_msg *m)
 {
-    (void)p;
-    (void)c;
-    (void)pc;
-    (void)m;
-    /* task 3.2: startup/session; 3.3: simple query; 3.4: extended. */
+    if (m->flags & LK_MSG_STARTUP) {
+        pg_session_startup(p, c, pc, m); /* StartupMessage / Cancel / SSL (3.2) */
+        return;
+    }
+    switch (m->type) {
+    case 'p':
+        /* PasswordMessage / SASL: the body is the password. It is never read
+         * or copied — a security invariant, not an optimisation (Р16). */
+        break;
+    default:
+        /* Q simple query (3.3); P/B/E/S extended (3.4); d/c/f COPY (3.5). */
+        break;
+    }
 }
 
-/* backend -> frontend (SEND on the server socket): R, Z, T, D, C, E, ... */
+/* backend -> frontend (SEND on the server socket): R, S, Z, T, D, C, E, ... */
 static void pg_backend_msg(struct lk_proto *p, struct lk_conn *c, struct pg_conn *pc,
                            const struct lk_msg *m)
 {
-    (void)p;
-    (void)c;
-    (void)pc;
-    (void)m;
-    /* task 3.3: rows/CommandComplete/errors/txn; 3.5: COPY/replication. */
+    switch (m->type) {
+    case 'R': /* Authentication: AuthenticationOk -> session (3.2) */
+        pg_session_auth(p, c, pc, m);
+        break;
+    case 'S': /* ParameterStatus: server_version label (3.2). The one-byte
+               * SSL 'S' reply also lands here with an empty body — parsed as an
+               * empty ParameterStatus, i.e. harmlessly ignored. */
+        pg_session_param_status(pc, m);
+        break;
+    default:
+        /* rows / CommandComplete / ErrorResponse / txn (3.3); COPY (3.5). */
+        break;
+    }
 }
 
 /* --- lk_msg_sink implementation (down contract) --------------------------- */

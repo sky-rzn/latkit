@@ -24,6 +24,7 @@ static bool opt_hexdump;
 static bool opt_cap_headers;
 static bool opt_events;
 static bool opt_messages;
+static bool opt_queries;
 static __u16 opt_ports[LK_MAX_PORTS];
 static int opt_nports;
 static __u64 opt_ringbuf_bytes = LK_RINGBUF_SZ;
@@ -64,6 +65,8 @@ static void usage(const char *argv0)
             "      --events          print one line per raw ringbuf event\n"
             "      --messages        print one line per reassembled protocol\n"
             "                        message\n"
+            "      --queries         print one line per session and query\n"
+            "                        observation from the protocol parser\n"
             "  -x, --hexdump         dump payload of events (--events) and the\n"
             "                        captured body prefix (--messages)\n",
             argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT,
@@ -97,6 +100,7 @@ static int parse_args(int argc, char **argv)
         OPT_RECORD,
         OPT_EVENTS,
         OPT_MESSAGES,
+        OPT_QUERIES,
     };
     static const struct option opts[] = {
         {"port", required_argument, NULL, 'p'},
@@ -109,6 +113,7 @@ static int parse_args(int argc, char **argv)
         {"record", required_argument, NULL, OPT_RECORD},
         {"events", no_argument, NULL, OPT_EVENTS},
         {"messages", no_argument, NULL, OPT_MESSAGES},
+        {"queries", no_argument, NULL, OPT_QUERIES},
         {"hexdump", no_argument, NULL, 'x'},
         {},
     };
@@ -181,6 +186,9 @@ static int parse_args(int argc, char **argv)
             break;
         case OPT_MESSAGES:
             opt_messages = true;
+            break;
+        case OPT_QUERIES:
+            opt_queries = true;
             break;
         case 'x':
             opt_hexdump = true;
@@ -277,6 +285,7 @@ int main(int argc, char **argv)
         .cap_headers = opt_cap_headers,
         .events = opt_events,
         .messages = opt_messages,
+        .queries = opt_queries,
     };
 
     events = lk_events_new(&ecfg);

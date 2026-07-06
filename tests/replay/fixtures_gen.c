@@ -190,6 +190,11 @@ static void prelude(struct bld *b)
     n = pgmsg(w, 'Z', "I", 1);
     call(b, LK_DIR_SEND, w, n);
     expect(b, LK_DIR_SEND, 'Z', 5, 0);
+
+    /* AuthenticationOk emits one session; startup_params carries these labels. */
+    b->x->sessions = 1;
+    b->x->sess_user = "postgres";
+    b->x->sess_db = "postgres";
 }
 
 static void bld_init(struct bld *b, struct fx *x)
@@ -375,6 +380,9 @@ static void build_ssl_plain(struct fx *x)
     n = pgmsg(w, 'Z', "I", 1);
     call(&b, LK_DIR_SEND, w, n);
     expect(&b, LK_DIR_SEND, 'Z', 5, 0);
+    b.x->sessions = 1; /* plaintext startup completes: one session */
+    b.x->sess_user = "postgres";
+    b.x->sess_db = "postgres";
 
     n = pgmsg(w, 'Q', "select 1", 9);
     call(&b, LK_DIR_RECV, w, n);

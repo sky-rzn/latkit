@@ -25,6 +25,7 @@ struct lk_events_cfg {
     bool cap_headers;
     bool events;   /* per-event log lines (the stage-1 output) */
     bool messages; /* one line per reassembled protocol message */
+    bool queries;  /* one line per session/query observation (stage 3) */
 };
 
 struct lk_events;

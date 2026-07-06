@@ -37,6 +37,14 @@ struct fx {
     bool clean;      /* expect zero bad_len/hdr_holes/off_anomalies */
     __u64 resyncs;   /* expected reasm resync count */
     __u64 tls_conns; /* expected reasm tls_conns count */
+
+    /* Stage-3 parser expectations (task 3.2): the sessions the PG handler
+     * emits and their labels; the observation count (0 until 3.3, non-zero
+     * only for CANCEL). */
+    __u64 sessions;         /* expected on_session count */
+    __u64 queries;          /* expected on_query count */
+    const char *sess_user;  /* last session's user     (when sessions > 0) */
+    const char *sess_db;    /* last session's database (when sessions > 0) */
 };
 
 struct fixture {

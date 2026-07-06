@@ -19,6 +19,7 @@
 #include "conn_table.h"
 #include "fixtures_gen.h"
 #include "pipeline.h"
+#include "proto.h"
 #include "record.h"
 
 #ifndef LK_FIXTURES_DIR
@@ -33,30 +34,81 @@
         }                                                                                          \
     } while (0)
 
-/* --- message-collecting sink --------------------------------------------- */
+/* --- message-collecting sink + PG-parser tee ------------------------------
+ * The pipeline sink both records the framer's message stream (the stage-2
+ * framing assertions) and tees every message / resync / close into the PG
+ * handler (Р15), whose query sink records the sessions and observations the
+ * stage-3 assertions check. This mirrors how events.c wires the two together
+ * over live traffic. */
 
 struct collector {
     struct lk_pipeline pipe;
+    struct lk_proto *proto;               /* PG handler under test */
+    const struct lk_msg_sink *psink;      /* = lk_proto_sink(proto) */
     struct fx_msg got[FX_MAX_MSGS * 2];
     size_t ngot;
     bool overflow;
+
+    /* Query-sink side: what the PG parser emitted upward. */
+    size_t nsessions;
+    size_t nqueries;
+    struct lk_session last_session;
 };
+
+static void on_session(void *ctx, const struct lk_conn *c, const struct lk_session *s)
+{
+    struct collector *col = ctx;
+
+    (void)c;
+    col->nsessions++;
+    col->last_session = *s;
+}
+
+static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session *s,
+                     const struct lk_query_obs *o)
+{
+    struct collector *col = ctx;
+
+    (void)c;
+    (void)s;
+    (void)o;
+    col->nqueries++;
+}
 
 static void on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struct lk_msg *m)
 {
     struct collector *col = ctx;
 
-    (void)c;
-    if (col->ngot >= sizeof(col->got) / sizeof(col->got[0])) {
+    if (col->ngot >= sizeof(col->got) / sizeof(col->got[0]))
         col->overflow = true;
-        return;
-    }
-    col->got[col->ngot++] = (struct fx_msg){
-        .dir = (__u8)dir,
-        .type = m->type,
-        .len = m->len,
-        .flags = m->flags,
-    };
+    else
+        col->got[col->ngot++] = (struct fx_msg){
+            .dir = (__u8)dir,
+            .type = m->type,
+            .len = m->len,
+            .flags = m->flags,
+        };
+    if (col->psink->on_msg)
+        col->psink->on_msg(col->psink->ctx, c, dir, m);
+}
+
+static void on_resync(void *ctx, struct lk_conn *c, enum lk_dir dir)
+{
+    struct collector *col = ctx;
+
+    if (col->psink->on_resync)
+        col->psink->on_resync(col->psink->ctx, c, dir);
+}
+
+/* The pipeline routes the conn-table destroy hook here; forward it so the
+ * parser frees proto_state on every removal path (Р15) — otherwise ASAN sees a
+ * leak on teardown. */
+static void on_conn_close(void *ctx, struct lk_conn *c)
+{
+    struct collector *col = ctx;
+
+    if (col->psink->on_conn_close)
+        col->psink->on_conn_close(col->psink->ctx, c);
 }
 
 static int feed_record(void *ctx, const void *data, __u32 size)
@@ -132,10 +184,23 @@ static int run_fixture(const struct fixture *fix)
         return 1;
     }
 
-    /* 2. Replay the committed trace through the shared pipeline. */
+    /* 2. Replay the committed trace through the shared pipeline, teeing every
+     * message into the PG handler. */
     memset(&col, 0, sizeof(col));
+    col.proto = lk_proto_pg_new(
+        &(struct lk_query_sink){.ctx = &col, .on_session = on_session, .on_query = on_query});
+    if (!col.proto) {
+        free(committed);
+        free(x.buf);
+        return 1;
+    }
+    col.psink = lk_proto_sink(col.proto);
     if (lk_pipeline_init(&col.pipe, LK_MAX_CONNS_DEFAULT, 600ULL * 1000000000ULL,
-                         &(struct lk_msg_sink){.ctx = &col, .on_msg = on_msg})) {
+                         &(struct lk_msg_sink){.ctx = &col,
+                                               .on_msg = on_msg,
+                                               .on_resync = on_resync,
+                                               .on_conn_close = on_conn_close})) {
+        lk_proto_free(col.proto);
         free(committed);
         free(x.buf);
         return 1;
@@ -185,14 +250,37 @@ static int run_fixture(const struct fixture *fix)
         goto fail;
     }
 
+    /* Stage-3 parser expectations (task 3.2): sessions and observations. */
+    if (col.nsessions != x.sessions) {
+        fprintf(stderr, "FAIL %s: expected %llu sessions, got %zu\n", fix->name,
+                (unsigned long long)x.sessions, col.nsessions);
+        goto fail;
+    }
+    if (x.sessions && (strcmp(col.last_session.user, x.sess_user) ||
+                       strcmp(col.last_session.database, x.sess_db))) {
+        fprintf(stderr, "FAIL %s: session labels expected user=%s db=%s, got user=%s db=%s\n",
+                fix->name, x.sess_user, x.sess_db, col.last_session.user,
+                col.last_session.database);
+        goto fail;
+    }
+    if (col.nqueries != x.queries) {
+        fprintf(stderr, "FAIL %s: expected %llu observations, got %zu\n", fix->name,
+                (unsigned long long)x.queries, col.nqueries);
+        goto fail;
+    }
+
+    /* Tear the table down first (its destroy hooks free proto_state through the
+     * parser, which must still be alive), then release the handler. */
     lk_pipeline_fini(&col.pipe);
+    lk_proto_free(col.proto);
     free(committed);
     free(x.buf);
-    printf("ok %s (%zu msgs)\n", fix->name, col.ngot);
+    printf("ok %s (%zu msgs, %zu sessions)\n", fix->name, col.ngot, col.nsessions);
     return 0;
 
 fail:
     lk_pipeline_fini(&col.pipe);
+    lk_proto_free(col.proto);
     free(committed);
     free(x.buf);
     return 1;
