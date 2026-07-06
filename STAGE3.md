@@ -471,25 +471,60 @@ TLS-соединении запись HEADERS появляется в карте
 локальный критерий — «этап 4 может начинаться»: наблюдения корректны,
 API вверх стабилен.
 
-- [ ] psql-сессия: `--queries` показывает запросы с корректными
+- [x] psql-сессия: `--queries` показывает запросы с корректными
       текстами, строками, длительностями; ошибки — с SQLSTATE.
-- [ ] `pgbench -c 8 -T 60` во всех трёх режимах (`simple`, `extended`,
+- [x] `pgbench -c 8 -T 60` во всех трёх режимах (`simple`, `extended`,
       `prepared`): число наблюдений сходится с числом транзакций ×
       стейтментов; `prepared` — без `NO_TEXT`; 0 parse_errors.
-- [ ] Pipelining (фикстура + живой тест при наличии libpq-pipeline):
+- [x] Pipelining (фикстура + живой тест при наличии libpq-pipeline):
       ответы сопоставлены своим запросам, ошибка в батче не портит
       соседей.
-- [ ] Потери (крошечный ringbuf) + чурн `pgbench -C`: ни одного
+- [x] Потери (крошечный ringbuf) + чурн `pgbench -C`: ни одного
       наблюдения через разрыв, `units_dropped_*` растут, RSS стабилен,
       после нагрузки таблица и очереди возвращаются к нулю.
-- [ ] TLS и репликационные соединения: ноль наблюдений, HEADERS в карте
+- [x] TLS и репликационные соединения: ноль наблюдений, HEADERS в карте
       `capmode`, гонка RMW устранена (seq/dropped целы).
-- [ ] Unit + replay + fuzz-корпус в CI зелёные без привилегий/BPF;
+- [x] Unit + replay + fuzz-корпус в CI зелёные без привилегий/BPF;
       ASAN чист.
-- [ ] `src/proto/` не включает ни одного заголовка из `src/agent/`,
+- [x] `src/proto/` не включает ни одного заголовка из `src/agent/`,
       кроме контрактных (`latkit.h`, `conn_table.h`, `reassembly.h`
       через `proto.h`) — проверить включениями, это и есть «единый и
       чёткий API» из PLAN.md.
+
+### Результаты прогона (2026-07-06)
+
+Все 7 пунктов пройдены на живом стенде (ядро 6.17, dev-postgres-1
+172.18.0.2, pg-ssl-test 172.17.0.2).
+
+1. **psql**: 14 наблюдений, тексты/строки верны
+   (`generate_series(1,5)`→rows=5, insert/update→3, delete→1),
+   `select 1/0`→SQLSTATE 22012, `no_such_table`→42P01, txn I→T→I;
+   `errors_sql=2`, `parse_errors=0`.
+2. **pgbench -c 8 -T 60** (builtin TPC-B, 7 стейтментов):
+   simple txns 155703→obs 1 089 923; extended 64887→454 211;
+   prepared 65846→460 924. Всюду `obs = txns×7 + 2` (служебное
+   metadata-соединение pgbench, `sessions=9`). prepared: `NO_TEXT=0`.
+   Во всех трёх — `parse_errors=0`, `units_dropped=0`, drops=0.
+3. **Pipelining** (фикстура `pipeline_error`: ровно 1 ERROR + хвост
+   ABORTED|PIPELINED; живой `pgbench \startpipeline` ×5): 470 128 батчей
+   → 2 350 640 наблюдений, все с флагом PIPELINED, 0 ошибок сопоставления.
+4. **Потери/чурн**: 4 КиБ ringbuf под нагрузкой → drops=23228,
+   resyncs=4027, `queries=0` (ни одно наблюдение не пересекло разрыв);
+   256 КиБ + STOP-столл → `units_dropped_resync=3` (in-flight дропнуты, не
+   эмитированы); `pgbench -C` 10581 циклов → active→0, RSS 19200→19216 КиБ
+   (стабилен), `parse_errors=0`.
+5. **TLS** (pg-ssl-test, sslmode=require): `tls_conns=1`, `sessions=0`,
+   `queries=0`, `capmode`-запись `{cookie→1}` (HEADERS). **Репликация**
+   (`pg_receivewal`, CopyBothResponse): `replication_conns=1`,
+   HEADERS в `capmode`, WAL-поток `3496/2 622 142` байт captured/total —
+   ноль наблюдений от стрима (5 наблюдений — преамбула IDENTIFY_SYSTEM/SHOW
+   до START_REPLICATION). Во всех прогонах `lost == drops` побайтово —
+   гонка RMW seq/dropped устранена.
+6. **CI-тесты**: `ctest` 9/9 (обычная сборка) и 10/10 (ASAN/UBSAN +
+   fuzz-корпус) зелёные, без привилегий/BPF, ASAN чист.
+7. **Изоляция API**: `src/proto/**` включает только `proto.h`,
+   `conn_table.h`, `reassembly.h` (контрактные) + свой `pg_wire.h`;
+   ни одного `src/agent/*.h` (проверено grep'ом).
 
 ## Риски этапа
 
