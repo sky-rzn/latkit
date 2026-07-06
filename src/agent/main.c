@@ -277,7 +277,7 @@ int main(int argc, char **argv)
     struct lk_events_cfg ecfg = {
         .ringbuf = skel->maps.events,
         .stats = skel->maps.stats,
-        .conns = skel->maps.conns,
+        .capmode = skel->maps.capmode,
         .max_conns = opt_max_conns,
         .conn_idle_timeout_sec = opt_conn_idle_timeout,
         .record_path = opt_record,

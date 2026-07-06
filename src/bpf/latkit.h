@@ -87,15 +87,19 @@ struct lk_ev_data { /* payload is LK_CHUNK_SMALL or LK_CHUNK_FULL */
     __u8 payload[];
 };
 
-/* Kernel-side connection registry entry (map `conns`, key = cookie).
- * Userspace writes capture_mode here (task 1.6), hence shared. */
+/* Kernel-side connection registry entry (map `conns`, key = cookie). */
 
 #define LK_CS_OPEN_SENT (1 << 0) /* CONN_OPEN already emitted for this conn */
 
-/* Per-connection capture budget override (task 1.6, mechanism only — the
- * policy that flips connections between modes is the stage-3 parser; stage 1
- * has just the --cap-headers test hook). HEADERS caps the capture at
- * LK_CAP_HEADERS_LIMIT bytes per send/recv call; total_len stays honest. */
+/* Per-connection capture budget override. The value lives in its own `capmode`
+ * map (key = cookie, value = __u8 enum lk_cap_mode), written *only* by userspace
+ * and read by the kernel data path (Р21): keeping it out of lk_conn_state means
+ * the userspace writer no longer read-modify-writes the whole struct, so it can
+ * never clobber the kernel's concurrent seq/dropped updates. Absent entry ==
+ * FULL. HEADERS caps the capture at LK_CAP_HEADERS_LIMIT bytes per send/recv
+ * call; total_len stays honest. Policy (stage 3): TLS / CANCEL / replication —
+ * connections whose payload is never needed — are flipped to HEADERS; stage 1's
+ * --cap-headers test hook writes the same map. */
 enum lk_cap_mode { LK_CAP_FULL = 0, LK_CAP_HEADERS = 1 };
 
 #define LK_CAP_HEADERS_LIMIT 64 /* HEADERS budget, bytes per call */
@@ -106,7 +110,6 @@ struct lk_conn_state {
     __u32 dropped;         /* events lost on reserve failure */
     __u32 gap_pending;     /* loss recorded; next event carries LK_F_GAP */
     __u8 flags;            /* LK_CS_* */
-    __u8 capture_mode;     /* enum lk_cap_mode (task 1.6) */
 };
 
 #endif /* LATKIT_H */

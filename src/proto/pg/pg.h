@@ -55,9 +55,14 @@ struct pg_unit {
     __u64 ts_first_row_ns; /* first DataRow; 0 = none */
     __u64 ts_complete_ns;  /* backend message that completed it (C/E/s/I) */
     __u64 rows;            /* summed over the CommandComplete tags */
-    __u64 bytes;           /* COPY payload bytes (task 3.5) */
+    __u64 bytes;           /* COPY: summed len of CopyData messages (task 3.5) */
     __u32 ncomplete;       /* CommandComplete/EmptyQueryResponse count seen */
-    __u8 kind;             /* enum lk_query_kind */
+    __u8 kind;             /* enum lk_query_kind: the *opening* kind (SIMPLE /
+                              EXTENDED / FUNCTION), which decides whether the unit
+                              closes on its reply or waits for Z */
+    __u8 copy_kind;        /* 0, or LK_Q_COPY_IN / LK_Q_COPY_OUT once a Copy*
+                              Response arrives — reported as the observation kind
+                              while `kind` keeps driving the Z-close logic */
     __u16 flags;           /* accumulated LK_QO_* */
     char sqlstate[6];      /* from ErrorResponse 'C'; valid on LK_QO_ERROR */
 
@@ -184,6 +189,18 @@ void pg_query_empty(struct pg_conn *pc, const struct lk_msg *m);
 void pg_query_suspended(struct pg_conn *pc, const struct lk_msg *m);
 void pg_query_error(struct pg_conn *pc, const struct lk_msg *m);
 void pg_query_func_response(struct pg_conn *pc, const struct lk_msg *m);
+
+/* COPY (Р20). CopyInResponse ('G') / CopyOutResponse ('H') turn the open unit
+ * into a COPY_IN / COPY_OUT unit and move the connection into the matching COPY
+ * phase; CopyData ('d', either direction) adds its len to the unit's byte
+ * counter (bodies are never inspected); the closing CommandComplete ("COPY n")
+ * supplies rows, and Z emits — a simple-protocol COPY like any simple query, an
+ * extended one advancing nclosed. CopyBothResponse ('W') is walsender /
+ * replication: the connection goes IGNORE, its queue is dropped, and
+ * replication_conns is bumped (userspace flips it to HEADERS capture, Р21). */
+void pg_query_copy_begin(struct pg_conn *pc, __u8 copy_kind);
+void pg_query_copy_data(struct pg_conn *pc, const struct lk_msg *m);
+void pg_query_copy_both(struct lk_proto *p, struct lk_conn *c, struct pg_conn *pc);
 
 /* Backend ReadyForQuery ('Z'): emit the batch (every closed unit plus the open
  * simple/function unit, all sharing this Z as ts_ready), drop any leftovers, end

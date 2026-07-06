@@ -287,12 +287,14 @@ static int run_fixture(const struct fixture *fix)
      * SQLSTATE only when the fixture pins them. */
     if (x.queries) {
         if (col.last_obs.kind != x.obs_kind || col.last_obs.rows != x.obs_rows ||
-            col.last_obs.flags != x.obs_flags) {
+            col.last_obs.flags != x.obs_flags || col.last_obs.bytes != x.obs_bytes) {
             fprintf(stderr,
-                    "FAIL %s: obs expected kind=%u rows=%llu flags=0x%x, "
-                    "got kind=%u rows=%llu flags=0x%x\n",
-                    fix->name, x.obs_kind, (unsigned long long)x.obs_rows, x.obs_flags,
-                    col.last_obs.kind, (unsigned long long)col.last_obs.rows, col.last_obs.flags);
+                    "FAIL %s: obs expected kind=%u rows=%llu bytes=%llu flags=0x%x, "
+                    "got kind=%u rows=%llu bytes=%llu flags=0x%x\n",
+                    fix->name, x.obs_kind, (unsigned long long)x.obs_rows,
+                    (unsigned long long)x.obs_bytes, x.obs_flags, col.last_obs.kind,
+                    (unsigned long long)col.last_obs.rows, (unsigned long long)col.last_obs.bytes,
+                    col.last_obs.flags);
             goto fail;
         }
         if (x.obs_text && strcmp(col.last_text, x.obs_text)) {

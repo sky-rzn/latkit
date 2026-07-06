@@ -781,13 +781,194 @@ static int test_function_call(void)
     return 0;
 }
 
+/* COPY FROM STDIN (Р20): Q "COPY .. FROM STDIN" opens the unit, CopyInResponse
+ * turns it into COPY_IN, the frontend CopyData messages sum their bytes, and the
+ * "COPY n" CommandComplete + Z emit one COPY_IN observation. */
+static int test_copy_in(void)
+{
+    struct rec r = {0};
+    struct lk_query_sink qs = {.ctx = &r, .on_query = rec_on_query};
+    struct lk_proto *p = lk_proto_pg_new(&qs);
+    const struct lk_msg_sink *sink = lk_proto_sink(p);
+    struct lk_conn c = {0};
+    static const __u8 gbody[5] = {0}; /* format + ncols + col formats */
+    static const __u8 dbody[8] = {0};
+
+    CHECK(p);
+    handshake(sink, &c);
+
+    q_simple(sink, &c, "COPY t FROM STDIN", 1000);
+    feed_ts(sink, &c, LK_DIR_SEND, 'G', 0, gbody, sizeof(gbody), 1010); /* CopyInResponse */
+    feed_ts(sink, &c, LK_DIR_RECV, 'd', 0, dbody, sizeof(dbody), 1020); /* CopyData: len 12 */
+    feed_ts(sink, &c, LK_DIR_RECV, 'd', 0, dbody, sizeof(dbody), 1030); /* len 12 */
+    feed_ts(sink, &c, LK_DIR_RECV, 'c', 0, "", 0, 1040);               /* CopyDone */
+    complete(sink, &c, "COPY 2", 1050);
+    CHECK(r.nqueries == 0); /* simple COPY emits at its Z */
+    ready(sink, &c, 'I', 1060);
+
+    CHECK(r.nqueries == 1);
+    CHECK(r.last.kind == LK_Q_COPY_IN);
+    CHECK(r.last.rows == 2);
+    CHECK(r.last.bytes == 24); /* two CopyData, len = body_cap + 4 = 12 each */
+    CHECK(strcmp(r.last_text, "COPY t FROM STDIN") == 0);
+    CHECK(r.last.flags == 0);
+
+    /* The connection is back to READY: a normal query flows again. */
+    q_simple(sink, &c, "select 1", 1070);
+    complete(sink, &c, "SELECT 1", 1080);
+    ready(sink, &c, 'I', 1090);
+    CHECK(r.nqueries == 2);
+    CHECK(r.last.kind == LK_Q_SIMPLE);
+
+    sink->on_conn_close(sink->ctx, &c);
+    lk_proto_free(p);
+    printf("ok copy-in\n");
+    return 0;
+}
+
+/* COPY TO STDOUT: CopyOutResponse -> backend CopyData -> "COPY n". One COPY_OUT
+ * observation with the backend bytes. */
+static int test_copy_out(void)
+{
+    struct rec r = {0};
+    struct lk_query_sink qs = {.ctx = &r, .on_query = rec_on_query};
+    struct lk_proto *p = lk_proto_pg_new(&qs);
+    const struct lk_msg_sink *sink = lk_proto_sink(p);
+    struct lk_conn c = {0};
+    static const __u8 hbody[5] = {0};
+    static const __u8 dbody[8] = {0};
+
+    CHECK(p);
+    handshake(sink, &c);
+
+    q_simple(sink, &c, "COPY t TO STDOUT", 2000);
+    feed_ts(sink, &c, LK_DIR_SEND, 'H', 0, hbody, sizeof(hbody), 2010); /* CopyOutResponse */
+    feed_ts(sink, &c, LK_DIR_SEND, 'd', 0, dbody, sizeof(dbody), 2020);
+    feed_ts(sink, &c, LK_DIR_SEND, 'd', 0, dbody, sizeof(dbody), 2030);
+    feed_ts(sink, &c, LK_DIR_SEND, 'c', 0, "", 0, 2040); /* CopyDone (backend) */
+    complete(sink, &c, "COPY 2", 2050);
+    ready(sink, &c, 'I', 2060);
+
+    CHECK(r.nqueries == 1);
+    CHECK(r.last.kind == LK_Q_COPY_OUT);
+    CHECK(r.last.rows == 2);
+    CHECK(r.last.bytes == 24);
+    CHECK(strcmp(r.last_text, "COPY t TO STDOUT") == 0);
+
+    sink->on_conn_close(sink->ctx, &c);
+    lk_proto_free(p);
+    printf("ok copy-out\n");
+    return 0;
+}
+
+/* CopyBothResponse (Р20/Р21): a walsender/replication stream. The connection
+ * goes IGNORE, emits nothing, bumps replication_conns, and is flagged
+ * LK_CONN_REPLICATION so userspace can flip it to HEADERS capture. */
+static int test_replication(void)
+{
+    struct rec r = {0};
+    struct lk_query_sink qs = {.ctx = &r, .on_query = rec_on_query};
+    struct lk_proto *p = lk_proto_pg_new(&qs);
+    const struct lk_msg_sink *sink = lk_proto_sink(p);
+    struct lk_conn c = {0};
+    static const __u8 wbody[7] = {0};
+    static const __u8 dbody[8] = {0};
+
+    CHECK(p);
+    handshake(sink, &c);
+
+    q_simple(sink, &c, "START_REPLICATION SLOT s LOGICAL 0/0", 3000);
+    feed_ts(sink, &c, LK_DIR_SEND, 'W', 0, wbody, sizeof(wbody), 3010); /* CopyBothResponse */
+    CHECK(lk_proto_stats(p)->replication_conns == 1);
+    CHECK(c.flags & LK_CONN_REPLICATION);
+
+    /* WAL data now streams both ways: all ignored, no observation ever. */
+    for (int i = 0; i < 5; i++)
+        feed_ts(sink, &c, LK_DIR_SEND, 'd', 0, dbody, sizeof(dbody), 3020 + i);
+    CHECK(r.nqueries == 0);
+
+    sink->on_conn_close(sink->ctx, &c);
+    lk_proto_free(p);
+    printf("ok replication\n");
+    return 0;
+}
+
+/* Parse-error path (Р18): a CommandComplete whose tag has no NUL terminator on a
+ * *full* body is corruption (not budget truncation). It bumps parse_errors,
+ * drops the in-flight unit, and resets to the next clean Z — after which queries
+ * flow again. */
+static int test_corrupt_body(void)
+{
+    struct rec r = {0};
+    struct lk_query_sink qs = {.ctx = &r, .on_query = rec_on_query};
+    struct lk_proto *p = lk_proto_pg_new(&qs);
+    const struct lk_msg_sink *sink = lk_proto_sink(p);
+    struct lk_conn c = {0};
+
+    CHECK(p);
+    handshake(sink, &c);
+
+    /* A truncated tag (no NUL, but LK_MSG_BODY_TRUNC set) is *not* an error: the
+     * statement still completed, the count is just unknown. */
+    q_simple(sink, &c, "select trunc", 3900);
+    feed_ts(sink, &c, LK_DIR_SEND, 'C', LK_MSG_BODY_TRUNC, "SELECT", 6, 3910);
+    ready(sink, &c, 'I', 3920);
+    CHECK(r.nqueries == 1);
+    CHECK(lk_proto_stats(p)->parse_errors == 0);
+    CHECK(r.last.rows == 0); /* count unknown, but the unit was emitted */
+
+    /* A full body with no terminator is corruption: parse_errors, unit dropped. */
+    q_simple(sink, &c, "select 1", 4000);
+    feed_ts(sink, &c, LK_DIR_SEND, 'C', 0, "SELECT 1", 8, 4010); /* full body, no NUL */
+    CHECK(lk_proto_stats(p)->parse_errors == 1);
+    ready(sink, &c, 'I', 4020);
+    CHECK(r.nqueries == 1); /* the corrupt query was dropped, not emitted */
+
+    /* The clean Z above ended the degraded window; queries flow again. */
+    q_simple(sink, &c, "select 2", 4030);
+    complete(sink, &c, "SELECT 1", 4040);
+    ready(sink, &c, 'I', 4050);
+    CHECK(r.nqueries == 2);
+    CHECK(strcmp(r.last_text, "select 2") == 0);
+
+    sink->on_conn_close(sink->ctx, &c);
+    lk_proto_free(p);
+    printf("ok corrupt-body\n");
+    return 0;
+}
+
+/* Honesty (Р19): a unit still in flight when the connection closes is dropped,
+ * never emitted — a request cut off by a disconnect is not an observation. */
+static int test_close_drops_inflight(void)
+{
+    struct rec r = {0};
+    struct lk_query_sink qs = {.ctx = &r, .on_query = rec_on_query};
+    struct lk_proto *p = lk_proto_pg_new(&qs);
+    const struct lk_msg_sink *sink = lk_proto_sink(p);
+    struct lk_conn c = {0};
+
+    CHECK(p);
+    handshake(sink, &c);
+
+    q_simple(sink, &c, "select pg_sleep(10)", 5000); /* never gets its Z */
+    sink->on_conn_close(sink->ctx, &c);              /* connection dies mid-query */
+
+    CHECK(r.nqueries == 0);
+    CHECK(lk_proto_stats(p)->units_dropped_close == 1);
+
+    lk_proto_free(p);
+    printf("ok close-drops-inflight\n");
+    return 0;
+}
+
 int main(void)
 {
     if (test_happy_path() || test_error() || test_multi_stmt() || test_empty_query() ||
         test_transaction() || test_resync_drops_unit() || test_synthetic_degraded() ||
         test_tag_table() || test_truncated_text() || test_extended_basic() || test_bind_no_text() ||
         test_pipelining() || test_batch_error_abort() || test_overflow_lossy() || test_suspended() ||
-        test_function_call())
+        test_function_call() || test_copy_in() || test_copy_out() || test_replication() ||
+        test_corrupt_body() || test_close_drops_inflight())
         return 1;
     printf("ok\n");
     return 0;

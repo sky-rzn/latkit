@@ -312,22 +312,34 @@ static void on_conn_close(void *ctx, struct lk_conn *c)
         e->proto_sink->on_conn_close(e->proto_sink->ctx, c);
 }
 
-/* --cap-headers test hook (task 1.6): flip the connection into HEADERS mode
- * by writing capture_mode into its live `conns` entry — the same control
- * surface the stage-3 parser will use, just with a trivial policy (every
- * connection, right at OPEN). The read-modify-write races with kernel-side
- * seq/dropped updates and can lose an increment (a spurious one-event "gap"
- * in the log); acceptable for a test hook, revisit with the real policy. */
-static void set_cap_headers(struct bpf_map *conns, __u64 cookie)
+/* Flip a connection into HEADERS capture (Р21) by writing its cookie into the
+ * `capmode` map. This is a blind insert into a map the kernel only reads, so —
+ * unlike the stage-1 hook it replaces — there is no read-modify-write of
+ * lk_conn_state and thus no race that could clobber the kernel's seq/dropped
+ * counters. The entry ages out by LRU or is deleted on CONN_CLOSE. */
+static void set_cap_headers(struct bpf_map *capmode, __u64 cookie)
 {
-    struct lk_conn_state st;
+    __u8 mode = LK_CAP_HEADERS;
 
-    if (bpf_map__lookup_elem(conns, &cookie, sizeof(cookie), &st, sizeof(st), 0))
-        return; /* already closed or LRU-evicted */
-    st.capture_mode = LK_CAP_HEADERS;
-    if (bpf_map__update_elem(conns, &cookie, sizeof(cookie), &st, sizeof(st), BPF_EXIST))
+    if (bpf_map__update_elem(capmode, &cookie, sizeof(cookie), &mode, sizeof(mode), BPF_ANY))
         fprintf(stderr, "warn: conn=%llx: failed to set HEADERS mode\n",
                 (unsigned long long)cookie);
+}
+
+/* Capture policy (Р21): a connection whose payload will never be needed again —
+ * TLS (ciphertext), CancelRequest, or a replication/walsender stream — is
+ * flipped to HEADERS so its bytes stop travelling the ringbuf. Deliberately
+ * one-directional and one-shot (LK_CONN_CAP_HEADERS guards against re-writing
+ * the map on every subsequent event): no FULL<->HEADERS flapping, which at a
+ * deep ringbuf would only mis-cut events already in flight. */
+static void apply_cap_policy(struct lk_events *e, struct lk_conn *c)
+{
+    if (!c || (c->flags & LK_CONN_CAP_HEADERS))
+        return;
+    if (!(c->flags & (LK_CONN_TLS | LK_CONN_CANCEL | LK_CONN_REPLICATION)))
+        return;
+    set_cap_headers(e->cfg.capmode, c->cookie);
+    c->flags |= LK_CONN_CAP_HEADERS;
 }
 
 static int handle_event(void *ctx, void *data, size_t size)
@@ -342,22 +354,32 @@ static int handle_event(void *ctx, void *data, size_t size)
     lk_pipeline_feed(&e->pipe, data, size, &ev);
     switch (ev.status) {
     case LK_DEC_CONN:
-        if (ev.view.hdr->type == LK_EV_CONN_OPEN && e->cfg.cap_headers)
-            set_cap_headers(e->cfg.conns, ev.view.hdr->conn_id);
+        if (ev.view.hdr->type == LK_EV_CONN_OPEN && e->cfg.cap_headers && ev.conn) {
+            /* --cap-headers test hook: cap every connection from its first byte. */
+            set_cap_headers(e->cfg.capmode, ev.view.hdr->conn_id);
+            ev.conn->flags |= LK_CONN_CAP_HEADERS;
+        }
+        if (ev.view.hdr->type == LK_EV_CONN_CLOSE)
+            /* Drop the override so a recycled cookie starts at FULL (LRU would
+             * eventually reclaim it anyway). */
+            bpf_map__delete_elem(e->cfg.capmode, &ev.view.hdr->conn_id,
+                                 sizeof(ev.view.hdr->conn_id), 0);
         if (e->cfg.events)
             print_conn_event(ev.view.conn);
         break;
     case LK_DEC_DATA:
         if (e->cfg.events)
             print_data_event(ev.view.data, ev.view.cap_len, e->cfg.hexdump);
-        if (ev.tls_now) {
-            /* TLS accepted: the ciphertext is useless to the framer, so
-             * shrink what the kernel captures for this connection (the
-             * plaintext source will be the stage-6 uprobe channel). */
+        if (ev.tls_now)
+            /* One-time log; the HEADERS flip itself is apply_cap_policy's job
+             * (LK_CONN_TLS is set by now). The plaintext source becomes the
+             * stage-6 uprobe channel. */
             fprintf(stderr, "latkit: conn=%llx TLS detected, framing off\n",
                     (unsigned long long)ev.view.hdr->conn_id);
-            set_cap_headers(e->cfg.conns, ev.view.hdr->conn_id);
-        }
+        /* TLS / CANCEL / replication -> HEADERS (Р21). The PG parser ran inside
+         * lk_pipeline_feed above, so a CopyBoth this event carried already set
+         * LK_CONN_REPLICATION on ev.conn. */
+        apply_cap_policy(e, ev.conn);
         break;
     case LK_DEC_UNKNOWN:
         fprintf(stderr, "warn: unknown event type %u (size %zu)\n",

@@ -501,6 +501,129 @@ static void build_bind_unknown(struct fx *x)
     b.x->obs_text = NULL; /* NO_TEXT: nothing to compare */
 }
 
+/* CopyInResponse / CopyOutResponse body: overall format (0 = text), int16
+ * column count, then one int16 format per column. Content is never parsed — this
+ * is just a plausible shape. */
+static __u32 copy_response(__u8 *out, char type)
+{
+    __u8 body[8], *p = body;
+
+    *p++ = 0;         /* overall format: text */
+    p = be16(p, 1);   /* one column */
+    p = be16(p, 0);   /* column format: text */
+    return pgmsg(out, type, body, (__u32)(p - body));
+}
+
+/* \copy FROM STDIN: Q "COPY ... FROM STDIN" -> CopyInResponse -> two CopyData
+ * rows -> CopyDone -> CommandComplete "COPY 2" -> Z. One COPY_IN observation
+ * whose text is the opening command, rows from the tag, bytes = summed CopyData
+ * len (Р20). */
+static void build_copy_in(struct fx *x)
+{
+    struct bld b;
+    __u8 w[128];
+    __u32 n;
+    /* Two CopyData messages; bytes = sum of their protocol len (payload + 4). */
+    const char *rows[2] = {"1\tone\n", "2\ttwo\n"};
+    __u64 bytes = 0;
+
+    bld_init(&b, x);
+    prelude(&b);
+
+    n = pgmsg(w, 'Q', "COPY t FROM STDIN", 18); /* "...\0" */
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'Q', 22, 0);
+
+    n = copy_response(w, 'G');
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'G', n - 1, 0);
+
+    for (int i = 0; i < 2; i++) {
+        __u32 rl = (__u32)strlen(rows[i]);
+
+        n = pgmsg(w, 'd', rows[i], rl);
+        call(&b, LK_DIR_RECV, w, n);
+        expect(&b, LK_DIR_RECV, 'd', rl + 4, 0);
+        bytes += rl + 4;
+    }
+    n = pgmsg(w, 'c', NULL, 0); /* CopyDone */
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'c', 4, 0);
+
+    n = pgmsg(w, 'C', "COPY 2", 7);
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'C', 11, 0);
+    n = pgmsg(w, 'Z', "I", 1);
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'Z', 5, 0);
+
+    n = pgmsg(w, 'X', NULL, 0);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'X', 4, 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_kind = LK_Q_COPY_IN;
+    b.x->obs_rows = 2;
+    b.x->obs_bytes = bytes;
+    b.x->obs_flags = 0;
+    b.x->obs_text = "COPY t FROM STDIN";
+}
+
+/* \copy TO STDOUT: Q "COPY ... TO STDOUT" -> CopyOutResponse -> two CopyData
+ * rows (backend direction) -> CopyDone -> CommandComplete "COPY 2" -> Z. One
+ * COPY_OUT observation. */
+static void build_copy_out(struct fx *x)
+{
+    struct bld b;
+    __u8 w[128];
+    __u32 n;
+    const char *rows[2] = {"1\tone\n", "2\ttwo\n"};
+    __u64 bytes = 0;
+
+    bld_init(&b, x);
+    prelude(&b);
+
+    n = pgmsg(w, 'Q', "COPY t TO STDOUT", 17); /* "...\0" */
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'Q', 21, 0);
+
+    n = copy_response(w, 'H');
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'H', n - 1, 0);
+
+    for (int i = 0; i < 2; i++) {
+        __u32 rl = (__u32)strlen(rows[i]);
+
+        n = pgmsg(w, 'd', rows[i], rl);
+        call(&b, LK_DIR_SEND, w, n);
+        expect(&b, LK_DIR_SEND, 'd', rl + 4, 0);
+        bytes += rl + 4;
+    }
+    n = pgmsg(w, 'c', NULL, 0); /* CopyDone (backend) */
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'c', 4, 0);
+
+    n = pgmsg(w, 'C', "COPY 2", 7);
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'C', 11, 0);
+    n = pgmsg(w, 'Z', "I", 1);
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'Z', 5, 0);
+
+    n = pgmsg(w, 'X', NULL, 0);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'X', 4, 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_kind = LK_Q_COPY_OUT;
+    b.x->obs_rows = 2;
+    b.x->obs_bytes = bytes;
+    b.x->obs_flags = 0;
+    b.x->obs_text = "COPY t TO STDOUT";
+}
+
 /* Session with a break: a clean query, then a lost-event seq gap dirties both
  * directions; the backend resyncs on a ReadyForQuery anchor and the frontend
  * on its next call boundary, and framing recovers (Р10). */
@@ -687,6 +810,8 @@ const struct fixture lk_fixtures[] = {
     {"prepared", build_prepared},
     {"pipeline_error", build_pipeline_error},
     {"bind_unknown", build_bind_unknown},
+    {"copy_in", build_copy_in},
+    {"copy_out", build_copy_out},
     {"session_gap", build_session_gap},
     {"ssl_plain", build_ssl_plain},
     {"ssl_tls", build_ssl_tls},

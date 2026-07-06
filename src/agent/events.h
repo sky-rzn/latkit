@@ -17,7 +17,7 @@ struct lk_loop;
 struct lk_events_cfg {
     struct bpf_map *ringbuf;     /* `events` map */
     struct bpf_map *stats;       /* `stats` per-CPU counters */
-    struct bpf_map *conns;       /* kernel conn registry, for --cap-headers */
+    struct bpf_map *capmode;     /* per-conn capture-budget override (Р21) */
     __u32 max_conns;             /* userspace conn table ceiling (LRU past it) */
     __u32 conn_idle_timeout_sec; /* idle sweep threshold */
     const char *record_path;     /* --record: raw trace file, NULL when off (Р14) */

@@ -50,6 +50,8 @@ static struct pg_conn *pg_conn_get(struct lk_proto *p, struct lk_conn *c)
 static void pg_frontend_msg(struct lk_proto *p, struct lk_conn *c, struct pg_conn *pc,
                             const struct lk_msg *m)
 {
+    if (pc->phase == PG_PH_IGNORE)
+        return; /* replication / cancel: no observations, just the by_type tally */
     if (m->flags & LK_MSG_STARTUP) {
         pg_session_startup(p, c, pc, m); /* StartupMessage / Cancel / SSL (3.2) */
         return;
@@ -85,9 +87,11 @@ static void pg_frontend_msg(struct lk_proto *p, struct lk_conn *c, struct pg_con
     case 'H': /* Flush: forces backend output, no query semantics */
     case 'X': /* Terminate: teardown, handled by the framer / close hook */
         break;
-    case 'd': /* CopyData */
-    case 'c': /* CopyDone */
-    case 'f': /* CopyFail: COPY arrives with task 3.5 */
+    case 'd': /* CopyData (COPY IN): count its bytes, ignore the content (Р20) */
+        pg_query_copy_data(pc, m);
+        break;
+    case 'c': /* CopyDone: the CommandComplete that follows closes the unit */
+    case 'f': /* CopyFail: the backend answers ErrorResponse, which closes it */
         break;
     default:
         p->st.unknown_msgs++; /* an unknown frontend type (Р18) */
@@ -99,6 +103,8 @@ static void pg_frontend_msg(struct lk_proto *p, struct lk_conn *c, struct pg_con
 static void pg_backend_msg(struct lk_proto *p, struct lk_conn *c, struct pg_conn *pc,
                            const struct lk_msg *m)
 {
+    if (pc->phase == PG_PH_IGNORE)
+        return; /* replication stream: no observations, just the by_type tally */
     switch (m->type) {
     case 'R': /* Authentication: AuthenticationOk -> session (3.2) */
         pg_session_auth(p, c, pc, m);
@@ -142,9 +148,19 @@ static void pg_backend_msg(struct lk_proto *p, struct lk_conn *c, struct pg_conn
     case 'A': /* NotificationResponse */
     case 'K': /* BackendKeyData */
         break;
-    case 'G': /* CopyInResponse */
-    case 'H': /* CopyOutResponse */
-    case 'W': /* CopyBothResponse: COPY/replication arrive with task 3.5 */
+    case 'G': /* CopyInResponse: the open unit becomes a COPY_IN unit (Р20) */
+        pg_query_copy_begin(pc, LK_Q_COPY_IN);
+        break;
+    case 'H': /* CopyOutResponse: the open unit becomes a COPY_OUT unit */
+        pg_query_copy_begin(pc, LK_Q_COPY_OUT);
+        break;
+    case 'd': /* CopyData (COPY OUT): count its bytes, ignore the content */
+        pg_query_copy_data(pc, m);
+        break;
+    case 'c': /* CopyDone: the CommandComplete that follows closes the unit */
+        break;
+    case 'W': /* CopyBothResponse: walsender/replication -> IGNORE (Р20/Р21) */
+        pg_query_copy_both(p, c, pc);
         break;
     default:
         p->st.unknown_msgs++; /* an unknown backend type (Р18) */
@@ -193,7 +209,12 @@ static void pg_on_resync(void *ctx, struct lk_conn *c, enum lk_dir dir)
     pg_query_drop_all(pc, &p->st.units_dropped_resync);
     pc->degraded = true;
     pc->txn_status = 0;
-    if (pc->phase == PG_PH_SKIP_TO_SYNC)
+    /* Leave the extended skip-to-Sync and any mid-COPY phase behind — the stream
+     * broke, so those sub-states are moot; the next clean Z (which we now wait
+     * for, degraded) re-establishes a normal boundary. IGNORE (replication) is
+     * deliberately preserved: that connection never emits again. */
+    if (pc->phase == PG_PH_SKIP_TO_SYNC || pc->phase == PG_PH_COPY_IN ||
+        pc->phase == PG_PH_COPY_OUT)
         pc->phase = PG_PH_READY;
 }
 

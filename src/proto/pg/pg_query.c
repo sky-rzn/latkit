@@ -243,7 +243,9 @@ static void emit_unit(struct lk_proto *p, struct lk_conn *c, struct pg_conn *pc,
         .ts_ready_ns = ready_ns,
         .rows = u->rows,
         .bytes = u->bytes,
-        .kind = u->kind,
+        /* copy_kind (once a Copy*Response arrived) is what the consumer sees;
+         * the opening `kind` only drove the internal close semantics (Р20). */
+        .kind = u->copy_kind ? u->copy_kind : u->kind,
         .flags = u->flags,
         .txn_status = txn_status,
     };
@@ -495,6 +497,46 @@ void pg_query_func_response(struct pg_conn *pc, const struct lk_msg *m)
     }
 }
 
+/* --- COPY (Р20) ------------------------------------------------------------ */
+
+void pg_query_copy_begin(struct pg_conn *pc, __u8 copy_kind)
+{
+    struct pg_unit *u = current_unit(pc);
+
+    /* The response bodies (overall + per-column format codes) carry no latency
+     * signal, so they are not parsed. Enter the matching COPY phase so a stray
+     * Q/Bind is refused until the copy finishes; the opening unit becomes the
+     * COPY observation. A CopyInResponse with no open unit (post-resync noise)
+     * still switches phase — the next Z clears it. */
+    pc->phase = (copy_kind == LK_Q_COPY_IN) ? PG_PH_COPY_IN : PG_PH_COPY_OUT;
+    if (u)
+        u->copy_kind = copy_kind;
+}
+
+void pg_query_copy_data(struct pg_conn *pc, const struct lk_msg *m)
+{
+    struct pg_unit *u = current_unit(pc);
+
+    /* Bytes in flight, not content (Р20): sum the honest protocol len (which
+     * stays exact even when the capture budget truncated the body). */
+    if (u)
+        u->bytes += m->len;
+}
+
+void pg_query_copy_both(struct lk_proto *p, struct lk_conn *c, struct pg_conn *pc)
+{
+    /* CopyBothResponse: this is a walsender / logical-replication stream. No
+     * per-query observations will ever come from it — drop the queue, count the
+     * connection, and go IGNORE. Mark the connection so userspace flips it to
+     * HEADERS capture (Р21): gigabytes of WAL should not travel the ringbuf. The
+     * flag lives on lk_conn (owned by the core, but a public contract field), so
+     * the pure parser stays libbpf-free — the core reads it after this call. */
+    pg_query_drop_all(pc, NULL);
+    pc->phase = PG_PH_IGNORE;
+    c->flags |= LK_CONN_REPLICATION;
+    p->st.replication_conns++;
+}
+
 void pg_query_ready(struct lk_proto *p, struct lk_conn *c, struct pg_conn *pc,
                     const struct lk_msg *m)
 {
@@ -531,9 +573,12 @@ void pg_query_ready(struct lk_proto *p, struct lk_conn *c, struct pg_conn *pc,
     pc->nclosed = 0;
     pc->lossy = false;
     /* A clean Z is the guaranteed boundary between queries: it ends READY-
-     * degraded and the extended skip-to-Sync state (Р19). */
+     * degraded, the extended skip-to-Sync state (Р19) and a finished COPY. An
+     * IGNORE'd replication connection never reaches here (no Z on a CopyBoth
+     * stream), so it stays IGNORE. */
     pc->degraded = false;
-    if (pc->phase == PG_PH_SKIP_TO_SYNC)
+    if (pc->phase == PG_PH_SKIP_TO_SYNC || pc->phase == PG_PH_COPY_IN ||
+        pc->phase == PG_PH_COPY_OUT)
         pc->phase = PG_PH_READY;
 
     /* Transaction span (Р16): remember the I->T that opens one, emit on_txn on

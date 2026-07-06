@@ -48,6 +48,7 @@ struct fx {
 
     /* Last observation's fields (task 3.3), checked when queries > 0. */
     __u64 obs_rows;           /* expected lk_query_obs.rows */
+    __u64 obs_bytes;          /* expected lk_query_obs.bytes (COPY) */
     __u16 obs_flags;          /* expected lk_query_obs.flags (LK_QO_*) */
     __u8 obs_kind;            /* expected lk_query_obs.kind */
     const char *obs_text;     /* expected SQL text; NULL = do not check */

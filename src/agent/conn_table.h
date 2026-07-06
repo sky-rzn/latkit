@@ -72,6 +72,14 @@ struct lk_frame {
 #define LK_CONN_CANCEL                                                                             \
     (1 << 3) /* CancelRequest seen: nothing else travels                                           \
                 on this connection, discard until CLOSE */
+#define LK_CONN_REPLICATION                                                                        \
+    (1 << 4) /* CopyBothResponse: walsender/logical                                                \
+                replication (set by the PG parser, Р20);                                           \
+                payload is never needed -> HEADERS (Р21) */
+#define LK_CONN_CAP_HEADERS                                                                        \
+    (1 << 5) /* userspace already flipped this connection                                          \
+                to HEADERS capture: a one-shot guard so the                                        \
+                capmode map is written once, not per event */
 
 struct lk_conn {
     struct lk_conn *hnext; /* hash chain */

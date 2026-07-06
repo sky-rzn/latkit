@@ -64,6 +64,19 @@ struct {
     __type(value, struct lk_conn_state);
 } conns SEC(".maps");
 
+/* Per-connection capture-budget override (Р21), key = socket cookie, value =
+ * __u8 enum lk_cap_mode. Written only by userspace (the stage-3 policy and the
+ * --cap-headers hook), read here on the data path. Split out of `conns` so the
+ * userspace writer never read-modify-writes lk_conn_state and thus cannot race
+ * the kernel's seq/dropped updates. LRU so a missed CONN_CLOSE ages out; a miss
+ * means FULL. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);
+    __type(value, __u8);
+} capmode SEC(".maps");
+
 /* Snapshot of the userspace segments of one send/recv call: up to LK_MAX_SEGS
  * {base, len} pairs in call order. Filled by iter_snapshot(), consumed by
  * emit_data_chunks(). nr == 0 means nothing capturable (unsupported iterator
@@ -464,10 +477,13 @@ static __always_inline void emit_data_chunks(__u64 cookie, struct lk_conn_state 
      * the HEADERS mode, an unsupported iterator, or segments beyond
      * LK_MAX_SEGS), and every chunk of the chain carries LK_F_TRUNC. */
     budget = cfg_capture_limit;
-    /* capture_mode is written by userspace into the live map entry (task
-     * 1.6), so it can flip mid-connection; each call reads the current value.
-     * Whatever the mode, only cap_len is affected — total_len stays honest. */
-    if (st->capture_mode == LK_CAP_HEADERS && budget > LK_CAP_HEADERS_LIMIT)
+    /* The per-connection override lives in `capmode`, written by userspace (Р21),
+     * so it can flip mid-connection; each call reads the current value. A miss
+     * means FULL. Whatever the mode, only cap_len is affected — total_len stays
+     * honest. */
+    __u8 *cm = bpf_map_lookup_elem(&capmode, &cookie);
+
+    if (cm && *cm == LK_CAP_HEADERS && budget > LK_CAP_HEADERS_LIMIT)
         budget = LK_CAP_HEADERS_LIMIT;
     if (budget > total_len)
         budget = total_len;
