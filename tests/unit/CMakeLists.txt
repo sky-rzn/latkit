@@ -48,3 +48,9 @@ target_include_directories(test_pg_prep PRIVATE
     ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf)
 target_link_libraries(test_pg_prep latkit_proto)
 add_test(NAME pg_prep COMMAND test_pg_prep)
+
+# SQL normaliser + fingerprint (task 4.1): table-driven cases over the public
+# lk_norm_sql API. Links the pure normaliser lib (no libbpf, no privileges).
+add_executable(test_norm_sql test_norm_sql.c)
+target_link_libraries(test_norm_sql latkit_norm)
+add_test(NAME norm_sql COMMAND test_norm_sql)

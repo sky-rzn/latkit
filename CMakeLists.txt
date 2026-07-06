@@ -140,6 +140,16 @@ set(PROTO_INC ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
 add_library(latkit_proto STATIC ${PROTO_SRC})
 target_include_directories(latkit_proto PUBLIC ${PROTO_INC})
 
+# --- SQL normaliser (stage 4) ----------------------------------------------
+# src/norm/** is pure like src/proto/**: no libbpf, no I/O beyond the caller's
+# buffer, so it links into the agent and the offline harnesses alike. It depends
+# on nothing but libc and the vendored xxhash (XXH3-64, header-only, BSD) — kept
+# as a SYSTEM include so -Werror does not police third-party code.
+add_library(latkit_norm STATIC src/norm/norm_sql.c)
+target_include_directories(latkit_norm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/norm)
+target_include_directories(latkit_norm SYSTEM PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xxhash)
+
 # --- agent -----------------------------------------------------------------
 add_executable(latkit src/agent/main.c src/agent/loop.c src/agent/events.c
                src/agent/decode.c src/agent/conn_table.c src/agent/reassembly.c

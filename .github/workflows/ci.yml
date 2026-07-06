@@ -50,6 +50,7 @@ jobs:
       - name: Build tests
         run: |
           cmake --build build --target test_smoke test_decode test_conn_table \
-              test_reassembly test_replay -j"$(nproc)"
+              test_reassembly test_pg_wire test_pg_session test_pg_query \
+              test_pg_prep test_norm_sql test_replay -j"$(nproc)"
       - name: Run tests
         run: ctest --test-dir build --output-on-failure

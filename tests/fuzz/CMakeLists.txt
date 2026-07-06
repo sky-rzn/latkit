@@ -34,3 +34,18 @@ if(LATKIT_FUZZER)
     target_compile_options(pg_fuzz_libfuzzer PRIVATE -fsanitize=fuzzer)
     target_link_options(pg_fuzz_libfuzzer PRIVATE -fsanitize=fuzzer)
 endif()
+
+# --- SQL normaliser fuzz harness (task 4.1, stage-8 groundwork) -------------
+# lk_norm_fuzz_one lives in latkit_norm; norm_fuzz.c is just the corpus/libFuzzer
+# driver, mirroring pg_fuzz. Arbitrary bytes into lk_norm_sql must never crash.
+add_executable(norm_fuzz norm_fuzz.c)
+target_link_libraries(norm_fuzz latkit_norm)
+add_test(NAME norm_fuzz COMMAND norm_fuzz ${FUZZ_CORPUS})
+
+if(LATKIT_FUZZER)
+    add_executable(norm_fuzz_libfuzzer norm_fuzz.c)
+    target_link_libraries(norm_fuzz_libfuzzer latkit_norm)
+    target_compile_definitions(norm_fuzz_libfuzzer PRIVATE LK_FUZZ_LIBFUZZER)
+    target_compile_options(norm_fuzz_libfuzzer PRIVATE -fsanitize=fuzzer)
+    target_link_options(norm_fuzz_libfuzzer PRIVATE -fsanitize=fuzzer)
+endif()
