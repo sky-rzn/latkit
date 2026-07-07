@@ -23,6 +23,7 @@
 #include "decode.h"
 #include "latkit.h"
 #include "loop.h"
+#include "metrics.h"
 #include "pipeline.h"
 #include "proto.h"
 #include "reassembly.h"
@@ -38,6 +39,9 @@ struct lk_events {
     struct lk_proto *proto;               /* PG handler: the standard framer sink */
     const struct lk_msg_sink *proto_sink; /* = lk_proto_sink(proto) */
     struct lk_recorder *rec;              /* --record trace writer, NULL when off */
+    struct lk_metrics *metrics;           /* aggregator: the parser's standard consumer */
+    const struct lk_query_sink *msink;    /* = lk_metrics_query_sink(metrics) */
+    struct lk_query_sink qsink;           /* tee installed into the parser (below) */
 };
 
 /* --- --queries logger (stage 3): the standard consumer of the parser -------
@@ -70,9 +74,8 @@ static void on_session(void *ctx, const struct lk_conn *c, const struct lk_sessi
     (void)ctx;
     printf("%llu session conn=%llx user=%s db=%s app=%s ver=%s%s\n",
            (unsigned long long)c->last_activity_ns, (unsigned long long)c->cookie,
-           s->user[0] ? s->user : "?", s->database[0] ? s->database : "?",
-           s->app[0] ? s->app : "?", s->server_version[0] ? s->server_version : "?",
-           s->complete ? "" : " (incomplete)");
+           s->user[0] ? s->user : "?", s->database[0] ? s->database : "?", s->app[0] ? s->app : "?",
+           s->server_version[0] ? s->server_version : "?", s->complete ? "" : " (incomplete)");
 }
 
 /* One line per observation (task 3.3). Duration is the honest per-query span
@@ -93,7 +96,41 @@ static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session
            (unsigned long long)dur, kind_str(o->kind), s->database[0] ? s->database : "?",
            s->user[0] ? s->user : "?", (unsigned long long)o->rows,
            (o->flags & LK_QO_ERROR) ? o->sqlstate : "-", o->txn_status ? o->txn_status : '?',
-           o->flags, tlen, o->text ? o->text : "", o->text_len > LK_QUERY_TEXT_LOG_MAX ? "..." : "");
+           o->flags, tlen, o->text ? o->text : "",
+           o->text_len > LK_QUERY_TEXT_LOG_MAX ? "..." : "");
+}
+
+/* Tee query sink (task 4.3): the parser's standard consumer is now the metrics
+ * aggregator; --queries keeps the stage-3 logger, run first as a debug mirror.
+ * The logger takes no ctx, so it is called with NULL. on_txn has no log line. */
+static void ev_on_session(void *ctx, const struct lk_conn *c, const struct lk_session *s)
+{
+    struct lk_events *e = ctx;
+
+    if (e->cfg.queries)
+        on_session(NULL, c, s);
+    if (e->msink->on_session)
+        e->msink->on_session(e->msink->ctx, c, s);
+}
+
+static void ev_on_query(void *ctx, const struct lk_conn *c, const struct lk_session *s,
+                        const struct lk_query_obs *o)
+{
+    struct lk_events *e = ctx;
+
+    if (e->cfg.queries)
+        on_query(NULL, c, s, o);
+    if (e->msink->on_query)
+        e->msink->on_query(e->msink->ctx, c, s, o);
+}
+
+static void ev_on_txn(void *ctx, const struct lk_conn *c, __u64 start_ns, __u64 end_ns,
+                      char final_status)
+{
+    struct lk_events *e = ctx;
+
+    if (e->msink->on_txn)
+        e->msink->on_txn(e->msink->ctx, c, start_ns, end_ns, final_status);
 }
 
 /* PG parser counters (stage 3). The skeleton (task 3.1) only tallies messages,
@@ -440,16 +477,33 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
     if (!e)
         return NULL;
     e->cfg = *cfg;
-    /* The PG handler is the standard consumer of the framer (Р15). With
-     * --queries its upward sink is the logger below (task 3.2: sessions +
-     * CANCEL; the full query line arrives with 3.3); without it the parser
-     * still runs and its counters still accrue, just with no per-observation
-     * output. events.c's own message sink (above) tees messages into the parser
-     * and mirrors them to the --messages logger. */
-    e->proto = lk_proto_pg_new(cfg->queries ? &(struct lk_query_sink){.on_session = on_session,
-                                                                       .on_query = on_query}
-                                            : NULL);
+
+    /* The metrics aggregator (task 4.3) is the parser's standard consumer (Р26);
+     * it is always present so counters accrue regardless of output flags. */
+    struct lk_metrics_cfg mcfg;
+
+    lk_metrics_cfg_defaults(&mcfg);
+    if (cfg->top_queries)
+        mcfg.top_queries = cfg->top_queries;
+    if (cfg->query_label_len)
+        mcfg.query_label_len = cfg->query_label_len;
+    mcfg.first_row_hist = cfg->first_row_hist;
+    e->metrics = lk_metrics_new(&mcfg);
+    if (!e->metrics) {
+        free(e);
+        return NULL;
+    }
+    e->msink = lk_metrics_query_sink(e->metrics);
+
+    /* Install a tee (ev_*) as the parser's upward sink: it fans every
+     * observation into the aggregator and, with --queries, the stage-3 logger
+     * (Р15). events.c's own message sink (above) similarly tees messages into
+     * the parser and mirrors them to the --messages logger. */
+    e->qsink = (struct lk_query_sink){
+        .ctx = e, .on_session = ev_on_session, .on_query = ev_on_query, .on_txn = ev_on_txn};
+    e->proto = lk_proto_pg_new(&e->qsink);
     if (!e->proto) {
+        lk_metrics_free(e->metrics);
         free(e);
         return NULL;
     }
@@ -457,6 +511,7 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
     if (lk_pipeline_init(&e->pipe, cfg->max_conns, cfg->conn_idle_timeout_sec * 1000000000ULL,
                          &sink)) {
         lk_proto_free(e->proto);
+        lk_metrics_free(e->metrics);
         free(e);
         return NULL;
     }
@@ -467,6 +522,7 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
                     strerror(errno));
             lk_pipeline_fini(&e->pipe);
             lk_proto_free(e->proto);
+            lk_metrics_free(e->metrics);
             free(e);
             return NULL;
         }
@@ -477,10 +533,41 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
         lk_recorder_close(e->rec);
         lk_pipeline_fini(&e->pipe);
         lk_proto_free(e->proto);
+        lk_metrics_free(e->metrics);
         free(e);
         return NULL;
     }
     return e;
+}
+
+/* Refresh the connection metrics from the conn table and write the exposition
+ * to the --dump-metrics target (task 4.3). */
+void lk_events_dump_metrics(struct lk_events *e)
+{
+    const struct lk_conn_table_stats *cs;
+    FILE *f = stderr;
+    bool close_f = false;
+
+    if (!e->cfg.dump_metrics)
+        return;
+    cs = lk_conn_table_stats(e->pipe.conns);
+    lk_metrics_set_gauge(e->metrics, "latkit_connections_active", "Connections currently tracked.",
+                         cs->active);
+    lk_metrics_set_counter(e->metrics, "latkit_connections_opened_total",
+                           "Connections opened since start.", (double)cs->created);
+
+    if (e->cfg.dump_metrics_path) {
+        f = fopen(e->cfg.dump_metrics_path, "w");
+        if (!f) {
+            fprintf(stderr, "latkit: --dump-metrics: cannot open '%s': %s\n",
+                    e->cfg.dump_metrics_path, strerror(errno));
+            return;
+        }
+        close_f = true;
+    }
+    lk_metrics_dump(e->metrics, f);
+    if (close_f)
+        fclose(f);
 }
 
 void lk_events_free(struct lk_events *e)
@@ -494,7 +581,13 @@ void lk_events_free(struct lk_events *e)
      * proto_state through the parser, which must still be alive here. */
     lk_pipeline_fini(&e->pipe);
     lk_proto_free(e->proto);
+    lk_metrics_free(e->metrics);
     free(e);
+}
+
+static void on_dump_signal(void *ctx)
+{
+    lk_events_dump_metrics(ctx);
 }
 
 int lk_events_register(struct lk_events *e, struct lk_loop *loop)
@@ -506,5 +599,7 @@ int lk_events_register(struct lk_events *e, struct lk_loop *loop)
     err = lk_loop_every(loop, LK_STATS_INTERVAL_SEC, on_stats_tick, e);
     if (err)
         return err;
+    if (e->cfg.dump_metrics) /* SIGUSR1 -> dump the exposition on demand */
+        lk_loop_on_sigusr1(loop, on_dump_signal, e);
     return lk_loop_every(loop, LK_SWEEP_INTERVAL_SEC, on_sweep_tick, e);
 }

@@ -19,6 +19,7 @@
 #include "latkit.h"
 #include "latkit.skel.h"
 #include "loop.h"
+#include "metrics.h"
 
 static bool opt_hexdump;
 static bool opt_cap_headers;
@@ -33,6 +34,11 @@ static __u32 opt_max_conns = LK_MAX_CONNS_DEFAULT;
 static __u32 opt_conn_idle_timeout = LK_CONN_IDLE_TIMEOUT_SEC;
 static const char *opt_record;
 static char opt_comm[16];
+static __u32 opt_top_queries;     /* 0 = metrics default (K = 500) */
+static __u32 opt_query_label_len; /* 0 = metrics default (256) */
+static bool opt_first_row_hist;
+static bool opt_dump_metrics;
+static const char *opt_dump_metrics_path; /* NULL = stderr */
 
 static int libbpf_print(enum libbpf_print_level level, const char *fmt, va_list args)
 {
@@ -66,12 +72,22 @@ static void usage(const char *argv0)
             "      --messages        print one line per reassembled protocol\n"
             "                        message\n"
             "      --queries         print one line per session and query\n"
-            "                        observation from the protocol parser\n"
+            "                        observation (debug tee before the aggregator)\n"
+            "      --top-queries N   distinct normalised queries tracked before the\n"
+            "                        rest fold into query=\"other\" (default: %d)\n"
+            "      --query-label-len N\n"
+            "                        max chars of the normalised text kept as the\n"
+            "                        `query` label (default: %d)\n"
+            "      --first-row-hist  also record latkit_query_first_row_seconds\n"
+            "                        (doubles the query-labelled series; off)\n"
+            "      --dump-metrics[=FILE]\n"
+            "                        write the Prometheus exposition on SIGUSR1 and\n"
+            "                        at exit, to FILE (default: stderr)\n"
             "  -x, --hexdump         dump payload of events (--events) and the\n"
             "                        captured body prefix (--messages)\n",
             argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT,
             LK_MAX_CHUNKS * LK_CHUNK_FULL, LK_CAP_HEADERS_LIMIT, LK_MAX_CONNS_DEFAULT,
-            LK_CONN_IDLE_TIMEOUT_SEC);
+            LK_CONN_IDLE_TIMEOUT_SEC, LK_TOP_QUERIES_DEFAULT, LK_QUERY_LABEL_LEN_DEFAULT);
 }
 
 /* Strict decimal parse into [min, max]; -1 on any trailing garbage. */
@@ -101,6 +117,10 @@ static int parse_args(int argc, char **argv)
         OPT_EVENTS,
         OPT_MESSAGES,
         OPT_QUERIES,
+        OPT_TOP_QUERIES,
+        OPT_QUERY_LABEL_LEN,
+        OPT_FIRST_ROW_HIST,
+        OPT_DUMP_METRICS,
     };
     static const struct option opts[] = {
         {"port", required_argument, NULL, 'p'},
@@ -114,6 +134,10 @@ static int parse_args(int argc, char **argv)
         {"events", no_argument, NULL, OPT_EVENTS},
         {"messages", no_argument, NULL, OPT_MESSAGES},
         {"queries", no_argument, NULL, OPT_QUERIES},
+        {"top-queries", required_argument, NULL, OPT_TOP_QUERIES},
+        {"query-label-len", required_argument, NULL, OPT_QUERY_LABEL_LEN},
+        {"first-row-hist", no_argument, NULL, OPT_FIRST_ROW_HIST},
+        {"dump-metrics", optional_argument, NULL, OPT_DUMP_METRICS},
         {"hexdump", no_argument, NULL, 'x'},
         {},
     };
@@ -189,6 +213,28 @@ static int parse_args(int argc, char **argv)
             break;
         case OPT_QUERIES:
             opt_queries = true;
+            break;
+        case OPT_TOP_QUERIES:
+            if (parse_num(optarg, 1, 1 << 20, &v)) {
+                fprintf(stderr, "--top-queries: expected 1..%d, got '%s'\n", 1 << 20, optarg);
+                return -1;
+            }
+            opt_top_queries = v;
+            break;
+        case OPT_QUERY_LABEL_LEN:
+            if (parse_num(optarg, 1, LK_QUERY_LABEL_MAX - 1, &v)) {
+                fprintf(stderr, "--query-label-len: expected 1..%d, got '%s'\n",
+                        LK_QUERY_LABEL_MAX - 1, optarg);
+                return -1;
+            }
+            opt_query_label_len = v;
+            break;
+        case OPT_FIRST_ROW_HIST:
+            opt_first_row_hist = true;
+            break;
+        case OPT_DUMP_METRICS:
+            opt_dump_metrics = true;
+            opt_dump_metrics_path = optarg; /* NULL unless --dump-metrics=FILE */
             break;
         case 'x':
             opt_hexdump = true;
@@ -286,6 +332,11 @@ int main(int argc, char **argv)
         .events = opt_events,
         .messages = opt_messages,
         .queries = opt_queries,
+        .top_queries = opt_top_queries,
+        .query_label_len = opt_query_label_len,
+        .first_row_hist = opt_first_row_hist,
+        .dump_metrics = opt_dump_metrics,
+        .dump_metrics_path = opt_dump_metrics_path,
     };
 
     events = lk_events_new(&ecfg);
@@ -311,8 +362,10 @@ int main(int argc, char **argv)
     fprintf(stderr, " (Ctrl-C to exit)\n");
 
     err = lk_loop_run(loop);
-    if (!err)
-        lk_events_print_stats(events); /* final totals on shutdown */
+    if (!err) {
+        lk_events_print_stats(events);  /* final totals on shutdown */
+        lk_events_dump_metrics(events); /* final exposition (no-op without --dump-metrics) */
+    }
 
 cleanup:
     lk_loop_free(loop);

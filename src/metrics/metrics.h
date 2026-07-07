@@ -38,6 +38,29 @@ enum lk_code {
     LK_N_CODES = 2,
 };
 
+/* code label of latkit_queries_total (Р23): four states — a superset of the
+ * duration code, since aborted/canceled observations carry no latency. */
+enum lk_qcode {
+    LK_QCODE_OK = 0,
+    LK_QCODE_ERROR,
+    LK_QCODE_ABORTED,
+    LK_QCODE_CANCELED,
+    LK_N_QCODES,
+};
+
+/* kind label of latkit_queries_total. Mirrors enum lk_query_kind (proto.h) by
+ * value so the facade can pass lk_query_obs.kind straight through; kept as an
+ * independent enum so the pure metrics/registry code needs no protocol header. */
+enum lk_qkind {
+    LK_QK_SIMPLE = 0,
+    LK_QK_EXTENDED,
+    LK_QK_FUNCTION,
+    LK_QK_COPY_IN,
+    LK_QK_COPY_OUT,
+    LK_QK_CANCEL,
+    LK_N_QKINDS,
+};
+
 struct lk_metrics_cfg {
     uint32_t top_queries;      /* K, top-K query dictionary (Р23) */
     uint32_t query_label_len;  /* stored `query` label length (Р28) */
@@ -49,13 +72,27 @@ struct lk_metrics_cfg {
 void lk_metrics_cfg_defaults(struct lk_metrics_cfg *cfg);
 
 struct lk_metrics;
+struct lk_query_sink;
 
 /* cfg is copied; NULL means defaults. Returns NULL on allocation failure. */
 struct lk_metrics *lk_metrics_new(const struct lk_metrics_cfg *cfg);
 void lk_metrics_free(struct lk_metrics *m);
 
-/* Write the whole registry as Prometheus text exposition format (Р26); stable
- * line order for replay diff-asserts. Returns 0. */
+/* The aggregator (Р26, task 4.3): the lk_query_sink turning parser observations
+ * (lk_query_obs) into registry series. Install it as lk_proto_pg_new()'s output.
+ * Borrowed — valid for the metrics object's lifetime. */
+const struct lk_query_sink *lk_metrics_query_sink(struct lk_metrics *m);
+
+/* Flat named scalar series the facade dumps after the registry families (Р27):
+ * idempotent absolute writes of a counter/gauge value, keyed by name (no labels
+ * in stage 4 — connections and, later, the self-metric providers). `help` is
+ * remembered on first sight and may be NULL afterwards. Unknown-name writes
+ * register the series; memory is bounded by the fixed metric set. */
+void lk_metrics_set_counter(struct lk_metrics *m, const char *name, const char *help, double v);
+void lk_metrics_set_gauge(struct lk_metrics *m, const char *name, const char *help, double v);
+
+/* Write the whole registry plus the flat scalars as Prometheus text exposition
+ * format (Р26); stable line order for replay diff-asserts. Returns 0. */
 int lk_metrics_dump(struct lk_metrics *m, FILE *f);
 
 #endif /* LATKIT_METRICS_H */

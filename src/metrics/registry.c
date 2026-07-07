@@ -23,21 +23,24 @@
 #include "hist.h"
 
 #define LK_DOORKEEPER_SLOTS 2048u /* Р23: N ~= 2K candidate fingerprints */
+#define LK_MAX_SQLSTATES    64u   /* Р23: distinct SQLSTATE codes before "other" */
 
 struct series {
     struct series *h_next; /* hash chain */
     struct series *q_next; /* owning slot's list (for the other-fold) */
     uint32_t qslot;        /* query slot, or r->k for "other" */
     uint32_t dim;          /* dim id, or r->max_dims for (other,other) */
-    uint8_t code;          /* enum lk_code */
+    uint8_t code;          /* enum lk_code (ok|error) */
+    uint64_t rows;         /* latkit_query_rows_total (summed over code at dump) */
     struct lk_hist dur;
+    struct lk_hist *first_row; /* latkit_query_first_row_seconds, lazy (flag off = NULL) */
 };
 
 struct qentry {
     uint64_t fp;
     bool used;
-    int32_t lru_prev, lru_next;  /* indices into entries[], -1 = none */
-    struct series *series;       /* head of this slot's series list */
+    int32_t lru_prev, lru_next; /* indices into entries[], -1 = none */
+    struct series *series;      /* head of this slot's series list */
     char label[LK_QUERY_LABEL_MAX];
 };
 
@@ -49,6 +52,7 @@ struct lk_registry {
     uint32_t k;         /* cfg.top_queries; entries has k+1 slots */
     uint32_t label_len; /* stored label chars, clamped [1, MAX-1] */
     uint32_t max_dims;  /* cfg.max_session_dims; dims has max_dims+1 slots */
+    bool first_row;     /* cfg.first_row_hist: record the first-row histogram */
 
     struct qentry *entries;
     int32_t *fp_hash; /* [fp_hcap], slot index or -1 */
@@ -66,9 +70,26 @@ struct lk_registry {
     uint32_t sbuckets_n; /* power of two */
     uint32_t n_series;
 
+    /* Bounded label-keyed families, flat over the interned dimensions. dim ids
+     * run [0, max_dims] (max_dims = the (other,other) pseudo-pair), so each is
+     * sized ndims = max_dims + 1. */
+    uint64_t *q_total;   /* [ndims][N_QKINDS][N_QCODES] latkit_queries_total */
+    uint64_t *err_total; /* [MAX_SQLSTATES+1][ndims] latkit_query_errors_total */
+    struct lk_hist *txn; /* [ndims][2] latkit_txn_duration_seconds (ok|aborted) */
+    struct {
+        char code[8];
+    } sqlstates[LK_MAX_SQLSTATES]; /* interned SQLSTATEs */
+    uint32_t n_sqlstates;
+
+    uint64_t truncated_obs; /* latkit_queries_truncated_total */
     uint64_t total_obs;
     uint64_t other_obs;
 };
+
+static inline uint32_t reg_ndims(const struct lk_registry *r)
+{
+    return r->max_dims + 1;
+}
 
 /* --- small helpers -------------------------------------------------------- */
 
@@ -203,8 +224,7 @@ static uint64_t series_key(uint32_t qslot, uint32_t dim, uint8_t code)
     return ((uint64_t)qslot << 32) | ((uint64_t)dim << 8) | code;
 }
 
-static struct series *series_get(struct lk_registry *r, uint32_t qslot, uint32_t dim,
-                                 uint8_t code)
+static struct series *series_get(struct lk_registry *r, uint32_t qslot, uint32_t dim, uint8_t code)
 {
     uint64_t key = series_key(qslot, dim, code);
     uint32_t b = (uint32_t)mix64(key) & (r->sbuckets_n - 1);
@@ -256,6 +276,21 @@ static uint32_t intern_dim(struct lk_registry *r, const char *db, const char *us
     return id;
 }
 
+/* Intern a SQLSTATE for latkit_query_errors_total (Р23): a linear scan capped at
+ * LK_MAX_SQLSTATES, then the "other" pseudo-code at index LK_MAX_SQLSTATES. */
+static uint32_t intern_sqlstate(struct lk_registry *r, const char *code)
+{
+    for (uint32_t i = 0; i < r->n_sqlstates; i++)
+        if (!strcmp(r->sqlstates[i].code, code))
+            return i;
+    if (r->n_sqlstates >= LK_MAX_SQLSTATES)
+        return LK_MAX_SQLSTATES;
+
+    uint32_t id = r->n_sqlstates++;
+    snprintf(r->sqlstates[id].code, sizeof(r->sqlstates[id].code), "%s", code);
+    return id;
+}
+
 /* --- query dictionary: admit / evict / resolve ---------------------------- */
 
 static int32_t admit(struct lk_registry *r, uint64_t fp, const char *label)
@@ -272,6 +307,16 @@ static int32_t admit(struct lk_registry *r, uint64_t fp, const char *label)
     return s;
 }
 
+/* A series' lazily-allocated first-row histogram, created on first use (only
+ * when the feature is on). NULL on OOM: caller drops the first-row observation,
+ * never crashes. */
+static struct lk_hist *series_first_row(struct series *s)
+{
+    if (!s->first_row)
+        s->first_row = calloc(1, sizeof(*s->first_row));
+    return s->first_row;
+}
+
 /* Fold the LRU slot's series into query="other" (Р23) and free the slot. */
 static void evict_lru(struct lk_registry *r)
 {
@@ -283,9 +328,18 @@ static void evict_lru(struct lk_registry *r)
         struct series *dst = series_get(r, r->k, s->dim, s->code);
 
         next = s->q_next;
-        if (dst)
+        if (dst) {
             lk_hist_merge(&dst->dur, &s->dur);
+            dst->rows += s->rows;
+            if (s->first_row) {
+                struct lk_hist *dfr = series_first_row(dst);
+
+                if (dfr)
+                    lk_hist_merge(dfr, s->first_row);
+            }
+        }
         series_unlink_hash(r, s);
+        free(s->first_row);
         free(s);
         r->n_series--;
     }
@@ -323,18 +377,52 @@ static uint32_t resolve_query(struct lk_registry *r, uint64_t fp, const char *la
 
 /* --- public API ----------------------------------------------------------- */
 
-void lk_reg_observe(struct lk_registry *r, uint64_t fp, const char *label, const char *db,
-                    const char *user, enum lk_code code, double dur_seconds)
+void lk_reg_observe(struct lk_registry *r, const struct lk_reg_obs *o)
 {
-    uint32_t dim = intern_dim(r, db ? db : "", user ? user : "");
-    uint32_t qslot = resolve_query(r, fp, label);
-    struct series *s = series_get(r, qslot, dim, (uint8_t)code);
+    uint32_t dim = intern_dim(r, o->db ? o->db : "", o->user ? o->user : "");
+    uint32_t ndims = reg_ndims(r);
+    uint8_t kind = o->kind < LK_N_QKINDS ? o->kind : LK_QK_SIMPLE;
+    uint8_t qc = o->qcode < LK_N_QCODES ? o->qcode : LK_QCODE_OK;
+    uint32_t qslot;
+    struct series *s;
+
+    /* latkit_queries_total{db,user,kind,code} — every observation. */
+    r->q_total[(dim * LK_N_QKINDS + kind) * LK_N_QCODES + qc]++;
+    if (o->truncated)
+        r->truncated_obs++;
+    if (o->sqlstate)
+        r->err_total[intern_sqlstate(r, o->sqlstate) * ndims + dim]++;
+
+    /* Aborted / canceled observations carry no latency: counters only (Р25). */
+    if (!o->has_duration)
+        return;
+
+    /* Query-keyed families: forced "other" (NO_TEXT / CANCEL, Р28) skips the
+     * dictionary so ad-hoc text never churns the top-K; otherwise resolve. */
+    qslot = (o->force_other || !o->label) ? r->k : resolve_query(r, o->fp, o->label);
+    s = series_get(r, qslot, dim, (uint8_t)o->dcode);
 
     r->total_obs++;
     if (qslot == r->k)
         r->other_obs++;
-    if (s)
-        lk_hist_observe(&s->dur, dur_seconds);
+    if (!s)
+        return;
+    lk_hist_observe(&s->dur, o->dur_seconds);
+    s->rows += o->rows;
+    if (r->first_row && o->has_first_row) {
+        struct lk_hist *fr = series_first_row(s);
+
+        if (fr)
+            lk_hist_observe(fr, o->first_row_seconds);
+    }
+}
+
+void lk_reg_observe_txn(struct lk_registry *r, const char *db, const char *user, bool aborted,
+                        double dur_seconds)
+{
+    uint32_t dim = intern_dim(r, db ? db : "", user ? user : "");
+
+    lk_hist_observe(&r->txn[dim * 2 + (aborted ? 1u : 0u)], dur_seconds);
 }
 
 struct lk_registry *lk_reg_new(const struct lk_metrics_cfg *cfg)
@@ -359,6 +447,7 @@ struct lk_registry *lk_reg_new(const struct lk_metrics_cfg *cfg)
     r->k = c.top_queries;
     r->label_len = c.query_label_len;
     r->max_dims = c.max_session_dims;
+    r->first_row = c.first_row_hist;
     r->lru_head = r->lru_tail = -1;
 
     r->fp_hcap = next_pow2((r->k + 1) * 2);
@@ -366,13 +455,19 @@ struct lk_registry *lk_reg_new(const struct lk_metrics_cfg *cfg)
     if (r->sbuckets_n < 1024)
         r->sbuckets_n = 1024;
 
+    uint32_t ndims = reg_ndims(r);
+
     r->entries = calloc(r->k + 1, sizeof(*r->entries));
     r->fp_hash = malloc(r->fp_hcap * sizeof(*r->fp_hash));
     r->free_slots = malloc(r->k * sizeof(*r->free_slots));
     r->door = calloc(LK_DOORKEEPER_SLOTS, sizeof(*r->door));
-    r->dims = calloc(r->max_dims + 1, sizeof(*r->dims));
+    r->dims = calloc(ndims, sizeof(*r->dims));
     r->sbuckets = calloc(r->sbuckets_n, sizeof(*r->sbuckets));
-    if (!r->entries || !r->fp_hash || !r->free_slots || !r->door || !r->dims || !r->sbuckets) {
+    r->q_total = calloc((size_t)ndims * LK_N_QKINDS * LK_N_QCODES, sizeof(*r->q_total));
+    r->err_total = calloc((size_t)(LK_MAX_SQLSTATES + 1) * ndims, sizeof(*r->err_total));
+    r->txn = calloc((size_t)ndims * 2, sizeof(*r->txn));
+    if (!r->entries || !r->fp_hash || !r->free_slots || !r->door || !r->dims || !r->sbuckets ||
+        !r->q_total || !r->err_total || !r->txn) {
         lk_reg_free(r);
         return NULL;
     }
@@ -397,9 +492,13 @@ void lk_reg_free(struct lk_registry *r)
 
             for (; s; s = next) {
                 next = s->h_next;
+                free(s->first_row);
                 free(s);
             }
         }
+    free(r->txn);
+    free(r->err_total);
+    free(r->q_total);
     free(r->sbuckets);
     free(r->dims);
     free(r->door);
@@ -411,12 +510,30 @@ void lk_reg_free(struct lk_registry *r)
 
 /* --- introspection -------------------------------------------------------- */
 
-uint32_t lk_reg_n_queries(const struct lk_registry *r) { return r->k - r->n_free; }
-uint32_t lk_reg_n_dims(const struct lk_registry *r) { return r->n_dims; }
-uint32_t lk_reg_n_series(const struct lk_registry *r) { return r->n_series; }
-uint64_t lk_reg_total_obs(const struct lk_registry *r) { return r->total_obs; }
-uint64_t lk_reg_other_obs(const struct lk_registry *r) { return r->other_obs; }
-bool lk_reg_has_fp(const struct lk_registry *r, uint64_t fp) { return fp_find(r, fp) >= 0; }
+uint32_t lk_reg_n_queries(const struct lk_registry *r)
+{
+    return r->k - r->n_free;
+}
+uint32_t lk_reg_n_dims(const struct lk_registry *r)
+{
+    return r->n_dims;
+}
+uint32_t lk_reg_n_series(const struct lk_registry *r)
+{
+    return r->n_series;
+}
+uint64_t lk_reg_total_obs(const struct lk_registry *r)
+{
+    return r->total_obs;
+}
+uint64_t lk_reg_other_obs(const struct lk_registry *r)
+{
+    return r->other_obs;
+}
+bool lk_reg_has_fp(const struct lk_registry *r, uint64_t fp)
+{
+    return fp_find(r, fp) >= 0;
+}
 
 uint64_t lk_reg_fp_count(const struct lk_registry *r, uint64_t fp)
 {
@@ -443,6 +560,11 @@ uint64_t lk_reg_series_count_sum(const struct lk_registry *r)
 /* --- dump ----------------------------------------------------------------- */
 
 #define LK_DUR_METRIC "latkit_query_duration_seconds"
+#define LK_FR_METRIC  "latkit_query_first_row_seconds"
+#define LK_TXN_METRIC "latkit_txn_duration_seconds"
+
+/* Escaped db/user pair: worst case each 64-byte label doubles under escaping. */
+#define ESC64 (2 * 64)
 
 /* Escape a label value per the text format (Р28): backslash, double-quote and
  * newline. out must hold 2*strlen(s)+1. */
@@ -471,6 +593,44 @@ static void esc(const char *s, char *out)
     *o = '\0';
 }
 
+static const char *qkind_str(uint8_t k)
+{
+    static const char *const s[LK_N_QKINDS] = {"simple",  "extended", "function",
+                                               "copy_in", "copy_out", "cancel"};
+    return k < LK_N_QKINDS ? s[k] : "?";
+}
+
+static const char *qcode_str(uint8_t c)
+{
+    static const char *const s[LK_N_QCODES] = {"ok", "error", "aborted", "canceled"};
+    return c < LK_N_QCODES ? s[c] : "?";
+}
+
+/* Order interned dimensions by (db,user) so the dump is stable regardless of
+ * first-seen interning order. Insertion sort: ndims is tiny (<= max_dims + 1). */
+static void order_dims(const struct lk_registry *r, uint32_t *ord, uint32_t ndims)
+{
+    for (uint32_t i = 0; i < ndims; i++)
+        ord[i] = i;
+    for (uint32_t i = 1; i < ndims; i++) {
+        uint32_t v = ord[i], j = i;
+
+        for (; j > 0; j--) {
+            const struct dim *a = &r->dims[ord[j - 1]], *b = &r->dims[v];
+            int c = strcmp(a->db, b->db);
+
+            if (c == 0)
+                c = strcmp(a->user, b->user);
+            if (c <= 0)
+                break;
+            ord[j] = ord[j - 1];
+        }
+        ord[j] = v;
+    }
+}
+
+/* --- query-keyed families (duration / rows / first_row) ------------------- */
+
 struct dump_row {
     const struct series *s;
     const char *q, *db, *user;
@@ -491,13 +651,115 @@ static int row_cmp(const void *a, const void *b)
     return x->code - y->code;
 }
 
+/* True when rows i and j share the (query,db,user) identity (they differ only
+ * in `code`) — the group boundary for the code-free rows / first_row families. */
+static bool same_qseries(const struct dump_row *a, const struct dump_row *b)
+{
+    return !strcmp(a->q, b->q) && !strcmp(a->db, b->db) && !strcmp(a->user, b->user);
+}
+
+static void write_qkeyed(const struct lk_registry *r, FILE *f, const struct dump_row *rows,
+                         uint32_t n)
+{
+    /* duration: one histogram per (query,db,user,code). */
+    fprintf(f, "# HELP " LK_DUR_METRIC " Server-side query latency in seconds.\n");
+    fprintf(f, "# TYPE " LK_DUR_METRIC " histogram\n");
+    for (uint32_t i = 0; i < n; i++) {
+        char qe[2 * LK_QUERY_LABEL_MAX], dbe[ESC64], ue[ESC64];
+        char labelset[2 * LK_QUERY_LABEL_MAX + 3 * ESC64 + 64];
+
+        esc(rows[i].q, qe);
+        esc(rows[i].db, dbe);
+        esc(rows[i].user, ue);
+        snprintf(labelset, sizeof(labelset), "query=\"%s\",db=\"%s\",user=\"%s\",code=\"%s\"", qe,
+                 dbe, ue, rows[i].code == LK_CODE_ERROR ? "error" : "ok");
+        lk_hist_write(&rows[i].s->dur, f, LK_DUR_METRIC, labelset);
+    }
+
+    /* rows_total: sum over code within each (query,db,user) group. */
+    fprintf(f, "# HELP latkit_query_rows_total Rows returned/affected, from CommandComplete.\n");
+    fprintf(f, "# TYPE latkit_query_rows_total counter\n");
+    for (uint32_t i = 0; i < n;) {
+        uint32_t j = i;
+        uint64_t sum = 0;
+        char qe[2 * LK_QUERY_LABEL_MAX], dbe[ESC64], ue[ESC64];
+
+        for (; j < n && same_qseries(&rows[i], &rows[j]); j++)
+            sum += rows[j].s->rows;
+        esc(rows[i].q, qe);
+        esc(rows[i].db, dbe);
+        esc(rows[i].user, ue);
+        fprintf(f, "latkit_query_rows_total{query=\"%s\",db=\"%s\",user=\"%s\"} %llu\n", qe, dbe,
+                ue, (unsigned long long)sum);
+        i = j;
+    }
+
+    /* first_row: merge the code series' histograms within each group (opt-in). */
+    if (!r->first_row)
+        return;
+    fprintf(f, "# HELP " LK_FR_METRIC " Time to first row in seconds.\n");
+    fprintf(f, "# TYPE " LK_FR_METRIC " histogram\n");
+    for (uint32_t i = 0; i < n;) {
+        uint32_t j = i;
+        struct lk_hist acc = {0};
+        bool any = false;
+        char qe[2 * LK_QUERY_LABEL_MAX], dbe[ESC64], ue[ESC64];
+        char labelset[2 * LK_QUERY_LABEL_MAX + 3 * ESC64];
+
+        for (; j < n && same_qseries(&rows[i], &rows[j]); j++)
+            if (rows[j].s->first_row) {
+                lk_hist_merge(&acc, rows[j].s->first_row);
+                any = true;
+            }
+        if (!any) {
+            i = j;
+            continue;
+        }
+        esc(rows[i].q, qe);
+        esc(rows[i].db, dbe);
+        esc(rows[i].user, ue);
+        snprintf(labelset, sizeof(labelset), "query=\"%s\",db=\"%s\",user=\"%s\"", qe, dbe, ue);
+        lk_hist_write(&acc, f, LK_FR_METRIC, labelset);
+        i = j;
+    }
+}
+
 int lk_reg_dump(const struct lk_registry *r, FILE *f)
 {
+    uint32_t ndims = reg_ndims(r);
     struct dump_row *rows = r->n_series ? malloc(r->n_series * sizeof(*rows)) : NULL;
+    uint32_t *ord = malloc(ndims * sizeof(*ord));
     uint32_t n = 0;
 
-    if (r->n_series && !rows)
+    if ((r->n_series && !rows) || !ord) {
+        free(rows);
+        free(ord);
         return -1;
+    }
+    order_dims(r, ord, ndims);
+
+    /* --- latkit_queries_total{db,user,kind,code} ------------------------- */
+    fprintf(f, "# HELP latkit_queries_total Query observations by kind and outcome.\n");
+    fprintf(f, "# TYPE latkit_queries_total counter\n");
+    for (uint32_t oi = 0; oi < ndims; oi++) {
+        uint32_t d = ord[oi];
+        char dbe[ESC64], ue[ESC64];
+
+        esc(r->dims[d].db, dbe);
+        esc(r->dims[d].user, ue);
+        for (uint8_t k = 0; k < LK_N_QKINDS; k++)
+            for (uint8_t c = 0; c < LK_N_QCODES; c++) {
+                uint64_t v = r->q_total[(d * LK_N_QKINDS + k) * LK_N_QCODES + c];
+
+                if (v)
+                    fprintf(f,
+                            "latkit_queries_total{db=\"%s\",user=\"%s\",kind=\"%s\",code=\"%s\"} "
+                            "%llu\n",
+                            dbe, ue, qkind_str(k), qcode_str(c), (unsigned long long)v);
+            }
+    }
+
+    /* --- query-keyed families ------------------------------------------- */
     for (uint32_t b = 0; b < r->sbuckets_n; b++)
         for (const struct series *s = r->sbuckets[b]; s; s = s->h_next) {
             const struct dim *d = &r->dims[s->dim];
@@ -509,21 +771,77 @@ int lk_reg_dump(const struct lk_registry *r, FILE *f)
             rows[n].code = s->code;
             n++;
         }
-    qsort(rows, n, sizeof(*rows), row_cmp);
+    if (n)
+        qsort(rows, n, sizeof(*rows), row_cmp);
+    write_qkeyed(r, f, rows, n);
 
-    fprintf(f, "# HELP " LK_DUR_METRIC " Server-side query latency in seconds.\n");
-    fprintf(f, "# TYPE " LK_DUR_METRIC " histogram\n");
-    for (uint32_t i = 0; i < n; i++) {
-        char qe[2 * LK_QUERY_LABEL_MAX], dbe[2 * 64], ue[2 * 64];
-        char labelset[2 * LK_QUERY_LABEL_MAX + 4 * 64 + 64];
+    /* --- latkit_query_errors_total{sqlstate,db,user} -------------------- */
+    fprintf(f, "# HELP latkit_query_errors_total Errors by SQLSTATE (query-independent).\n");
+    fprintf(f, "# TYPE latkit_query_errors_total counter\n");
+    {
+        uint32_t sord[LK_MAX_SQLSTATES];
 
-        esc(rows[i].q, qe);
-        esc(rows[i].db, dbe);
-        esc(rows[i].user, ue);
-        snprintf(labelset, sizeof(labelset), "query=\"%s\",db=\"%s\",user=\"%s\",code=\"%s\"", qe,
-                 dbe, ue, rows[i].code == LK_CODE_ERROR ? "error" : "ok");
-        lk_hist_write(&rows[i].s->dur, f, LK_DUR_METRIC, labelset);
+        for (uint32_t i = 0; i < r->n_sqlstates; i++)
+            sord[i] = i;
+        for (uint32_t i = 1; i < r->n_sqlstates; i++) { /* sort SQLSTATEs lexically */
+            uint32_t v = sord[i], j = i;
+
+            for (; j > 0 && strcmp(r->sqlstates[sord[j - 1]].code, r->sqlstates[v].code) > 0; j--)
+                sord[j] = sord[j - 1];
+            sord[j] = v;
+        }
+        /* real codes in order, then the "other" pseudo-code last */
+        for (uint32_t si = 0; si <= r->n_sqlstates; si++) {
+            uint32_t sq = si < r->n_sqlstates ? sord[si] : LK_MAX_SQLSTATES;
+            const char *code = si < r->n_sqlstates ? r->sqlstates[sq].code : "other";
+
+            for (uint32_t oi = 0; oi < ndims; oi++) {
+                uint32_t d = ord[oi];
+                uint64_t v = r->err_total[sq * ndims + d];
+                char dbe[ESC64], ue[ESC64], ce[2 * sizeof(r->sqlstates[0].code)];
+
+                if (!v)
+                    continue;
+                esc(code, ce);
+                esc(r->dims[d].db, dbe);
+                esc(r->dims[d].user, ue);
+                fprintf(f,
+                        "latkit_query_errors_total{sqlstate=\"%s\",db=\"%s\",user=\"%s\"} %llu\n",
+                        ce, dbe, ue, (unsigned long long)v);
+            }
+        }
     }
+
+    /* --- label-free counters -------------------------------------------- */
+    fprintf(f, "# HELP latkit_queries_truncated_total Observations with truncated SQL text.\n");
+    fprintf(f, "# TYPE latkit_queries_truncated_total counter\n");
+    fprintf(f, "latkit_queries_truncated_total %llu\n", (unsigned long long)r->truncated_obs);
+    fprintf(f, "# HELP latkit_queries_other_total Observations folded into query=\"other\".\n");
+    fprintf(f, "# TYPE latkit_queries_other_total counter\n");
+    fprintf(f, "latkit_queries_other_total %llu\n", (unsigned long long)r->other_obs);
+
+    /* --- latkit_txn_duration_seconds{db,user,status} -------------------- */
+    fprintf(f, "# HELP " LK_TXN_METRIC " Transaction duration in seconds.\n");
+    fprintf(f, "# TYPE " LK_TXN_METRIC " histogram\n");
+    for (uint32_t oi = 0; oi < ndims; oi++) {
+        uint32_t d = ord[oi];
+        char dbe[ESC64], ue[ESC64];
+
+        esc(r->dims[d].db, dbe);
+        esc(r->dims[d].user, ue);
+        for (uint32_t st = 0; st < 2; st++) {
+            const struct lk_hist *h = &r->txn[d * 2 + st];
+            char labelset[3 * ESC64 + 64];
+
+            if (!h->count)
+                continue;
+            snprintf(labelset, sizeof(labelset), "db=\"%s\",user=\"%s\",status=\"%s\"", dbe, ue,
+                     st ? "aborted" : "ok");
+            lk_hist_write(h, f, LK_TXN_METRIC, labelset);
+        }
+    }
+
     free(rows);
+    free(ord);
     return 0;
 }

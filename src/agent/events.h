@@ -25,7 +25,15 @@ struct lk_events_cfg {
     bool cap_headers;
     bool events;   /* per-event log lines (the stage-1 output) */
     bool messages; /* one line per reassembled protocol message */
-    bool queries;  /* one line per session/query observation (stage 3) */
+    bool queries;  /* tee: one line per session/query observation (stage 3) */
+
+    /* Aggregator (stage 4). The parser's standard consumer is now the metrics
+     * aggregator; --queries is a debug tee in front of it. */
+    __u32 top_queries;             /* --top-queries (K); 0 = default */
+    __u32 query_label_len;         /* --query-label-len; 0 = default */
+    bool first_row_hist;           /* --first-row-hist */
+    bool dump_metrics;             /* --dump-metrics[=path] given */
+    const char *dump_metrics_path; /* target file, NULL = stderr */
 };
 
 struct lk_events;
@@ -39,5 +47,11 @@ int lk_events_register(struct lk_events *e, struct lk_loop *loop);
 /* One stats line to stderr; the loop calls this periodically, main calls it
  * once more for the final totals on shutdown. */
 void lk_events_print_stats(struct lk_events *e);
+
+/* Write the metrics registry as Prometheus text exposition to the configured
+ * --dump-metrics target (stderr when no path), refreshing the connection gauges
+ * from the conn table first. Fired on SIGUSR1 and once by main on shutdown;
+ * no-op when --dump-metrics was not given. */
+void lk_events_dump_metrics(struct lk_events *e);
 
 #endif /* LATKIT_EVENTS_H */

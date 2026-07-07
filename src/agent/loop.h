@@ -23,6 +23,12 @@ void lk_loop_free(struct lk_loop *l);
 int lk_loop_add_fd(struct lk_loop *l, int fd, lk_loop_fd_fn fn, void *ctx);
 int lk_loop_every(struct lk_loop *l, unsigned int interval_sec, lk_loop_task_fn fn, void *ctx);
 
+/* Register a handler for SIGUSR1 (delivered through the same signalfd as the
+ * shutdown signals, so it is serialised with the rest of the loop rather than
+ * running in async-signal context). Used for --dump-metrics on demand. At most
+ * one; without it SIGUSR1 is ignored. */
+void lk_loop_on_sigusr1(struct lk_loop *l, lk_loop_task_fn fn, void *ctx);
+
 /* Blocks in epoll_wait until SIGINT/SIGTERM (returns 0) or a handler fails
  * (returns its error). */
 int lk_loop_run(struct lk_loop *l);

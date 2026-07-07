@@ -153,12 +153,16 @@ target_include_directories(latkit_norm SYSTEM PRIVATE
 # --- metrics registry (stage 4) --------------------------------------------
 # src/metrics/** is pure like src/norm/**: histograms, the top-K series registry
 # and the text-format dump, no libbpf and no I/O beyond the caller's FILE. The
-# aggregator (lk_query_sink) and the self-metric providers wire in at tasks
-# 4.3/4.4; the histogram needs libm (frexp/ldexp).
+# aggregator (task 4.3) links the normaliser and reads the lk_query_obs contract
+# (proto.h, types only) — hence the proto/agent/bpf header dirs — but still no
+# libbpf. The histogram needs libm (frexp/ldexp).
 add_library(latkit_metrics STATIC
     src/metrics/hist.c src/metrics/registry.c src/metrics/metrics.c)
 target_include_directories(latkit_metrics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics)
-target_link_libraries(latkit_metrics PUBLIC m)
+target_include_directories(latkit_metrics PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/proto ${CMAKE_CURRENT_SOURCE_DIR}/src/agent
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf)
+target_link_libraries(latkit_metrics PUBLIC m latkit_norm)
 
 # --- agent -----------------------------------------------------------------
 add_executable(latkit src/agent/main.c src/agent/loop.c src/agent/events.c
@@ -168,8 +172,9 @@ add_dependencies(latkit latkit_skel)
 set_source_files_properties(src/agent/main.c PROPERTIES OBJECT_DEPENDS ${SKEL_H})
 target_include_directories(latkit PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/proto ${LIBBPF_INCLUDE_DIR})
-target_link_libraries(latkit latkit_proto ${LATKIT_LIBBPF_LIBS})
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/proto ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics
+    ${LIBBPF_INCLUDE_DIR})
+target_link_libraries(latkit latkit_proto latkit_metrics ${LATKIT_LIBBPF_LIBS})
 
 # --- tests -----------------------------------------------------------------
 enable_testing()

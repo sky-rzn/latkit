@@ -40,6 +40,8 @@ struct lk_loop {
     struct lk_loop_fd fds[LK_LOOP_MAX_FDS];
     int ntasks;
     struct lk_loop_task tasks[LK_LOOP_MAX_TASKS];
+    lk_loop_task_fn usr1_fn; /* SIGUSR1 handler (--dump-metrics), NULL = ignore */
+    void *usr1_ctx;
 };
 
 int lk_loop_add_fd(struct lk_loop *l, int fd, lk_loop_fd_fn fn, void *ctx)
@@ -85,14 +87,26 @@ void lk_loop_stop(struct lk_loop *l)
     l->stop = true;
 }
 
+void lk_loop_on_sigusr1(struct lk_loop *l, lk_loop_task_fn fn, void *ctx)
+{
+    l->usr1_fn = fn;
+    l->usr1_ctx = ctx;
+}
+
 static int on_signal(void *ctx)
 {
     struct lk_loop *l = ctx;
     struct signalfd_siginfo si;
 
-    /* Which signal it was does not matter — both mean shutdown. */
-    if (read(l->sigfd, &si, sizeof(si)) < 0 && errno != EAGAIN)
-        return -errno;
+    if (read(l->sigfd, &si, sizeof(si)) < 0)
+        return errno == EAGAIN ? 0 : -errno;
+    /* SIGUSR1 is a live request (dump metrics), not a shutdown; anything else
+     * on this fd (SIGINT/SIGTERM) stops the loop. */
+    if (si.ssi_signo == SIGUSR1) {
+        if (l->usr1_fn)
+            l->usr1_fn(l->usr1_ctx);
+        return 0;
+    }
     lk_loop_stop(l);
     return 0;
 }
@@ -141,6 +155,7 @@ struct lk_loop *lk_loop_new(void)
     sigemptyset(&mask);
     sigaddset(&mask, SIGINT);
     sigaddset(&mask, SIGTERM);
+    sigaddset(&mask, SIGUSR1);
     if (sigprocmask(SIG_BLOCK, &mask, NULL)) {
         fprintf(stderr, "loop: sigprocmask: %s\n", strerror(errno));
         goto fail;

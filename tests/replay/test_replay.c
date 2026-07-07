@@ -18,6 +18,7 @@
 
 #include "conn_table.h"
 #include "fixtures_gen.h"
+#include "metrics.h"
 #include "pipeline.h"
 #include "proto.h"
 #include "record.h"
@@ -43,8 +44,8 @@
 
 struct collector {
     struct lk_pipeline pipe;
-    struct lk_proto *proto;               /* PG handler under test */
-    const struct lk_msg_sink *psink;      /* = lk_proto_sink(proto) */
+    struct lk_proto *proto;          /* PG handler under test */
+    const struct lk_msg_sink *psink; /* = lk_proto_sink(proto) */
     struct fx_msg got[FX_MAX_MSGS * 2];
     size_t ngot;
     bool overflow;
@@ -55,15 +56,21 @@ struct collector {
     struct lk_session last_session;
     struct lk_query_obs last_obs; /* text pointer nulled; see last_text */
     char last_text[256];          /* last_obs.text copied out (it dangles) */
+
+    /* Aggregator (task 4.3): the same observations tee into the metrics facade,
+     * exactly as events.c wires them over live traffic. */
+    struct lk_metrics *metrics;
+    const struct lk_query_sink *msink;
 };
 
 static void on_session(void *ctx, const struct lk_conn *c, const struct lk_session *s)
 {
     struct collector *col = ctx;
 
-    (void)c;
     col->nsessions++;
     col->last_session = *s;
+    if (col->msink->on_session)
+        col->msink->on_session(col->msink->ctx, c, s);
 }
 
 static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session *s,
@@ -71,8 +78,6 @@ static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session
 {
     struct collector *col = ctx;
 
-    (void)c;
-    (void)s;
     col->nqueries++;
     col->last_obs = *o;
     /* o->text is only valid during this call; copy it out for the assertions. */
@@ -82,6 +87,16 @@ static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session
         col->last_text[o->text_len] = '\0';
     }
     col->last_obs.text = NULL;
+    if (col->msink->on_query)
+        col->msink->on_query(col->msink->ctx, c, s, o);
+}
+
+static void on_txn(void *ctx, const struct lk_conn *c, __u64 start_ns, __u64 end_ns, char status)
+{
+    struct collector *col = ctx;
+
+    if (col->msink->on_txn)
+        col->msink->on_txn(col->msink->ctx, c, start_ns, end_ns, status);
 }
 
 static void on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struct lk_msg *m)
@@ -159,6 +174,22 @@ static const char *msg_str(const struct fx_msg *m, char *out, size_t n)
     return out;
 }
 
+/* Capture a metrics dump into buf; returns the byte count (0 on failure). */
+static size_t dump_metrics(struct lk_metrics *m, char *buf, size_t cap)
+{
+    FILE *f = tmpfile();
+    size_t n;
+
+    if (!f)
+        return 0;
+    lk_metrics_dump(m, f);
+    rewind(f);
+    n = fread(buf, 1, cap - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+    return n;
+}
+
 static int run_fixture(const struct fixture *fix)
 {
     struct fx x;
@@ -196,9 +227,17 @@ static int run_fixture(const struct fixture *fix)
     /* 2. Replay the committed trace through the shared pipeline, teeing every
      * message into the PG handler. */
     memset(&col, 0, sizeof(col));
-    col.proto = lk_proto_pg_new(
-        &(struct lk_query_sink){.ctx = &col, .on_session = on_session, .on_query = on_query});
+    col.metrics = lk_metrics_new(NULL);
+    if (!col.metrics) {
+        free(committed);
+        free(x.buf);
+        return 1;
+    }
+    col.msink = lk_metrics_query_sink(col.metrics);
+    col.proto = lk_proto_pg_new(&(struct lk_query_sink){
+        .ctx = &col, .on_session = on_session, .on_query = on_query, .on_txn = on_txn});
     if (!col.proto) {
+        lk_metrics_free(col.metrics);
         free(committed);
         free(x.buf);
         return 1;
@@ -309,10 +348,26 @@ static int run_fixture(const struct fixture *fix)
         }
     }
 
+    /* Aggregator (task 4.3): the metrics dump must be deterministic — two dumps
+     * of the same aggregated state are byte-identical (stable line order, no
+     * addresses / iteration-order leakage). 4.5 layers golden-value asserts on
+     * top of this. */
+    {
+        static char a[65536], b[65536];
+        size_t na = dump_metrics(col.metrics, a, sizeof(a));
+        size_t nb = dump_metrics(col.metrics, b, sizeof(b));
+
+        if (!na || na != nb || memcmp(a, b, na)) {
+            fprintf(stderr, "FAIL %s: metrics dump not deterministic\n", fix->name);
+            goto fail;
+        }
+    }
+
     /* Tear the table down first (its destroy hooks free proto_state through the
      * parser, which must still be alive), then release the handler. */
     lk_pipeline_fini(&col.pipe);
     lk_proto_free(col.proto);
+    lk_metrics_free(col.metrics);
     free(committed);
     free(x.buf);
     printf("ok %s (%zu msgs, %zu sessions)\n", fix->name, col.ngot, col.nsessions);
@@ -321,6 +376,7 @@ static int run_fixture(const struct fixture *fix)
 fail:
     lk_pipeline_fini(&col.pipe);
     lk_proto_free(col.proto);
+    lk_metrics_free(col.metrics);
     free(committed);
     free(x.buf);
     return 1;

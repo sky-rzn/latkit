@@ -37,7 +37,19 @@ static struct lk_registry *reg(uint32_t k, uint32_t dims)
 static void obs(struct lk_registry *r, uint64_t fp, const char *label, const char *db,
                 const char *user, enum lk_code code)
 {
-    lk_reg_observe(r, fp, label, db, user, code, 0.2);
+    struct lk_reg_obs o = {
+        .fp = fp,
+        .label = label,
+        .db = db,
+        .user = user,
+        .kind = LK_QK_SIMPLE,
+        .qcode = code == LK_CODE_ERROR ? LK_QCODE_ERROR : LK_QCODE_OK,
+        .has_duration = true,
+        .dcode = code,
+        .dur_seconds = 0.2,
+    };
+
+    lk_reg_observe(r, &o);
 }
 
 /* Capture a dump into buf; returns bytes read. */
@@ -56,7 +68,10 @@ static size_t dump(struct lk_registry *r, char *buf, size_t cap)
     return n;
 }
 
-static int contains(const char *hay, const char *needle) { return strstr(hay, needle) != NULL; }
+static int contains(const char *hay, const char *needle)
+{
+    return strstr(hay, needle) != NULL;
+}
 
 /* A new fingerprint at a full dictionary lands in query="other". */
 static int test_overflow_to_other(void)
@@ -141,8 +156,8 @@ static int test_cardinality_ceiling(void)
     for (uint64_t i = 1; i <= n; i++)
         obs(r, i, "q", "db", "u", LK_CODE_OK);
 
-    CHECK(lk_reg_n_queries(r) == 64);      /* first 64 admitted, rest -> other */
-    CHECK(lk_reg_n_series(r) == 64 + 1);   /* one series each + the other row */
+    CHECK(lk_reg_n_queries(r) == 64);    /* first 64 admitted, rest -> other */
+    CHECK(lk_reg_n_series(r) == 64 + 1); /* one series each + the other row */
     CHECK(lk_reg_total_obs(r) == n);
     CHECK(lk_reg_series_count_sum(r) == n);
     lk_reg_free(r);
@@ -183,9 +198,8 @@ static int test_dump_format(void)
     dump(r, buf, sizeof(buf));
     CHECK(contains(buf, "# HELP latkit_query_duration_seconds "));
     CHECK(contains(buf, "# TYPE latkit_query_duration_seconds histogram\n"));
-    CHECK(contains(buf,
-                   "latkit_query_duration_seconds_count{query=\"select ?\",db=\"app\","
-                   "user=\"alice\",code=\"ok\"} 2\n"));
+    CHECK(contains(buf, "latkit_query_duration_seconds_count{query=\"select ?\",db=\"app\","
+                        "user=\"alice\",code=\"ok\"} 2\n"));
     CHECK(contains(buf, "code=\"error\""));
     CHECK(contains(buf, "query=\"upd\\\"ate\"")); /* the " is backslash-escaped */
     CHECK(contains(buf, "le=\"+Inf\""));

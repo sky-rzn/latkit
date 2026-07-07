@@ -66,3 +66,12 @@ add_test(NAME hist COMMAND test_hist)
 add_executable(test_registry test_registry.c)
 target_link_libraries(test_registry latkit_metrics)
 add_test(NAME registry COMMAND test_registry)
+
+# Aggregator (task 4.3): synthetic lk_query_obs through the lk_query_sink,
+# asserting the resulting exposition. Uses the lk_query_obs contract (proto.h,
+# types only) — hence the proto/agent/bpf header dirs — over the pure metrics lib.
+add_executable(test_metrics test_metrics.c)
+target_include_directories(test_metrics PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf)
+target_link_libraries(test_metrics latkit_metrics)
+add_test(NAME metrics COMMAND test_metrics)
