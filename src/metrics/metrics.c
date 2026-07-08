@@ -38,15 +38,27 @@ struct sess_ent {
 };
 
 /* Flat named scalar series (Р27): connections in task 4.3, the self-metric
- * providers in 4.4. Bounded by the fixed metric set. */
+ * providers in 4.4. Each series is keyed by (name, one optional label); several
+ * label values of one name form a single family. Bounded by the fixed set. */
 enum { LK_SC_COUNTER, LK_SC_GAUGE };
-#define LK_MAX_SCALARS 32
+#define LK_MAX_SCALARS 64
 
 struct scalar {
     char name[64];
     char help[160];
+    char label_key[16]; /* "" = no label */
+    char label_val[32];
     int type;
     double value;
+};
+
+/* Self-metric providers (Р27): the fixed set of subsystems is tiny (kernel
+ * stats, framer, parser, conn table, process_*), so a small table suffices. */
+#define LK_MAX_PROVIDERS 8
+
+struct provider {
+    lk_metrics_provider_fn fn;
+    void *ctx;
 };
 
 struct lk_metrics {
@@ -56,6 +68,8 @@ struct lk_metrics {
     struct sess_ent sess[LK_SESS_CACHE];
     struct scalar scalars[LK_MAX_SCALARS];
     uint32_t n_scalars;
+    struct provider providers[LK_MAX_PROVIDERS];
+    uint32_t n_providers;
 };
 
 /* --- session-label cache -------------------------------------------------- */
@@ -172,12 +186,16 @@ const struct lk_query_sink *lk_metrics_query_sink(struct lk_metrics *m)
 
 /* --- flat scalars --------------------------------------------------------- */
 
-static void scalar_set(struct lk_metrics *m, const char *name, const char *help, int type, double v)
+static void scalar_set(struct lk_metrics *m, const char *name, const char *help, const char *lkey,
+                       const char *lval, int type, double v)
 {
     struct scalar *sc = NULL;
 
+    lkey = lkey ? lkey : "";
+    lval = lval ? lval : "";
     for (uint32_t i = 0; i < m->n_scalars; i++)
-        if (!strcmp(m->scalars[i].name, name)) {
+        if (!strcmp(m->scalars[i].name, name) && !strcmp(m->scalars[i].label_key, lkey) &&
+            !strcmp(m->scalars[i].label_val, lval)) {
             sc = &m->scalars[i];
             break;
         }
@@ -186,6 +204,8 @@ static void scalar_set(struct lk_metrics *m, const char *name, const char *help,
             return; /* fixed metric set: silently ignore an unexpected overflow */
         sc = &m->scalars[m->n_scalars++];
         snprintf(sc->name, sizeof(sc->name), "%s", name);
+        snprintf(sc->label_key, sizeof(sc->label_key), "%s", lkey);
+        snprintf(sc->label_val, sizeof(sc->label_val), "%s", lval);
     }
     sc->type = type;
     sc->value = v;
@@ -195,17 +215,41 @@ static void scalar_set(struct lk_metrics *m, const char *name, const char *help,
 
 void lk_metrics_set_counter(struct lk_metrics *m, const char *name, const char *help, double v)
 {
-    scalar_set(m, name, help, LK_SC_COUNTER, v);
+    scalar_set(m, name, help, NULL, NULL, LK_SC_COUNTER, v);
 }
 
 void lk_metrics_set_gauge(struct lk_metrics *m, const char *name, const char *help, double v)
 {
-    scalar_set(m, name, help, LK_SC_GAUGE, v);
+    scalar_set(m, name, help, NULL, NULL, LK_SC_GAUGE, v);
 }
 
+void lk_metrics_set_counter_l(struct lk_metrics *m, const char *name, const char *help,
+                              const char *label_key, const char *label_val, double v)
+{
+    scalar_set(m, name, help, label_key, label_val, LK_SC_COUNTER, v);
+}
+
+void lk_metrics_set_gauge_l(struct lk_metrics *m, const char *name, const char *help,
+                            const char *label_key, const char *label_val, double v)
+{
+    scalar_set(m, name, help, label_key, label_val, LK_SC_GAUGE, v);
+}
+
+void lk_metrics_add_provider(struct lk_metrics *m, lk_metrics_provider_fn fn, void *ctx)
+{
+    if (!fn || m->n_providers >= LK_MAX_PROVIDERS)
+        return;
+    m->providers[m->n_providers++] = (struct provider){.fn = fn, .ctx = ctx};
+}
+
+/* Sort key: family (name) first, then label value, so one HELP/TYPE header
+ * covers a whole labeled family and its series print in a stable order. */
 static int scalar_cmp(const void *a, const void *b)
 {
-    return strcmp(((const struct scalar *)a)->name, ((const struct scalar *)b)->name);
+    const struct scalar *x = a, *y = b;
+    int c = strcmp(x->name, y->name);
+
+    return c ? c : strcmp(x->label_val, y->label_val);
 }
 
 /* --- lifecycle + dump ----------------------------------------------------- */
@@ -251,22 +295,49 @@ void lk_metrics_free(struct lk_metrics *m)
 int lk_metrics_dump(struct lk_metrics *m, FILE *f)
 {
     struct scalar sorted[LK_MAX_SCALARS];
-    int rv = lk_reg_dump(m->reg, f);
+    const char *cur = NULL;
+    int rv;
 
+    /* Refresh the flat scalars from their live sources first (Р27): the kernel
+     * counters, the framer/parser/conn-table stats and process_* are all pulled
+     * in here, at the moment of the dump. */
+    for (uint32_t i = 0; i < m->n_providers; i++)
+        m->providers[i].fn(m->providers[i].ctx, m);
+    /* The registry's own honesty gauge: the actual number of cardinality-
+     * controlled series it holds (Р27). queries_other_total is emitted by the
+     * registry dump itself. */
+    lk_metrics_set_gauge(m, "latkit_metric_series", "Cardinality-controlled series currently held.",
+                         (double)lk_reg_n_series(m->reg));
+
+    rv = lk_reg_dump(m->reg, f);
     if (rv)
         return rv;
 
-    /* Flat scalars after the registry families, sorted by name for a stable
-     * dump. Each name is a distinct family (no labels in stage 4). */
+    /* Flat scalars after the registry families, sorted by (name, label) so each
+     * labeled family gets one HELP/TYPE header followed by its series. */
     memcpy(sorted, m->scalars, m->n_scalars * sizeof(sorted[0]));
     qsort(sorted, m->n_scalars, sizeof(sorted[0]), scalar_cmp);
     for (uint32_t i = 0; i < m->n_scalars; i++) {
         const struct scalar *sc = &sorted[i];
 
-        if (sc->help[0])
-            fprintf(f, "# HELP %s %s\n", sc->name, sc->help);
-        fprintf(f, "# TYPE %s %s\n", sc->name, sc->type == LK_SC_GAUGE ? "gauge" : "counter");
-        fprintf(f, "%s %.17g\n", sc->name, sc->value);
+        if (!cur || strcmp(cur, sc->name)) {
+            cur = sc->name;
+            /* One HELP/TYPE header per family. HELP may have been supplied on any
+             * one of the family's label values (a labeled setter passes NULL for
+             * the rest), so scan the contiguous group for the first non-empty. */
+            const char *help = sc->help;
+
+            for (uint32_t j = i; j < m->n_scalars && !help[0] && !strcmp(sorted[j].name, sc->name);
+                 j++)
+                help = sorted[j].help;
+            if (help[0])
+                fprintf(f, "# HELP %s %s\n", sc->name, help);
+            fprintf(f, "# TYPE %s %s\n", sc->name, sc->type == LK_SC_GAUGE ? "gauge" : "counter");
+        }
+        if (sc->label_key[0])
+            fprintf(f, "%s{%s=\"%s\"} %.17g\n", sc->name, sc->label_key, sc->label_val, sc->value);
+        else
+            fprintf(f, "%s %.17g\n", sc->name, sc->value);
     }
     return 0;
 }

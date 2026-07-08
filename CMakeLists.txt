@@ -155,9 +155,11 @@ target_include_directories(latkit_norm SYSTEM PRIVATE
 # and the text-format dump, no libbpf and no I/O beyond the caller's FILE. The
 # aggregator (task 4.3) links the normaliser and reads the lk_query_obs contract
 # (proto.h, types only) — hence the proto/agent/bpf header dirs — but still no
-# libbpf. The histogram needs libm (frexp/ldexp).
+# libbpf. selfstats.c (task 4.4) is the one impure member: it reads getrusage /
+# procfs for the process_* series, still with no libbpf. The histogram needs
+# libm (frexp/ldexp).
 add_library(latkit_metrics STATIC
-    src/metrics/hist.c src/metrics/registry.c src/metrics/metrics.c)
+    src/metrics/hist.c src/metrics/registry.c src/metrics/metrics.c src/metrics/selfstats.c)
 target_include_directories(latkit_metrics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics)
 target_include_directories(latkit_metrics PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/proto ${CMAKE_CURRENT_SOURCE_DIR}/src/agent

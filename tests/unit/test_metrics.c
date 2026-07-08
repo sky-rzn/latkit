@@ -11,6 +11,7 @@
 
 #include "metrics.h"
 #include "proto.h"
+#include "selfstats.h"
 
 #define CHECK(cond)                                                                                \
     do {                                                                                           \
@@ -320,11 +321,86 @@ static int test_scalars(void)
     return 0;
 }
 
+/* Labeled scalars (task 4.4, Р27): several label values of one name form a
+ * single family — one HELP/TYPE header, one series line per value. */
+static int test_labeled_scalars(void)
+{
+    struct lk_metrics *m = lk_metrics_new(NULL);
+    char buf[65536];
+
+    CHECK(m);
+    lk_metrics_set_counter_l(m, "latkit_queries_dropped_total", "Dropped units.", "reason",
+                             "resync", 3);
+    lk_metrics_set_counter_l(m, "latkit_queries_dropped_total", NULL, "reason", "disconnect", 1);
+    lk_metrics_set_counter_l(m, "latkit_queries_dropped_total", NULL, "reason", "overflow", 0);
+    lk_metrics_set_counter_l(m, "latkit_queries_dropped_total", NULL, "reason", "resync",
+                             5); /* overwrite */
+    dump(m, buf, sizeof(buf));
+
+    /* Exactly one HELP and one TYPE header for the whole family. */
+    CHECK(strstr(buf, "# TYPE latkit_queries_dropped_total counter\n"));
+    CHECK(!strstr(strstr(buf, "# TYPE latkit_queries_dropped_total counter\n") + 1,
+                  "# TYPE latkit_queries_dropped_total"));
+    CHECK(has(buf, "latkit_queries_dropped_total{reason=\"resync\"} 5\n"));
+    CHECK(has(buf, "latkit_queries_dropped_total{reason=\"disconnect\"} 1\n"));
+    CHECK(has(buf, "latkit_queries_dropped_total{reason=\"overflow\"} 0\n"));
+    lk_metrics_free(m);
+    return 0;
+}
+
+/* Providers (task 4.4): the callback runs at dump time and pours its series in;
+ * the registry's own latkit_metric_series honesty gauge appears too. */
+static void probe_provider(void *ctx, struct lk_metrics *m)
+{
+    (*(int *)ctx)++;
+    lk_metrics_set_gauge(m, "test_probe", "Set by a provider.", 99);
+}
+
+static int test_providers(void)
+{
+    struct lk_metrics *m = lk_metrics_new(NULL);
+    char buf[65536];
+    int calls = 0;
+
+    CHECK(m);
+    lk_metrics_add_provider(m, probe_provider, &calls);
+
+    dump(m, buf, sizeof(buf));
+    CHECK(calls == 1); /* the provider ran exactly once for the dump */
+    CHECK(has(buf, "test_probe 99\n"));
+    CHECK(has(buf, "# TYPE latkit_metric_series gauge\n"));
+
+    dump(m, buf, sizeof(buf));
+    CHECK(calls == 2); /* ... and again on the next dump */
+    lk_metrics_free(m);
+    return 0;
+}
+
+/* The selfstats provider (task 4.4) emits the standard process_* series. */
+static int test_selfstats_provider(void)
+{
+    struct lk_metrics *m = lk_metrics_new(NULL);
+    struct lk_selfstats *ss = lk_selfstats_new();
+    char buf[65536];
+
+    CHECK(m && ss);
+    lk_metrics_add_provider(m, lk_selfstats_provide, ss);
+    dump(m, buf, sizeof(buf));
+
+    CHECK(has(buf, "# TYPE process_cpu_seconds_total counter\n"));
+    CHECK(has(buf, "process_cpu_seconds_total "));
+    CHECK(has(buf, "# TYPE process_start_time_seconds gauge\n"));
+    CHECK(has(buf, "process_resident_memory_bytes "));
+    lk_selfstats_free(ss);
+    lk_metrics_free(m);
+    return 0;
+}
+
 int main(void)
 {
     if (test_ok_query() || test_error_query() || test_no_duration() || test_no_text_other() ||
         test_truncated() || test_pipelined_duration() || test_txn() || test_first_row_flag() ||
-        test_scalars())
+        test_scalars() || test_labeled_scalars() || test_providers() || test_selfstats_provider())
         return 1;
     printf("test_metrics: all passed\n");
     return 0;

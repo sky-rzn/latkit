@@ -84,15 +84,30 @@ void lk_metrics_free(struct lk_metrics *m);
 const struct lk_query_sink *lk_metrics_query_sink(struct lk_metrics *m);
 
 /* Flat named scalar series the facade dumps after the registry families (Р27):
- * idempotent absolute writes of a counter/gauge value, keyed by name (no labels
- * in stage 4 — connections and, later, the self-metric providers). `help` is
- * remembered on first sight and may be NULL afterwards. Unknown-name writes
- * register the series; memory is bounded by the fixed metric set. */
+ * idempotent absolute writes of a counter/gauge value, keyed by (name, label).
+ * The plain form is label-free; the `_l` form carries one label (Р27 needs
+ * {dir}/{reason}), and several values of the same name form one family. `help`
+ * is remembered on first sight and may be NULL afterwards. Unknown keys register
+ * a new series; memory is bounded by the fixed metric set. */
 void lk_metrics_set_counter(struct lk_metrics *m, const char *name, const char *help, double v);
 void lk_metrics_set_gauge(struct lk_metrics *m, const char *name, const char *help, double v);
+void lk_metrics_set_counter_l(struct lk_metrics *m, const char *name, const char *help,
+                              const char *label_key, const char *label_val, double v);
+void lk_metrics_set_gauge_l(struct lk_metrics *m, const char *name, const char *help,
+                            const char *label_key, const char *label_val, double v);
+
+/* Self-metric providers (Р27): callbacks invoked once at the top of each dump to
+ * pour a subsystem's live statistics into flat scalar series via the setters
+ * above. This is the seam that keeps the facade pure — the kernel per-CPU
+ * counters, the framer/parser/conn-table stats and process_* all plug in this
+ * way, so the aggregator never learns about libbpf or procfs. `ctx` is borrowed.
+ * Registration is bounded by a small fixed table; extra providers are ignored. */
+typedef void (*lk_metrics_provider_fn)(void *ctx, struct lk_metrics *m);
+void lk_metrics_add_provider(struct lk_metrics *m, lk_metrics_provider_fn fn, void *ctx);
 
 /* Write the whole registry plus the flat scalars as Prometheus text exposition
- * format (Р26); stable line order for replay diff-asserts. Returns 0. */
+ * format (Р26); stable line order for replay diff-asserts. Runs every registered
+ * provider first, so the scalars reflect the moment of the dump. Returns 0. */
 int lk_metrics_dump(struct lk_metrics *m, FILE *f);
 
 #endif /* LATKIT_METRICS_H */

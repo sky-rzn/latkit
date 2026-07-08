@@ -28,6 +28,7 @@
 #include "proto.h"
 #include "reassembly.h"
 #include "record.h"
+#include "selfstats.h"
 
 #define LK_STATS_INTERVAL_SEC 10
 #define LK_SWEEP_INTERVAL_SEC 60
@@ -42,6 +43,7 @@ struct lk_events {
     struct lk_metrics *metrics;           /* aggregator: the parser's standard consumer */
     const struct lk_query_sink *msink;    /* = lk_metrics_query_sink(metrics) */
     struct lk_query_sink qsink;           /* tee installed into the parser (below) */
+    struct lk_selfstats *selfstats;       /* process_* provider (task 4.4) */
 };
 
 /* --- --queries logger (stage 3): the standard consumer of the parser -------
@@ -176,21 +178,22 @@ static void print_proto_stats(const struct lk_proto_stats *ps)
     fprintf(stderr, "latkit: pg types fe:%s | be:%s\n", fe, be);
 }
 
-/* --- global stats (task 1.5) ---------------------------------------------
- * Sum the per-CPU `stats` counters and print one line to stderr; called
- * every LK_STATS_INTERVAL_SEC from the loop and once on exit. */
-void lk_events_print_stats(struct lk_events *e)
+/* Sum the per-CPU kernel `stats` counters into sum[]. Both the human stats line
+ * and the metrics provider (Р27) read the kernel counters through here, so the
+ * numbers in the log and in the exposition come from one source. Returns false
+ * (sum left zeroed) if the CPU count is unavailable; a per-id lookup failure
+ * leaves that counter at 0 rather than aborting the whole read. */
+static bool sum_kernel_stats(struct lk_events *e, __u64 sum[LK_ST_MAX])
 {
-    __u64 sum[LK_ST_MAX] = {0}, drops;
     int ncpus = libbpf_num_possible_cpus();
     __u64 *vals;
 
+    memset(sum, 0, LK_ST_MAX * sizeof(sum[0]));
     if (ncpus < 1)
-        return;
+        return false;
     vals = calloc(ncpus, sizeof(*vals));
     if (!vals)
-        return;
-
+        return false;
     for (__u32 id = 0; id < LK_ST_MAX; id++) {
         if (bpf_map__lookup_elem(e->cfg.stats, &id, sizeof(id), vals, ncpus * sizeof(*vals), 0))
             continue; /* leaves the counter at 0 rather than aborting */
@@ -198,6 +201,75 @@ void lk_events_print_stats(struct lk_events *e)
             sum[id] += vals[cpu];
     }
     free(vals);
+    return true;
+}
+
+/* --- self-metric provider (task 4.4, Р27) ---------------------------------
+ * events.c is the only place that touches libbpf, so this is where the kernel
+ * per-CPU counters, the framer/parser/conn-table stats become metric series;
+ * the facade stays oblivious to the BPF maps. Installed via
+ * lk_metrics_add_provider, it runs at the top of every lk_metrics_dump — the
+ * same source structs the 10 s stats line reads, so log and exposition agree. */
+static void ev_provide_stats(void *ctx, struct lk_metrics *m)
+{
+    struct lk_events *e = ctx;
+    __u64 sum[LK_ST_MAX];
+
+    if (sum_kernel_stats(e, sum)) {
+        __u64 drops = sum[LK_ST_RESERVE_FAIL_DATA] + sum[LK_ST_RESERVE_FAIL_OPEN] +
+                      sum[LK_ST_RESERVE_FAIL_CLOSE];
+
+        lk_metrics_set_counter(m, "latkit_ringbuf_dropped_total",
+                               "Ringbuf records the kernel could not reserve.", (double)drops);
+        /* The kernel stats map counts records without a direction split, so this
+         * family carries no {dir} label — a documented deviation from Р27. */
+        lk_metrics_set_counter(m, "latkit_events_total", "Records submitted to the ringbuf.",
+                               (double)sum[LK_ST_EVENTS]);
+    }
+
+    const struct lk_reasm_stats *rs = &e->pipe.reasm.st;
+
+    lk_metrics_set_counter(m, "latkit_resync_total",
+                           "Stream directions resynchronised after a loss.", (double)rs->resyncs);
+
+    const struct lk_proto_stats *ps = lk_proto_stats(e->proto);
+
+    lk_metrics_set_counter(m, "latkit_parse_errors_total",
+                           "Protocol fields the parser rejected as corrupt.",
+                           (double)ps->parse_errors);
+    lk_metrics_set_counter(m, "latkit_unknown_msgs_total",
+                           "Unknown message types skipped by length.", (double)ps->unknown_msgs);
+    /* Р19 blind spot ("query cut off mid-flight") now has a counter, split by
+     * why the in-flight unit was dropped. */
+    lk_metrics_set_counter_l(m, "latkit_queries_dropped_total",
+                             "In-flight query units dropped before completion.", "reason", "resync",
+                             (double)ps->units_dropped_resync);
+    lk_metrics_set_counter_l(m, "latkit_queries_dropped_total", NULL, "reason", "disconnect",
+                             (double)ps->units_dropped_close);
+    lk_metrics_set_counter_l(m, "latkit_queries_dropped_total", NULL, "reason", "overflow",
+                             (double)ps->units_dropped_overflow);
+
+    const struct lk_conn_table_stats *cs = lk_conn_table_stats(e->pipe.conns);
+
+    lk_metrics_set_gauge(m, "latkit_connections_active", "Connections currently tracked.",
+                         (double)cs->active);
+    lk_metrics_set_counter(m, "latkit_connections_opened_total", "Connections opened since start.",
+                           (double)cs->created);
+    lk_metrics_set_counter_l(m, "latkit_conns_evicted_total", "Connections evicted from the table.",
+                             "reason", "lru", (double)cs->evicted_lru);
+    lk_metrics_set_counter_l(m, "latkit_conns_evicted_total", NULL, "reason", "idle",
+                             (double)cs->evicted_idle);
+}
+
+/* --- global stats (task 1.5) ---------------------------------------------
+ * Sum the per-CPU `stats` counters and print one line to stderr; called
+ * every LK_STATS_INTERVAL_SEC from the loop and once on exit. */
+void lk_events_print_stats(struct lk_events *e)
+{
+    __u64 sum[LK_ST_MAX], drops;
+
+    if (!sum_kernel_stats(e, sum))
+        return;
 
     drops =
         sum[LK_ST_RESERVE_FAIL_DATA] + sum[LK_ST_RESERVE_FAIL_OPEN] + sum[LK_ST_RESERVE_FAIL_CLOSE];
@@ -495,6 +567,15 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
     }
     e->msink = lk_metrics_query_sink(e->metrics);
 
+    /* Self-metric providers (Р27), invoked at every dump: the agent-side
+     * counters (kernel/framer/parser/conn-table) and process_* (getrusage /
+     * procfs). Registered unconditionally — they only cost anything on a dump.
+     * selfstats is optional; without it process_* is simply absent. */
+    lk_metrics_add_provider(e->metrics, ev_provide_stats, e);
+    e->selfstats = lk_selfstats_new();
+    if (e->selfstats)
+        lk_metrics_add_provider(e->metrics, lk_selfstats_provide, e->selfstats);
+
     /* Install a tee (ev_*) as the parser's upward sink: it fans every
      * observation into the aggregator and, with --queries, the stage-3 logger
      * (Р15). events.c's own message sink (above) similarly tees messages into
@@ -503,6 +584,7 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
         .ctx = e, .on_session = ev_on_session, .on_query = ev_on_query, .on_txn = ev_on_txn};
     e->proto = lk_proto_pg_new(&e->qsink);
     if (!e->proto) {
+        lk_selfstats_free(e->selfstats);
         lk_metrics_free(e->metrics);
         free(e);
         return NULL;
@@ -511,6 +593,7 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
     if (lk_pipeline_init(&e->pipe, cfg->max_conns, cfg->conn_idle_timeout_sec * 1000000000ULL,
                          &sink)) {
         lk_proto_free(e->proto);
+        lk_selfstats_free(e->selfstats);
         lk_metrics_free(e->metrics);
         free(e);
         return NULL;
@@ -533,6 +616,7 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
         lk_recorder_close(e->rec);
         lk_pipeline_fini(&e->pipe);
         lk_proto_free(e->proto);
+        lk_selfstats_free(e->selfstats);
         lk_metrics_free(e->metrics);
         free(e);
         return NULL;
@@ -540,21 +624,16 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
     return e;
 }
 
-/* Refresh the connection metrics from the conn table and write the exposition
- * to the --dump-metrics target (task 4.3). */
+/* Write the exposition to the --dump-metrics target (task 4.3). The registered
+ * providers (task 4.4) refresh every self / connection series from its live
+ * source inside lk_metrics_dump, so there is nothing to prime here. */
 void lk_events_dump_metrics(struct lk_events *e)
 {
-    const struct lk_conn_table_stats *cs;
     FILE *f = stderr;
     bool close_f = false;
 
     if (!e->cfg.dump_metrics)
         return;
-    cs = lk_conn_table_stats(e->pipe.conns);
-    lk_metrics_set_gauge(e->metrics, "latkit_connections_active", "Connections currently tracked.",
-                         cs->active);
-    lk_metrics_set_counter(e->metrics, "latkit_connections_opened_total",
-                           "Connections opened since start.", (double)cs->created);
 
     if (e->cfg.dump_metrics_path) {
         f = fopen(e->cfg.dump_metrics_path, "w");
@@ -581,6 +660,7 @@ void lk_events_free(struct lk_events *e)
      * proto_state through the parser, which must still be alive here. */
     lk_pipeline_fini(&e->pipe);
     lk_proto_free(e->proto);
+    lk_selfstats_free(e->selfstats);
     lk_metrics_free(e->metrics);
     free(e);
 }
