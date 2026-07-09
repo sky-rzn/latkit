@@ -190,6 +190,132 @@ static size_t dump_metrics(struct lk_metrics *m, char *buf, size_t cap)
     return n;
 }
 
+/* --- task 4.5: point assertions on the aggregated metrics dump ------------
+ * The stage-3 fixtures replay into the metrics facade exactly as over live
+ * traffic; here we pin what the M2 dump must show — the invariant that
+ * observations become the expected series, and (for the loss / TLS fixtures)
+ * that nothing survives a gap: no query series at all (Р19). Point asserts
+ * rather than a golden dump: robust to incidental format churn, and they name
+ * the invariant directly. db/user are "postgres" for every query-bearing
+ * fixture (the shared prelude's startup params). */
+struct metric_expect {
+    const char *name;             /* fixture stem */
+    const char *query;            /* normalized `query` label, or NULL = no query series */
+    const char *code;             /* duration series code checked: "ok" | "error" */
+    unsigned long long dur_count; /* latkit_query_duration_seconds_count for it */
+    unsigned long long rows;      /* latkit_query_rows_total for `query` */
+    unsigned series;              /* latkit_metric_series (query-keyed series held) */
+    unsigned long long other;     /* latkit_queries_other_total */
+    const char *sqlstate;         /* NULL, or a code whose errors_total must be 1 */
+};
+
+static const struct metric_expect metric_expects[] = {
+    {"simple_query", "select ?", "ok", 1, 1, 1, 0, NULL},
+    {"error", "select ? / ?", "error", 1, 0, 1, 0, "22012"},
+    {"multi_statement", "select ? ; select ?", "ok", 1, 3, 1, 0, NULL},
+    {"cancel", NULL, NULL, 0, 0, 0, 0, NULL},
+    {"extended", "select ?", "ok", 1, 1, 1, 0, NULL},
+    {"prepared", "select ?", "ok", 2, 2, 1, 0, NULL},
+    /* pipelined batch: unit 1 ok, unit 2 errors, unit 3 aborted -> two series
+     * ("select ?" ok + error), the error counter ticks, nothing folds to other. */
+    {"pipeline_error", "select ?", "ok", 1, 1, 2, 0, "42P01"},
+    {"copy_in", "copy t from stdin", "ok", 1, 2, 1, 0, NULL},
+    {"copy_out", "copy t to stdout", "ok", 1, 2, 1, 0, NULL},
+    /* Р19: a lost-event gap dirties the connection; no observation survives it,
+     * so the dump carries no query series at all. */
+    {"session_gap", NULL, NULL, 0, 0, 0, 0, NULL},
+    /* NO_TEXT (Bind on an un-Parsed name): honest latency under query="other". */
+    {"bind_unknown", "other", "ok", 1, 5, 1, 1, NULL},
+    {"ssl_plain", "select ?", "ok", 1, 1, 1, 0, NULL},
+    {"ssl_tls", NULL, NULL, 0, 0, 0, 0, NULL},
+    {"synthetic_midsession", NULL, NULL, 0, 0, 0, 0, NULL},
+};
+
+/* Numeric value on the dump line that begins (at column 0) with `prefix` and is
+ * followed by a space. Returns 1 and sets *out, or 0 if no such line exists. */
+static int dump_line_val(const char *buf, const char *prefix, double *out)
+{
+    size_t plen = strlen(prefix);
+    const char *p = buf;
+
+    while ((p = strstr(p, prefix))) {
+        if ((p == buf || p[-1] == '\n') && p[plen] == ' ') {
+            *out = strtod(p + plen + 1, NULL);
+            return 1;
+        }
+        p += plen;
+    }
+    return 0;
+}
+
+/* Assert one dump line's value equals `want` (the line must be present). */
+static int check_line(const char *fixname, const char *buf, const char *prefix,
+                      unsigned long long want)
+{
+    double v;
+
+    if (!dump_line_val(buf, prefix, &v)) {
+        fprintf(stderr, "FAIL %s: metrics dump missing line \"%s ...\"\n", fixname, prefix);
+        return 1;
+    }
+    if ((unsigned long long)v != want) {
+        fprintf(stderr, "FAIL %s: \"%s\" = %llu, expected %llu\n", fixname, prefix,
+                (unsigned long long)v, want);
+        return 1;
+    }
+    return 0;
+}
+
+/* Assert the dump has no line beginning with `prefix` (used to prove no query
+ * series exist for the loss / TLS fixtures). */
+static int check_absent(const char *fixname, const char *buf, const char *prefix)
+{
+    double v;
+
+    if (dump_line_val(buf, prefix, &v)) {
+        fprintf(stderr, "FAIL %s: metrics dump has unexpected \"%s\" = %g\n", fixname, prefix, v);
+        return 1;
+    }
+    return 0;
+}
+
+static int check_metrics(const struct metric_expect *e, const char *buf)
+{
+    char pfx[512];
+
+    if (check_line(e->name, buf, "latkit_metric_series", e->series) ||
+        check_line(e->name, buf, "latkit_queries_other_total", e->other))
+        return 1;
+
+    if (e->query) {
+        snprintf(pfx, sizeof(pfx),
+                 "latkit_query_duration_seconds_count{query=\"%s\",db=\"postgres\","
+                 "user=\"postgres\",code=\"%s\"}",
+                 e->query, e->code);
+        if (check_line(e->name, buf, pfx, e->dur_count))
+            return 1;
+        snprintf(pfx, sizeof(pfx),
+                 "latkit_query_rows_total{query=\"%s\",db=\"postgres\",user=\"postgres\"}",
+                 e->query);
+        if (check_line(e->name, buf, pfx, e->rows))
+            return 1;
+    } else {
+        /* No observation survived: the query-keyed families must be empty. */
+        if (check_absent(e->name, buf, "latkit_query_duration_seconds_count") ||
+            check_absent(e->name, buf, "latkit_query_rows_total"))
+            return 1;
+    }
+
+    if (e->sqlstate) {
+        snprintf(pfx, sizeof(pfx),
+                 "latkit_query_errors_total{sqlstate=\"%s\",db=\"postgres\",user=\"postgres\"}",
+                 e->sqlstate);
+        if (check_line(e->name, buf, pfx, 1))
+            return 1;
+    }
+    return 0;
+}
+
 static int run_fixture(const struct fixture *fix)
 {
     struct fx x;
@@ -361,6 +487,15 @@ static int run_fixture(const struct fixture *fix)
             fprintf(stderr, "FAIL %s: metrics dump not deterministic\n", fix->name);
             goto fail;
         }
+
+        /* Task 4.5: pin the aggregated series values against the expectation
+         * table (the M2 invariant, and Р19 for the loss fixtures). */
+        for (size_t k = 0; k < sizeof(metric_expects) / sizeof(metric_expects[0]); k++)
+            if (!strcmp(metric_expects[k].name, fix->name)) {
+                if (check_metrics(&metric_expects[k], a))
+                    goto fail;
+                break;
+            }
     }
 
     /* Tear the table down first (its destroy hooks free proto_state through the

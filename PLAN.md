@@ -67,10 +67,8 @@ latkit/
 │   │   ├── events.c            # чтение ringbuf, диспетчеризация
 │   │   ├── conn_table.c        # таблица соединений, LRU, таймауты
 │   │   ├── reassembly.c        # сборка потока сообщений из фрагментов
-│   │   ├── normalize.c         # фингерпринт SQL (литералы → $N)
-│   │   ├── metrics.c           # гистограммы, счётчики, top-N
-│   │   ├── prom.c              # HTTP /metrics
-│   │   └── otlp.c              # экспорт OTLP
+│   │   ├── prom.c              # HTTP /metrics (этап 5)
+│   │   └── otlp.c              # экспорт OTLP (этап 5)
 │   ├── proto/                  # код протоколов, единый API «ядро↔обработчик»
 │   │   ├── proto.h             # оба контракта: вниз lk_msg_sink, вверх lk_query_sink
 │   │   └── pg/                 # обработчик PostgreSQL v3 (был agent/pgproto.c)
@@ -79,6 +77,13 @@ latkit/
 │   │       ├── pg_query.c      # фазовая машина, in-flight очередь, тайминги
 │   │       ├── pg_prep.c       # кэш prepared statements
 │   │       └── pg_wire.h       # bounded cursor (недоверенный вход)
+│   ├── norm/                   # нормализатор SQL (этап 4, было agent/normalize.c)
+│   │   └── norm_sql.c/.h       # однопроходный лексер + XXH3-64 fingerprint
+│   ├── metrics/                # метрики (этап 4, было agent/metrics.c)
+│   │   ├── metrics.c/.h        # фасад, aggregator (lk_query_sink), провайдеры, dump
+│   │   ├── registry.c/.h       # реестр рядов, top-K LRU, doorkeeper, other
+│   │   ├── hist.c/.h           # экспоненциальная гистограмма (schema=2)
+│   │   └── selfstats.c/.h      # process_* (getrusage, /proc/self)
 │   └── common/                 # лог, конфиг, утилиты
 ├── tests/
 │   ├── unit/                   # парсер, нормализация, reassembly
@@ -123,16 +128,17 @@ latkit/
 - [x] Крайние случаи: COPY-режим, длинные запросы (обрезанные по бюджету захвата — фингерпринт по префиксу с пометкой), multi-statement `Q` (`select 1; select 2`), отмена запроса (CancelRequest — отдельное соединение).
 - [x] Unit-тесты на дампах: детерминированные фикстуры из `tests/replay/fixtures_gen.c` (`tests/fixtures/*.lkt`); покрыты simple, extended, pipeline, ошибки, COPY, multi-statement, cancel, обрыв соединения; fuzz-харнесс `bytes → lk_msg → парсер` (`tests/fuzz`, ASAN/UBSAN).
 
-### Этап 4 — нормализация запросов и метрики (~1 неделя)
-- [ ] Нормализация SQL (как pg_stat_statements, но без парсера PG): лексер-токенизатор — литералы/числа → `?`, схлопывание списков `IN (...)`, нижний регистр ключевых слов, схлопывание whitespace; fingerprint = 64-bit hash (xxhash).
-- [ ] Контроль кардинальности: LRU top-K нормализованных запросов (конфигурируемый K, по умолчанию ~500), остальное — в bucket `other`. Это критично для Prometheus.
-- [ ] Метрики (нативные гистограммы + классические бакеты, лог-шкала 0.1ms…60s):
-  - `latkit_query_duration_seconds{query, db, user, code}` — histogram;
+### Этап 4 — нормализация запросов и метрики (~1 неделя) — детализация в [STAGE4.md](STAGE4.md), заметки [docs/notes-metrics.md](docs/notes-metrics.md)
+- [x] Нормализация SQL (как pg_stat_statements, но без парсера PG): лексер-токенизатор — литералы/числа → `?`, схлопывание списков `IN (...)`, нижний регистр ключевых слов, схлопывание whitespace; fingerprint = 64-bit hash (xxhash). → `src/norm/`, `$N` тоже сворачивается в `?` (осознанное отклонение, Р22).
+- [x] Контроль кардинальности: LRU top-K нормализованных запросов (конфигурируемый K, по умолчанию 500), остальное — в bucket `other`; плюс doorkeeper (допуск со 2-го появления) и лимиты на `(db,user)` и SQLSTATE (Р23). Это критично для Prometheus.
+- [x] Метрики (нативные гистограммы + классические бакеты, лог-шкала 0.1ms…60s, `src/metrics/`):
+  - `latkit_query_duration_seconds{query, db, user, code}` — histogram (`code`=ok|error, Р23);
   - `latkit_query_rows_total`, `latkit_queries_total`, `latkit_query_errors_total{sqlstate}`;
   - `latkit_connections_active`, `latkit_connections_opened_total`;
-  - `latkit_txn_duration_seconds` (по статусу из `ReadyForQuery`: I/T/E);
-  - self-метрики: `latkit_ringbuf_dropped_total`, `latkit_parse_errors_total`, `latkit_resync_total`, CPU/mem агента.
-- [ ] Лейбл `query` — нормализованный текст, усечённый до N символов; полный текст — только в OTel-спаны/exemplars (не в Prometheus).
+  - `latkit_txn_duration_seconds` (по статусу из `ReadyForQuery`: T→I ok / E→I aborted);
+  - self-метрики через провайдеры (Р27): `latkit_ringbuf_dropped_total`, `latkit_parse_errors_total`, `latkit_resync_total`, `latkit_queries_dropped_total{reason}`, `process_*` (CPU/mem агента).
+- [x] Лейбл `query` — нормализованный текст, усечённый до N символов (`--query-label-len`); полный текст — только в OTel-спаны/exemplars (этап 5), не в Prometheus.
+- [x] Валидация M2: replay-ассерты по дампу для каждой фикстуры этапа 3 (число рядов, count/sum, ноль наблюдений через разрыв — Р19); стресс кардинальности (`test_cardinality_ceiling`); дамп — валидный exposition (`--dump-metrics`, промтул/ручная проверка).
 
 ### Этап 5 — экспортеры (~1 неделя)
 - [ ] Prometheus: HTTP-сервер `/metrics` (text format), `/healthz`; сериализация гистограмм; exemplars (trace_id) — опционально.
@@ -173,8 +179,8 @@ latkit/
 
 ## 6. Вехи
 
-- **M1 (конец этапа 1):** сырой захват PG-трафика стабилен, потери учитываются.
-- **M2 (конец этапа 4):** `psql`/pgbench-нагрузка → корректные latency-гистограммы по нормализованным запросам (plaintext).
+- **M1 (конец этапа 1):** сырой захват PG-трафика стабилен, потери учитываются. ✅
+- **M2 (конец этапа 4):** `psql`/pgbench-нагрузка → корректные latency-гистограммы по нормализованным запросам (plaintext). ✅ — дамп реестра (`--dump-metrics`) — валидный Prometheus text exposition; имена рядов зафиксированы как публичный API (см. [docs/notes-metrics.md](docs/notes-metrics.md)).
 - **M3 (конец этапа 5):** метрики в Prometheus и OTel Collector, читаются Grafana.
 - **v1.0 (конец этапа 8):** TLS, демо-стек, дашборды, подтверждённый overhead <3%, документация.
 

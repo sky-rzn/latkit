@@ -6,22 +6,28 @@ protocol into per-query latency metrics exported to Prometheus and
 OpenTelemetry. No backend of its own — Grafana reads the data from
 Prometheus / an OTel-compatible store.
 
-**Status: capture layer done (milestone M1); framing + PostgreSQL v3 parser in
-place.** The agent attaches to a live kernel, captures both directions of
-traffic on configured server ports as a stream of connection-scoped events,
-accounts for every lost event, and survives overload without touching the
-database. On top of that it runs the stage-2 userspace pipeline (an epoll event
-loop, a connection table, and a streaming framer that reassembles the event
-stream into whole PostgreSQL v3 messages) and the stage-3 protocol handler,
-which turns those messages into protocol-independent **query observations** —
-timings, the SQL-text prefix, row counts, SQLSTATE, and session labels — for
-simple, extended (prepared / pipelined) and COPY traffic, honestly dropping
-anything that spans a loss. Query normalisation, metrics and exporters are the
-next stages — see [PLAN.md](PLAN.md) (Russian) for the roadmap,
+**Status: capture, framing, parser, and metrics done (milestones M1 + M2).**
+The agent attaches to a live kernel, captures both directions of traffic on
+configured server ports as a stream of connection-scoped events, accounts for
+every lost event, and survives overload without touching the database. On top of
+that it runs the stage-2 userspace pipeline (an epoll event loop, a connection
+table, and a streaming framer that reassembles the event stream into whole
+PostgreSQL v3 messages) and the stage-3 protocol handler, which turns those
+messages into protocol-independent **query observations** — timings, the
+SQL-text prefix, row counts, SQLSTATE, and session labels — for simple, extended
+(prepared / pipelined) and COPY traffic, honestly dropping anything that spans a
+loss. Stage 4 aggregates those observations into a bounded set of Prometheus
+series: it normalises the SQL to a fingerprint (literals → `?`, à la
+`pg_stat_statements` but lexer-only), keeps latency histograms under a top-K
+cardinality cap, and exposes them plus agent self-metrics as a valid Prometheus
+text exposition (`--dump-metrics`). Serving that over HTTP `/metrics` and OTLP is
+the next stage — see [PLAN.md](PLAN.md) (Russian) for the roadmap,
 [STAGE1.md](STAGE1.md) for the capture-layer decisions, [STAGE2.md](STAGE2.md) /
-[docs/notes-reassembly.md](docs/notes-reassembly.md) for the framing model, and
+[docs/notes-reassembly.md](docs/notes-reassembly.md) for the framing model,
 [STAGE3.md](STAGE3.md) / [docs/notes-pgproto.md](docs/notes-pgproto.md) for the
-parser (phase machine, message table, timing model, blind spots).
+parser, and [STAGE4.md](STAGE4.md) / [docs/notes-metrics.md](docs/notes-metrics.md)
+for normalisation, the metric nomenclature, the duration model, and cardinality
+control.
 
 ## How it works
 
@@ -96,7 +102,11 @@ sudo ./build/latkit                    # captures local port 5432
 | `--record FILE` | off | append every raw ringbuf record to FILE for offline replay (LKT1 trace) |
 | `--events` | off | print one line per raw ringbuf event (the stage-1 output) |
 | `--messages` | off | print one line per reassembled protocol message |
-| `--queries` | off | print one line per session and per parsed query observation |
+| `--queries` | off | print one line per session and per parsed query observation (debug tee before the aggregator) |
+| `--top-queries N` | 500 | distinct normalised queries tracked before the rest fold into `query="other"` |
+| `--query-label-len N` | 256 | max chars of the normalised text kept as the `query` label |
+| `--first-row-hist` | off | also record `latkit_query_first_row_seconds` (doubles the query-labelled series) |
+| `--dump-metrics[=FILE]` | off | write the Prometheus exposition on `SIGUSR1` and at exit, to FILE (default: stderr) |
 | `-x, --hexdump` | off | dump event payload (`--events`) and the captured message body prefix (`--messages`) |
 
 Dev environment (PostgreSQL 16 in docker + pgbench load):
@@ -142,6 +152,39 @@ ts_start`; a pipelined batch shares one `ReadyForQuery`, so this per-unit span i
 more honest than `ts_ready − ts_start`. The full rationale and the parser's blind
 spots (query cut off by a disconnect, `NO_TEXT`, TLS) are in
 [docs/notes-pgproto.md](docs/notes-pgproto.md).
+
+### Metrics (`--dump-metrics`)
+
+`--dump-metrics[=FILE]` writes a Prometheus text exposition on `SIGUSR1` and at
+exit — the aggregated form of the query observations, and the seam stage 5 wraps
+in HTTP `/metrics` unchanged. Each observation is normalised to a fingerprint,
+histogrammed by latency, and bounded by a top-K cardinality cap; agent
+self-metrics (ringbuf drops, resyncs, parser errors, CPU/RSS) come through the
+same dump. Send `kill -USR1 $(pidof latkit)` to sample it live.
+
+```
+# HELP latkit_query_duration_seconds Server-side query latency in seconds.
+# TYPE latkit_query_duration_seconds histogram
+latkit_query_duration_seconds_bucket{query="select ?",db="latkit",user="latkit",code="ok",le="0.0001220703125"} 165292
+...
+latkit_query_duration_seconds_bucket{query="select ?",db="latkit",user="latkit",code="ok",le="+Inf"} 165343
+latkit_query_duration_seconds_sum{query="select ?",db="latkit",user="latkit",code="ok"} 23.71
+latkit_query_duration_seconds_count{query="select ?",db="latkit",user="latkit",code="ok"} 165343
+latkit_queries_total{db="latkit",user="latkit",kind="extended",code="ok"} 596799
+latkit_query_errors_total{sqlstate="22012",db="latkit",user="latkit"} 3
+latkit_metric_series 7
+```
+
+The `le` boundaries are exact powers of two, so they read as "un-round" decimals
+(`0.0001220703125` = 2⁻¹³) — this is deliberate; see
+[docs/notes-metrics.md](docs/notes-metrics.md) for the grid, the full series
+nomenclature, the duration model, and the top-K / `other` behaviour.
+
+**Security.** The agent sees SQL text, but literal masking is on by default and
+by construction: normalisation turns every string and numeric literal into `?`
+before it can reach a metric label, and raw SQL never enters the registry — only
+the normalised, masked prefix does. Full SQL is available only to stage-5 OTel
+spans/exemplars, opt-in.
 
 ## Known limitations (v1 scope)
 
