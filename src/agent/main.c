@@ -23,6 +23,7 @@
 #include "metrics.h"
 #include "otel_env.h"
 #include "spans.h"
+#include "tls_attach.h"
 
 #define LK_OTLP_MAX_KV 32 /* --otlp-header / --otlp-resource entries accepted */
 
@@ -56,6 +57,8 @@ static double opt_otlp_span_ratio;   /* --otlp-spans RATIO; 0 = off */
 static __u64 opt_otlp_span_slow_ms;  /* --otlp-spans-slow-ms; 0 = off */
 static __u64 opt_otlp_span_text_max; /* --otlp-span-text-max; 0 = default */
 static bool opt_otlp_span_masked;
+static enum lk_tls_mode opt_tls_mode = LK_TLS_OFF; /* --tls; default off in stage 6.1 */
+static const char *opt_libssl;                     /* --libssl PATH: explicit uprobe target */
 /* Env-derived header/resource arrays (freed at exit for ASAN cleanliness). */
 static char **env_headers, **env_resource;
 static int env_nheaders, env_nresource;
@@ -134,6 +137,11 @@ static void usage(const char *argv0)
             "      --otlp-span-masked\n"
             "                        send the normalised (literal-free) SQL as\n"
             "                        db.query.text instead of the raw text\n"
+            "      --tls auto|off    capture TLS plaintext via libssl uprobes\n"
+            "                        (default: off). 'auto' scans for libssl in\n"
+            "                        stage 6.3; for now use --libssl.\n"
+            "      --libssl PATH     attach the SSL_* uprobes to this libssl,\n"
+            "                        skipping the scan (e.g. a container's copy)\n"
             "      --print-config    resolve config (flag > LATKIT_* env > default)\n"
             "                        to stdout and exit; every flag has a LATKIT_*\n"
             "                        env equivalent (see README)\n"
@@ -185,6 +193,8 @@ enum {
     OPT_OTLP_SPANS_SLOW_MS,
     OPT_OTLP_SPAN_TEXT_MAX,
     OPT_OTLP_SPAN_MASKED,
+    OPT_TLS,
+    OPT_LIBSSL,
     OPT_PRINT_CONFIG,
 };
 
@@ -342,6 +352,19 @@ static int set_option(int c, char *optarg)
     case OPT_OTLP_SPAN_MASKED:
         opt_otlp_span_masked = true;
         break;
+    case OPT_TLS:
+        if (!strcmp(optarg, "off"))
+            opt_tls_mode = LK_TLS_OFF;
+        else if (!strcmp(optarg, "auto"))
+            opt_tls_mode = LK_TLS_AUTO;
+        else {
+            fprintf(stderr, "--tls: expected 'auto' or 'off', got '%s'\n", optarg);
+            return -1;
+        }
+        break;
+    case OPT_LIBSSL:
+        opt_libssl = optarg;
+        break;
     case 'x':
         opt_hexdump = true;
         break;
@@ -401,6 +424,8 @@ static const struct env_opt env_opts[] = {
     {"LATKIT_OTLP_SPANS_SLOW_MS", OPT_OTLP_SPANS_SLOW_MS, true, false},
     {"LATKIT_OTLP_SPAN_TEXT_MAX", OPT_OTLP_SPAN_TEXT_MAX, true, false},
     {"LATKIT_OTLP_SPAN_MASKED", OPT_OTLP_SPAN_MASKED, false, false},
+    {"LATKIT_TLS", OPT_TLS, true, false},
+    {"LATKIT_LIBSSL", OPT_LIBSSL, true, false},
 };
 
 /* Apply LATKIT_* env variables to flags not given on the CLI (Р34): flag > env
@@ -476,6 +501,8 @@ static int parse_args(int argc, char **argv)
         {"otlp-spans-slow-ms", required_argument, NULL, OPT_OTLP_SPANS_SLOW_MS},
         {"otlp-span-text-max", required_argument, NULL, OPT_OTLP_SPAN_TEXT_MAX},
         {"otlp-span-masked", no_argument, NULL, OPT_OTLP_SPAN_MASKED},
+        {"tls", required_argument, NULL, OPT_TLS},
+        {"libssl", required_argument, NULL, OPT_LIBSSL},
         {"print-config", no_argument, NULL, OPT_PRINT_CONFIG},
         {"hexdump", no_argument, NULL, 'x'},
         {},
@@ -578,6 +605,8 @@ static void print_config(void)
            (unsigned long long)(opt_otlp_span_text_max ? opt_otlp_span_text_max
                                                        : LK_SPAN_TEXT_MAX_DEF));
     printf("otlp_span_masked=%d\n", opt_otlp_span_masked);
+    printf("tls=%s\n", opt_tls_mode == LK_TLS_AUTO ? "auto" : "off");
+    printf("libssl=%s\n", opt_libssl ? opt_libssl : "");
 }
 
 /* The `ports` map exists only after load; attach happens after this, so the
@@ -603,6 +632,7 @@ int main(int argc, char **argv)
     struct lk_events *events = NULL;
     struct lk_loop *loop = NULL;
     struct latkit_bpf *skel;
+    struct lk_tls *tls = NULL;
     int err;
 
     if (parse_args(argc, argv))
@@ -634,6 +664,21 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
+    /* Decide autoload of the SSL_* uprobe programs before load (Р39): with no
+     * libssl to attach, they are dropped from the load entirely. */
+    struct lk_tls_cfg tlscfg = {
+        .mode = opt_tls_mode,
+        .libssl_override = opt_libssl,
+        .comm_filter = NULL, /* --tls-comm: stage 6.3 */
+        .rescan_sec = 0,     /* rescan: stage 6.3 */
+    };
+
+    tls = lk_tls_new(skel, &tlscfg);
+    if (!tls) {
+        err = -1;
+        goto cleanup;
+    }
+
     err = latkit_bpf__load(skel);
     if (err) {
         fprintf(stderr, "failed to load BPF skeleton: %d\n", err);
@@ -649,6 +694,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "failed to attach BPF programs: %d\n", err);
         goto cleanup;
     }
+
+    /* Attach the TLS uprobes after the core programs; a missing libssl is a
+     * soft none, not a startup failure (Р39). */
+    err = lk_tls_attach(tls);
+    if (err)
+        goto cleanup;
 
     struct lk_events_cfg ecfg = {
         .ringbuf = skel->maps.events,
@@ -714,6 +765,7 @@ cleanup:
      * listen and client fds from the loop as it tears down. */
     lk_events_free(events);
     lk_loop_free(loop);
+    lk_tls_free(tls); /* detach uprobe links before the skeleton owning them */
     latkit_bpf__destroy(skel);
     lk_free_pairs(env_headers, env_nheaders);
     lk_free_pairs(env_resource, env_nresource);

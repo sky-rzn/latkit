@@ -108,8 +108,13 @@ set(SKEL_H ${CMAKE_CURRENT_BINARY_DIR}/latkit.skel.h)
 
 add_custom_command(OUTPUT ${BPF_OBJ}
     # -mcpu=v3: atomic fetch-add (per-conn seq) needs BPF_ATOMIC ops, kernel >= 5.12.
+    # -fms-extensions + -Wno-microsoft-anon-tag: kernels built with GCC's Plan 9
+    # anonymous tagged members (e.g. `struct aes_enckey;` inside struct aes_key)
+    # dump into vmlinux.h as tagged anonymous members; -fms-extensions is clang's
+    # equivalent that keeps them as real embedded members (correct layout), the
+    # -Wno silences the "Microsoft extension" note that -Werror would fail on.
     COMMAND ${CLANG_BPF} -g -O2 -target bpf -mcpu=v3 -D__TARGET_ARCH_${BPF_ARCH}
-            -Wall -Werror
+            -Wall -Werror -fms-extensions -Wno-microsoft-anon-tag
             -I${VMLINUX_INCLUDE_DIR} -I${CMAKE_CURRENT_SOURCE_DIR}/src/bpf
             -I${LIBBPF_INCLUDE_DIR}
             -c ${BPF_SRC} -o ${BPF_OBJ}
@@ -186,7 +191,8 @@ target_link_libraries(latkit_export PUBLIC latkit_metrics latkit_norm)
 # --- agent -----------------------------------------------------------------
 add_executable(latkit src/agent/main.c src/agent/loop.c src/agent/events.c
                src/agent/decode.c src/agent/conn_table.c src/agent/reassembly.c
-               src/agent/pipeline.c src/agent/record.c src/common/otel_env.c)
+               src/agent/pipeline.c src/agent/record.c src/agent/tls_attach.c
+               src/common/otel_env.c)
 add_dependencies(latkit latkit_skel)
 set_source_files_properties(src/agent/main.c PROPERTIES OBJECT_DEPENDS ${SKEL_H})
 target_include_directories(latkit PRIVATE

@@ -653,3 +653,291 @@ int BPF_PROG(lk_tcp_recvmsg_exit, struct sock *sk, struct msghdr *msg, size_t le
     bpf_map_delete_elem(&recv_state, &pid_tgid);
     return 0;
 }
+
+/* ------------------------------------------------------------------------- *
+ * TLS plaintext channel (stage 6, Р35): uprobes on libssl SSL_read/SSL_write
+ * (and the _ex variants). The library boundary is where the application buffer
+ * is still/already decrypted; we capture it there and feed the very same
+ * lk_ev_data records (with LK_F_DECRYPTED) into the pipeline, so the framer and
+ * PG parser never learn the stream was encrypted.
+ *
+ * Entry saves {ssl, buf, written_ptr} keyed by pid_tgid; the return probe reads
+ * the real byte count (ret for the classic calls, *written for _ex) and, on a
+ * positive length, copies the buffer out. postgres backends are single-threaded
+ * per connection and never nest SSL_read/SSL_write, so pid_tgid uniquely keys
+ * the in-flight call.
+ *
+ * Correlating SSL* to a socket cookie is stage 6.2; here cookie stays 0 and the
+ * decrypted events are only meaningful for --events/--hexdump inspection. The
+ * per-cookie seq lives in tls_seq (its own space, Р38), independent of the
+ * socket path's conns.seq. Attach lifecycle and comm/path selection live in
+ * userspace (tls_attach.c); these programs auto-attach nothing. */
+
+/* In-flight SSL_write/SSL_read arguments, saved on entry, consumed on return.
+ * written_ptr is the _ex out-param (userspace size_t*), 0 for the classic
+ * calls. Split wr/rd maps because a thread can have one of each in flight and
+ * the two return probes must not collide on the pid_tgid key. */
+struct lk_ssl_call {
+    __u64 ssl;
+    __u64 buf;
+    __u64 written_ptr;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64); /* pid_tgid */
+    __type(value, struct lk_ssl_call);
+} active_ssl_wr SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64); /* pid_tgid */
+    __type(value, struct lk_ssl_call);
+} active_ssl_rd SEC(".maps");
+
+/* Per-connection seq space of the decrypted channel (Р38), key = socket cookie.
+ * Kept apart from conns.seq: ciphertext socket events are dropped in userspace
+ * for a TLS connection, so mixing the two seq spaces would fake holes. LRU so a
+ * missed cleanup ages out. Cookie is 0 until the stage-6.2 bridge lands. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);
+    __type(value, __u32);
+} tls_seq SEC(".maps");
+
+/* Next decrypted-channel seq for this cookie, lazily starting the counter at 0.
+ * Like conns.seq, consumed before the reserve so a lost event leaves a hole. */
+static __always_inline __u32 tls_next_seq(__u64 cookie)
+{
+    __u32 *s = bpf_map_lookup_elem(&tls_seq, &cookie);
+    __u32 init = 0;
+
+    if (!s) {
+        bpf_map_update_elem(&tls_seq, &cookie, &init, BPF_NOEXIST);
+        s = bpf_map_lookup_elem(&tls_seq, &cookie);
+        if (!s)
+            return 0;
+    }
+    return __sync_fetch_and_add(s, 1);
+}
+
+/* Emit one decrypted chunk of the compile-constant size class `chunk_sz`. The
+ * decrypted buffer is one contiguous userspace pointer (no iov_iter), so the
+ * copy is a single bpf_probe_read_user at a constant destination offset — the
+ * same verifier-friendly shape as emit_chunk, minus the segment machinery and
+ * the per-conn loss/gap tracking (no conn_state on this path yet, stage 6.2).
+ * Returns bytes captured; 0 on a failed user read (event still submitted);
+ * -1 when reserve failed. */
+static __always_inline int emit_ssl_chunk(__u64 cookie, __u8 dir, __u32 total_len, __u32 off,
+                                          __u64 base, __u64 cap, __u16 flags, __u32 chunk_sz)
+{
+    struct lk_ev_data *ev;
+    __u32 seq = tls_next_seq(cookie);
+
+    ev = bpf_ringbuf_reserve(&events, sizeof(*ev) + chunk_sz, 0);
+    if (!ev) {
+        stat_add(LK_ST_TLS_RESERVE_FAIL, 1);
+        return -1;
+    }
+
+    ev->hdr.conn_id = cookie;
+    ev->hdr.ts_ns = bpf_ktime_get_ns();
+    ev->hdr.seq = seq;
+    ev->hdr.type = LK_EV_DATA;
+    ev->hdr.dir = dir;
+    ev->total_len = total_len;
+    ev->off = off;
+    ev->_pad = 0;
+
+    /* Same 64-bit clamp + barrier_var dance as emit_chunk: keep the bound the
+     * verifier propagates to bpf_probe_read_user pinned to one register. */
+    if (cap > chunk_sz)
+        cap = chunk_sz;
+    barrier_var(cap);
+    if (cap == 0 || base == 0)
+        cap = 0;
+    else if (bpf_probe_read_user(ev->payload, cap, (const void *)base))
+        cap = 0; /* unmapped or paged-out user page */
+    if (cap == 0 && total_len > 0)
+        flags |= LK_F_TRUNC;
+    ev->cap_len = cap;
+    ev->hdr.flags = flags | LK_F_DECRYPTED;
+
+    bpf_ringbuf_submit(ev, 0);
+    stat_add(LK_ST_EVENTS, 1);
+    stat_add(LK_ST_TLS_UPROBE_EVENTS, 1);
+    stat_add(LK_ST_TLS_DECRYPTED_BYTES, cap);
+    return cap;
+}
+
+/* Emit the decrypted buffer of one SSL_read/SSL_write call as a chain of data
+ * events sharing total_len, with increasing off and consecutive seq — the
+ * decrypted twin of emit_data_chunks. The buffer is contiguous, so the chain is
+ * a straight walk by offset; the --capture-limit budget is applied (never the
+ * HEADERS capmode — that governs the ciphertext socket path, the plaintext must
+ * stay full for the parser, Р40). The per-CPU cursor holds the loop-carried
+ * state exactly as emit_data_chunks needs it for the verifier. */
+static __always_inline void emit_ssl_data(__u64 cookie, __u8 dir, __u32 total_len, __u64 buf)
+{
+    __u32 zero = 0, budget;
+    struct lk_cursor *cur;
+    __u16 flags = 0;
+
+    stat_add(LK_ST_BYTES_TOTAL, total_len);
+
+    budget = cfg_capture_limit;
+    if (budget > total_len)
+        budget = total_len;
+    if (budget < total_len)
+        flags = LK_F_TRUNC;
+
+    if (budget == 0) {
+        /* Zero-length capture: still emit one empty event so total_len stays
+         * honest (a ret>0 call always has total_len>0 here, but keep parity). */
+        emit_ssl_chunk(cookie, dir, total_len, 0, 0, 0, flags, LK_CHUNK_SMALL);
+        return;
+    }
+
+    cur = bpf_map_lookup_elem(&cursor, &zero);
+    if (!cur)
+        return;
+    if (__sync_lock_test_and_set(&cur->busy, 1)) {
+        /* Preempted another chain on this CPU: degrade to a single event. */
+        emit_ssl_chunk(cookie, dir, total_len, 0, 0, 0,
+                       total_len ? LK_F_TRUNC : flags, LK_CHUNK_SMALL);
+        return;
+    }
+    ONCE(cur->pos) = 0;
+    ONCE(cur->budget) = budget;
+
+    for (__u32 c = 0; c < LK_MAX_CHUNKS; c++) {
+        __u64 base, cap;
+        __u32 pos;
+        int done;
+
+        budget = ONCE(cur->budget);
+        pos = ONCE(cur->pos);
+        if (budget == 0)
+            break;
+        cap = budget;
+        if (cap > LK_CHUNK_FULL)
+            cap = LK_CHUNK_FULL;
+        base = buf + pos;
+
+        if (cap <= LK_CHUNK_SMALL)
+            done = emit_ssl_chunk(cookie, dir, total_len, pos, base, cap, flags, LK_CHUNK_SMALL);
+        else
+            done = emit_ssl_chunk(cookie, dir, total_len, pos, base, cap, flags, LK_CHUNK_FULL);
+        if (done <= 0)
+            break;
+        ONCE(cur->pos) = pos + done;
+        ONCE(cur->budget) = budget - done;
+    }
+
+    ONCE(cur->busy) = 0;
+}
+
+/* Entry: stash the call arguments for the matching return probe. comm-filtered
+ * (same cfg_comm_filter as the socket path) so attaching on pid=-1 does not turn
+ * every libssl user on the host into events. */
+static __always_inline int ssl_entry(void *active_map, __u64 ssl, __u64 buf, __u64 written_ptr)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct lk_ssl_call call = {.ssl = ssl, .buf = buf, .written_ptr = written_ptr};
+
+    if (!comm_allowed())
+        return 0;
+    bpf_map_update_elem(active_map, &id, &call, BPF_ANY);
+    return 0;
+}
+
+/* Return: recover the saved buffer, resolve the real length (ret for the
+ * classic calls, *written for _ex) and emit it. ret <= 0 (WANT_READ/WRITE,
+ * error, EOF) yields nothing (Р35). The entry is always dropped so the map
+ * cannot leak. */
+static __always_inline int ssl_ret(void *active_map, __u8 dir, long ret, int is_ex)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct lk_ssl_call *call = bpf_map_lookup_elem(active_map, &id);
+    __u64 len = 0;
+
+    if (!call)
+        return 0;
+
+    if (!is_ex) {
+        if (ret > 0)
+            len = (__u64)ret;
+    } else if (ret == 1 && call->written_ptr) {
+        __u64 written = 0;
+
+        if (bpf_probe_read_user(&written, sizeof(written), (const void *)call->written_ptr) == 0)
+            len = written;
+    }
+    if (len > 0xffffffffULL)
+        len = 0xffffffffULL; /* total_len is u32; a single SSL call never nears this */
+
+    if (len > 0)
+        emit_ssl_data(0 /* cookie: stage 6.2 bridge */, dir, (__u32)len, call->buf);
+
+    bpf_map_delete_elem(active_map, &id);
+    return 0;
+}
+
+/* SSL_write(SSL *ssl, const void *buf, int num): application plaintext handed to
+ * OpenSSL -> backend->frontend (SEND). Buffer is valid already on entry, but the
+ * count written is known only on return. */
+SEC("uprobe")
+int BPF_UPROBE(lk_ssl_write, void *ssl, void *buf, int num)
+{
+    return ssl_entry(&active_ssl_wr, (__u64)ssl, (__u64)buf, 0);
+}
+
+SEC("uretprobe")
+int BPF_URETPROBE(lk_ssl_write_ret, int ret)
+{
+    return ssl_ret(&active_ssl_wr, LK_DIR_SEND, ret, 0);
+}
+
+/* SSL_write_ex(SSL*, const void *buf, size_t num, size_t *written). */
+SEC("uprobe")
+int BPF_UPROBE(lk_ssl_write_ex, void *ssl, void *buf, __u64 num, void *written)
+{
+    return ssl_entry(&active_ssl_wr, (__u64)ssl, (__u64)buf, (__u64)written);
+}
+
+SEC("uretprobe")
+int BPF_URETPROBE(lk_ssl_write_ex_ret, int ret)
+{
+    return ssl_ret(&active_ssl_wr, LK_DIR_SEND, ret, 1);
+}
+
+/* SSL_read(SSL *ssl, void *buf, int num): OpenSSL fills buf with decrypted
+ * plaintext -> frontend->backend (RECV). buf holds garbage on entry; it is only
+ * valid at return, so the copy must happen there. */
+SEC("uprobe")
+int BPF_UPROBE(lk_ssl_read, void *ssl, void *buf, int num)
+{
+    return ssl_entry(&active_ssl_rd, (__u64)ssl, (__u64)buf, 0);
+}
+
+SEC("uretprobe")
+int BPF_URETPROBE(lk_ssl_read_ret, int ret)
+{
+    return ssl_ret(&active_ssl_rd, LK_DIR_RECV, ret, 0);
+}
+
+/* SSL_read_ex(SSL*, void *buf, size_t num, size_t *readbytes). */
+SEC("uprobe")
+int BPF_UPROBE(lk_ssl_read_ex, void *ssl, void *buf, __u64 num, void *readbytes)
+{
+    return ssl_entry(&active_ssl_rd, (__u64)ssl, (__u64)buf, (__u64)readbytes);
+}
+
+SEC("uretprobe")
+int BPF_URETPROBE(lk_ssl_read_ex_ret, int ret)
+{
+    return ssl_ret(&active_ssl_rd, LK_DIR_RECV, ret, 1);
+}

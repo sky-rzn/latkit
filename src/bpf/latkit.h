@@ -42,6 +42,11 @@ enum lk_stat_id {
     LK_ST_BYTES_CAPTURED,   /* payload bytes actually submitted */
     LK_ST_ITER_UNSUPPORTED, /* iter_snapshot rejected the iterator type */
     LK_ST_RECV_STATE_MISS,  /* fexit(tcp_recvmsg) found no fentry snapshot */
+    /* TLS uprobe channel (stage 6, Р35/Р41). */
+    LK_ST_TLS_CORR_MISS,       /* uretprobe without a known cookie (Р37; stage 6.2) */
+    LK_ST_TLS_UPROBE_EVENTS,   /* decrypted data events submitted */
+    LK_ST_TLS_DECRYPTED_BYTES, /* sum of cap_len over decrypted events */
+    LK_ST_TLS_RESERVE_FAIL,    /* bpf_ringbuf_reserve failures on the decrypted path */
     LK_ST_MAX,
 };
 
@@ -52,6 +57,9 @@ enum lk_dir { LK_DIR_SEND = 0, LK_DIR_RECV = 1 };
 #define LK_F_TRUNC (1 << 0)     /* cap_len < total_len: cut by capture budget */
 #define LK_F_GAP (1 << 1)       /* events for this conn were lost before this one */
 #define LK_F_SYNTHETIC (1 << 2) /* CONN_OPEN created lazily; startup not seen */
+#define LK_F_DECRYPTED (1 << 3) /* payload came from an SSL_* uprobe (stage 6, Р35):
+                                   plaintext of a TLS connection, framed like a
+                                   normal stream but sourced from userspace */
 
 struct lk_tuple {
     __u8 family; /* AF_INET / AF_INET6 */
