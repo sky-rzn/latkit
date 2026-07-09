@@ -1,8 +1,10 @@
 # notes — exporters (stage 5)
 
 Design notes for `src/export/`. This file grows over stage 5; task 5.1 covers
-the Prometheus pull path (the HTTP server, `/metrics`, `/healthz`). The OTLP
-push path, spans and the full config/env table land with tasks 5.2–5.4.
+the Prometheus pull path (the HTTP server, `/metrics`, `/healthz`) and task 5.2
+the OTLP/HTTP push path (protobuf writer, exponential-histogram mapping, async
+client, timebase, config/env mechanics). Spans and the full config/env table
+land with tasks 5.3–5.4.
 
 ## HTTP server (Р29, task 5.1)
 
@@ -79,3 +81,67 @@ headroom, and the top-K ceiling (Р23) bounds the series count regardless of
 workload. If this ever bites (a much larger K, or a tighter ringbuf under a
 burst), the seam for an incremental chunked dump is `lk_metrics_iter` (stage 8);
 the number above is the baseline to watch.
+
+## OTLP/HTTP push (Р31, Р33, task 5.2)
+
+The push path mirrors the pull path over the same registry — `lk_metrics_iter`
+walks the exact rows `lk_metrics_dump` prints (contract Р26/Р31), recomputing
+nothing — and serialises them straight to OTLP protobuf by hand (`pbuf.c` +
+`otlp.c`), no `opentelemetry-cpp`, no `protobuf-c`.
+
+**Wire format.** `pbuf.c` is an append-only proto3 writer: varints, tags, and
+length-delimited submessages written body-first (the length varint is inserted
+before the body with a `memmove` once the body is complete, so submessages close
+in LIFO order). Golden-byte tests (`test_pbuf`) pin the primitives; the encoder
+tests (`test_otlp_enc`) decode the output and assert the OTLP shape; the live
+Collector is the strict schema authority (it rejects malformed protobuf 400).
+
+**Mapping.** counters → `Sum{is_monotonic, cumulative}`, gauges → `Gauge`,
+histograms → `ExponentialHistogram{scale=2}`. The Р24 grid goes out **as-is**:
+`positive.offset = -53` (= `LK_HIST_MIN_INDEX`), `bucket_counts` is the flat
+77-cell array; the underflow cell becomes `zero_count` with
+`zero_threshold = 2^(-53/4)` = `lk_hist_bound(MIN)`; the overflow cell is folded
+into the **top** bucket. That last fold distorts only values ≥ `2^6` s (64 s) —
+acceptable, since the histogram's declared range tops out at 60 s. Grid index
+`k` maps to OTLP index `k` directly; the two conventions differ only at exact
+power boundaries (OTLP buckets are `(base^i, base^(i+1)]`, ours are lower-
+inclusive), which is noise next to the ~9% bucketing error the grid already
+carries.
+
+**Temporality — cumulative.** `time_unix_nano` is the export instant;
+`start_time_unix_nano` is the series' `created_ns` (added to the registry row in
+this task). A fingerprint evicted from the top-K (Р23) and later re-admitted gets
+a **new** series with a fresh `created_ns`, i.e. a new stream with a new start —
+a legal cumulative reset per the OTLP spec, never a shrinking counter. The fixed
+families (`queries_total`, `errors_total`, txn) and the flat scalars carry their
+own creation stamps too; all are captured at startup, consistent with
+`process_start_time_seconds` to within construction jitter.
+
+**Time (Р33).** Every pipeline stamp is `CLOCK_MONOTONIC` (Р13). `timebase.c`
+samples `offset = REALTIME − MONOTONIC` on **every** export tick (an NTP step
+moves REALTIME, and the offset must follow) and `lk_wall_ns(mono)` converts. A
+step between two ticks shifts absolute timestamps by ≤ the step within one
+interval; durations, being monotonic differences, are unaffected. The Prometheus
+text format carries no timestamps and must not.
+
+**Delivery.** POST `<endpoint>/v1/metrics`, `application/x-protobuf`, every
+`--otlp-interval` seconds (default 15). **No queue, no retries**: a batch that
+does not land (timeout, non-2xx, connect refused) is dropped and
+`latkit_otlp_exports_total{result="error"}` bumps — cumulative temporality makes
+the loss harmless, the next push carries full state. `429`/`503` with a
+`Retry-After` (seconds form) are honoured by pausing ticks until then. The client
+is a non-blocking state machine (connect → write → read status) in the shared
+loop with **one export in flight** — a tick arriving mid-export is skipped
+(`latkit_otlp_export_ticks_skipped_total`). `getaddrinfo` is blocking, so the
+endpoint is resolved once and cached; a connection/timeout failure marks it for
+re-resolve on the next attempt (a Collector that moves), while an HTTP error
+keeps the cache. `http://` only in v1 (a sidecar Collector is the standard OTel
+topology); `https://` is rejected with a message.
+
+**Config (Р34).** Enabled by an endpoint (`--otlp-endpoint` or
+`OTEL_EXPORTER_OTLP_ENDPOINT`). Priority flag > `LATKIT_*` > `OTEL_*` > default;
+`--otlp-header`/`--otlp-resource` (repeatable) default to
+`OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_RESOURCE_ATTRIBUTES`, and `OTEL_SERVICE_NAME`
+sets `service.name`. Resource defaults: `service.name=latkit`,
+`service.version`, `host.name`. The full `LATKIT_*` table over every flag and the
+README quickstart land in task 5.4; no YAML in v1.

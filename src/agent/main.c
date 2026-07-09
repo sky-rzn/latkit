@@ -20,6 +20,9 @@
 #include "latkit.skel.h"
 #include "loop.h"
 #include "metrics.h"
+#include "otel_env.h"
+
+#define LK_OTLP_MAX_KV 32 /* --otlp-header / --otlp-resource entries accepted */
 
 static bool opt_hexdump;
 static bool opt_cap_headers;
@@ -40,6 +43,16 @@ static bool opt_first_row_hist;
 static bool opt_dump_metrics;
 static const char *opt_dump_metrics_path;                  /* NULL = stderr */
 static const char *opt_prom_listen = LK_PROM_LISTEN_DEFAULT; /* "none" disables */
+static const char *opt_otlp_endpoint;                        /* NULL disables the OTLP exporter */
+static __u64 opt_otlp_interval;                              /* 0 = exporter default (15 s) */
+static const char *opt_otlp_headers[LK_OTLP_MAX_KV];
+static int opt_otlp_nheaders;
+static const char *opt_otlp_resource[LK_OTLP_MAX_KV];
+static int opt_otlp_nresource;
+static const char *opt_otlp_service_name;
+/* Env-derived header/resource arrays (freed at exit for ASAN cleanliness). */
+static char **env_headers, **env_resource;
+static int env_nheaders, env_nresource;
 
 static int libbpf_print(enum libbpf_print_level level, const char *fmt, va_list args)
 {
@@ -88,6 +101,17 @@ static void usage(const char *argv0)
             "                        serve Prometheus /metrics and /healthz on this\n"
             "                        address (default: %s; 'none' disables). Bind\n"
             "                        0.0.0.0 to scrape from outside the host.\n"
+            "      --otlp-endpoint URL\n"
+            "                        push OTLP/HTTP metrics to this Collector base URL\n"
+            "                        (http:// only); enables the exporter. Defaults to\n"
+            "                        $OTEL_EXPORTER_OTLP_ENDPOINT.\n"
+            "      --otlp-interval SEC\n"
+            "                        OTLP export period (default: 15)\n"
+            "      --otlp-header K=V repeatable OTLP request header (auth); defaults to\n"
+            "                        $OTEL_EXPORTER_OTLP_HEADERS\n"
+            "      --otlp-resource K=V\n"
+            "                        repeatable OTLP resource attribute; defaults to\n"
+            "                        $OTEL_RESOURCE_ATTRIBUTES\n"
             "  -x, --hexdump         dump payload of events (--events) and the\n"
             "                        captured body prefix (--messages)\n",
             argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT,
@@ -128,6 +152,10 @@ static int parse_args(int argc, char **argv)
         OPT_FIRST_ROW_HIST,
         OPT_DUMP_METRICS,
         OPT_PROM_LISTEN,
+        OPT_OTLP_ENDPOINT,
+        OPT_OTLP_INTERVAL,
+        OPT_OTLP_HEADER,
+        OPT_OTLP_RESOURCE,
     };
     static const struct option opts[] = {
         {"port", required_argument, NULL, 'p'},
@@ -146,6 +174,10 @@ static int parse_args(int argc, char **argv)
         {"first-row-hist", no_argument, NULL, OPT_FIRST_ROW_HIST},
         {"dump-metrics", optional_argument, NULL, OPT_DUMP_METRICS},
         {"prom-listen", required_argument, NULL, OPT_PROM_LISTEN},
+        {"otlp-endpoint", required_argument, NULL, OPT_OTLP_ENDPOINT},
+        {"otlp-interval", required_argument, NULL, OPT_OTLP_INTERVAL},
+        {"otlp-header", required_argument, NULL, OPT_OTLP_HEADER},
+        {"otlp-resource", required_argument, NULL, OPT_OTLP_RESOURCE},
         {"hexdump", no_argument, NULL, 'x'},
         {},
     };
@@ -247,6 +279,30 @@ static int parse_args(int argc, char **argv)
         case OPT_PROM_LISTEN:
             opt_prom_listen = optarg; /* "none" disables the /metrics server */
             break;
+        case OPT_OTLP_ENDPOINT:
+            opt_otlp_endpoint = optarg;
+            break;
+        case OPT_OTLP_INTERVAL:
+            if (parse_num(optarg, 1, 86400, &v)) {
+                fprintf(stderr, "--otlp-interval: expected seconds 1..86400, got '%s'\n", optarg);
+                return -1;
+            }
+            opt_otlp_interval = v;
+            break;
+        case OPT_OTLP_HEADER:
+            if (opt_otlp_nheaders >= LK_OTLP_MAX_KV) {
+                fprintf(stderr, "--otlp-header: at most %d headers\n", LK_OTLP_MAX_KV);
+                return -1;
+            }
+            opt_otlp_headers[opt_otlp_nheaders++] = optarg;
+            break;
+        case OPT_OTLP_RESOURCE:
+            if (opt_otlp_nresource >= LK_OTLP_MAX_KV) {
+                fprintf(stderr, "--otlp-resource: at most %d attributes\n", LK_OTLP_MAX_KV);
+                return -1;
+            }
+            opt_otlp_resource[opt_otlp_nresource++] = optarg;
+            break;
         case 'x':
             opt_hexdump = true;
             break;
@@ -264,6 +320,42 @@ static int parse_args(int argc, char **argv)
     if (opt_nports == 0)
         opt_ports[opt_nports++] = LK_DEFAULT_PORT;
     return 0;
+}
+
+/* First non-empty of $a (agent-native LATKIT_*) then $b (standard OTel var). */
+static const char *env_or(const char *a, const char *b)
+{
+    const char *v = getenv(a);
+
+    if (v && v[0])
+        return v;
+    v = b ? getenv(b) : NULL;
+    return (v && v[0]) ? v : NULL;
+}
+
+/* Fill the OTLP config from the environment where a flag was not given (Р34):
+ * flag > LATKIT_* > OTEL_* > default. Standard OTel variables are honoured so an
+ * agent deployed beside other OTel tooling inherits the ambient config. */
+static void apply_otlp_env_defaults(void)
+{
+    if (!opt_otlp_endpoint)
+        opt_otlp_endpoint = env_or("LATKIT_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_ENDPOINT");
+    if (!opt_otlp_interval) {
+        const char *s = env_or("LATKIT_OTLP_INTERVAL", NULL);
+        __u64 v;
+
+        if (s && !parse_num(s, 1, 86400, &v))
+            opt_otlp_interval = v;
+    }
+    if (!opt_otlp_service_name)
+        opt_otlp_service_name = env_or("LATKIT_OTLP_SERVICE_NAME", "OTEL_SERVICE_NAME");
+    /* Repeated flags replace, rather than merge with, their env equivalent. */
+    if (opt_otlp_nheaders == 0)
+        env_headers = lk_split_pairs(env_or("LATKIT_OTLP_HEADERS", "OTEL_EXPORTER_OTLP_HEADERS"),
+                                     &env_nheaders);
+    if (opt_otlp_nresource == 0)
+        env_resource = lk_split_pairs(env_or("LATKIT_OTLP_RESOURCE", "OTEL_RESOURCE_ATTRIBUTES"),
+                                      &env_nresource);
 }
 
 /* The `ports` map exists only after load; attach happens after this, so the
@@ -293,6 +385,7 @@ int main(int argc, char **argv)
 
     if (parse_args(argc, argv))
         return 1;
+    apply_otlp_env_defaults();
 
     libbpf_set_print(libbpf_print);
 
@@ -349,6 +442,13 @@ int main(int argc, char **argv)
         .dump_metrics = opt_dump_metrics,
         .dump_metrics_path = opt_dump_metrics_path,
         .prom_listen = opt_prom_listen,
+        .otlp_endpoint = opt_otlp_endpoint,
+        .otlp_interval = (unsigned)opt_otlp_interval,
+        .otlp_headers = opt_otlp_nheaders ? opt_otlp_headers : (const char *const *)env_headers,
+        .otlp_nheaders = opt_otlp_nheaders ? opt_otlp_nheaders : env_nheaders,
+        .otlp_resource = opt_otlp_nresource ? opt_otlp_resource : (const char *const *)env_resource,
+        .otlp_nresource = opt_otlp_nresource ? opt_otlp_nresource : env_nresource,
+        .otlp_service_name = opt_otlp_service_name,
     };
 
     events = lk_events_new(&ecfg);
@@ -385,5 +485,7 @@ cleanup:
     lk_events_free(events);
     lk_loop_free(loop);
     latkit_bpf__destroy(skel);
+    lk_free_pairs(env_headers, env_nheaders);
+    lk_free_pairs(env_resource, env_nresource);
     return err < 0 ? 1 : 0;
 }

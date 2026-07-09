@@ -172,22 +172,25 @@ target_link_libraries(latkit_metrics PUBLIC m latkit_norm)
 # libbpf or the rest of src/agent. That keeps it testable on loopback without
 # BPF (test_http links it against a bare loop.c). loop.c itself stays with the
 # agent; whoever links latkit_export also provides loop.o.
-add_library(latkit_export STATIC src/export/http.c src/export/prom.c)
+add_library(latkit_export STATIC src/export/http.c src/export/prom.c src/export/pbuf.c
+            src/export/timebase.c src/export/otlp.c)
 target_include_directories(latkit_export PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/export)
 target_include_directories(latkit_export PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/agent ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/agent ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
 target_link_libraries(latkit_export PUBLIC latkit_metrics)
 
 # --- agent -----------------------------------------------------------------
 add_executable(latkit src/agent/main.c src/agent/loop.c src/agent/events.c
                src/agent/decode.c src/agent/conn_table.c src/agent/reassembly.c
-               src/agent/pipeline.c src/agent/record.c)
+               src/agent/pipeline.c src/agent/record.c src/common/otel_env.c)
 add_dependencies(latkit latkit_skel)
 set_source_files_properties(src/agent/main.c PROPERTIES OBJECT_DEPENDS ${SKEL_H})
 target_include_directories(latkit PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf
     ${CMAKE_CURRENT_SOURCE_DIR}/src/proto ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/export ${LIBBPF_INCLUDE_DIR})
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/export ${CMAKE_CURRENT_SOURCE_DIR}/src/common
+    ${LIBBPF_INCLUDE_DIR})
 target_link_libraries(latkit latkit_proto latkit_metrics latkit_export ${LATKIT_LIBBPF_LIBS})
 
 # --- tests -----------------------------------------------------------------

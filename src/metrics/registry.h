@@ -83,6 +83,15 @@ void lk_reg_observe_txn(struct lk_registry *r, const char *db, const char *user,
  * 0, or -1 on an allocation failure while building the sort scratch. */
 int lk_reg_dump(const struct lk_registry *r, FILE *f);
 
+/* Structured walk of every registry-owned family, same order as lk_reg_dump,
+ * emitting each series as a read-only lk_metric_view (Р31, task 5.2). Counters
+ * carry created_ns = the registry's creation time; query-keyed series carry
+ * their own, so a fingerprint evicted and re-admitted starts a fresh OTLP stream
+ * (a legal cumulative reset). Best-effort: an allocation failure while building
+ * the sort scratch skips the query-keyed families rather than aborting. The
+ * view's `labels`/`hist` pointers are valid only for the duration of the call. */
+void lk_reg_iter(const struct lk_registry *r, lk_metrics_iter_fn fn, void *ctx);
+
 /* --- introspection for the Р23 invariant tests --------------------------- */
 uint32_t lk_reg_n_queries(const struct lk_registry *r); /* admitted real fps (excl. other) */
 uint32_t lk_reg_n_dims(const struct lk_registry *r);    /* interned (db,user) pairs */

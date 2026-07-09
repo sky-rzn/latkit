@@ -39,6 +39,16 @@ struct lk_events_cfg {
     bool dump_metrics;             /* --dump-metrics[=path] given */
     const char *dump_metrics_path; /* target file, NULL = stderr */
     const char *prom_listen;       /* --prom-listen ADDR:PORT, or "none"/NULL to disable */
+
+    /* OTLP/HTTP push exporter (task 5.2, Р31). Enabled by a non-NULL endpoint
+     * (flag or OTEL_EXPORTER_OTLP_ENDPOINT). */
+    const char *otlp_endpoint;         /* http://host:port[/path]; NULL disables */
+    unsigned otlp_interval;            /* --otlp-interval seconds; 0 = default (15) */
+    const char *const *otlp_headers;   /* --otlp-header / OTEL_EXPORTER_OTLP_HEADERS */
+    int otlp_nheaders;
+    const char *const *otlp_resource;  /* --otlp-resource / OTEL_RESOURCE_ATTRIBUTES */
+    int otlp_nresource;
+    const char *otlp_service_name;     /* OTEL_SERVICE_NAME; NULL = "latkit" */
 };
 
 struct lk_events;

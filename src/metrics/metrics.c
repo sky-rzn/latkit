@@ -17,12 +17,24 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "norm_sql.h"
 #include "proto.h"
 #include "registry.h"
 
 #define LK_NS 1000000000.0 /* ns per second */
+
+/* CLOCK_MONOTONIC now (ns): stamps a flat scalar's created_ns so its OTLP Sum
+ * carries an honest start_time (Р31). Same clock as the registry and pipeline. */
+static uint64_t mx_now_ns(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts))
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
 
 /* on_txn (Р16) carries only the connection, and the query sink has no close
  * hook, so remember (db,user) per connection cookie in a fixed direct-mapped
@@ -52,6 +64,7 @@ struct scalar {
     char label_val2[32];
     int type;
     double value;
+    uint64_t created_ns; /* mono; first sight of this series -> OTLP start_time (Р31) */
 };
 
 /* Self-metric providers (Р27): the fixed set of subsystems is tiny (kernel
@@ -208,6 +221,7 @@ static void scalar_set(struct lk_metrics *m, const char *name, const char *help,
         if (m->n_scalars >= LK_MAX_SCALARS)
             return; /* fixed metric set: silently ignore an unexpected overflow */
         sc = &m->scalars[m->n_scalars++];
+        sc->created_ns = mx_now_ns();
         snprintf(sc->name, sizeof(sc->name), "%s", name);
         snprintf(sc->label_key, sizeof(sc->label_key), "%s", lkey);
         snprintf(sc->label_val, sizeof(sc->label_val), "%s", lval);
@@ -360,4 +374,42 @@ int lk_metrics_dump(struct lk_metrics *m, FILE *f)
             fprintf(f, "%s %.17g\n", sc->name, sc->value);
     }
     return 0;
+}
+
+void lk_metrics_iter(struct lk_metrics *m, lk_metrics_iter_fn fn, void *ctx)
+{
+    struct scalar sorted[LK_MAX_SCALARS];
+
+    /* Refresh the flat scalars from their live sources first, exactly as a dump
+     * does (Р27), so the values reflect the moment of the export. */
+    for (uint32_t i = 0; i < m->n_providers; i++)
+        m->providers[i].fn(m->providers[i].ctx, m);
+    lk_metrics_set_gauge(m, "latkit_metric_series", "Cardinality-controlled series currently held.",
+                         (double)lk_reg_n_series(m->reg));
+
+    /* Registry families first (same order as the dump), then the flat scalars. */
+    lk_reg_iter(m->reg, fn, ctx);
+
+    memcpy(sorted, m->scalars, m->n_scalars * sizeof(sorted[0]));
+    qsort(sorted, m->n_scalars, sizeof(sorted[0]), scalar_cmp);
+    for (uint32_t i = 0; i < m->n_scalars; i++) {
+        const struct scalar *sc = &sorted[i];
+        struct lk_label lbl[2];
+        struct lk_metric_view v = {
+            .name = sc->name,
+            .help = sc->help[0] ? sc->help : NULL,
+            .type = sc->type == LK_SC_GAUGE ? LK_MT_GAUGE : LK_MT_COUNTER,
+            .labels = lbl,
+            .nlabels = 0,
+            .created_ns = sc->created_ns,
+            .val = sc->value,
+        };
+
+        if (sc->label_key[0]) {
+            lbl[v.nlabels++] = (struct lk_label){sc->label_key, sc->label_val};
+            if (sc->label_key2[0])
+                lbl[v.nlabels++] = (struct lk_label){sc->label_key2, sc->label_val2};
+        }
+        fn(ctx, &v);
+    }
 }

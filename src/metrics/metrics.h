@@ -117,4 +117,42 @@ void lk_metrics_add_provider(struct lk_metrics *m, lk_metrics_provider_fn fn, vo
  * provider first, so the scalars reflect the moment of the dump. Returns 0. */
 int lk_metrics_dump(struct lk_metrics *m, FILE *f);
 
+/* --- structured iteration (Р31, task 5.2) ---------------------------------
+ * The OTLP serialiser needs the same rows the text dump prints, but as values
+ * rather than lines — so the two exports walk one registry, recomputing nothing
+ * (contract Р26/Р31). lk_metrics_iter yields every series as a read-only view,
+ * in the same stable order lk_metrics_dump uses; the callback consumes each view
+ * in place (all pointers, including `labels`, are borrowed and valid only for
+ * the duration of the call). Providers run first, exactly as in a dump. */
+struct lk_hist; /* metrics/hist.h — grid Р24, taken as-is by the exponential export */
+
+struct lk_label {
+    const char *key;
+    const char *value;
+};
+
+enum lk_metric_type {
+    LK_MT_COUNTER, /* monotonic cumulative Sum */
+    LK_MT_GAUGE,   /* Gauge */
+    LK_MT_HIST,    /* ExponentialHistogram (Р24 grid, scale=2) */
+};
+
+struct lk_metric_view {
+    const char *name;
+    const char *help; /* may be NULL */
+    enum lk_metric_type type;
+    const struct lk_label *labels;
+    uint32_t nlabels;
+    uint64_t created_ns; /* CLOCK_MONOTONIC; series/family creation -> OTLP start_time (Р31) */
+    union {
+        double val;                 /* COUNTER / GAUGE */
+        const struct lk_hist *hist; /* HIST */
+    };
+};
+
+typedef void (*lk_metrics_iter_fn)(void *ctx, const struct lk_metric_view *v);
+
+/* Run providers, then visit every registry family and flat scalar as a view. */
+void lk_metrics_iter(struct lk_metrics *m, lk_metrics_iter_fn fn, void *ctx);
+
 #endif /* LATKIT_METRICS_H */

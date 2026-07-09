@@ -19,8 +19,22 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "hist.h"
+
+/* CLOCK_MONOTONIC now, in nanoseconds — the same clock as the pipeline's event
+ * timestamps (Р13), so a series' created_ns converts to wall time through the
+ * one timebase (Р33). This is the registry's only OS read; like selfstats.c it
+ * is a documented exception to "I/O only via FILE" (no libbpf, no heap). */
+static uint64_t reg_now_ns(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts))
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
 
 #define LK_DOORKEEPER_SLOTS 2048u /* Р23: N ~= 2K candidate fingerprints */
 #define LK_MAX_SQLSTATES    64u   /* Р23: distinct SQLSTATE codes before "other" */
@@ -31,6 +45,7 @@ struct series {
     uint32_t qslot;        /* query slot, or r->k for "other" */
     uint32_t dim;          /* dim id, or r->max_dims for (other,other) */
     uint8_t code;          /* enum lk_code (ok|error) */
+    uint64_t created_ns;   /* mono; when this stream began -> OTLP start_time (Р31) */
     uint64_t rows;         /* latkit_query_rows_total (summed over code at dump) */
     struct lk_hist dur;
     struct lk_hist *first_row; /* latkit_query_first_row_seconds, lazy (flag off = NULL) */
@@ -84,6 +99,8 @@ struct lk_registry {
     uint64_t truncated_obs; /* latkit_queries_truncated_total */
     uint64_t total_obs;
     uint64_t other_obs;
+
+    uint64_t created_ns; /* mono; registry construction -> start_time of the fixed families */
 };
 
 static inline uint32_t reg_ndims(const struct lk_registry *r)
@@ -240,6 +257,7 @@ static struct series *series_get(struct lk_registry *r, uint32_t qslot, uint32_t
     s->qslot = qslot;
     s->dim = dim;
     s->code = code;
+    s->created_ns = reg_now_ns();
     s->h_next = r->sbuckets[b];
     r->sbuckets[b] = s;
     s->q_next = r->entries[qslot].series;
@@ -449,6 +467,7 @@ struct lk_registry *lk_reg_new(const struct lk_metrics_cfg *cfg)
     r->max_dims = c.max_session_dims;
     r->first_row = c.first_row_hist;
     r->lru_head = r->lru_tail = -1;
+    r->created_ns = reg_now_ns();
 
     r->fp_hcap = next_pow2((r->k + 1) * 2);
     r->sbuckets_n = next_pow2(r->k * 4);
@@ -844,4 +863,223 @@ int lk_reg_dump(const struct lk_registry *r, FILE *f)
     free(rows);
     free(ord);
     return 0;
+}
+
+/* --- structured iteration (Р31) ------------------------------------------- */
+
+/* Emit the query-keyed families (duration / rows / first_row) as views, exactly
+ * the grouping write_qkeyed uses for the text dump. */
+static void iter_qkeyed(const struct lk_registry *r, lk_metrics_iter_fn fn, void *ctx,
+                        const struct dump_row *rows, uint32_t n)
+{
+    /* duration: one histogram view per (query,db,user,code). */
+    for (uint32_t i = 0; i < n; i++) {
+        struct lk_label lbl[4] = {
+            {"query", rows[i].q},
+            {"db", rows[i].db},
+            {"user", rows[i].user},
+            {"code", rows[i].code == LK_CODE_ERROR ? "error" : "ok"},
+        };
+        struct lk_metric_view v = {
+            .name = LK_DUR_METRIC,
+            .help = "Server-side query latency in seconds.",
+            .type = LK_MT_HIST,
+            .labels = lbl,
+            .nlabels = 4,
+            .created_ns = rows[i].s->created_ns,
+            .hist = &rows[i].s->dur,
+        };
+        fn(ctx, &v);
+    }
+
+    /* rows_total: sum over code within each (query,db,user) group. */
+    for (uint32_t i = 0; i < n;) {
+        uint32_t j = i;
+        uint64_t sum = 0;
+        struct lk_label lbl[3] = {{"query", rows[i].q}, {"db", rows[i].db}, {"user", rows[i].user}};
+        struct lk_metric_view v = {
+            .name = "latkit_query_rows_total",
+            .help = "Rows returned/affected, from CommandComplete.",
+            .type = LK_MT_COUNTER,
+            .labels = lbl,
+            .nlabels = 3,
+            .created_ns = rows[i].s->created_ns,
+        };
+
+        for (; j < n && same_qseries(&rows[i], &rows[j]); j++)
+            sum += rows[j].s->rows;
+        v.val = (double)sum;
+        fn(ctx, &v);
+        i = j;
+    }
+
+    /* first_row: merge the code series' histograms within each group (opt-in). */
+    if (!r->first_row)
+        return;
+    for (uint32_t i = 0; i < n;) {
+        uint32_t j = i;
+        struct lk_hist acc = {0};
+        bool any = false;
+        struct lk_label lbl[3] = {{"query", rows[i].q}, {"db", rows[i].db}, {"user", rows[i].user}};
+
+        for (; j < n && same_qseries(&rows[i], &rows[j]); j++)
+            if (rows[j].s->first_row) {
+                lk_hist_merge(&acc, rows[j].s->first_row);
+                any = true;
+            }
+        if (any) {
+            struct lk_metric_view v = {
+                .name = LK_FR_METRIC,
+                .help = "Time to first row in seconds.",
+                .type = LK_MT_HIST,
+                .labels = lbl,
+                .nlabels = 3,
+                .created_ns = rows[i].s->created_ns,
+                .hist = &acc,
+            };
+            fn(ctx, &v);
+        }
+        i = j;
+    }
+}
+
+void lk_reg_iter(const struct lk_registry *r, lk_metrics_iter_fn fn, void *ctx)
+{
+    uint32_t ndims = reg_ndims(r);
+    struct dump_row *rows = r->n_series ? malloc(r->n_series * sizeof(*rows)) : NULL;
+    uint32_t *ord = malloc(ndims * sizeof(*ord));
+    uint32_t n = 0;
+
+    if (!ord || (r->n_series && !rows)) {
+        free(rows);
+        free(ord);
+        return; /* best-effort: this export cycle skips the registry families */
+    }
+    order_dims(r, ord, ndims);
+
+    /* latkit_queries_total{db,user,kind,code}. */
+    for (uint32_t oi = 0; oi < ndims; oi++) {
+        uint32_t d = ord[oi];
+
+        for (uint8_t k = 0; k < LK_N_QKINDS; k++)
+            for (uint8_t c = 0; c < LK_N_QCODES; c++) {
+                uint64_t val = r->q_total[(d * LK_N_QKINDS + k) * LK_N_QCODES + c];
+                struct lk_label lbl[4] = {{"db", r->dims[d].db},
+                                          {"user", r->dims[d].user},
+                                          {"kind", qkind_str(k)},
+                                          {"code", qcode_str(c)}};
+                struct lk_metric_view v = {
+                    .name = "latkit_queries_total",
+                    .help = "Query observations by kind and outcome.",
+                    .type = LK_MT_COUNTER,
+                    .labels = lbl,
+                    .nlabels = 4,
+                    .created_ns = r->created_ns,
+                };
+
+                if (!val)
+                    continue;
+                v.val = (double)val;
+                fn(ctx, &v);
+            }
+    }
+
+    /* Query-keyed families over the sorted series list. */
+    for (uint32_t b = 0; b < r->sbuckets_n; b++)
+        for (const struct series *s = r->sbuckets[b]; s; s = s->h_next) {
+            const struct dim *d = &r->dims[s->dim];
+
+            rows[n].s = s;
+            rows[n].q = s->qslot == r->k ? "other" : r->entries[s->qslot].label;
+            rows[n].db = d->db;
+            rows[n].user = d->user;
+            rows[n].code = s->code;
+            n++;
+        }
+    if (n)
+        qsort(rows, n, sizeof(*rows), row_cmp);
+    iter_qkeyed(r, fn, ctx, rows, n);
+
+    /* latkit_query_errors_total{sqlstate,db,user}: real codes lexically, then
+     * the "other" pseudo-code, matching the dump. */
+    {
+        uint32_t sord[LK_MAX_SQLSTATES];
+
+        for (uint32_t i = 0; i < r->n_sqlstates; i++)
+            sord[i] = i;
+        for (uint32_t i = 1; i < r->n_sqlstates; i++) {
+            uint32_t v = sord[i], j = i;
+
+            for (; j > 0 && strcmp(r->sqlstates[sord[j - 1]].code, r->sqlstates[v].code) > 0; j--)
+                sord[j] = sord[j - 1];
+            sord[j] = v;
+        }
+        for (uint32_t si = 0; si <= r->n_sqlstates; si++) {
+            uint32_t sq = si < r->n_sqlstates ? sord[si] : LK_MAX_SQLSTATES;
+            const char *code = si < r->n_sqlstates ? r->sqlstates[sq].code : "other";
+
+            for (uint32_t oi = 0; oi < ndims; oi++) {
+                uint32_t d = ord[oi];
+                uint64_t val = r->err_total[sq * ndims + d];
+                struct lk_label lbl[3] = {
+                    {"sqlstate", code}, {"db", r->dims[d].db}, {"user", r->dims[d].user}};
+                struct lk_metric_view v = {
+                    .name = "latkit_query_errors_total",
+                    .help = "Errors by SQLSTATE (query-independent).",
+                    .type = LK_MT_COUNTER,
+                    .labels = lbl,
+                    .nlabels = 3,
+                    .created_ns = r->created_ns,
+                };
+
+                if (!val)
+                    continue;
+                v.val = (double)val;
+                fn(ctx, &v);
+            }
+        }
+    }
+
+    /* Label-free counters. */
+    {
+        struct lk_metric_view v = {
+            .name = "latkit_queries_truncated_total",
+            .help = "Observations with truncated SQL text.",
+            .type = LK_MT_COUNTER,
+            .created_ns = r->created_ns,
+            .val = (double)r->truncated_obs,
+        };
+        fn(ctx, &v);
+        v.name = "latkit_queries_other_total";
+        v.help = "Observations folded into query=\"other\".";
+        v.val = (double)r->other_obs;
+        fn(ctx, &v);
+    }
+
+    /* latkit_txn_duration_seconds{db,user,status}. */
+    for (uint32_t oi = 0; oi < ndims; oi++) {
+        uint32_t d = ord[oi];
+
+        for (uint32_t st = 0; st < 2; st++) {
+            const struct lk_hist *h = &r->txn[d * 2 + st];
+            struct lk_label lbl[3] = {
+                {"db", r->dims[d].db}, {"user", r->dims[d].user}, {"status", st ? "aborted" : "ok"}};
+            struct lk_metric_view v = {
+                .name = LK_TXN_METRIC,
+                .help = "Transaction duration in seconds.",
+                .type = LK_MT_HIST,
+                .labels = lbl,
+                .nlabels = 3,
+                .created_ns = r->created_ns,
+                .hist = h,
+            };
+
+            if (!h->count)
+                continue;
+            fn(ctx, &v);
+        }
+    }
+
+    free(rows);
+    free(ord);
 }

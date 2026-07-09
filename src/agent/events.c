@@ -24,6 +24,7 @@
 #include "latkit.h"
 #include "loop.h"
 #include "metrics.h"
+#include "otlp.h"
 #include "pipeline.h"
 #include "prom.h"
 #include "proto.h"
@@ -46,6 +47,7 @@ struct lk_events {
     struct lk_query_sink qsink;           /* tee installed into the parser (below) */
     struct lk_selfstats *selfstats;       /* process_* provider (task 4.4) */
     struct lk_prom *prom;                 /* Prometheus /metrics server (task 5.1), NULL if off */
+    struct lk_otlp *otlp;                 /* OTLP/HTTP push exporter (task 5.2), NULL if off */
 };
 
 /* --- --queries logger (stage 3): the standard consumer of the parser -------
@@ -673,6 +675,7 @@ void lk_events_free(struct lk_events *e)
         return;
     /* Tear the HTTP server down first: it deregisters its fds from the loop, so
      * it must go before the loop is freed (main frees events before the loop). */
+    lk_otlp_free(e->otlp);
     lk_prom_free(e->prom);
     ring_buffer__free(e->rb);
     if (lk_recorder_close(e->rec))
@@ -724,6 +727,30 @@ int lk_events_register(struct lk_events *e, struct lk_loop *loop)
         }
         fprintf(stderr, "latkit: serving Prometheus /metrics and /healthz on %s (port %d)\n",
                 e->cfg.prom_listen, lk_prom_port(e->prom));
+    }
+
+    /* OTLP/HTTP push exporter (task 5.2, Р31). Enabled by an endpoint; a bad
+     * endpoint (unparseable URL, https) is fatal like a bad bind — fail loudly
+     * rather than run half-configured. A collector that is merely down at start
+     * is tolerated (lk_otlp_new resolves lazily and drops batches meanwhile). */
+    if (e->cfg.otlp_endpoint && e->cfg.otlp_endpoint[0]) {
+        struct lk_otlp_cfg oc = {
+            .endpoint = e->cfg.otlp_endpoint,
+            .interval_sec = e->cfg.otlp_interval,
+            .headers = e->cfg.otlp_headers,
+            .nheaders = e->cfg.otlp_nheaders,
+            .resource_attrs = e->cfg.otlp_resource,
+            .nresource = e->cfg.otlp_nresource,
+            .service_name = e->cfg.otlp_service_name,
+        };
+
+        e->otlp = lk_otlp_new(loop, e->metrics, &oc);
+        if (!e->otlp) {
+            fprintf(stderr, "latkit: cannot start OTLP exporter for %s\n", e->cfg.otlp_endpoint);
+            return -1;
+        }
+        fprintf(stderr, "latkit: exporting OTLP metrics to %s every %us\n", e->cfg.otlp_endpoint,
+                e->cfg.otlp_interval ? e->cfg.otlp_interval : 15);
     }
     return 0;
 }

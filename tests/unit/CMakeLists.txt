@@ -84,3 +84,35 @@ target_include_directories(test_http PRIVATE
     ${CMAKE_SOURCE_DIR}/src/export ${CMAKE_SOURCE_DIR}/src/agent)
 target_link_libraries(test_http latkit_export)
 add_test(NAME http COMMAND test_http)
+
+# Protobuf writer golden bytes (task 5.2): varints, scalar fields, submessage
+# length insertion via memmove. Pure, links the export lib for pbuf.c.
+add_executable(test_pbuf test_pbuf.c)
+target_include_directories(test_pbuf PRIVATE ${CMAKE_SOURCE_DIR}/src/export)
+target_link_libraries(test_pbuf latkit_export)
+add_test(NAME pbuf COMMAND test_pbuf)
+
+# OTLP metric encoder (task 5.2): decodes the writer's output and asserts the
+# OTLP structure + the Р24-grid -> ExponentialHistogram mapping. Needs the export
+# lib (otlp/pbuf/timebase) and the metrics lib (hist, view types).
+add_executable(test_otlp_enc test_otlp_enc.c ${CMAKE_SOURCE_DIR}/src/agent/loop.c)
+target_include_directories(test_otlp_enc PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/export ${CMAKE_SOURCE_DIR}/src/metrics ${CMAKE_SOURCE_DIR}/src/agent)
+target_link_libraries(test_otlp_enc latkit_export)
+add_test(NAME otlp_enc COMMAND test_otlp_enc)
+
+# Mono -> wall timebase (task 5.2): offset arithmetic and a sanity bound on a
+# live sample. Pure, links the export lib for timebase.c.
+add_executable(test_timebase test_timebase.c)
+target_include_directories(test_timebase PRIVATE ${CMAKE_SOURCE_DIR}/src/export)
+target_link_libraries(test_timebase latkit_export)
+add_test(NAME timebase COMMAND test_timebase)
+
+# OTLP client end-to-end on loopback (task 5.2): drives the real connect/write/
+# read state machine in the loop against a bare TCP listener, no BPF. Pulls in
+# loop.c like test_http and links the export + metrics libs.
+add_executable(test_otlp_client test_otlp_client.c ${CMAKE_SOURCE_DIR}/src/agent/loop.c)
+target_include_directories(test_otlp_client PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/export ${CMAKE_SOURCE_DIR}/src/metrics ${CMAKE_SOURCE_DIR}/src/agent)
+target_link_libraries(test_otlp_client latkit_export)
+add_test(NAME otlp_client COMMAND test_otlp_client)
