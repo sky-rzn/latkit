@@ -1,0 +1,17 @@
+# Runtime image for the e2e stand (STAGE5.md task 5.4). We do NOT build the
+# agent here — the BPF skeleton pipeline (clang, bpftool, the libbpf submodule)
+# is heavy and already lives in the host build. Instead this wraps the
+# host-built `build/latkit` binary in a minimal image carrying only its runtime
+# shared libraries (libelf/zlib/zstd). verify.sh builds the binary on the host
+# first, so the COPY below always finds a fresh one.
+#
+# Build context is the repo root (see docker-compose.yml `build.context: ../..`).
+FROM ubuntu:24.04
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libelf1 zlib1g libzstd1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY build/latkit /usr/local/bin/latkit
+
+ENTRYPOINT ["/usr/local/bin/latkit"]

@@ -16,12 +16,12 @@
 #include <string.h>
 
 static int failures;
-#define EXPECT(cond, msg)                                                                         \
-    do {                                                                                          \
-        if (!(cond)) {                                                                            \
-            printf("FAIL: %s\n", msg);                                                            \
+#define EXPECT(cond, msg)                                                                          \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            printf("FAIL: %s\n", msg);                                                             \
             failures++;                                                                            \
-        }                                                                                         \
+        }                                                                                          \
     } while (0)
 
 /* --- minimal protobuf reader --------------------------------------------- */
@@ -32,8 +32,8 @@ struct rd {
 
 struct field {
     uint32_t num, wire;
-    uint64_t varint;    /* wire 0 */
-    uint64_t i64;       /* wire 1 */
+    uint64_t varint;     /* wire 0 */
+    uint64_t i64;        /* wire 1 */
     const uint8_t *data; /* wire 2 */
     size_t len;
 };
@@ -152,7 +152,8 @@ static void test_counter(void)
            "counter: name matches");
     EXPECT(find(metric.data, metric.len, 7, &sum), "counter: Sum (field 7) present");
 
-    EXPECT(find(sum.data, sum.len, 2, &temp) && temp.varint == 2, "counter: temporality CUMULATIVE");
+    EXPECT(find(sum.data, sum.len, 2, &temp) && temp.varint == 2,
+           "counter: temporality CUMULATIVE");
     EXPECT(find(sum.data, sum.len, 3, &mono) && mono.varint == 1, "counter: is_monotonic true");
     EXPECT(find(sum.data, sum.len, 1, &dp), "counter: data point present");
 
@@ -225,10 +226,16 @@ static void test_hist(void)
     EXPECT(find(eh.data, eh.len, 2, &temp) && temp.varint == 2, "hist: temporality CUMULATIVE");
     EXPECT(find(eh.data, eh.len, 1, &dp), "hist: data point present");
 
-    EXPECT(find(dp.data, dp.len, 4, &cnt) && cnt.varint == 3, "hist: count=3");
+    /* count (field 4) and zero_count (field 7) are OTLP `fixed64`, i.e. wire
+     * type 1 — NOT varint. Encoding them as varint parses fine here but the
+     * live Collector rejects it ("wrong wireType = 0 for field Count"), so the
+     * wire type is asserted explicitly (regression: STAGE5.md task 5.4). */
+    EXPECT(find(dp.data, dp.len, 4, &cnt) && cnt.wire == 1 && cnt.i64 == 3,
+           "hist: count=3 (fixed64)");
     EXPECT(find(dp.data, dp.len, 5, &sum) && as_double(sum.i64) > 100.0, "hist: sum>100");
     EXPECT(find(dp.data, dp.len, 6, &scale) && unzig(scale.varint) == 2, "hist: scale=2");
-    EXPECT(find(dp.data, dp.len, 7, &zc) && zc.varint == 1, "hist: zero_count=1");
+    EXPECT(find(dp.data, dp.len, 7, &zc) && zc.wire == 1 && zc.i64 == 1,
+           "hist: zero_count=1 (fixed64)");
     EXPECT(find(dp.data, dp.len, 14, &zt) && as_double(zt.i64) == lk_hist_bound(LK_HIST_MIN_INDEX),
            "hist: zero_threshold=bound(MIN)");
 

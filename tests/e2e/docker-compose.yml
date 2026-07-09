@@ -1,0 +1,107 @@
+# e2e stand for milestone M3 (STAGE5.md task 5.4): postgres + pgbench + latkit +
+# prometheus + otel-collector, wired so both exporters run at once and can be
+# checked against each other. Drive it with ./verify.sh (which builds the agent
+# on the host, brings this up, asserts, and tears down).
+#
+#   ./verify.sh            # full build + up + assert + down
+#   docker compose up -d   # bring the stand up by hand (agent must be built)
+#
+# Capture note (see the project memory): pgbench talks to postgres over the
+# compose network by service name, NOT via a published localhost port. A
+# localhost hop would go through docker-proxy, which splice()s the payload and
+# defeats the socket capture (README "Known limitations"). So postgres does not
+# publish 5432, and latkit filters the server port 5432 it sees on the bridge.
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: latkit
+      POSTGRES_PASSWORD: latkit
+      POSTGRES_DB: latkit
+    # TLS off — encrypted socket bytes are opaque until stage 6 (STAGE0.md 0.4).
+    command: ["postgres", "-c", "ssl=off"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U latkit -d latkit"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One-shot: initialise the pgbench dataset, then exit.
+  pgbench-init:
+    image: postgres:16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: latkit
+    entrypoint: ["pgbench", "-h", "postgres", "-U", "latkit", "-i", "-s", "10", "latkit"]
+    restart: "no"
+
+  # Steady load so the metrics are non-trivial while verify.sh samples them.
+  pgbench:
+    image: postgres:16
+    depends_on:
+      pgbench-init:
+        condition: service_completed_successfully
+    environment:
+      PGPASSWORD: latkit
+    # -T is long; verify.sh tears the stand down when it is done asserting.
+    command: ["pgbench", "-h", "postgres", "-U", "latkit", "-c", "8", "-j", "2",
+              "-T", "3600", "-P", "10", "latkit"]
+    restart: "no"
+
+  # The agent: privileged for BPF load/attach, capturing the server port 5432 it
+  # sees kernel-wide (fentry on tcp_* is global, so being on the bridge net is
+  # fine — that also lets prometheus/otel reach it by name). Both exporters on:
+  # Prometheus pull on :9752, OTLP push to the collector, spans sampled 1.0.
+  latkit:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.latkit
+    depends_on:
+      postgres:
+        condition: service_healthy
+    privileged: true
+    pid: host
+    volumes:
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+    command:
+      - "-p"
+      - "5432"
+      - "--prom-listen"
+      - "0.0.0.0:9752"
+      - "--otlp-endpoint"
+      - "http://otel-collector:4318"
+      - "--otlp-interval"
+      - "5"
+      # A partial sample keeps the collector's debug log (and CPU) sane under
+      # pgbench while still exporting plenty of spans; raise to 1.0 for a demo.
+      - "--otlp-spans"
+      - "0.1"
+      - "--otlp-spans-slow-ms"
+      - "100"
+    # Handy for a browser: curl http://localhost:9752/metrics
+    ports: ["9752:9752"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      - latkit
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=1h"
+    # Host port 19090 (not 9090) to avoid clashing with a Prometheus already on
+    # the host; container-internal port stays 9090. verify.sh queries 19090.
+    ports: ["19090:9090"]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "4318:4318" # OTLP/HTTP
+      - "8889:8889" # collector's own Prometheus exporter (metrics readout)

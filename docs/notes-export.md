@@ -1,10 +1,10 @@
 # notes — exporters (stage 5)
 
-Design notes for `src/export/`. This file grows over stage 5; task 5.1 covers
-the Prometheus pull path (the HTTP server, `/metrics`, `/healthz`) and task 5.2
-the OTLP/HTTP push path (protobuf writer, exponential-histogram mapping, async
-client, timebase, config/env mechanics). Spans and the full config/env table
-land with tasks 5.3–5.4.
+Design notes for `src/export/`. Task 5.1 covers the Prometheus pull path (the
+HTTP server, `/metrics`, `/healthz`), task 5.2 the OTLP/HTTP push path (protobuf
+writer, exponential-histogram mapping, async client, timebase), task 5.3 the
+sampled spans, and task 5.4 the config/env layer, the security posture, and the
+v1 limitations — all below.
 
 ## HTTP server (Р29, task 5.1)
 
@@ -138,10 +138,125 @@ re-resolve on the next attempt (a Collector that moves), while an HTTP error
 keeps the cache. `http://` only in v1 (a sidecar Collector is the standard OTel
 topology); `https://` is rejected with a message.
 
+**Wire-type footguns (validated by the live Collector).** proto3 numeric fields
+are not all varints. In `(Exponential)HistogramDataPoint` the `count` (field 4)
+and `zero_count` (field 7) are `fixed64`, not varint; `start`/`time` are
+`fixed64`; `scale` is `sint32` (zigzag). Encoding `count` as a varint round-trips
+through our own decoder but the Collector rejects the whole batch with `proto:
+wrong wireType = 0 for field Count` (HTTP 400) — which is exactly why the e2e
+stand (task 5.4) keeps a live Collector in the loop as the strict schema
+authority: `protoc` is unavailable offline, so the golden `pbuf` tests pin the
+primitives and the Collector pins the OTLP schema. `bucket_counts` inside
+`Buckets` stays a packed `uint64` (varint) — that one *is* a varint.
+
 **Config (Р34).** Enabled by an endpoint (`--otlp-endpoint` or
-`OTEL_EXPORTER_OTLP_ENDPOINT`). Priority flag > `LATKIT_*` > `OTEL_*` > default;
-`--otlp-header`/`--otlp-resource` (repeatable) default to
-`OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_RESOURCE_ATTRIBUTES`, and `OTEL_SERVICE_NAME`
-sets `service.name`. Resource defaults: `service.name=latkit`,
-`service.version`, `host.name`. The full `LATKIT_*` table over every flag and the
-README quickstart land in task 5.4; no YAML in v1.
+`OTEL_EXPORTER_OTLP_ENDPOINT`). See the "Configuration & environment" section
+below for the priority rules; resource defaults are `service.name=latkit`,
+`service.version`, `host.name`.
+
+## Spans (Р32, task 5.3)
+
+Spans carry what metrics structurally cannot: the timings of one concrete
+execution and the **raw** SQL text (the registry only ever holds the normalised,
+literal-free form, Р28).
+
+**Collector as a sink.** The span collector is another `lk_query_sink`
+implementation, so it slots into the tee `proto_pg → (metrics | spans |
+--queries)` without the parser or aggregator knowing it exists (the stage-4 tee
+generalised to a list of sinks in `events.c`).
+
+**Sampling.** Decided in `on_query` by two independent predicates: `--otlp-spans
+RATIO` (a probabilistic "representative slice", via a splitmix64 hash of
+ts+cookie+seed — deterministic under a seed, no `rand(3)`) and/or
+`--otlp-spans-slow-ms N` (a duration floor, "every slow query"). A query is
+sampled if either fires. Off by default.
+
+**Ring + text.** A sampled query is copied into a fixed FIFO ring (`LK_SPAN_BUF =
+2048`); the raw SQL is copied (it only lives for the callback, Р16) capped at
+`--otlp-span-text-max` (default 4 KiB). A full ring drops the new span and bumps
+`latkit_spans_dropped_total`. Delivery is a POST to `/v1/traces` on the same
+client (Р31), alongside a metrics tick or when the ring hits 3/4.
+
+**Ids & timings.** `trace_id` (16 B) and `span_id` (8 B) come from a
+`getrandom(2)` seed; the trace is standalone (no parent — the client's context is
+invisible; parsing a `traceparent` from a sqlcommenter SQL comment is a v1.1
+candidate). `start = ts_start_ns`, `end = ts_complete_ns` (the precise
+per-request model — spans need no averaging compromise, cf. Р25), converted to
+wall clock by `timebase.c` (Р33).
+
+**Attributes** (OTel semconv for databases): `db.system.name="postgresql"`,
+`db.query.text` (raw SQL; omitted under `NO_TEXT`), `db.namespace` (database),
+`db.user`, `db.response.returned_rows`; the span name is the normalised text
+truncated to 64 chars (the normaliser Р22 runs only for sampled queries — a
+negligible cost). An error sets `otel.status = ERROR` and
+`db.response.status_code = SQLSTATE`.
+
+**Exemplars** (optional tail of 5.3, **deferred** — not an M3 criterion): the
+last sampled `{trace_id, span_id, value}` per histogram row, emitted in the
+OTLP histogram `exemplars` and in an OpenMetrics `/metrics` variant negotiated by
+`Accept`. The seam exists (`lk_span` already carries the ids); it bolts on
+without reworking anything.
+
+## Configuration & environment (Р34, task 5.4)
+
+Every agent flag has a `LATKIT_<UPPER_SNAKE>` environment equivalent. The
+resolution order is **flag > `LATKIT_*` env > (`OTEL_*` env for the five OTel
+vars) > default**. Mechanically: `main.c` records which options getopt saw, then
+`apply_env_defaults` fills only the *unseen* ones from `env_opts[]` — so a flag
+always wins, and a repeatable flag given on the CLI *replaces* (does not merge
+with) its env list. Booleans read a truthy word (`1`/`true`/`yes`/`on`);
+`0`/`false`/`no`/`off` leave the default. `--print-config` resolves everything
+and prints it (before any BPF work) — the no-privilege way to see what the agent
+will actually use, and the basis of `tests/unit/config_priority.sh`.
+
+Standard OpenTelemetry variables are honoured as the default for their flag, so
+an agent deployed beside other OTel tooling inherits the ambient config:
+
+| Flag | `LATKIT_*` | Standard OTel var |
+|---|---|---|
+| `--otlp-endpoint` | `LATKIT_OTLP_ENDPOINT` | `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `--otlp-interval` | `LATKIT_OTLP_INTERVAL` | — |
+| `--otlp-header` (list) | `LATKIT_OTLP_HEADERS` | `OTEL_EXPORTER_OTLP_HEADERS` |
+| `--otlp-resource` (list) | `LATKIT_OTLP_RESOURCE` | `OTEL_RESOURCE_ATTRIBUTES` |
+| (`service.name`) | `LATKIT_OTLP_SERVICE_NAME` | `OTEL_SERVICE_NAME` |
+
+For a list-valued env var (`LATKIT_OTLP_HEADERS`, `LATKIT_OTLP_RESOURCE`,
+`LATKIT_PORT`) the whole comma-separated list lives in the single variable
+(`LATKIT_OTLP_HEADERS="k1=v1,k2=v2"`), matching the OTel spelling. **No YAML in
+v1**: a YAML parser is a dependency or a chore, and a systemd unit / DaemonSet
+lives comfortably on flags + env; revisit on real demand.
+
+## Security posture (PLAN.md §7)
+
+- **Bind loopback by default.** `--prom-listen` defaults to `127.0.0.1:9752`;
+  scraping from another host or a container is an explicit `0.0.0.0` choice. No
+  TLS/auth on the agent's own endpoints in v1 (front with a reverse proxy) — a
+  documented limitation; a bind failure is fatal at startup, never a silent
+  fallback.
+- **Raw SQL leaves the agent only through spans.** Metrics are masked by
+  construction (normalisation turns literals into `?` before anything reaches a
+  label). Spans are the one place the raw SQL — literals and all — leaves the
+  process, so they are **off by default**. `--otlp-span-masked` sends the
+  normalised (literal-free) text as `db.query.text` for environments that need
+  spans without leaking literals; `--otlp-span-text-max` caps the text.
+  Exemplars carry only ids, never text.
+- **Untrusted network input.** The HTTP server is a microscopic GET-only subset
+  with per-connection size/time limits (Р29); the protobuf path is write-only.
+
+## v1 limitations (with the native-histogram recipe)
+
+- **No HTTPS on the OTLP endpoint** — `http://` only. A sidecar Collector is the
+  standard OTel topology; front a remote Collector with TLS termination if
+  needed.
+- **No OTLP/gRPC** — OTLP/HTTP only. The Collector accepts both; gRPC would add a
+  dependency for nothing.
+- **No Prometheus protobuf exposition / native histograms on `/metrics`.** The
+  text format carries classic `le` buckets (Р30). Native histograms need the
+  protobuf exposition format — a second serialiser for data the same Prometheus
+  already accepts over OTLP. **Recipe:** point latkit's OTLP exporter at
+  Prometheus directly (its `otlp-write-receiver`) or at a Collector in front of
+  it — our OTLP path already emits a lossless `ExponentialHistogram`, which
+  Prometheus stores as a native histogram. Revisit a protobuf exposition only if
+  real demand appears (stage 8+).
+- **No `traceparent` from SQL comments** (sqlcommenter) — spans are standalone;
+  correlating with an upstream trace is a v1.1 candidate.

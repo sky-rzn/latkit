@@ -67,8 +67,11 @@ latkit/
 │   │   ├── events.c            # чтение ringbuf, диспетчеризация
 │   │   ├── conn_table.c        # таблица соединений, LRU, таймауты
 │   │   ├── reassembly.c        # сборка потока сообщений из фрагментов
-│   │   ├── prom.c              # HTTP /metrics (этап 5)
-│   │   └── otlp.c              # экспорт OTLP (этап 5)
+│   │   └── loop.c              # epoll-петля (HTTP-сервер и OTLP-клиент — там же)
+│   ├── export/                 # экспортеры (этап 5): http.c (/metrics,
+│   │   │                       #   /healthz), prom.c, pbuf.c, otlp.c, spans.c,
+│   │   │                       #   timebase.c — зависят от metrics/ + loop.h,
+│   │   │                       #   без libbpf (см. STAGE5.md, отклонение §3)
 │   ├── proto/                  # код протоколов, единый API «ядро↔обработчик»
 │   │   ├── proto.h             # оба контракта: вниз lk_msg_sink, вверх lk_query_sink
 │   │   └── pg/                 # обработчик PostgreSQL v3 (был agent/pgproto.c)
@@ -140,10 +143,10 @@ latkit/
 - [x] Лейбл `query` — нормализованный текст, усечённый до N символов (`--query-label-len`); полный текст — только в OTel-спаны/exemplars (этап 5), не в Prometheus.
 - [x] Валидация M2: replay-ассерты по дампу для каждой фикстуры этапа 3 (число рядов, count/sum, ноль наблюдений через разрыв — Р19); стресс кардинальности (`test_cardinality_ceiling`); дамп — валидный exposition (`--dump-metrics`, промтул/ручная проверка).
 
-### Этап 5 — экспортеры (~1 неделя)
-- [ ] Prometheus: HTTP-сервер `/metrics` (text format), `/healthz`; сериализация гистограмм; exemplars (trace_id) — опционально.
-- [ ] OpenTelemetry: OTLP/HTTP protobuf в Collector — метрики (те же), опционально спаны на каждый запрос (sampling), которые дают точные тайминги и полный SQL. Конфиг: endpoint, headers, интервал, resource-атрибуты.
-- [ ] Оба экспортера независимо включаемы; конфиг — YAML/флаги/env.
+### Этап 5 — экспортеры (~1 неделя) — детализация в [STAGE5.md](STAGE5.md), заметки [docs/notes-export.md](docs/notes-export.md)
+- [x] Prometheus: HTTP-сервер `/metrics` (text format), `/healthz` (`src/export/http.c`, `prom.c`); классические `le`-бакеты; exemplars (trace_id) — отложены (шов есть, Р30/Р32).
+- [x] OpenTelemetry: OTLP/HTTP protobuf в Collector — метрики (`Sum`/`Gauge`/`ExponentialHistogram`, ручной `pbuf.c`), спаны на сэмплированные запросы (точные тайминги + полный SQL, `spans.c`). Конфиг: endpoint, headers, интервал, resource-атрибуты, ratio/slow-ms.
+- [x] Оба экспортера независимо включаемы; конфиг — **флаги + env** (`LATKIT_*` + стандартные `OTEL_*`, приоритет флаг > env > дефолт); **YAML отложен** (Р34, по реальному спросу).
 
 ### Этап 6 — TLS (~1–2 недели)
 - [ ] uprobes на `SSL_read/SSL_write(_ex)` в `libssl.so` (путь автодетектом через `/proc/<pid>/maps` процессов postgres); сопоставление SSL* ↔ fd ↔ conn_id (uprobe на `SSL_set_fd` или чтение fd из `BIO`).
@@ -181,7 +184,7 @@ latkit/
 
 - **M1 (конец этапа 1):** сырой захват PG-трафика стабилен, потери учитываются. ✅
 - **M2 (конец этапа 4):** `psql`/pgbench-нагрузка → корректные latency-гистограммы по нормализованным запросам (plaintext). ✅ — дамп реестра (`--dump-metrics`) — валидный Prometheus text exposition; имена рядов зафиксированы как публичный API (см. [docs/notes-metrics.md](docs/notes-metrics.md)).
-- **M3 (конец этапа 5):** метрики в Prometheus и OTel Collector, читаются Grafana.
+- **M3 (конец этапа 5):** метрики в Prometheus и OTel Collector, читаются Grafana. ✅ — оба экспортера работают одновременно; e2e-стенд ([tests/e2e/](tests/e2e)) подтверждает pull (`/metrics`) и push (OTLP: `Sum`/`ExponentialHistogram` + спаны), значения сходятся; живой Collector — строгий валидатор protobuf (поймал `fixed64` wire-type в `ExponentialHistogramDataPoint`).
 - **v1.0 (конец этапа 8):** TLS, демо-стек, дашборды, подтверждённый overhead <3%, документация.
 
 Суммарная оценка: **8–11 недель** одним разработчиком.

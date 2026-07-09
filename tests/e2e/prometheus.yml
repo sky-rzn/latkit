@@ -1,0 +1,16 @@
+# Prometheus config for the e2e stand (task 5.4). Scrapes the latkit agent's
+# /metrics on the compose network. A short interval keeps verify.sh quick.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: latkit
+    static_configs:
+      - targets: ["latkit:9752"]
+
+  # The collector re-exports what it received over OTLP; scraping it lets us
+  # compare the push path against the pull path from the same Prometheus.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8889"]

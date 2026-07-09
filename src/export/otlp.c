@@ -13,8 +13,9 @@
  *   Gauge { data_points=1 }
  *   ExponentialHistogram { data_points=1, aggregation_temporality=2 }
  *   NumberDataPoint { start=2(fixed64), time=3(fixed64), as_double=4, attrs=7 }
- *   ExponentialHistogramDataPoint { attrs=1, start=2, time=3, count=4, sum=5,
- *     scale=6(sint32), zero_count=7, positive=8, zero_threshold=14 }
+ *   ExponentialHistogramDataPoint { attrs=1, start=2(fixed64), time=3(fixed64),
+ *     count=4(fixed64), sum=5(double), scale=6(sint32), zero_count=7(fixed64),
+ *     positive=8, zero_threshold=14(double) }
  *   Buckets { offset=1(sint32), bucket_counts=2(packed uint64) }
  *   ExportTraceServiceRequest { resource_spans = 1 }       (== TracesData wire)
  *   ResourceSpans { resource=1, scope_spans=2 }
@@ -137,10 +138,10 @@ static void enc_exp_hist_dp(struct pbuf *pb, const struct lk_metric_view *v,
 
     pb_field_fixed64(pb, 2, lk_wall_ns(tb, v->created_ns)); /* start_time_unix_nano */
     pb_field_fixed64(pb, 3, now);                           /* time_unix_nano */
-    pb_field_varint(pb, 4, h->count);                       /* count */
+    pb_field_fixed64(pb, 4, h->count);                      /* count (fixed64, not varint) */
     pb_field_double(pb, 5, h->sum);                         /* sum */
     pb_field_sint32(pb, 6, LK_HIST_SCHEMA);                 /* scale = 2 */
-    pb_field_varint(pb, 7, h->underflow);                   /* zero_count */
+    pb_field_fixed64(pb, 7, h->underflow);                  /* zero_count (fixed64) */
 
     buckets = pb_submsg_begin(pb, 8); /* positive Buckets */
     pb_field_sint32(pb, 1, LK_HIST_MIN_INDEX);

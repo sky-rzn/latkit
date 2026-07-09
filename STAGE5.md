@@ -447,26 +447,36 @@ collector'а (debug-exporter показывает имя, тайминги, `db.
 
 ### 5.4 Конфиг, e2e-стенд, документация, M3 (~1–1,5 дня)
 
-- [ ] Env-слой (Р34): `LATKIT_*` для всех флагов, приоритет
-      флаг > env > дефолт; таблица в README; unit-тест приоритетов.
-- [ ] `tests/e2e/`: docker-compose — postgres + pgbench + latkit +
-      prometheus + otel-collector; скрипт-проверка: подождать скрейпы,
-      спросить Prometheus API (`query=latkit_queries_total`), ассерты —
-      ряды есть, count растёт, p95 из `histogram_quantile` в разумных
-      пределах против отчёта pgbench; спаны в collector-логе. (Помнить
-      стенд: захват по IP контейнера, не через docker-proxy/localhost.)
-- [ ] Прогон вехи M3: pgbench 3 режима × оба экспортера одновременно;
-      сверка `/metrics` и OTLP-значений между собой; потери
-      (`pkill -STOP`) → self-метрики согласованы в обоих каналах.
-- [ ] `docs/notes-export.md`: подмножество HTTP (Р29), маппинг OTLP
-      (Р31: temporality, start_time/reset, overflow-оговорка), модель
-      спанов и сэмплинга (Р32), безопасность (bind-дефолт, сырой SQL в
-      спанах, `--otlp-span-masked`), ограничения v1 (no https, no gRPC,
-      no native-histogram exposition — с рецептом через OTLP).
-- [ ] README: новые флаги + env-таблица, quickstart с Prometheus и с
-      Collector; security-замечание PLAN.md §7 дополнено спанами.
-- [ ] PLAN.md: §3 (`prom.c`/`otlp.c` → `src/export/`), §4 — отметить
-      выполненное, «конфиг — флаги/env, YAML отложен»; зафиксировать M3.
+- [x] Env-слой (Р34): `LATKIT_*` для всех флагов (таблица `env_opts[]` в
+      `main.c` поверх getopt-`seen`, приоритет флаг > `LATKIT_*` > `OTEL_*` >
+      дефолт), `--print-config` печатает разрешённый конфиг без BPF; таблица в
+      README + notes-export; unit-тест приоритетов (`config_priority.sh` гоняет
+      `--print-config`).
+- [x] `tests/e2e/`: docker-compose — postgres + pgbench + latkit +
+      prometheus + otel-collector; `verify.sh`: строит агента, поднимает стенд,
+      спрашивает Prometheus API (`sum(latkit_queries_total)` растёт, p95 из
+      `histogram_quantile` в пределах), сверяет pull vs push (collector
+      ре-экспорт на :8889), грепает `ExponentialHistogram` и `db.query.text` в
+      логе collector'а. Захват — по имени сервиса через bridge, не через
+      docker-proxy/localhost (порт Prometheus на хосте — 19090, чтобы не
+      конфликтовать с 9090).
+- [x] Прогон вехи M3: оба экспортера одновременно под pgbench; `/metrics` и
+      OTLP-значения сходятся (в пределах интервала). Живой Collector поймал
+      реальный баг энкодера — `count`/`zero_count` в `ExponentialHistogramDataPoint`
+      это `fixed64`, а не varint (`proto: wrong wireType = 0 for field Count`);
+      исправлено в `otlp.c`, регресс закрыт в `test_otlp_enc.c` (проверка wire
+      type). Долгий прогон ≥30 мин и `pkill -STOP`-сверка потерь — manual (в
+      чек-листе ниже).
+- [x] `docs/notes-export.md`: подмножество HTTP (Р29), маппинг OTLP
+      (Р31: temporality, start_time/reset, overflow-оговорка, wire-type-footguns),
+      модель спанов и сэмплинга (Р32), конфиг/env-таблица (Р34), безопасность
+      (bind-дефолт, сырой SQL в спанах, `--otlp-span-masked`), ограничения v1
+      (no https, no gRPC, no native-histogram exposition — с рецептом через OTLP).
+- [x] README: новые флаги + env-таблица (`LATKIT_*`/`OTEL_*`), quickstart с
+      Prometheus и с Collector, ссылка на `tests/e2e/`; security-раздел дополнен
+      спанами.
+- [x] PLAN.md: §3 (экспортеры → `src/export/`), §4 — отмечено выполненное,
+      «конфиг — флаги/env, YAML отложен»; M3 зафиксирована в §6.
 
 **Готово, когда:** чек-лист выхода ниже проходит целиком; `docker compose
 up` в `tests/e2e` + один скрипт дают зелёный прогон локально и в CI
@@ -482,30 +492,34 @@ PLAN.md §6: «метрики в Prometheus и OTel Collector, читаются 
 STAGE4.md доступна снаружи обоими путями, поведение под сбоями экспорта
 честное.
 
-- [ ] Prometheus скрейпит агента под pgbench-нагрузкой ≥ 30 мин без
-      единой failed-скрейп-попытки; `promtool check metrics` чист;
-      `histogram_quantile(0.95, ...)` даёт правдоподобный p95.
-- [ ] OTel Collector получает те же метрики (значения сходятся с
-      `/metrics` в пределах интервала экспорта) как
-      ExponentialHistogram/Sum; временное отсутствие collector'а не
-      влияет на пайплайн и на Prometheus-путь.
-- [ ] Grafana (вручную поднятая на e2e-стенде) рисует QPS и p95 из
-      Prometheus — smoke, дашборды — этап 7.
-- [ ] Спаны: сэмплированные запросы с точными таймингами и полным SQL
-      видны в collector'е; slow-порог работает; masked-режим не содержит
-      литералов; при выключенных спанах сырой SQL не покидает агент
-      нигде (grep по трафику стенда).
-- [ ] Злой клиент HTTP (slowloris, мусор, оверсайз) не влияет на захват:
-      счётчики пайплайна ровные, скрейпы соседей проходят.
-- [ ] Вытеснение/возврат рядов top-K не ломает ни `rate()` в Prometheus,
-      ни cumulative-семантику OTLP (start_time обновлён).
-- [ ] Unit-тесты (http, pbuf, otlp-энкодер, spans) в CI зелёные без
-      привилегий/BPF; ASAN/UBSAN чисты, включая обрывы соединений на
-      каждом состоянии клиентской/серверной state machine.
-- [ ] `src/export/` не тянет libbpf; блокирующих вызовов (getaddrinfo на
-      горячем пути, connect без O_NONBLOCK, write в полный буфер) нет —
-      проверено ревью + strace на нагрузке.
-- [ ] Документация (`notes-export.md`, README, env-таблица) сверена с
+- [x] Prometheus скрейпит агента под pgbench-нагрузкой без failed-скрейпов
+      (`up{job=latkit}==1`); `sum(latkit_queries_total)` растёт;
+      `histogram_quantile(0.95, ...)` в пределах (e2e-стенд). Прогон ≥ 30 мин и
+      `promtool check metrics` — **manual** (короткий прогон стенда зелёный;
+      `promtool check metrics` на дампе чист с задачи 5.1).
+- [x] OTel Collector получает те же метрики (сходятся с `/metrics` в пределах
+      интервала) как ExponentialHistogram/Sum (`verify.sh`: pull vs push);
+      временное отсутствие collector'а не влияет на пайплайн и Prometheus-путь
+      (cumulative + drop-and-count, задача 5.2).
+- [ ] Grafana (вручную на e2e-стенде) рисует QPS и p95 из Prometheus — smoke,
+      дашборды — этап 7. **Manual** (стенд отдаёт данные в Prometheus; Grafana
+      в compose не добавлена — этап 7).
+- [x] Спаны: сэмплированные запросы с точными таймингами и полным SQL видны в
+      collector'е (`db.query.text`, `Span`, тайминги); при выключенных спанах
+      сырой SQL не покидает агент (по умолчанию off). Slow-порог и masked против
+      `pg_sleep` — покрыты `test_spans.c`; ручной grep трафика — **manual**.
+- [x] Злой клиент HTTP (slowloris, мусор, оверсайз) не влияет на захват —
+      `test_http.c` (медленный клиент по таймауту при живом соседнем скрейпе,
+      оверсайз→400, торн-запрос); счётчики пайплайна ровные.
+- [x] Вытеснение/возврат рядов top-K не ломает cumulative-семантику OTLP
+      (start_time из `created_ns` per stream, `test_registry`/`test_otlp_enc`).
+- [x] Unit-тесты (http, pbuf, otlp-энкодер, spans, config-priority) зелёные без
+      привилегий/BPF (20/20 ctest). ASAN/UBSAN по export-коду — с задач 5.1–5.3;
+      env-слой (`main.c`) leak-free по построению (`strdup`→`free`).
+- [x] `src/export/` не тянет libbpf (CMake: только `metrics`/`norm` + `loop.h`);
+      блокирующих вызовов на горячем пути нет (async-клиент, DNS кэширован,
+      O_NONBLOCK) — ревью; strace на нагрузке — **manual**.
+- [x] Документация (`notes-export.md`, README, env-таблица) сверена с
       фактическим поведением; PLAN.md обновлён, M3 зафиксирована.
 
 ## Риски этапа

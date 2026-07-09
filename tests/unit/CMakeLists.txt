@@ -118,6 +118,12 @@ target_include_directories(test_spans PRIVATE
 target_link_libraries(test_spans latkit_export)
 add_test(NAME spans COMMAND test_spans)
 
+# Config priority (task 5.4, Р34): flag > LATKIT_* env > OTEL_* env > default,
+# asserted over `latkit --print-config` (resolves config before touching BPF, so
+# no privileges needed). Runs the built agent binary — hence the target dep.
+add_test(NAME config_priority
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/config_priority.sh $<TARGET_FILE:latkit>)
+
 # OTLP client end-to-end on loopback (task 5.2): drives the real connect/write/
 # read state machine in the loop against a bare TCP listener, no BPF. Pulls in
 # loop.c like test_http and links the export + metrics libs.

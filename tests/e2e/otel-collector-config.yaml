@@ -1,0 +1,34 @@
+# OTel Collector config for the e2e stand (task 5.4). Receives latkit's OTLP/HTTP
+# metrics and traces, logs them in full via the debug exporter (verify.sh greps
+# the container log for latkit series and span names — the live collector is
+# also the strict protobuf validator: it 400s malformed OTLP, Р31), and
+# re-exports the metrics on :8889 so Prometheus can read the push path back.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch: {}
+
+exporters:
+  # Full dump of every metric/span to the collector's stdout.
+  debug:
+    verbosity: detailed
+  # Mirror the received metrics onto a Prometheus endpoint for cross-checking.
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    resource_to_telemetry_conversion:
+      enabled: true
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, prometheus]
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]

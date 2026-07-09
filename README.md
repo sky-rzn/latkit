@@ -6,7 +6,7 @@ protocol into per-query latency metrics exported to Prometheus and
 OpenTelemetry. No backend of its own — Grafana reads the data from
 Prometheus / an OTel-compatible store.
 
-**Status: capture, framing, parser, and metrics done (milestones M1 + M2).**
+**Status: capture, framing, parser, metrics, and exporters done (milestones M1 + M2 + M3).**
 The agent attaches to a live kernel, captures both directions of traffic on
 configured server ports as a stream of connection-scoped events, accounts for
 every lost event, and survives overload without touching the database. On top of
@@ -20,14 +20,18 @@ loss. Stage 4 aggregates those observations into a bounded set of Prometheus
 series: it normalises the SQL to a fingerprint (literals → `?`, à la
 `pg_stat_statements` but lexer-only), keeps latency histograms under a top-K
 cardinality cap, and exposes them plus agent self-metrics as a valid Prometheus
-text exposition (`--dump-metrics`). Serving that over HTTP `/metrics` and OTLP is
-the next stage — see [PLAN.md](PLAN.md) (Russian) for the roadmap,
+text exposition. Stage 5 serves that exposition over HTTP `/metrics`
+(`--prom-listen`) and pushes the same registry to an OTel Collector as OTLP/HTTP
+protobuf (`--otlp-endpoint`) — `Sum`s, `Gauge`s, and `ExponentialHistogram`s —
+plus optional sampled **spans** carrying the exact per-query timings and full
+SQL. See [PLAN.md](PLAN.md) (Russian) for the roadmap,
 [STAGE1.md](STAGE1.md) for the capture-layer decisions, [STAGE2.md](STAGE2.md) /
 [docs/notes-reassembly.md](docs/notes-reassembly.md) for the framing model,
 [STAGE3.md](STAGE3.md) / [docs/notes-pgproto.md](docs/notes-pgproto.md) for the
-parser, and [STAGE4.md](STAGE4.md) / [docs/notes-metrics.md](docs/notes-metrics.md)
+parser, [STAGE4.md](STAGE4.md) / [docs/notes-metrics.md](docs/notes-metrics.md)
 for normalisation, the metric nomenclature, the duration model, and cardinality
-control.
+control, and [STAGE5.md](STAGE5.md) / [docs/notes-export.md](docs/notes-export.md)
+for the exporters, the OTLP mapping, spans, and the config/env layer.
 
 ## How it works
 
@@ -183,8 +187,75 @@ nomenclature, the duration model, and the top-K / `other` behaviour.
 **Security.** The agent sees SQL text, but literal masking is on by default and
 by construction: normalisation turns every string and numeric literal into `?`
 before it can reach a metric label, and raw SQL never enters the registry — only
-the normalised, masked prefix does. Full SQL is available only to stage-5 OTel
-spans/exemplars, opt-in.
+the normalised, masked prefix does. Full SQL is available only to OTel spans,
+opt-in (see below).
+
+## Exporters (Prometheus + OpenTelemetry)
+
+Two independent paths expose the registry above. The Prometheus **pull** server
+is on by default; the OTLP **push** exporter turns on when an endpoint is set.
+
+```sh
+# Prometheus scrape target on :9752 (the default), OTLP push to a Collector,
+# and 5 % of queries sampled as spans:
+sudo ./build/latkit \
+  --prom-listen 0.0.0.0:9752 \
+  --otlp-endpoint http://localhost:4318 \
+  --otlp-spans 0.05
+curl -s localhost:9752/metrics | promtool check metrics   # valid exposition
+curl -s localhost:9752/healthz                             # uptime/events/drops
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--prom-listen ADDR:PORT\|none` | `127.0.0.1:9752` | serve `/metrics` + `/healthz`; `none` disables. Loopback by default — bind `0.0.0.0` to scrape from another host/container |
+| `--otlp-endpoint URL` | off | push OTLP/HTTP metrics to this Collector base URL (`http://` only); **enables** the OTLP exporter |
+| `--otlp-interval SEC` | 15 | OTLP export period |
+| `--otlp-header K=V` | — | repeatable OTLP request header (auth for managed backends) |
+| `--otlp-resource K=V` | — | repeatable OTLP resource attribute |
+| `--otlp-spans RATIO` | off | sample this fraction `[0,1]` of queries as spans (**raw SQL!**); needs `--otlp-endpoint` |
+| `--otlp-spans-slow-ms N` | off | also sample every query at least N ms long |
+| `--otlp-span-text-max N` | 4096 | cap `db.query.text` at N bytes |
+| `--otlp-span-masked` | off | send the normalised (literal-free) SQL as `db.query.text` instead of the raw text |
+| `--print-config` | — | resolve config (flag > env > default) to stdout and exit; no BPF |
+
+A quick end-to-end stack (postgres + pgbench + latkit + Prometheus + Collector)
+lives in [tests/e2e/](tests/e2e) — `./tests/e2e/verify.sh` builds the agent,
+brings it up, and asserts both paths (milestone M3).
+
+### Configuration & environment
+
+Every flag has a `LATKIT_<UPPER_SNAKE>` environment equivalent; the priority is
+**flag > `LATKIT_*` env > (`OTEL_*` env, below) > default**. Booleans take a
+truthy word (`1`/`true`/`yes`/`on`); repeatable/list vars hold a comma-separated
+list in the one variable (`LATKIT_PORT=5432,5433`,
+`LATKIT_OTLP_HEADERS="k1=v1,k2=v2"`). `latkit --print-config` prints the resolved
+result. Standard OpenTelemetry variables are honoured as the default for their
+flag, so an agent deployed beside other OTel tooling inherits the ambient config:
+
+| Flag | `LATKIT_*` | Standard OTel var |
+|---|---|---|
+| `--otlp-endpoint` | `LATKIT_OTLP_ENDPOINT` | `OTEL_EXPORTER_OTLP_ENDPOINT` |
+| `--otlp-interval` | `LATKIT_OTLP_INTERVAL` | — |
+| `--otlp-header` | `LATKIT_OTLP_HEADERS` | `OTEL_EXPORTER_OTLP_HEADERS` |
+| `--otlp-resource` | `LATKIT_OTLP_RESOURCE` | `OTEL_RESOURCE_ATTRIBUTES` |
+| (`service.name`) | `LATKIT_OTLP_SERVICE_NAME` | `OTEL_SERVICE_NAME` |
+
+No YAML config in v1 — flags + env only (see [docs/notes-export.md](docs/notes-export.md)).
+
+### Export security
+
+- **Loopback by default.** `--prom-listen` binds `127.0.0.1`; exposing the
+  endpoint (`0.0.0.0`) is an explicit choice. No TLS/auth on the agent's own
+  endpoints in v1 — front with a reverse proxy; a bind failure is fatal.
+- **Spans are the only path for raw SQL.** Metrics are masked by construction;
+  spans carry the literal SQL and are **off by default**. Turn them on
+  deliberately, and use `--otlp-span-masked` where literals must not leave the
+  host (it substitutes the normalised text). `--otlp-endpoint` is `http://` only;
+  a remote Collector should be fronted with TLS.
+- **Native histograms in Prometheus?** Don't scrape for them — point the OTLP
+  exporter at Prometheus's `otlp-write-receiver` (or a Collector in front of it);
+  our OTLP `ExponentialHistogram` lands as a native histogram losslessly.
 
 ## Known limitations (v1 scope)
 
