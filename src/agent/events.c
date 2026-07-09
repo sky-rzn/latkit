@@ -45,9 +45,13 @@ struct lk_events {
     struct lk_metrics *metrics;           /* aggregator: the parser's standard consumer */
     const struct lk_query_sink *msink;    /* = lk_metrics_query_sink(metrics) */
     struct lk_query_sink qsink;           /* tee installed into the parser (below) */
-    struct lk_selfstats *selfstats;       /* process_* provider (task 4.4) */
-    struct lk_prom *prom;                 /* Prometheus /metrics server (task 5.1), NULL if off */
-    struct lk_otlp *otlp;                 /* OTLP/HTTP push exporter (task 5.2), NULL if off */
+    /* Fan-out list the tee drives (Р32): the aggregator always, plus the span
+     * collector when spans are enabled. --queries is a separate debug mirror. */
+    const struct lk_query_sink *qsinks[2];
+    int n_qsinks;
+    struct lk_selfstats *selfstats; /* process_* provider (task 4.4) */
+    struct lk_prom *prom;           /* Prometheus /metrics server (task 5.1), NULL if off */
+    struct lk_otlp *otlp;           /* OTLP/HTTP push exporter (task 5.2), NULL if off */
 };
 
 /* --- --queries logger (stage 3): the standard consumer of the parser -------
@@ -106,17 +110,20 @@ static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session
            o->text_len > LK_QUERY_TEXT_LOG_MAX ? "..." : "");
 }
 
-/* Tee query sink (task 4.3): the parser's standard consumer is now the metrics
- * aggregator; --queries keeps the stage-3 logger, run first as a debug mirror.
- * The logger takes no ctx, so it is called with NULL. on_txn has no log line. */
+/* Tee query sink (task 4.3, generalised to a list in task 5.3): the parser's
+ * consumers are now a small fan-out — the metrics aggregator always, the span
+ * collector when spans are on (Р32). --queries keeps the stage-3 logger, run
+ * first as a debug mirror; the logger takes no ctx, so it is called with NULL.
+ * on_txn has no log line and no span consumer. */
 static void ev_on_session(void *ctx, const struct lk_conn *c, const struct lk_session *s)
 {
     struct lk_events *e = ctx;
 
     if (e->cfg.queries)
         on_session(NULL, c, s);
-    if (e->msink->on_session)
-        e->msink->on_session(e->msink->ctx, c, s);
+    for (int i = 0; i < e->n_qsinks; i++)
+        if (e->qsinks[i]->on_session)
+            e->qsinks[i]->on_session(e->qsinks[i]->ctx, c, s);
 }
 
 static void ev_on_query(void *ctx, const struct lk_conn *c, const struct lk_session *s,
@@ -126,8 +133,9 @@ static void ev_on_query(void *ctx, const struct lk_conn *c, const struct lk_sess
 
     if (e->cfg.queries)
         on_query(NULL, c, s, o);
-    if (e->msink->on_query)
-        e->msink->on_query(e->msink->ctx, c, s, o);
+    for (int i = 0; i < e->n_qsinks; i++)
+        if (e->qsinks[i]->on_query)
+            e->qsinks[i]->on_query(e->qsinks[i]->ctx, c, s, o);
 }
 
 static void ev_on_txn(void *ctx, const struct lk_conn *c, __u64 start_ns, __u64 end_ns,
@@ -135,8 +143,9 @@ static void ev_on_txn(void *ctx, const struct lk_conn *c, __u64 start_ns, __u64 
 {
     struct lk_events *e = ctx;
 
-    if (e->msink->on_txn)
-        e->msink->on_txn(e->msink->ctx, c, start_ns, end_ns, final_status);
+    for (int i = 0; i < e->n_qsinks; i++)
+        if (e->qsinks[i]->on_txn)
+            e->qsinks[i]->on_txn(e->qsinks[i]->ctx, c, start_ns, end_ns, final_status);
 }
 
 /* PG parser counters (stage 3). The skeleton (task 3.1) only tallies messages,
@@ -586,6 +595,7 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
         return NULL;
     }
     e->msink = lk_metrics_query_sink(e->metrics);
+    e->qsinks[e->n_qsinks++] = e->msink; /* the aggregator; spans join in register */
 
     /* Self-metric providers (Р27), invoked at every dump: the agent-side
      * counters (kernel/framer/parser/conn-table) and process_* (getrusage /
@@ -742,6 +752,10 @@ int lk_events_register(struct lk_events *e, struct lk_loop *loop)
             .resource_attrs = e->cfg.otlp_resource,
             .nresource = e->cfg.otlp_nresource,
             .service_name = e->cfg.otlp_service_name,
+            .span_sample_ratio = e->cfg.otlp_span_ratio,
+            .span_slow_ms = e->cfg.otlp_span_slow_ms,
+            .span_text_max = e->cfg.otlp_span_text_max,
+            .span_masked = e->cfg.otlp_span_masked,
         };
 
         e->otlp = lk_otlp_new(loop, e->metrics, &oc);
@@ -751,6 +765,21 @@ int lk_events_register(struct lk_events *e, struct lk_loop *loop)
         }
         fprintf(stderr, "latkit: exporting OTLP metrics to %s every %us\n", e->cfg.otlp_endpoint,
                 e->cfg.otlp_interval ? e->cfg.otlp_interval : 15);
+
+        /* Add the span collector to the parser's fan-out (Р32). The tee reads
+         * qsinks[] live, so a sink added here — after the parser was built in
+         * lk_events_new — takes effect on the next observation. */
+        const struct lk_query_sink *ss = lk_otlp_span_sink(e->otlp);
+
+        if (ss && e->n_qsinks < (int)(sizeof(e->qsinks) / sizeof(e->qsinks[0]))) {
+            e->qsinks[e->n_qsinks++] = ss;
+            fprintf(stderr, "latkit: OTLP spans enabled%s (ratio=%g slow=%ums)\n",
+                    e->cfg.otlp_span_masked ? " (masked)" : "", e->cfg.otlp_span_ratio,
+                    e->cfg.otlp_span_slow_ms);
+        }
+    } else if (e->cfg.otlp_span_ratio > 0 || e->cfg.otlp_span_slow_ms) {
+        fprintf(stderr,
+                "latkit: --otlp-spans* ignored without --otlp-endpoint (nowhere to send)\n");
     }
     return 0;
 }

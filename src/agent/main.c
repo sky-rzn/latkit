@@ -21,6 +21,7 @@
 #include "loop.h"
 #include "metrics.h"
 #include "otel_env.h"
+#include "spans.h"
 
 #define LK_OTLP_MAX_KV 32 /* --otlp-header / --otlp-resource entries accepted */
 
@@ -41,7 +42,7 @@ static __u32 opt_top_queries;     /* 0 = metrics default (K = 500) */
 static __u32 opt_query_label_len; /* 0 = metrics default (256) */
 static bool opt_first_row_hist;
 static bool opt_dump_metrics;
-static const char *opt_dump_metrics_path;                  /* NULL = stderr */
+static const char *opt_dump_metrics_path;                    /* NULL = stderr */
 static const char *opt_prom_listen = LK_PROM_LISTEN_DEFAULT; /* "none" disables */
 static const char *opt_otlp_endpoint;                        /* NULL disables the OTLP exporter */
 static __u64 opt_otlp_interval;                              /* 0 = exporter default (15 s) */
@@ -50,6 +51,10 @@ static int opt_otlp_nheaders;
 static const char *opt_otlp_resource[LK_OTLP_MAX_KV];
 static int opt_otlp_nresource;
 static const char *opt_otlp_service_name;
+static double opt_otlp_span_ratio;   /* --otlp-spans RATIO; 0 = off */
+static __u64 opt_otlp_span_slow_ms;  /* --otlp-spans-slow-ms; 0 = off */
+static __u64 opt_otlp_span_text_max; /* --otlp-span-text-max; 0 = default */
+static bool opt_otlp_span_masked;
 /* Env-derived header/resource arrays (freed at exit for ASAN cleanliness). */
 static char **env_headers, **env_resource;
 static int env_nheaders, env_nresource;
@@ -112,12 +117,23 @@ static void usage(const char *argv0)
             "      --otlp-resource K=V\n"
             "                        repeatable OTLP resource attribute; defaults to\n"
             "                        $OTEL_RESOURCE_ATTRIBUTES\n"
+            "      --otlp-spans RATIO\n"
+            "                        sample this fraction [0,1] of queries as OTLP\n"
+            "                        spans (raw SQL!); needs --otlp-endpoint. Off by\n"
+            "                        default. SECURITY: spans carry literal SQL.\n"
+            "      --otlp-spans-slow-ms N\n"
+            "                        also sample every query at least N ms long\n"
+            "      --otlp-span-text-max N\n"
+            "                        cap db.query.text at N bytes (default: %d)\n"
+            "      --otlp-span-masked\n"
+            "                        send the normalised (literal-free) SQL as\n"
+            "                        db.query.text instead of the raw text\n"
             "  -x, --hexdump         dump payload of events (--events) and the\n"
             "                        captured body prefix (--messages)\n",
             argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT,
             LK_MAX_CHUNKS * LK_CHUNK_FULL, LK_CAP_HEADERS_LIMIT, LK_MAX_CONNS_DEFAULT,
             LK_CONN_IDLE_TIMEOUT_SEC, LK_TOP_QUERIES_DEFAULT, LK_QUERY_LABEL_LEN_DEFAULT,
-            LK_PROM_LISTEN_DEFAULT);
+            LK_PROM_LISTEN_DEFAULT, LK_SPAN_TEXT_MAX_DEF);
 }
 
 /* Strict decimal parse into [min, max]; -1 on any trailing garbage. */
@@ -156,6 +172,10 @@ static int parse_args(int argc, char **argv)
         OPT_OTLP_INTERVAL,
         OPT_OTLP_HEADER,
         OPT_OTLP_RESOURCE,
+        OPT_OTLP_SPANS,
+        OPT_OTLP_SPANS_SLOW_MS,
+        OPT_OTLP_SPAN_TEXT_MAX,
+        OPT_OTLP_SPAN_MASKED,
     };
     static const struct option opts[] = {
         {"port", required_argument, NULL, 'p'},
@@ -178,6 +198,10 @@ static int parse_args(int argc, char **argv)
         {"otlp-interval", required_argument, NULL, OPT_OTLP_INTERVAL},
         {"otlp-header", required_argument, NULL, OPT_OTLP_HEADER},
         {"otlp-resource", required_argument, NULL, OPT_OTLP_RESOURCE},
+        {"otlp-spans", required_argument, NULL, OPT_OTLP_SPANS},
+        {"otlp-spans-slow-ms", required_argument, NULL, OPT_OTLP_SPANS_SLOW_MS},
+        {"otlp-span-text-max", required_argument, NULL, OPT_OTLP_SPAN_TEXT_MAX},
+        {"otlp-span-masked", no_argument, NULL, OPT_OTLP_SPAN_MASKED},
         {"hexdump", no_argument, NULL, 'x'},
         {},
     };
@@ -302,6 +326,36 @@ static int parse_args(int argc, char **argv)
                 return -1;
             }
             opt_otlp_resource[opt_otlp_nresource++] = optarg;
+            break;
+        case OPT_OTLP_SPANS: {
+            char *end;
+
+            errno = 0;
+            opt_otlp_span_ratio = strtod(optarg, &end);
+            if (errno || end == optarg || *end || opt_otlp_span_ratio < 0.0 ||
+                opt_otlp_span_ratio > 1.0) {
+                fprintf(stderr, "--otlp-spans: expected a ratio in [0, 1], got '%s'\n", optarg);
+                return -1;
+            }
+            break;
+        }
+        case OPT_OTLP_SPANS_SLOW_MS:
+            if (parse_num(optarg, 1, 3600000, &v)) {
+                fprintf(stderr, "--otlp-spans-slow-ms: expected 1..3600000, got '%s'\n", optarg);
+                return -1;
+            }
+            opt_otlp_span_slow_ms = v;
+            break;
+        case OPT_OTLP_SPAN_TEXT_MAX:
+            if (parse_num(optarg, 1, 1 << 20, &v)) {
+                fprintf(stderr, "--otlp-span-text-max: expected 1..%d, got '%s'\n", 1 << 20,
+                        optarg);
+                return -1;
+            }
+            opt_otlp_span_text_max = v;
+            break;
+        case OPT_OTLP_SPAN_MASKED:
+            opt_otlp_span_masked = true;
             break;
         case 'x':
             opt_hexdump = true;
@@ -449,6 +503,10 @@ int main(int argc, char **argv)
         .otlp_resource = opt_otlp_nresource ? opt_otlp_resource : (const char *const *)env_resource,
         .otlp_nresource = opt_otlp_nresource ? opt_otlp_nresource : env_nresource,
         .otlp_service_name = opt_otlp_service_name,
+        .otlp_span_ratio = opt_otlp_span_ratio,
+        .otlp_span_slow_ms = (unsigned)opt_otlp_span_slow_ms,
+        .otlp_span_text_max = (unsigned)opt_otlp_span_text_max,
+        .otlp_span_masked = opt_otlp_span_masked,
     };
 
     events = lk_events_new(&ecfg);

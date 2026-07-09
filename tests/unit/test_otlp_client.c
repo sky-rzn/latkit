@@ -12,6 +12,7 @@
 #include "loop.h"
 #include "metrics.h"
 #include "otlp.h"
+#include "proto.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -25,12 +26,12 @@
 #include <unistd.h>
 
 static int failures;
-#define EXPECT(cond, msg)                                                                         \
-    do {                                                                                          \
-        if (!(cond)) {                                                                            \
-            printf("FAIL: %s\n", msg);                                                            \
+#define EXPECT(cond, msg)                                                                          \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            printf("FAIL: %s\n", msg);                                                             \
             failures++;                                                                            \
-        }                                                                                         \
+        }                                                                                          \
     } while (0)
 
 static uint64_t now_ms(void)
@@ -196,10 +197,76 @@ int main(void)
     EXPECT(dump_export_count(m, "ok") >= 1, "exports_total{result=ok} >= 1");
 
     /* Second export: reply 503, expect result="error" to advance. */
-    req = serve_one(loop, lfd, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n", &rlen);
+    req = serve_one(loop, lfd, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n",
+                    &rlen);
     EXPECT(req != NULL, "second request received");
     free(req);
     EXPECT(dump_export_count(m, "error") >= 1, "exports_total{result=error} >= 1");
+
+    /* Spans (task 5.3): a fresh exporter with spans on, on its own loop and
+     * metrics object. A dedicated loop matters — lk_otlp_free does not cancel the
+     * export tick (the exporter's lifetime is the loop's in production), so an
+     * exporter and the loop it drives must be torn down together, not reused.
+     * Feeding one sampled observation makes the next tick POST metrics and then,
+     * once that settles, POST /v1/traces carrying the span. */
+    struct lk_loop *loop2 = lk_loop_new();
+    struct lk_metrics *m2 = lk_metrics_new(NULL);
+    struct lk_otlp *o2;
+
+    cfg.span_sample_ratio = 1.0;
+    cfg.span_seed = 1;
+    o2 = (loop2 && m2) ? lk_otlp_new(loop2, m2, &cfg) : NULL;
+    EXPECT(o2 != NULL, "exporter with spans created");
+    if (o2) {
+        const struct lk_query_sink *ss = lk_otlp_span_sink(o2);
+        struct lk_conn c = {.cookie = 0x1234};
+        struct lk_session sess = {0};
+        struct lk_query_obs qo = {
+            .ts_start_ns = 1000,
+            .ts_complete_ns = 1000 + 5000000, /* 5 ms, measurable -> eligible */
+            .text = "select 1",
+            .text_len = 8,
+            .rows = 1,
+            .kind = LK_Q_SIMPLE,
+        };
+        char *traces = NULL;
+        size_t tlen;
+
+        EXPECT(ss != NULL, "span sink exposed");
+        snprintf(sess.database, sizeof(sess.database), "%s", "appdb");
+        if (ss)
+            ss->on_query(ss->ctx, &c, &sess, &qo);
+
+        /* First request the tick sends is metrics; then traces follows it. */
+        for (int i = 0; i < 2 && !traces; i++) {
+            char *req =
+                serve_one(loop2, lfd, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", &tlen);
+
+            EXPECT(req != NULL, "export request received");
+            if (req && !strncmp(req, "POST /v1/traces", 15))
+                traces = req;
+            else
+                free(req);
+        }
+        EXPECT(traces != NULL, "a POST /v1/traces was sent");
+        if (traces) {
+            char *body = strstr(traces, "\r\n\r\n");
+
+            /* Body's first byte is ExportTraceServiceRequest.resource_spans
+             * (field 1, wire 2 = 0x0a); the span carries db.system.name. */
+            EXPECT(body && (unsigned char)body[4] == 0x0a,
+                   "traces body starts with resource_spans");
+            EXPECT(strstr(traces, "postgresql") != NULL, "span carries db.system.name=postgresql");
+            EXPECT(strstr(traces, "select 1") != NULL, "span carries db.query.text");
+            free(traces);
+        }
+        EXPECT(dump_export_count(m2, "ok") >= 1, "an OTLP export succeeded with spans on");
+    }
+    /* Tear the spans exporter down with its own loop (order: exporter, then the
+     * loop whose tick still references it). */
+    lk_otlp_free(o2);
+    lk_loop_free(loop2);
+    lk_metrics_free(m2);
 
     lk_otlp_free(o);
     lk_metrics_free(m);

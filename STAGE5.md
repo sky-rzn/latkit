@@ -414,21 +414,30 @@ top-K) не рождает «убывающий cumulative» — start_time но
 
 ### 5.3 Спаны и exemplars (~1,5 дня)
 
-- [ ] Tee в `events.c`/`pipeline.c`: список `lk_query_sink`-потребителей
-      (metrics, spans, `--queries`) вместо пары этапа 4.
-- [ ] `spans.c` (Р32): предикаты сэмплинга (ratio через xorshift от
-      ts+cookie — без rand(3); порог slow-ms), кольцо `LK_SPAN_BUF`,
-      копия текста ≤ `--otlp-span-text-max`, счётчики sampled/dropped;
-      `test_spans.c` — сэмплинг детерминирован сидом, переполнение
-      кольца, NO_TEXT-запросы.
-- [ ] OTLP traces: энкодер Span (semconv-атрибуты Р32, статус из
-      LK_QO_ERROR + sqlstate), отправка `/v1/traces` тем же клиентом,
-      флаш по тику и по 3/4 заполнения; `--otlp-span-masked`.
+- [x] Tee в `events.c`: список `lk_query_sink`-потребителей (`qsinks[]` —
+      metrics всегда, spans при включённых спанах) вместо пары этапа 4;
+      `--queries` остаётся отдельным debug-зеркалом. (`pipeline.c` трогать
+      не пришлось — фан-аут живёт в `events.c`, где собирается парсер.)
+- [x] `spans.c` (Р32): предикаты сэмплинга (ratio через splitmix64-хэш от
+      ts+cookie+seed — без rand(3), детерминирован сидом; порог slow-ms),
+      кольцо-FIFO `LK_SPAN_BUF` (полное → новый выбрасывается), копия
+      текста ≤ `--otlp-span-text-max` (raw либо нормализованный при
+      masked), id из getrandom-сида, счётчики sampled/dropped, watermark
+      3/4; `test_spans.c` — детерминизм сида, границы ratio, slow-предикат,
+      переполнение кольца, NO_TEXT, masked, усечение текста.
+- [x] OTLP traces: энкодер Span (semconv-атрибуты Р32 — `db.system.name`,
+      `db.namespace`, `db.user`, `db.query.text`, `db.response.returned_rows`;
+      статус ERROR + `db.response.status_code`=SQLSTATE), отправка
+      `/v1/traces` тем же клиентом (двухсигнальная state machine, один в
+      полёте: метрики по тику, traces следом либо по 3/4), `--otlp-span-masked`;
+      `test_otlp_client.c` — сквозной POST `/v1/traces` по loopback.
 - [ ] Опционально (не критерий M3): exemplars — кольцо 4 шт. на ряд
       гистограммы, выдача в OTLP `exemplars` и в OpenMetrics-вариант
-      дампа по `Accept` (Р30).
-- [ ] Replay-фикстуры этапа 3 через spans-sink: ассерты на число
-      сэмплированных при ratio=1.0, тексты, статусы ошибок.
+      дампа по `Accept` (Р30). **Отложено** (не веха M3) — шов есть
+      (`lk_span` несёт trace/span id), подключается поверх без переделок.
+- [x] Replay-фикстуры этапа 3 через spans-sink (ratio=1.0): ассерт
+      sampled == число obs с измеримой длительностью, dropped==0, текст и
+      статус ошибки последнего спана сходятся с последним obs.
 
 **Готово, когда:** `--otlp-spans 1.0` на psql-сессии доводит спаны до
 collector'а (debug-exporter показывает имя, тайминги, `db.query.text`);

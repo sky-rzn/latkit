@@ -20,6 +20,7 @@
 #ifndef LATKIT_OTLP_H
 #define LATKIT_OTLP_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 struct lk_loop;
@@ -28,6 +29,7 @@ struct lk_otlp;
 struct pbuf;
 struct lk_metric_view;
 struct lk_timebase;
+struct lk_query_sink;
 
 struct lk_otlp_cfg {
     const char *endpoint;              /* http://host:port[/path]; enables the exporter */
@@ -38,6 +40,15 @@ struct lk_otlp_cfg {
     int nresource;
     const char *service_name;    /* service.name (OTEL_SERVICE_NAME); NULL -> "latkit" */
     const char *service_version; /* service.version / scope version; NULL -> LK_VERSION */
+
+    /* Spans (Р32, task 5.3): enabled when either predicate is set. The exporter
+     * owns the span collector and POSTs traces to /v1/traces with the same
+     * client, flushed on the export tick and when the ring crosses 3/4 full. */
+    double span_sample_ratio; /* --otlp-spans RATIO; (0,1], 0 disables */
+    unsigned span_slow_ms;    /* --otlp-spans-slow-ms; 0 disables the slow predicate */
+    unsigned span_text_max;   /* --otlp-span-text-max bytes; 0 -> default (4 KiB) */
+    bool span_masked;         /* --otlp-span-masked: db.query.text is normalised */
+    uint64_t span_seed;       /* sampling/id seed; 0 -> random (getrandom) */
 };
 
 /* Creates the exporter, resolves the endpoint, registers the export tick and the
@@ -46,6 +57,10 @@ struct lk_otlp_cfg {
 struct lk_otlp *lk_otlp_new(struct lk_loop *loop, struct lk_metrics *m,
                             const struct lk_otlp_cfg *cfg);
 void lk_otlp_free(struct lk_otlp *o);
+
+/* The span-collector tee sink for the parser, or NULL if spans are disabled.
+ * Borrowed — valid for the exporter's lifetime (Р32). */
+const struct lk_query_sink *lk_otlp_span_sink(struct lk_otlp *o);
 
 /* --- encoder seam (exposed for unit tests) --------------------------------
  * Encode one metric view as an OTLP ScopeMetrics.metrics (field 2) Metric into

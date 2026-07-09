@@ -22,6 +22,7 @@
 #include "pipeline.h"
 #include "proto.h"
 #include "record.h"
+#include "spans.h"
 
 #ifndef LK_FIXTURES_DIR
 #define LK_FIXTURES_DIR "."
@@ -61,6 +62,16 @@ struct collector {
      * exactly as events.c wires them over live traffic. */
     struct lk_metrics *metrics;
     const struct lk_query_sink *msink;
+
+    /* Span collector (task 5.3): a third consumer at ratio=1.0, so every
+     * observation with a measurable duration must become exactly one span. The
+     * harness recomputes eligibility with the same predicate to cross-check. */
+    struct lk_spans *spans;
+    const struct lk_query_sink *ssink;
+    size_t neligible;
+    char last_elig_text[256];
+    bool last_elig_error;
+    char last_elig_sqlstate[6];
 };
 
 static void on_session(void *ctx, const struct lk_conn *c, const struct lk_session *s)
@@ -89,6 +100,21 @@ static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session
     col->last_obs.text = NULL;
     if (col->msink->on_query)
         col->msink->on_query(col->msink->ctx, c, s, o);
+
+    /* Recompute the span-eligibility predicate (measurable duration) and snapshot
+     * the last eligible observation, then tee into the span collector. */
+    if (o->ts_complete_ns > o->ts_start_ns) {
+        col->neligible++;
+        col->last_elig_text[0] = '\0';
+        if (o->text && o->text_len < sizeof(col->last_elig_text)) {
+            memcpy(col->last_elig_text, o->text, o->text_len);
+            col->last_elig_text[o->text_len] = '\0';
+        }
+        col->last_elig_error = (o->flags & LK_QO_ERROR) != 0;
+        snprintf(col->last_elig_sqlstate, sizeof(col->last_elig_sqlstate), "%s", o->sqlstate);
+    }
+    if (col->ssink->on_query)
+        col->ssink->on_query(col->ssink->ctx, c, s, o);
 }
 
 static void on_txn(void *ctx, const struct lk_conn *c, __u64 start_ns, __u64 end_ns, char status)
@@ -316,6 +342,28 @@ static int check_metrics(const struct metric_expect *e, const char *buf)
     return 0;
 }
 
+/* Drain callback: keep the last drained span's text / error status (Р32). */
+struct last_span {
+    bool any;
+    char text[256];
+    bool error;
+    char sqlstate[6];
+};
+
+static void grab_last_span(void *ctx, const struct lk_span *sp)
+{
+    struct last_span *ls = ctx;
+
+    ls->any = true;
+    ls->text[0] = '\0';
+    if (sp->text && sp->text_len < sizeof(ls->text)) {
+        memcpy(ls->text, sp->text, sp->text_len);
+        ls->text[sp->text_len] = '\0';
+    }
+    ls->error = sp->error;
+    snprintf(ls->sqlstate, sizeof(ls->sqlstate), "%s", sp->sqlstate);
+}
+
 static int run_fixture(const struct fixture *fix)
 {
     struct fx x;
@@ -360,9 +408,18 @@ static int run_fixture(const struct fixture *fix)
         return 1;
     }
     col.msink = lk_metrics_query_sink(col.metrics);
+    col.spans = lk_spans_new(&(struct lk_spans_cfg){.sample_ratio = 1.0, .seed = 1});
+    if (!col.spans) {
+        lk_metrics_free(col.metrics);
+        free(committed);
+        free(x.buf);
+        return 1;
+    }
+    col.ssink = lk_spans_sink(col.spans);
     col.proto = lk_proto_pg_new(&(struct lk_query_sink){
         .ctx = &col, .on_session = on_session, .on_query = on_query, .on_txn = on_txn});
     if (!col.proto) {
+        lk_spans_free(col.spans);
         lk_metrics_free(col.metrics);
         free(committed);
         free(x.buf);
@@ -375,6 +432,8 @@ static int run_fixture(const struct fixture *fix)
                                                .on_resync = on_resync,
                                                .on_conn_close = on_conn_close})) {
         lk_proto_free(col.proto);
+        lk_spans_free(col.spans);
+        lk_metrics_free(col.metrics);
         free(committed);
         free(x.buf);
         return 1;
@@ -498,10 +557,43 @@ static int run_fixture(const struct fixture *fix)
             }
     }
 
+    /* Task 5.3: the span sink saw the same observations at ratio=1.0, so every
+     * eligible obs (measurable duration) became exactly one span, none dropped,
+     * and the last span mirrors the last eligible obs' raw text and error. */
+    {
+        struct last_span ls = {0};
+
+        if (lk_spans_sampled_total(col.spans) != col.neligible) {
+            fprintf(stderr, "FAIL %s: spans sampled=%llu, expected eligible=%zu\n", fix->name,
+                    (unsigned long long)lk_spans_sampled_total(col.spans), col.neligible);
+            goto fail;
+        }
+        if (lk_spans_dropped_total(col.spans) != 0) {
+            fprintf(stderr, "FAIL %s: spans dropped=%llu, expected 0\n", fix->name,
+                    (unsigned long long)lk_spans_dropped_total(col.spans));
+            goto fail;
+        }
+        lk_spans_drain(col.spans, grab_last_span, &ls);
+        if (col.neligible) {
+            if (!ls.any || strcmp(ls.text, col.last_elig_text)) {
+                fprintf(stderr, "FAIL %s: last span text \"%s\", expected \"%s\"\n", fix->name,
+                        ls.text, col.last_elig_text);
+                goto fail;
+            }
+            if (ls.error != col.last_elig_error ||
+                (col.last_elig_error && strcmp(ls.sqlstate, col.last_elig_sqlstate))) {
+                fprintf(stderr, "FAIL %s: last span error=%d/%s, expected %d/%s\n", fix->name,
+                        ls.error, ls.sqlstate, col.last_elig_error, col.last_elig_sqlstate);
+                goto fail;
+            }
+        }
+    }
+
     /* Tear the table down first (its destroy hooks free proto_state through the
      * parser, which must still be alive), then release the handler. */
     lk_pipeline_fini(&col.pipe);
     lk_proto_free(col.proto);
+    lk_spans_free(col.spans);
     lk_metrics_free(col.metrics);
     free(committed);
     free(x.buf);
@@ -511,6 +603,7 @@ static int run_fixture(const struct fixture *fix)
 fail:
     lk_pipeline_fini(&col.pipe);
     lk_proto_free(col.proto);
+    lk_spans_free(col.spans);
     lk_metrics_free(col.metrics);
     free(committed);
     free(x.buf);

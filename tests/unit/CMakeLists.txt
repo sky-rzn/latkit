@@ -108,11 +108,22 @@ target_include_directories(test_timebase PRIVATE ${CMAKE_SOURCE_DIR}/src/export)
 target_link_libraries(test_timebase latkit_export)
 add_test(NAME timebase COMMAND test_timebase)
 
+# Span collector (task 5.3): sampling predicates + ring over synthetic
+# observations. Pure, links the export lib (spans.c) and reads the lk_query_obs
+# contract (proto.h, types only) — hence the proto/agent/bpf header dirs.
+add_executable(test_spans test_spans.c)
+target_include_directories(test_spans PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/export ${CMAKE_SOURCE_DIR}/src/proto
+    ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf)
+target_link_libraries(test_spans latkit_export)
+add_test(NAME spans COMMAND test_spans)
+
 # OTLP client end-to-end on loopback (task 5.2): drives the real connect/write/
 # read state machine in the loop against a bare TCP listener, no BPF. Pulls in
 # loop.c like test_http and links the export + metrics libs.
 add_executable(test_otlp_client test_otlp_client.c ${CMAKE_SOURCE_DIR}/src/agent/loop.c)
 target_include_directories(test_otlp_client PRIVATE
-    ${CMAKE_SOURCE_DIR}/src/export ${CMAKE_SOURCE_DIR}/src/metrics ${CMAKE_SOURCE_DIR}/src/agent)
+    ${CMAKE_SOURCE_DIR}/src/export ${CMAKE_SOURCE_DIR}/src/metrics ${CMAKE_SOURCE_DIR}/src/agent
+    ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/bpf)
 target_link_libraries(test_otlp_client latkit_export)
 add_test(NAME otlp_client COMMAND test_otlp_client)

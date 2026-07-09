@@ -173,12 +173,15 @@ target_link_libraries(latkit_metrics PUBLIC m latkit_norm)
 # BPF (test_http links it against a bare loop.c). loop.c itself stays with the
 # agent; whoever links latkit_export also provides loop.o.
 add_library(latkit_export STATIC src/export/http.c src/export/prom.c src/export/pbuf.c
-            src/export/timebase.c src/export/otlp.c)
+            src/export/timebase.c src/export/otlp.c src/export/spans.c)
 target_include_directories(latkit_export PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/export)
 target_include_directories(latkit_export PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/agent ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/common)
-target_link_libraries(latkit_export PUBLIC latkit_metrics)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf)
+# spans.c reads the lk_query_obs contract (proto.h) and normalises the span name
+# (latkit_norm) — still no libbpf, so the export lib stays BPF-free.
+target_link_libraries(latkit_export PUBLIC latkit_metrics latkit_norm)
 
 # --- agent -----------------------------------------------------------------
 add_executable(latkit src/agent/main.c src/agent/loop.c src/agent/events.c

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
-/* See otlp.h. Two halves: the encoder (metric view -> OTLP protobuf via pbuf)
- * and the non-blocking HTTP client (one export in flight, in the shared loop).
+/* See otlp.h. Three halves: the metric encoder (metric view -> OTLP protobuf via
+ * pbuf), the span encoder (task 5.3), and the non-blocking HTTP client that
+ * POSTs both signals — one request in flight, in the shared loop.
  *
  * OTLP field numbers are inlined as literals from the (stable) proto schema —
- * metrics.proto, common.proto, resource.proto. The subset we touch:
+ * metrics.proto, trace.proto, common.proto, resource.proto. The subset we touch:
  *   ExportMetricsServiceRequest { resource_metrics = 1 }   (== MetricsData wire)
  *   ResourceMetrics { resource = 1, scope_metrics = 2 }
  *   ScopeMetrics { scope = 1, metrics = 2 }
@@ -15,7 +16,13 @@
  *   ExponentialHistogramDataPoint { attrs=1, start=2, time=3, count=4, sum=5,
  *     scale=6(sint32), zero_count=7, positive=8, zero_threshold=14 }
  *   Buckets { offset=1(sint32), bucket_counts=2(packed uint64) }
- *   KeyValue { key=1, value=2 }  AnyValue { string_value=1 } */
+ *   ExportTraceServiceRequest { resource_spans = 1 }       (== TracesData wire)
+ *   ResourceSpans { resource=1, scope_spans=2 }
+ *   ScopeSpans { scope=1, spans=2 }
+ *   Span { trace_id=1(bytes), span_id=2(bytes), name=5, kind=6, start=7(fixed64),
+ *     end=8(fixed64), attributes=9, status=15 }
+ *   Status { message=2, code=3 }   (STATUS_CODE_ERROR = 2)
+ *   KeyValue { key=1, value=2 }  AnyValue { string_value=1, int_value=3 } */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -36,20 +43,24 @@
 #include "loop.h"
 #include "metrics.h"
 #include "pbuf.h"
+#include "spans.h"
 #include "timebase.h"
 #include "version.h"
 
-#define OTLP_DEFAULT_INTERVAL 15
-#define OTLP_DEFAULT_PORT     "4318"
-#define OTLP_TIMEOUT_SEC      5
+#define OTLP_DEFAULT_INTERVAL       15
+#define OTLP_DEFAULT_PORT           "4318"
+#define OTLP_TIMEOUT_SEC            5
 #define OTLP_TEMPORALITY_CUMULATIVE 2
-#define OTLP_MAX_RES_ATTRS    32
+#define OTLP_MAX_RES_ATTRS          32
 
-/* --- encoder -------------------------------------------------------------- */
+#define OTLP_SPAN_KIND_CLIENT 3 /* SpanKind.SPAN_KIND_CLIENT */
+#define OTLP_STATUS_ERROR     2 /* StatusCode.STATUS_CODE_ERROR */
+
+/* --- shared attribute helpers -------------------------------------------- */
 
 /* KeyValue{key, value:AnyValue{string_value}} at the given field number
- * (attributes are field 7 in NumberDataPoint, field 1 in the histogram DP and
- * in Resource/Scope). */
+ * (attributes are field 7 in NumberDataPoint, 1 in the histogram DP, 9 in Span
+ * and 1 in Resource/Scope). */
 static void enc_str_kv(struct pbuf *pb, uint32_t field, const char *key, const char *val)
 {
     size_t kv = pb_submsg_begin(pb, field);
@@ -61,6 +72,36 @@ static void enc_str_kv(struct pbuf *pb, uint32_t field, const char *key, const c
     pb_submsg_end(pb, any);
     pb_submsg_end(pb, kv);
 }
+
+/* Same, but the value carries an explicit length (raw SQL may not be a tidy
+ * C-string once truncated to the byte budget). */
+static void enc_str_kv_n(struct pbuf *pb, uint32_t field, const char *key, const char *val,
+                         size_t vlen)
+{
+    size_t kv = pb_submsg_begin(pb, field);
+    size_t any;
+
+    pb_field_string(pb, 1, key);
+    any = pb_submsg_begin(pb, 2);
+    pb_field_bytes(pb, 1, val, vlen); /* AnyValue.string_value (LEN wire) */
+    pb_submsg_end(pb, any);
+    pb_submsg_end(pb, kv);
+}
+
+/* KeyValue{key, value:AnyValue{int_value}} (db.response.returned_rows). */
+static void enc_int_kv(struct pbuf *pb, uint32_t field, const char *key, uint64_t val)
+{
+    size_t kv = pb_submsg_begin(pb, field);
+    size_t any;
+
+    pb_field_string(pb, 1, key);
+    any = pb_submsg_begin(pb, 2);
+    pb_field_varint(pb, 3, val); /* AnyValue.int_value */
+    pb_submsg_end(pb, any);
+    pb_submsg_end(pb, kv);
+}
+
+/* --- metric encoder ------------------------------------------------------- */
 
 static void enc_attrs(struct pbuf *pb, uint32_t field, const struct lk_metric_view *v)
 {
@@ -155,9 +196,46 @@ void lk_otlp_encode_metric(struct pbuf *pb, const struct lk_metric_view *v,
     pb_submsg_end(pb, metric);
 }
 
+/* --- span encoder (task 5.3, Р32) ----------------------------------------- */
+
+/* One Span into an open ScopeSpans (field 2). Attributes follow OTel database
+ * semconv; the raw SQL leaves the agent only here (or its masked form). */
+static void enc_span(struct pbuf *pb, const struct lk_span *sp, const struct lk_timebase *tb)
+{
+    size_t span = pb_submsg_begin(pb, 2); /* ScopeSpans.spans */
+
+    pb_field_bytes(pb, 1, sp->trace_id, sizeof(sp->trace_id));
+    pb_field_bytes(pb, 2, sp->span_id, sizeof(sp->span_id));
+    pb_field_string(pb, 5, sp->name);
+    pb_field_varint(pb, 6, OTLP_SPAN_KIND_CLIENT);
+    pb_field_fixed64(pb, 7, lk_wall_ns(tb, sp->start_ns));
+    pb_field_fixed64(pb, 8, lk_wall_ns(tb, sp->end_ns));
+
+    enc_str_kv(pb, 9, "db.system.name", "postgresql");
+    if (sp->db[0])
+        enc_str_kv(pb, 9, "db.namespace", sp->db);
+    if (sp->user[0])
+        enc_str_kv(pb, 9, "db.user", sp->user);
+    if (sp->text)
+        enc_str_kv_n(pb, 9, "db.query.text", sp->text, sp->text_len);
+    if (sp->have_rows)
+        enc_int_kv(pb, 9, "db.response.returned_rows", sp->rows);
+    if (sp->error) {
+        size_t st;
+
+        if (sp->sqlstate[0])
+            enc_str_kv(pb, 9, "db.response.status_code", sp->sqlstate);
+        st = pb_submsg_begin(pb, 15); /* Status */
+        pb_field_varint(pb, 3, OTLP_STATUS_ERROR);
+        pb_submsg_end(pb, st);
+    }
+    pb_submsg_end(pb, span);
+}
+
 /* --- client --------------------------------------------------------------- */
 
 enum otlp_state { OT_IDLE = 0, OT_CONNECT, OT_WRITE, OT_READ };
+enum otlp_signal { OTLP_SIG_METRICS = 0, OTLP_SIG_TRACES = 1, OTLP_NSIGNALS = 2 };
 
 struct res_attr {
     char key[64];
@@ -167,11 +245,12 @@ struct res_attr {
 struct lk_otlp {
     struct lk_loop *loop;
     struct lk_metrics *metrics;
+    struct lk_spans *spans; /* NULL when spans are disabled */
 
     char host[256];
     char port[16];
-    char target[300];  /* request path, e.g. /v1/metrics */
-    char hostport[288]; /* Host header value */
+    char base[256];      /* endpoint base path (no trailing slash), "" if none */
+    char hostport[288];  /* Host header value */
     char *extra_headers; /* joined "Key: Value\r\n" ... , or NULL */
     unsigned interval;
     const char *version;
@@ -190,6 +269,8 @@ struct lk_otlp {
     /* in-flight state machine */
     int fd;
     enum otlp_state state;
+    enum otlp_signal cur; /* which signal is in flight */
+    bool pending_traces;  /* traces due, waiting for the client to free up */
     uint64_t deadline_ns;
     char *req;
     size_t req_len, req_off;
@@ -199,7 +280,7 @@ struct lk_otlp {
 
     uint64_t skip_until_ns; /* Retry-After pause */
 
-    uint64_t exports_ok, exports_err, ticks_skipped;
+    uint64_t exports_ok[OTLP_NSIGNALS], exports_err[OTLP_NSIGNALS], ticks_skipped;
 };
 
 static uint64_t now_ns(void)
@@ -210,18 +291,20 @@ static uint64_t now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-/* Parse http://host[:port][/path] into host/port/target. Only http:// in v1
- * (Р31). Returns 0, or -1 with a message. */
+/* Parse http://host[:port][/path] into host/port and a cleaned base path (v1
+ * signal paths are appended per request). Only http:// in v1 (Р31). Returns 0,
+ * or -1 with a message. */
 static int parse_endpoint(const char *ep, char *host, size_t hostsz, char *port, size_t portsz,
-                          char *target, size_t targetsz)
+                          char *base, size_t basesz)
 {
     const char *p, *hs, *he, *pstart = NULL, *pend = NULL, *path = NULL;
 
     if (strncasecmp(ep, "http://", 7) == 0) {
         p = ep + 7;
     } else if (strncasecmp(ep, "https://", 8) == 0) {
-        fprintf(stderr, "otlp: https endpoints are not supported in v1 (use http:// to a "
-                        "sidecar Collector); '%s'\n",
+        fprintf(stderr,
+                "otlp: https endpoints are not supported in v1 (use http:// to a "
+                "sidecar Collector); '%s'\n",
                 ep);
         return -1;
     } else {
@@ -267,24 +350,19 @@ static int parse_endpoint(const char *ep, char *host, size_t hostsz, char *port,
         snprintf(port, portsz, "%s", OTLP_DEFAULT_PORT);
     }
 
-    /* Request target = base path (minus a trailing slash) + the signal path. */
-    {
-        char base[256] = "";
+    /* Base path minus any trailing slash; "" when the endpoint has no path. */
+    base[0] = '\0';
+    if (path) {
+        size_t n = strlen(path);
 
-        if (path) {
-            size_t n = strlen(path);
-
-            while (n > 1 && path[n - 1] == '/')
-                n--;
-            if (n >= sizeof(base))
-                return -1;
-            memcpy(base, path, n);
-            base[n] = '\0';
-            if (n == 1 && base[0] == '/')
-                base[0] = '\0';
-        }
-        if (snprintf(target, targetsz, "%s/v1/metrics", base) >= (int)targetsz)
+        while (n > 1 && path[n - 1] == '/')
+            n--;
+        if (n == 1 && path[0] == '/')
+            n = 0; /* bare "/" -> no base */
+        if (n >= basesz)
             return -1;
+        memcpy(base, path, n);
+        base[n] = '\0';
     }
     return 0;
 }
@@ -312,6 +390,8 @@ static int otlp_resolve(struct lk_otlp *o)
     return 0;
 }
 
+static void otlp_maybe_traces(struct lk_otlp *o);
+
 /* Tear down the in-flight request and return to idle. reresolve forces a fresh
  * getaddrinfo on the next attempt (used after connect/timeout failures, Р31). */
 static void otlp_finish(struct lk_otlp *o, bool reresolve)
@@ -331,10 +411,13 @@ static void otlp_finish(struct lk_otlp *o, bool reresolve)
         o->resolved = false;
 }
 
-/* Wall-clock export instant used for every data point's time_unix_nano. */
-static void otlp_build_body(struct lk_otlp *o, struct pbuf *pb, uint64_t now_wall);
-
-static void enc_metric_cb(void *ctx, const struct lk_metric_view *v);
+/* Finish the current request, then pump a pending traces export if one is
+ * waiting (metrics and traces share the single in-flight slot). */
+static void otlp_after(struct lk_otlp *o, bool reresolve)
+{
+    otlp_finish(o, reresolve);
+    otlp_maybe_traces(o);
+}
 
 struct enc_ctx {
     struct pbuf *pb;
@@ -349,36 +432,76 @@ static void enc_metric_cb(void *ctx, const struct lk_metric_view *v)
     lk_otlp_encode_metric(e->pb, v, e->tb, e->now_wall);
 }
 
-static void otlp_build_body(struct lk_otlp *o, struct pbuf *pb, uint64_t now_wall)
+static void enc_span_cb(void *ctx, const struct lk_span *sp)
 {
-    struct enc_ctx ec = {.pb = pb, .tb = &o->tb, .now_wall = now_wall};
-    size_t rm, res, sm, sc;
+    struct enc_ctx *e = ctx;
 
-    rm = pb_submsg_begin(pb, 1); /* resource_metrics */
-    res = pb_submsg_begin(pb, 1); /* Resource */
+    enc_span(e->pb, sp, e->tb);
+}
+
+static void otlp_enc_resource(struct lk_otlp *o, struct pbuf *pb)
+{
+    size_t res = pb_submsg_begin(pb, 1); /* Resource */
+
     for (int i = 0; i < o->nres; i++)
         enc_str_kv(pb, 1, o->res[i].key, o->res[i].val);
     pb_submsg_end(pb, res);
+}
 
-    sm = pb_submsg_begin(pb, 2); /* scope_metrics */
-    sc = pb_submsg_begin(pb, 1); /* InstrumentationScope */
+static void otlp_enc_scope(struct lk_otlp *o, struct pbuf *pb)
+{
+    size_t sc = pb_submsg_begin(pb, 1); /* InstrumentationScope */
+
     pb_field_string(pb, 1, "latkit");
     pb_field_string(pb, 2, o->version);
     pb_submsg_end(pb, sc);
+}
+
+static void otlp_build_metrics(struct lk_otlp *o, struct pbuf *pb, uint64_t now_wall)
+{
+    struct enc_ctx ec = {.pb = pb, .tb = &o->tb, .now_wall = now_wall};
+    size_t rm, sm;
+
+    rm = pb_submsg_begin(pb, 1); /* resource_metrics */
+    otlp_enc_resource(o, pb);
+    sm = pb_submsg_begin(pb, 2); /* scope_metrics */
+    otlp_enc_scope(o, pb);
     lk_metrics_iter(o->metrics, enc_metric_cb, &ec);
     pb_submsg_end(pb, sm);
     pb_submsg_end(pb, rm);
 }
 
-/* Assemble the HTTP request (headers + protobuf body) into a single buffer. */
-static int otlp_build_request(struct lk_otlp *o, uint64_t now_wall)
+static void otlp_build_traces(struct lk_otlp *o, struct pbuf *pb, uint64_t now_wall)
+{
+    struct enc_ctx ec = {.pb = pb, .tb = &o->tb, .now_wall = now_wall};
+    size_t rs, ss;
+
+    rs = pb_submsg_begin(pb, 1); /* resource_spans */
+    otlp_enc_resource(o, pb);
+    ss = pb_submsg_begin(pb, 2); /* scope_spans */
+    otlp_enc_scope(o, pb);
+    lk_spans_drain(o->spans, enc_span_cb, &ec); /* consumes the ring */
+    pb_submsg_end(pb, ss);
+    pb_submsg_end(pb, rs);
+}
+
+/* Assemble the HTTP request (headers + protobuf body) into a single buffer for
+ * the given signal. */
+static int otlp_build_request(struct lk_otlp *o, enum otlp_signal sig, uint64_t now_wall)
 {
     struct pbuf pb;
+    char target[288];
     char hdr[1024];
     int hn;
 
+    snprintf(target, sizeof(target), "%s/v1/%s", o->base,
+             sig == OTLP_SIG_TRACES ? "traces" : "metrics");
+
     pb_init(&pb);
-    otlp_build_body(o, &pb, now_wall);
+    if (sig == OTLP_SIG_TRACES)
+        otlp_build_traces(o, &pb, now_wall);
+    else
+        otlp_build_metrics(o, &pb, now_wall);
     if (pb.oom) {
         pb_free(&pb);
         return -1;
@@ -391,7 +514,7 @@ static int otlp_build_request(struct lk_otlp *o, uint64_t now_wall)
                   "%s"
                   "Connection: close\r\n"
                   "\r\n",
-                  o->target, o->hostport, pb.len, o->extra_headers ? o->extra_headers : "");
+                  target, o->hostport, pb.len, o->extra_headers ? o->extra_headers : "");
     if (hn < 0 || hn >= (int)sizeof(hdr)) {
         pb_free(&pb);
         return -1;
@@ -411,21 +534,23 @@ static int otlp_build_request(struct lk_otlp *o, uint64_t now_wall)
 
 static int on_conn(void *ctx);
 
-static void otlp_start(struct lk_otlp *o)
+/* Start an export of `sig` (client must be idle). Attributes failures to sig. */
+static void otlp_send(struct lk_otlp *o, enum otlp_signal sig)
 {
     uint64_t mono = now_ns();
     uint64_t wall;
     int fd, rc;
 
+    o->cur = sig;
     lk_timebase_sample(&o->tb);
     wall = lk_wall_ns(&o->tb, mono);
 
-    if (otlp_build_request(o, wall)) {
-        o->exports_err++;
+    if (otlp_build_request(o, sig, wall)) {
+        o->exports_err[sig]++;
         return;
     }
     if (!o->resolved && otlp_resolve(o)) {
-        o->exports_err++;
+        o->exports_err[sig]++;
         free(o->req);
         o->req = NULL;
         return; /* stay idle; the next tick retries the resolve */
@@ -433,7 +558,7 @@ static void otlp_start(struct lk_otlp *o)
 
     fd = socket(o->family, o->socktype | SOCK_NONBLOCK | SOCK_CLOEXEC, o->protocol);
     if (fd < 0) {
-        o->exports_err++;
+        o->exports_err[sig]++;
         free(o->req);
         o->req = NULL;
         return;
@@ -445,7 +570,7 @@ static void otlp_start(struct lk_otlp *o)
         o->state = OT_CONNECT;
     } else {
         close(fd);
-        o->exports_err++;
+        o->exports_err[sig]++;
         o->resolved = false; /* connection setup failed: re-resolve next time */
         free(o->req);
         o->req = NULL;
@@ -455,12 +580,24 @@ static void otlp_start(struct lk_otlp *o)
     o->deadline_ns = mono + (uint64_t)OTLP_TIMEOUT_SEC * 1000000000ULL;
     if (lk_loop_add_fd(o->loop, fd, on_conn, o) ||
         lk_loop_mod_fd(o->loop, fd, o->state == OT_READ, o->state != OT_READ)) {
+        o->exports_err[sig]++;
         otlp_finish(o, true);
-        o->exports_err++;
         return;
     }
     if (o->state == OT_WRITE)
         on_conn(o); /* already connected: try to write now */
+}
+
+/* Send a queued traces batch if the client is free (Р32: flush by tick or 3/4).
+ * Only starts traces — metrics is driven solely by the interval tick. */
+static void otlp_maybe_traces(struct lk_otlp *o)
+{
+    if (o->state != OT_IDLE || !o->pending_traces || !o->spans)
+        return;
+    o->pending_traces = false;
+    if (lk_spans_queued(o->spans) == 0)
+        return; /* nothing to send after all */
+    otlp_send(o, OTLP_SIG_TRACES);
 }
 
 /* Parse "HTTP/1.1 NNN ..." -> NNN; 0 if the line is not yet complete/parseable. */
@@ -502,9 +639,9 @@ static void otlp_on_response_done(struct lk_otlp *o)
     int code = o->status_code;
 
     if (code >= 200 && code < 300) {
-        o->exports_ok++;
+        o->exports_ok[o->cur]++;
     } else {
-        o->exports_err++;
+        o->exports_err[o->cur]++;
         if (code == 429 || code == 503) {
             unsigned secs = parse_retry_after(o->resp, o->resp_len);
 
@@ -513,7 +650,7 @@ static void otlp_on_response_done(struct lk_otlp *o)
             o->skip_until_ns = now_ns() + (uint64_t)secs * 1000000000ULL;
         }
     }
-    otlp_finish(o, false); /* an HTTP reply means DNS is fine: keep the cache */
+    otlp_after(o, false); /* an HTTP reply means DNS is fine: keep the cache */
 }
 
 static int on_conn(void *ctx)
@@ -525,14 +662,14 @@ static int on_conn(void *ctx)
         socklen_t l = sizeof(err);
 
         if (getsockopt(o->fd, SOL_SOCKET, SO_ERROR, &err, &l) || err) {
-            o->exports_err++;
-            otlp_finish(o, true);
+            o->exports_err[o->cur]++;
+            otlp_after(o, true);
             return 0;
         }
         o->state = OT_WRITE;
         if (lk_loop_mod_fd(o->loop, o->fd, false, true)) {
-            o->exports_err++;
-            otlp_finish(o, true);
+            o->exports_err[o->cur]++;
+            otlp_after(o, true);
             return 0;
         }
     }
@@ -548,15 +685,15 @@ static int on_conn(void *ctx)
             } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 return 0; /* wait for the next EPOLLOUT */
             } else {
-                o->exports_err++;
-                otlp_finish(o, true);
+                o->exports_err[o->cur]++;
+                otlp_after(o, true);
                 return 0;
             }
         }
         o->state = OT_READ;
         if (lk_loop_mod_fd(o->loop, o->fd, true, false)) {
-            o->exports_err++;
-            otlp_finish(o, true);
+            o->exports_err[o->cur]++;
+            otlp_after(o, true);
             return 0;
         }
     }
@@ -582,8 +719,8 @@ static int on_conn(void *ctx)
             } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 return 0;
             } else {
-                o->exports_err++;
-                otlp_finish(o, true);
+                o->exports_err[o->cur]++;
+                otlp_after(o, true);
                 return 0;
             }
         }
@@ -598,11 +735,25 @@ static void on_tick(void *ctx)
 
     if (now < o->skip_until_ns)
         return; /* honouring a Retry-After pause */
+
+    /* Spans flush on the tick too; a full-enough ring may already have set this
+     * via the watermark. */
+    if (o->spans && lk_spans_queued(o->spans) > 0)
+        o->pending_traces = true;
+
     if (o->state != OT_IDLE) {
-        o->ticks_skipped++; /* previous export still in flight (Р31) */
-        return;
+        o->ticks_skipped++; /* metrics export still in flight (Р31): skip this tick */
+        return;             /* pending_traces (if set) is sent when the client frees */
     }
-    otlp_start(o);
+    otlp_send(o, OTLP_SIG_METRICS); /* the tick owns metrics; traces follow it */
+}
+
+static void otlp_on_watermark(void *ctx)
+{
+    struct lk_otlp *o = ctx;
+
+    o->pending_traces = true;
+    otlp_maybe_traces(o);
 }
 
 static void on_sweep(void *ctx)
@@ -610,8 +761,8 @@ static void on_sweep(void *ctx)
     struct lk_otlp *o = ctx;
 
     if (o->state != OT_IDLE && now_ns() >= o->deadline_ns) {
-        o->exports_err++;
-        otlp_finish(o, true); /* stuck export: drop and re-resolve */
+        o->exports_err[o->cur]++;
+        otlp_after(o, true); /* stuck export: drop and re-resolve */
     }
 }
 
@@ -621,9 +772,20 @@ static void otlp_provide(void *ctx, struct lk_metrics *m)
     const char *help = "OTLP export attempts by signal and result.";
 
     lk_metrics_set_counter_l2(m, "latkit_otlp_exports_total", help, "signal", "metrics", "result",
-                              "ok", (double)o->exports_ok);
+                              "ok", (double)o->exports_ok[OTLP_SIG_METRICS]);
     lk_metrics_set_counter_l2(m, "latkit_otlp_exports_total", help, "signal", "metrics", "result",
-                              "error", (double)o->exports_err);
+                              "error", (double)o->exports_err[OTLP_SIG_METRICS]);
+    if (o->spans) {
+        lk_metrics_set_counter_l2(m, "latkit_otlp_exports_total", help, "signal", "traces",
+                                  "result", "ok", (double)o->exports_ok[OTLP_SIG_TRACES]);
+        lk_metrics_set_counter_l2(m, "latkit_otlp_exports_total", help, "signal", "traces",
+                                  "result", "error", (double)o->exports_err[OTLP_SIG_TRACES]);
+        lk_metrics_set_counter(m, "latkit_spans_sampled_total", "Queries sampled into spans (Р32).",
+                               (double)lk_spans_sampled_total(o->spans));
+        lk_metrics_set_counter(m, "latkit_spans_dropped_total",
+                               "Sampled spans dropped because the ring was full.",
+                               (double)lk_spans_dropped_total(o->spans));
+    }
     lk_metrics_set_counter(m, "latkit_otlp_export_ticks_skipped_total",
                            "Export ticks skipped because the previous export was still in flight.",
                            (double)o->ticks_skipped);
@@ -699,6 +861,24 @@ static char *join_headers(const char *const *headers, int n)
 
 /* --- lifecycle ------------------------------------------------------------ */
 
+/* Build the span collector if either predicate is configured (Р32). */
+static struct lk_spans *otlp_make_spans(struct lk_otlp *o, const struct lk_otlp_cfg *cfg)
+{
+    struct lk_spans_cfg sc;
+
+    if (cfg->span_sample_ratio <= 0.0 && cfg->span_slow_ms == 0)
+        return NULL;
+    memset(&sc, 0, sizeof(sc));
+    sc.sample_ratio = cfg->span_sample_ratio;
+    sc.slow_ns = (uint64_t)cfg->span_slow_ms * 1000000ULL;
+    sc.text_max = cfg->span_text_max;
+    sc.masked = cfg->span_masked;
+    sc.seed = cfg->span_seed;
+    sc.on_watermark = otlp_on_watermark;
+    sc.watermark_ctx = o;
+    return lk_spans_new(&sc);
+}
+
 struct lk_otlp *lk_otlp_new(struct lk_loop *loop, struct lk_metrics *m,
                             const struct lk_otlp_cfg *cfg)
 {
@@ -719,8 +899,8 @@ struct lk_otlp *lk_otlp_new(struct lk_loop *loop, struct lk_metrics *m,
     o->interval = cfg->interval_sec ? cfg->interval_sec : OTLP_DEFAULT_INTERVAL;
     o->version = cfg->service_version ? cfg->service_version : LK_VERSION;
 
-    if (parse_endpoint(cfg->endpoint, o->host, sizeof(o->host), o->port, sizeof(o->port),
-                       o->target, sizeof(o->target))) {
+    if (parse_endpoint(cfg->endpoint, o->host, sizeof(o->host), o->port, sizeof(o->port), o->base,
+                       sizeof(o->base))) {
         free(o);
         return NULL;
     }
@@ -739,12 +919,14 @@ struct lk_otlp *lk_otlp_new(struct lk_loop *loop, struct lk_metrics *m,
         res_add_pair(o, cfg->resource_attrs[i]);
 
     o->extra_headers = join_headers(cfg->headers, cfg->nheaders);
+    o->spans = otlp_make_spans(o, cfg);
 
     /* Resolve once up front, but tolerate a not-yet-up Collector: a failure
      * here just leaves resolved=false and the first tick retries (Р31). */
     otlp_resolve(o);
 
     if (lk_loop_every(loop, o->interval, on_tick, o) || lk_loop_every(loop, 1, on_sweep, o)) {
+        lk_spans_free(o->spans);
         free(o->extra_headers);
         free(o);
         return NULL;
@@ -753,11 +935,17 @@ struct lk_otlp *lk_otlp_new(struct lk_loop *loop, struct lk_metrics *m,
     return o;
 }
 
+const struct lk_query_sink *lk_otlp_span_sink(struct lk_otlp *o)
+{
+    return o->spans ? lk_spans_sink(o->spans) : NULL;
+}
+
 void lk_otlp_free(struct lk_otlp *o)
 {
     if (!o)
         return;
     otlp_finish(o, false);
+    lk_spans_free(o->spans);
     free(o->extra_headers);
     free(o);
 }

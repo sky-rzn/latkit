@@ -42,13 +42,20 @@ struct lk_events_cfg {
 
     /* OTLP/HTTP push exporter (task 5.2, Р31). Enabled by a non-NULL endpoint
      * (flag or OTEL_EXPORTER_OTLP_ENDPOINT). */
-    const char *otlp_endpoint;         /* http://host:port[/path]; NULL disables */
-    unsigned otlp_interval;            /* --otlp-interval seconds; 0 = default (15) */
-    const char *const *otlp_headers;   /* --otlp-header / OTEL_EXPORTER_OTLP_HEADERS */
+    const char *otlp_endpoint;       /* http://host:port[/path]; NULL disables */
+    unsigned otlp_interval;          /* --otlp-interval seconds; 0 = default (15) */
+    const char *const *otlp_headers; /* --otlp-header / OTEL_EXPORTER_OTLP_HEADERS */
     int otlp_nheaders;
-    const char *const *otlp_resource;  /* --otlp-resource / OTEL_RESOURCE_ATTRIBUTES */
+    const char *const *otlp_resource; /* --otlp-resource / OTEL_RESOURCE_ATTRIBUTES */
     int otlp_nresource;
-    const char *otlp_service_name;     /* OTEL_SERVICE_NAME; NULL = "latkit" */
+    const char *otlp_service_name; /* OTEL_SERVICE_NAME; NULL = "latkit" */
+
+    /* Spans (task 5.3, Р32). Enabled when a predicate is set AND an OTLP
+     * endpoint exists (nowhere to send otherwise). */
+    double otlp_span_ratio;      /* --otlp-spans RATIO; (0,1], 0 = off */
+    unsigned otlp_span_slow_ms;  /* --otlp-spans-slow-ms; 0 = off */
+    unsigned otlp_span_text_max; /* --otlp-span-text-max; 0 = default (4 KiB) */
+    bool otlp_span_masked;       /* --otlp-span-masked: strip literals from db.query.text */
 };
 
 struct lk_events;

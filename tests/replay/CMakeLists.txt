@@ -15,8 +15,9 @@ set(REPLAY_INC ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
 # replay tests drive the PG parser over fixtures from task 3.2 on. Task 4.3 tees
 # the observations into the metrics aggregator and asserts a deterministic dump.
 add_executable(test_replay test_replay.c ${REPLAY_SRC})
-target_include_directories(test_replay PRIVATE ${REPLAY_INC} ${CMAKE_SOURCE_DIR}/src/metrics)
-target_link_libraries(test_replay latkit_proto latkit_metrics)
+target_include_directories(test_replay PRIVATE ${REPLAY_INC}
+    ${CMAKE_SOURCE_DIR}/src/metrics ${CMAKE_SOURCE_DIR}/src/export)
+target_link_libraries(test_replay latkit_proto latkit_metrics latkit_export)
 target_compile_definitions(test_replay PRIVATE
     LK_FIXTURES_DIR="${CMAKE_SOURCE_DIR}/tests/fixtures")
 add_test(NAME replay COMMAND test_replay)
