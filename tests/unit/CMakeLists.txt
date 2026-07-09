@@ -75,3 +75,12 @@ target_include_directories(test_metrics PRIVATE
     ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf)
 target_link_libraries(test_metrics latkit_metrics)
 add_test(NAME metrics COMMAND test_metrics)
+
+# Mini HTTP server (task 5.1): loopback state-machine tests over the export lib.
+# Pulls in a bare loop.c (the loop lives with the agent, not the export lib) and
+# needs no libbpf or privileges. See test_http.c for the covered cases.
+add_executable(test_http test_http.c ${CMAKE_SOURCE_DIR}/src/agent/loop.c)
+target_include_directories(test_http PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/export ${CMAKE_SOURCE_DIR}/src/agent)
+target_link_libraries(test_http latkit_export)
+add_test(NAME http COMMAND test_http)

@@ -25,6 +25,7 @@
 #include "loop.h"
 #include "metrics.h"
 #include "pipeline.h"
+#include "prom.h"
 #include "proto.h"
 #include "reassembly.h"
 #include "record.h"
@@ -44,6 +45,7 @@ struct lk_events {
     const struct lk_query_sink *msink;    /* = lk_metrics_query_sink(metrics) */
     struct lk_query_sink qsink;           /* tee installed into the parser (below) */
     struct lk_selfstats *selfstats;       /* process_* provider (task 4.4) */
+    struct lk_prom *prom;                 /* Prometheus /metrics server (task 5.1), NULL if off */
 };
 
 /* --- --queries logger (stage 3): the standard consumer of the parser -------
@@ -259,6 +261,22 @@ static void ev_provide_stats(void *ctx, struct lk_metrics *m)
                              "reason", "lru", (double)cs->evicted_lru);
     lk_metrics_set_counter_l(m, "latkit_conns_evicted_total", NULL, "reason", "idle",
                              (double)cs->evicted_idle);
+}
+
+/* /healthz liveness source (task 5.1): the Prometheus server lives in src/export
+ * and must not touch libbpf, so it pulls the two counters it reports through
+ * this callback — the same kernel `stats` map as the exposition and the log. */
+static void ev_provide_health(void *ctx, struct lk_prom_health *out)
+{
+    struct lk_events *e = ctx;
+    __u64 sum[LK_ST_MAX];
+
+    if (!sum_kernel_stats(e, sum))
+        return; /* out->valid stays false: the body omits the counters */
+    out->events_total = sum[LK_ST_EVENTS];
+    out->ringbuf_dropped_total =
+        sum[LK_ST_RESERVE_FAIL_DATA] + sum[LK_ST_RESERVE_FAIL_OPEN] + sum[LK_ST_RESERVE_FAIL_CLOSE];
+    out->valid = true;
 }
 
 /* --- global stats (task 1.5) ---------------------------------------------
@@ -653,6 +671,9 @@ void lk_events_free(struct lk_events *e)
 {
     if (!e)
         return;
+    /* Tear the HTTP server down first: it deregisters its fds from the loop, so
+     * it must go before the loop is freed (main frees events before the loop). */
+    lk_prom_free(e->prom);
     ring_buffer__free(e->rb);
     if (lk_recorder_close(e->rec))
         fprintf(stderr, "warn: --record file may be incomplete (write error)\n");
@@ -681,5 +702,28 @@ int lk_events_register(struct lk_events *e, struct lk_loop *loop)
         return err;
     if (e->cfg.dump_metrics) /* SIGUSR1 -> dump the exposition on demand */
         lk_loop_on_sigusr1(loop, on_dump_signal, e);
-    return lk_loop_every(loop, LK_SWEEP_INTERVAL_SEC, on_sweep_tick, e);
+    err = lk_loop_every(loop, LK_SWEEP_INTERVAL_SEC, on_sweep_tick, e);
+    if (err)
+        return err;
+
+    /* Prometheus /metrics + /healthz server (task 5.1). A bind failure is fatal
+     * by design (Р29): fail startup rather than silently run without the pull
+     * endpoint. "none" opts out. */
+    if (e->cfg.prom_listen && strcmp(e->cfg.prom_listen, "none") != 0) {
+        struct lk_prom_cfg pc = {
+            .bind_addr = e->cfg.prom_listen,
+            .metrics = e->metrics,
+            .health_fn = ev_provide_health,
+            .health_ctx = e,
+        };
+
+        e->prom = lk_prom_new(loop, &pc);
+        if (!e->prom) {
+            fprintf(stderr, "latkit: cannot start Prometheus listener on %s\n", e->cfg.prom_listen);
+            return -1;
+        }
+        fprintf(stderr, "latkit: serving Prometheus /metrics and /healthz on %s (port %d)\n",
+                e->cfg.prom_listen, lk_prom_port(e->prom));
+    }
+    return 0;
 }

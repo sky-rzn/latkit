@@ -11,6 +11,10 @@
 #include <linux/types.h>
 #include <stdbool.h>
 
+/* Prometheus /metrics listener default (Р29): loopback only, so a scrape from
+ * outside the host is an explicit choice (bind 0.0.0.0). "none" disables it. */
+#define LK_PROM_LISTEN_DEFAULT "127.0.0.1:9752"
+
 struct bpf_map;
 struct lk_loop;
 
@@ -34,6 +38,7 @@ struct lk_events_cfg {
     bool first_row_hist;           /* --first-row-hist */
     bool dump_metrics;             /* --dump-metrics[=path] given */
     const char *dump_metrics_path; /* target file, NULL = stderr */
+    const char *prom_listen;       /* --prom-listen ADDR:PORT, or "none"/NULL to disable */
 };
 
 struct lk_events;

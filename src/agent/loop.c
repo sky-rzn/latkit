@@ -15,15 +15,25 @@
 #include <sys/timerfd.h>
 #include <unistd.h>
 
-/* Fixed capacities: the agent registers a handful of fds (ringbuf, signal,
- * timer, later the HTTP listen fd) and a couple of periodic tasks. */
-#define LK_LOOP_MAX_FDS   8
+/* Fixed capacities: the agent registers a handful of long-lived fds (ringbuf,
+ * signal, timer, HTTP listen fd) plus, in stage 5, up to a few short-lived HTTP
+ * client fds that come and go through lk_loop_add_fd / lk_loop_del_fd. */
+#define LK_LOOP_MAX_FDS   32
 #define LK_LOOP_MAX_TASKS 8
 
+/* An fd slot lives in a fixed array so epoll's data.ptr (set to &fds[i] at ADD)
+ * stays valid for the entry's whole life. Deregistration marks the slot
+ * inactive rather than compacting the array, keeping every other slot's stored
+ * pointer stable. `freed_gen` guards the classic epoll hazard where an fd is
+ * dropped mid-batch and its slot is reused before a stale event referencing it
+ * is dispatched: a slot freed during dispatch records the current generation
+ * and is not handed out again until the next epoll_wait advances `gen`. */
 struct lk_loop_fd {
     int fd;
     lk_loop_fd_fn fn;
     void *ctx;
+    bool active;
+    uint64_t freed_gen;
 };
 
 struct lk_loop_task {
@@ -36,7 +46,8 @@ struct lk_loop_task {
 struct lk_loop {
     int epfd, sigfd, tfd;
     bool stop;
-    int nfds;
+    bool dispatching;               /* true while inside a dispatch batch */
+    uint64_t gen;                   /* advances once per epoll_wait batch */
     struct lk_loop_fd fds[LK_LOOP_MAX_FDS];
     int ntasks;
     struct lk_loop_task tasks[LK_LOOP_MAX_TASKS];
@@ -44,25 +55,80 @@ struct lk_loop {
     void *usr1_ctx;
 };
 
-int lk_loop_add_fd(struct lk_loop *l, int fd, lk_loop_fd_fn fn, void *ctx)
+/* First slot that is inactive and not on hold from a same-batch free. */
+static struct lk_loop_fd *alloc_slot(struct lk_loop *l)
 {
-    struct epoll_event ev = {.events = EPOLLIN};
-    struct lk_loop_fd *ent;
+    for (int i = 0; i < LK_LOOP_MAX_FDS; i++)
+        if (!l->fds[i].active && l->fds[i].freed_gen != l->gen)
+            return &l->fds[i];
+    return NULL;
+}
 
-    if (l->nfds == LK_LOOP_MAX_FDS) {
+static struct lk_loop_fd *find_slot(struct lk_loop *l, int fd)
+{
+    for (int i = 0; i < LK_LOOP_MAX_FDS; i++)
+        if (l->fds[i].active && l->fds[i].fd == fd)
+            return &l->fds[i];
+    return NULL;
+}
+
+static int add_masked(struct lk_loop *l, int fd, uint32_t events, lk_loop_fd_fn fn, void *ctx)
+{
+    struct lk_loop_fd *ent = alloc_slot(l);
+    struct epoll_event ev = {.events = events};
+
+    if (!ent) {
         fprintf(stderr, "loop: fd table full (%d)\n", LK_LOOP_MAX_FDS);
         return -ENOSPC;
     }
-    ent = &l->fds[l->nfds];
     ent->fd = fd;
     ent->fn = fn;
     ent->ctx = ctx;
     ev.data.ptr = ent;
     if (epoll_ctl(l->epfd, EPOLL_CTL_ADD, fd, &ev)) {
         fprintf(stderr, "loop: epoll_ctl(ADD, %d): %s\n", fd, strerror(errno));
+        return -errno; /* slot left inactive: reusable */
+    }
+    ent->active = true;
+    return 0;
+}
+
+int lk_loop_add_fd(struct lk_loop *l, int fd, lk_loop_fd_fn fn, void *ctx)
+{
+    return add_masked(l, fd, EPOLLIN, fn, ctx);
+}
+
+int lk_loop_mod_fd(struct lk_loop *l, int fd, bool want_read, bool want_write)
+{
+    struct lk_loop_fd *ent = find_slot(l, fd);
+    struct epoll_event ev = {
+        .events = (want_read ? EPOLLIN : 0) | (want_write ? EPOLLOUT : 0),
+    };
+
+    if (!ent)
+        return -ENOENT;
+    ev.data.ptr = ent;
+    if (epoll_ctl(l->epfd, EPOLL_CTL_MOD, fd, &ev)) {
+        fprintf(stderr, "loop: epoll_ctl(MOD, %d): %s\n", fd, strerror(errno));
         return -errno;
     }
-    l->nfds++;
+    return 0;
+}
+
+int lk_loop_del_fd(struct lk_loop *l, int fd)
+{
+    struct lk_loop_fd *ent = find_slot(l, fd);
+
+    if (!ent)
+        return -ENOENT;
+    /* EPOLL_CTL_DEL can fail only on a programming error here; drop the slot
+     * regardless so a doomed fd never lingers as active. */
+    if (epoll_ctl(l->epfd, EPOLL_CTL_DEL, fd, NULL) && errno != EBADF && errno != ENOENT)
+        fprintf(stderr, "loop: epoll_ctl(DEL, %d): %s\n", fd, strerror(errno));
+    ent->active = false;
+    /* Hold the slot until the next batch if a stale event for it might still be
+     * pending in the batch currently dispatching. */
+    ent->freed_gen = l->dispatching ? l->gen : 0;
     return 0;
 }
 
@@ -143,6 +209,9 @@ struct lk_loop *lk_loop_new(void)
     if (!l)
         return NULL;
     l->epfd = l->sigfd = l->tfd = -1;
+    /* gen starts at 1 so pristine slots (freed_gen == 0) are allocatable and a
+     * slot freed outside dispatch (freed_gen := 0) is reusable at once. */
+    l->gen = 1;
 
     l->epfd = epoll_create1(EPOLL_CLOEXEC);
     if (l->epfd < 0) {
@@ -198,26 +267,43 @@ void lk_loop_free(struct lk_loop *l)
     free(l);
 }
 
-int lk_loop_run(struct lk_loop *l)
+int lk_loop_poll(struct lk_loop *l, int timeout_ms)
 {
     struct epoll_event evs[LK_LOOP_MAX_FDS];
+    int n = epoll_wait(l->epfd, evs, LK_LOOP_MAX_FDS, timeout_ms);
+    int rv = 0;
 
+    if (n < 0) {
+        if (errno == EINTR)
+            return 0;
+        fprintf(stderr, "loop: epoll_wait: %s\n", strerror(errno));
+        return -errno;
+    }
+    /* New batch: advance the generation, then dispatch. A slot freed during
+     * this dispatch keeps its stale event from being mistaken for a fresh
+     * registration (freed_gen == gen) and is not reused until the next batch. */
+    l->gen++;
+    l->dispatching = true;
+    for (int i = 0; i < n; i++) {
+        const struct lk_loop_fd *ent = evs[i].data.ptr;
+
+        if (!ent->active) /* deregistered earlier in this same batch */
+            continue;
+        rv = ent->fn(ent->ctx);
+        if (rv < 0)
+            break;
+    }
+    l->dispatching = false;
+    return rv;
+}
+
+int lk_loop_run(struct lk_loop *l)
+{
     while (!l->stop) {
-        int n = epoll_wait(l->epfd, evs, LK_LOOP_MAX_FDS, -1);
+        int rv = lk_loop_poll(l, -1);
 
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            fprintf(stderr, "loop: epoll_wait: %s\n", strerror(errno));
-            return -errno;
-        }
-        for (int i = 0; i < n; i++) {
-            const struct lk_loop_fd *ent = evs[i].data.ptr;
-            int err = ent->fn(ent->ctx);
-
-            if (err < 0)
-                return err;
-        }
+        if (rv < 0)
+            return rv;
     }
     return 0;
 }

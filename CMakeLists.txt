@@ -166,6 +166,18 @@ target_include_directories(latkit_metrics PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf)
 target_link_libraries(latkit_metrics PUBLIC m latkit_norm)
 
+# --- exporters (stage 5) ---------------------------------------------------
+# src/export/** is the pull/push export layer (Р29-Р31): it depends only on
+# src/metrics/ and the shared epoll loop (loop.h from src/agent), never on
+# libbpf or the rest of src/agent. That keeps it testable on loopback without
+# BPF (test_http links it against a bare loop.c). loop.c itself stays with the
+# agent; whoever links latkit_export also provides loop.o.
+add_library(latkit_export STATIC src/export/http.c src/export/prom.c)
+target_include_directories(latkit_export PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/export)
+target_include_directories(latkit_export PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/agent ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics)
+target_link_libraries(latkit_export PUBLIC latkit_metrics)
+
 # --- agent -----------------------------------------------------------------
 add_executable(latkit src/agent/main.c src/agent/loop.c src/agent/events.c
                src/agent/decode.c src/agent/conn_table.c src/agent/reassembly.c
@@ -175,8 +187,8 @@ set_source_files_properties(src/agent/main.c PROPERTIES OBJECT_DEPENDS ${SKEL_H}
 target_include_directories(latkit PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf
     ${CMAKE_CURRENT_SOURCE_DIR}/src/proto ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics
-    ${LIBBPF_INCLUDE_DIR})
-target_link_libraries(latkit latkit_proto latkit_metrics ${LATKIT_LIBBPF_LIBS})
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/export ${LIBBPF_INCLUDE_DIR})
+target_link_libraries(latkit latkit_proto latkit_metrics latkit_export ${LATKIT_LIBBPF_LIBS})
 
 # --- tests -----------------------------------------------------------------
 enable_testing()

@@ -96,6 +96,13 @@ void lk_metrics_set_counter_l(struct lk_metrics *m, const char *name, const char
 void lk_metrics_set_gauge_l(struct lk_metrics *m, const char *name, const char *help,
                             const char *label_key, const char *label_val, double v);
 
+/* Two-label counter (Р29 self-metric latkit_http_requests_total{path,code}): the
+ * only family in the flat-scalar set that needs a second dimension. Same keying
+ * rules; series of one name print under one HELP/TYPE header. */
+void lk_metrics_set_counter_l2(struct lk_metrics *m, const char *name, const char *help,
+                               const char *label_key1, const char *label_val1,
+                               const char *label_key2, const char *label_val2, double v);
+
 /* Self-metric providers (Р27): callbacks invoked once at the top of each dump to
  * pour a subsystem's live statistics into flat scalar series via the setters
  * above. This is the seam that keeps the facade pure — the kernel per-CPU

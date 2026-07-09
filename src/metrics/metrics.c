@@ -48,6 +48,8 @@ struct scalar {
     char help[160];
     char label_key[16]; /* "" = no label */
     char label_val[32];
+    char label_key2[16]; /* "" = no second label (Р29 http_requests_total) */
+    char label_val2[32];
     int type;
     double value;
 };
@@ -187,15 +189,18 @@ const struct lk_query_sink *lk_metrics_query_sink(struct lk_metrics *m)
 /* --- flat scalars --------------------------------------------------------- */
 
 static void scalar_set(struct lk_metrics *m, const char *name, const char *help, const char *lkey,
-                       const char *lval, int type, double v)
+                       const char *lval, const char *lkey2, const char *lval2, int type, double v)
 {
     struct scalar *sc = NULL;
 
     lkey = lkey ? lkey : "";
     lval = lval ? lval : "";
+    lkey2 = lkey2 ? lkey2 : "";
+    lval2 = lval2 ? lval2 : "";
     for (uint32_t i = 0; i < m->n_scalars; i++)
         if (!strcmp(m->scalars[i].name, name) && !strcmp(m->scalars[i].label_key, lkey) &&
-            !strcmp(m->scalars[i].label_val, lval)) {
+            !strcmp(m->scalars[i].label_val, lval) && !strcmp(m->scalars[i].label_key2, lkey2) &&
+            !strcmp(m->scalars[i].label_val2, lval2)) {
             sc = &m->scalars[i];
             break;
         }
@@ -206,6 +211,8 @@ static void scalar_set(struct lk_metrics *m, const char *name, const char *help,
         snprintf(sc->name, sizeof(sc->name), "%s", name);
         snprintf(sc->label_key, sizeof(sc->label_key), "%s", lkey);
         snprintf(sc->label_val, sizeof(sc->label_val), "%s", lval);
+        snprintf(sc->label_key2, sizeof(sc->label_key2), "%s", lkey2);
+        snprintf(sc->label_val2, sizeof(sc->label_val2), "%s", lval2);
     }
     sc->type = type;
     sc->value = v;
@@ -215,24 +222,31 @@ static void scalar_set(struct lk_metrics *m, const char *name, const char *help,
 
 void lk_metrics_set_counter(struct lk_metrics *m, const char *name, const char *help, double v)
 {
-    scalar_set(m, name, help, NULL, NULL, LK_SC_COUNTER, v);
+    scalar_set(m, name, help, NULL, NULL, NULL, NULL, LK_SC_COUNTER, v);
 }
 
 void lk_metrics_set_gauge(struct lk_metrics *m, const char *name, const char *help, double v)
 {
-    scalar_set(m, name, help, NULL, NULL, LK_SC_GAUGE, v);
+    scalar_set(m, name, help, NULL, NULL, NULL, NULL, LK_SC_GAUGE, v);
 }
 
 void lk_metrics_set_counter_l(struct lk_metrics *m, const char *name, const char *help,
                               const char *label_key, const char *label_val, double v)
 {
-    scalar_set(m, name, help, label_key, label_val, LK_SC_COUNTER, v);
+    scalar_set(m, name, help, label_key, label_val, NULL, NULL, LK_SC_COUNTER, v);
 }
 
 void lk_metrics_set_gauge_l(struct lk_metrics *m, const char *name, const char *help,
                             const char *label_key, const char *label_val, double v)
 {
-    scalar_set(m, name, help, label_key, label_val, LK_SC_GAUGE, v);
+    scalar_set(m, name, help, label_key, label_val, NULL, NULL, LK_SC_GAUGE, v);
+}
+
+void lk_metrics_set_counter_l2(struct lk_metrics *m, const char *name, const char *help,
+                               const char *label_key1, const char *label_val1,
+                               const char *label_key2, const char *label_val2, double v)
+{
+    scalar_set(m, name, help, label_key1, label_val1, label_key2, label_val2, LK_SC_COUNTER, v);
 }
 
 void lk_metrics_add_provider(struct lk_metrics *m, lk_metrics_provider_fn fn, void *ctx)
@@ -249,7 +263,10 @@ static int scalar_cmp(const void *a, const void *b)
     const struct scalar *x = a, *y = b;
     int c = strcmp(x->name, y->name);
 
-    return c ? c : strcmp(x->label_val, y->label_val);
+    if (c)
+        return c;
+    c = strcmp(x->label_val, y->label_val);
+    return c ? c : strcmp(x->label_val2, y->label_val2);
 }
 
 /* --- lifecycle + dump ----------------------------------------------------- */
@@ -334,7 +351,10 @@ int lk_metrics_dump(struct lk_metrics *m, FILE *f)
                 fprintf(f, "# HELP %s %s\n", sc->name, help);
             fprintf(f, "# TYPE %s %s\n", sc->name, sc->type == LK_SC_GAUGE ? "gauge" : "counter");
         }
-        if (sc->label_key[0])
+        if (sc->label_key[0] && sc->label_key2[0])
+            fprintf(f, "%s{%s=\"%s\",%s=\"%s\"} %.17g\n", sc->name, sc->label_key, sc->label_val,
+                    sc->label_key2, sc->label_val2, sc->value);
+        else if (sc->label_key[0])
             fprintf(f, "%s{%s=\"%s\"} %.17g\n", sc->name, sc->label_key, sc->label_val, sc->value);
         else
             fprintf(f, "%s %.17g\n", sc->name, sc->value);
