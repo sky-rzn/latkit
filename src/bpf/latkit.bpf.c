@@ -168,6 +168,29 @@ struct {
     __type(value, __u8);
 } ports SEC(".maps");
 
+/* cgroup filter (task 7.1, Р48): keys are cgroup ids
+ * (bpf_get_current_cgroup_id), value unused. Filled and diffed by the agent's
+ * resolver from --cgroup glob patterns; an empty map means the filter is off,
+ * exactly like `ports`. cgroup ids are only meaningful on a cgroup v2 unified
+ * hierarchy — the agent refuses --cgroup on a v1 host at startup. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, LK_MAX_CGROUPS);
+    __type(key, __u64);
+    __type(value, __u8);
+} cgroups SEC(".maps");
+
+/* Single flag mirroring "the `cgroups` map is non-empty", maintained by the
+ * agent after every re-resolve. HASH maps have no O(1) emptiness test in BPF,
+ * so this array carries it: index 0 is 1 while the filter is active, 0 when the
+ * map is empty (no --cgroup, or a glob that matched nothing — filter off). */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} cgroup_on SEC(".maps");
+
 /* Capture predicate (design decision Р7): the LOCAL port must be in `ports`,
  * i.e. only the server-side socket is captured. This dedups loopback traffic
  * (client SEND + server RECV of the same payload) for free and pins direction
@@ -178,6 +201,24 @@ static __always_inline int sk_port_match(struct sock *sk)
     __u16 lport = BPF_CORE_READ(sk, __sk_common.skc_num);
 
     return bpf_map_lookup_elem(&ports, &lport) != NULL;
+}
+
+/* cgroup filter (task 7.1, Р48): the calling task's cgroup id must be in the
+ * `cgroups` map. A no-op unless the map is non-empty (cgroup_on[0] != 0). Like
+ * comm_allowed(), only valid on the send/recv path: fentry(tcp_sendmsg) and
+ * fexit(tcp_recvmsg) run in the postgres backend's task context, so `current`
+ * is that backend and its cgroup id is the one we filter on. Never called from
+ * the lifecycle tracepoint, which can fire in softirq. */
+static __always_inline int cgroup_allowed(void)
+{
+    __u32 zero = 0;
+    __u32 *on = bpf_map_lookup_elem(&cgroup_on, &zero);
+    __u64 id;
+
+    if (!on || !*on)
+        return 1; /* map empty: filter off */
+    id = bpf_get_current_cgroup_id();
+    return bpf_map_lookup_elem(&cgroups, &id) != NULL;
 }
 
 /* Exact-match comm filter; a no-op unless cfg_comm_filter is set. Send/recv
@@ -681,7 +722,7 @@ int BPF_PROG(lk_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
     struct lk_conn_state *st;
     struct lk_segs segs = {};
 
-    if (!sk_port_match(sk) || !comm_allowed())
+    if (!sk_port_match(sk) || !comm_allowed() || !cgroup_allowed())
         return 0;
 
     __u64 cookie = bpf_get_socket_cookie(sk);
@@ -713,7 +754,7 @@ int BPF_PROG(lk_tcp_recvmsg_entry, struct sock *sk, struct msghdr *msg, size_t l
 
     /* Filtering here also covers fexit: without a recv_state entry the exit
      * program bails out before emitting anything. */
-    if (!sk_port_match(sk) || !comm_allowed())
+    if (!sk_port_match(sk) || !comm_allowed() || !cgroup_allowed())
         return 0;
 
     /* Fallback SSL*->cookie bridge (Р37): if this recv is the nested syscall of
@@ -745,7 +786,7 @@ int BPF_PROG(lk_tcp_recvmsg_exit, struct sock *sk, struct msghdr *msg, size_t le
         /* No fentry snapshot: usually the call was filtered out (no miss),
          * but a recv that passes the same filters here lost its entry —
          * recv_state overflow or attach mid-call — and its bytes with it. */
-        if (ret > 0 && sk_port_match(sk) && comm_allowed())
+        if (ret > 0 && sk_port_match(sk) && comm_allowed() && cgroup_allowed())
             stat_add(LK_ST_RECV_STATE_MISS, 1);
         return 0;
     }
@@ -928,7 +969,10 @@ static __always_inline int ssl_entry(void *active_map, __u64 ssl, __u64 buf, __u
     __u64 id = bpf_get_current_pid_tgid();
     struct lk_ssl_call call = {.ssl = ssl, .buf = buf, .written_ptr = written_ptr};
 
-    if (!comm_allowed())
+    /* Same filters as the socket path: a uprobe runs in the backend's task
+     * context, so the cgroup id is valid here too (Р48). Keeps a TLS backend in
+     * a non-target cgroup out, mirroring the plaintext send/recv gate. */
+    if (!comm_allowed() || !cgroup_allowed())
         return 0;
     bpf_map_update_elem(active_map, &id, &call, BPF_ANY);
     return 0;

@@ -192,6 +192,7 @@ target_link_libraries(latkit_export PUBLIC latkit_metrics latkit_norm)
 add_executable(latkit src/agent/main.c src/agent/loop.c src/agent/events.c
                src/agent/decode.c src/agent/conn_table.c src/agent/reassembly.c
                src/agent/pipeline.c src/agent/record.c src/agent/tls_attach.c
+               src/agent/cgroup_filter.c src/agent/cgroup_match.c
                src/common/otel_env.c)
 add_dependencies(latkit latkit_skel)
 set_source_files_properties(src/agent/main.c PROPERTIES OBJECT_DEPENDS ${SKEL_H})

@@ -19,6 +19,7 @@
 
 #include <bpf/libbpf.h>
 
+#include "cgroup_filter.h"
 #include "conn_table.h"
 #include "decode.h"
 #include "latkit.h"
@@ -318,6 +319,15 @@ static void ev_provide_stats(void *ctx, struct lk_metrics *m)
                              (double)cs->evicted_idle);
 
     ev_provide_tls_stats(e, m, sum_ok ? sum : NULL, cs);
+
+    /* cgroup filter observability (Р48): the number of cgroupfs paths the last
+     * re-resolve matched. 0 while a --cgroup pattern is set exposes a misconfig
+     * (the glob matched nothing, so the map is empty and the filter is off).
+     * Exported only when --cgroup was given — a bare 0 otherwise would be noise. */
+    if (lk_cgroup_enabled(e->cfg.cgroup))
+        lk_metrics_set_gauge(m, "latkit_cgroup_filter_paths",
+                             "cgroupfs paths currently matched by the --cgroup filter.",
+                             (double)lk_cgroup_paths(e->cfg.cgroup));
 }
 
 /* /healthz liveness source (task 5.1): the Prometheus server lives in src/export

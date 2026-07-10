@@ -15,6 +15,7 @@
 
 #include <bpf/libbpf.h>
 
+#include "cgroup_filter.h"
 #include "conn_table.h"
 #include "events.h"
 #include "latkit.h"
@@ -40,6 +41,9 @@ static __u32 opt_max_conns = LK_MAX_CONNS_DEFAULT;
 static __u32 opt_conn_idle_timeout = LK_CONN_IDLE_TIMEOUT_SEC;
 static const char *opt_record;
 static char opt_comm[16];
+static const char *opt_cgroup[LK_MAX_CGROUPS]; /* --cgroup glob patterns */
+static int opt_ncgroup;
+#define LK_CGROUP_RESCAN_SEC 30 /* re-resolve cgroup globs every N s (Р48; same ritm as TLS) */
 static __u32 opt_top_queries;     /* 0 = metrics default (K = 500) */
 static __u32 opt_query_label_len; /* 0 = metrics default (256) */
 static bool opt_first_row_hist;
@@ -88,6 +92,10 @@ static void usage(const char *argv0)
             "                        (default: %d, max: %d; total_len stays honest)\n"
             "      --comm NAME       only capture send/recv from processes with\n"
             "                        this exact comm, e.g. postgres (default: off)\n"
+            "      --cgroup PATTERN  only capture traffic from cgroups whose path\n"
+            "                        under /sys/fs/cgroup matches this glob;\n"
+            "                        repeatable. * stays within a path segment, **\n"
+            "                        spans segments. Requires cgroup v2. (default: off)\n"
             "      --cap-headers     test hook: switch every connection to HEADERS\n"
             "                        capture mode (%d bytes per call) at OPEN\n"
             "      --max-conns N     userspace conn table ceiling; the least\n"
@@ -178,6 +186,7 @@ enum {
     OPT_RINGBUF_BYTES = 256,
     OPT_CAPTURE_LIMIT,
     OPT_COMM,
+    OPT_CGROUP,
     OPT_CAP_HEADERS,
     OPT_MAX_CONNS,
     OPT_CONN_IDLE_TIMEOUT,
@@ -249,6 +258,26 @@ static int set_option(int c, char *optarg)
         }
         strncpy(opt_comm, optarg, sizeof(opt_comm) - 1);
         break;
+    case OPT_CGROUP: {
+        char *dup;
+
+        if (opt_ncgroup == LK_MAX_CGROUPS) {
+            fprintf(stderr, "--cgroup: at most %d patterns\n", LK_MAX_CGROUPS);
+            return -1;
+        }
+        if (!optarg[0]) {
+            fprintf(stderr, "--cgroup: empty pattern\n");
+            return -1;
+        }
+        /* Own the string: an env pattern (LATKIT_CGROUP=a,b) is a token into a
+         * temporary buffer the env layer frees; a CLI optarg is stable but
+         * strdup'd too so cleanup is uniform. Freed at exit for ASAN. */
+        dup = strdup(optarg);
+        if (!dup)
+            return -1;
+        opt_cgroup[opt_ncgroup++] = dup;
+        break;
+    }
     case OPT_CAP_HEADERS:
         opt_cap_headers = true;
         break;
@@ -421,6 +450,7 @@ static const struct env_opt env_opts[] = {
     {"LATKIT_RINGBUF_BYTES", OPT_RINGBUF_BYTES, true, false},
     {"LATKIT_CAPTURE_LIMIT", OPT_CAPTURE_LIMIT, true, false},
     {"LATKIT_COMM", OPT_COMM, true, false},
+    {"LATKIT_CGROUP", OPT_CGROUP, true, true},
     {"LATKIT_CAP_HEADERS", OPT_CAP_HEADERS, false, false},
     {"LATKIT_MAX_CONNS", OPT_MAX_CONNS, true, false},
     {"LATKIT_CONN_IDLE_TIMEOUT", OPT_CONN_IDLE_TIMEOUT, true, false},
@@ -495,6 +525,7 @@ static int parse_args(int argc, char **argv)
         {"ringbuf-bytes", required_argument, NULL, OPT_RINGBUF_BYTES},
         {"capture-limit", required_argument, NULL, OPT_CAPTURE_LIMIT},
         {"comm", required_argument, NULL, OPT_COMM},
+        {"cgroup", required_argument, NULL, OPT_CGROUP},
         {"cap-headers", no_argument, NULL, OPT_CAP_HEADERS},
         {"max-conns", required_argument, NULL, OPT_MAX_CONNS},
         {"conn-idle-timeout", required_argument, NULL, OPT_CONN_IDLE_TIMEOUT},
@@ -594,6 +625,8 @@ static void print_config(void)
     printf("ringbuf_bytes=%llu\n", (unsigned long long)opt_ringbuf_bytes);
     printf("capture_limit=%u\n", opt_capture_limit);
     printf("comm=%s\n", opt_comm);
+    for (int i = 0; i < opt_ncgroup; i++)
+        printf("cgroup=%s\n", opt_cgroup[i]);
     printf("cap_headers=%d\n", opt_cap_headers);
     printf("max_conns=%u\n", opt_max_conns);
     printf("conn_idle_timeout=%u\n", opt_conn_idle_timeout);
@@ -649,6 +682,7 @@ int main(int argc, char **argv)
     struct lk_loop *loop = NULL;
     struct latkit_bpf *skel;
     struct lk_tls *tls = NULL;
+    struct lk_cgroup *cgroup = NULL;
     int err;
 
     if (parse_args(argc, argv))
@@ -720,6 +754,24 @@ int main(int argc, char **argv)
     if (err)
         goto cleanup;
 
+    /* cgroup filter (Р48): resolve the globs and fill the maps before attach,
+     * like fill_ports, so the filter is live before the first event. A v1 host
+     * with --cgroup fails here. */
+    struct lk_cgroup_cfg cgcfg = {
+        .patterns = opt_cgroup,
+        .npatterns = opt_ncgroup,
+        .rescan_sec = LK_CGROUP_RESCAN_SEC,
+    };
+
+    cgroup = lk_cgroup_new(skel->maps.cgroups, skel->maps.cgroup_on, &cgcfg);
+    if (!cgroup) {
+        err = -1;
+        goto cleanup;
+    }
+    err = lk_cgroup_apply(cgroup);
+    if (err)
+        goto cleanup;
+
     err = latkit_bpf__attach(skel);
     if (err) {
         fprintf(stderr, "failed to attach BPF programs: %d\n", err);
@@ -736,7 +788,8 @@ int main(int argc, char **argv)
         .ringbuf = skel->maps.events,
         .stats = skel->maps.stats,
         .capmode = skel->maps.capmode,
-        .tls = tls, /* attach-state gauge source (latkit_tls_attached) */
+        .tls = tls,       /* attach-state gauge source (latkit_tls_attached) */
+        .cgroup = cgroup, /* latkit_cgroup_filter_paths gauge source */
         .max_conns = opt_max_conns,
         .conn_idle_timeout_sec = opt_conn_idle_timeout,
         .record_path = opt_record,
@@ -785,11 +838,20 @@ int main(int argc, char **argv)
     if (err)
         goto cleanup;
 
+    /* Re-resolve the cgroup globs periodically so a recreated pod (new cgroup
+     * id under the same glob) is re-picked up without a restart (Р48). */
+    err = lk_cgroup_register(cgroup, loop);
+    if (err)
+        goto cleanup;
+
     fprintf(stderr, "latkit: attached, capturing local port(s)");
     for (int i = 0; i < opt_nports; i++)
         fprintf(stderr, " %u", opt_ports[i]);
     if (opt_comm[0])
         fprintf(stderr, ", comm=%s", opt_comm);
+    if (opt_ncgroup)
+        fprintf(stderr, ", cgroup=%d pattern(s)/%d path(s)", opt_ncgroup,
+                lk_cgroup_paths(cgroup));
     fprintf(stderr, " (Ctrl-C to exit)\n");
 
     err = lk_loop_run(loop);
@@ -804,7 +866,10 @@ cleanup:
     lk_events_free(events);
     lk_loop_free(loop);
     lk_tls_free(tls); /* detach uprobe links before the skeleton owning them */
+    lk_cgroup_free(cgroup);
     latkit_bpf__destroy(skel);
+    for (int i = 0; i < opt_ncgroup; i++)
+        free((char *)opt_cgroup[i]);
     lk_free_pairs(env_headers, env_nheaders);
     lk_free_pairs(env_resource, env_nresource);
     return err < 0 ? 1 : 0;

@@ -9,6 +9,10 @@
 #define LK_MAX_PORTS 16      /* capacity of the `ports` filter map */
 #define LK_DEFAULT_PORT 5432 /* used when no --port is given */
 
+/* Capacity of the `cgroups` filter map (task 7.1, Р48): a handful of postgres
+ * pods per node; the userspace resolver caps matched paths at this too. */
+#define LK_MAX_CGROUPS 64
+
 /* Default --capture-limit: capture budget in bytes per send/recv call (Р6).
  * Invariant of every budget mechanism (this, LK_CAP_HEADERS, LK_MAX_SEGS,
  * LK_MAX_CHUNKS): total_len always reports the real call size — budgets cut

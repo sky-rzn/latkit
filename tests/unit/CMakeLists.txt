@@ -29,6 +29,13 @@ target_include_directories(test_tls_route PRIVATE
     ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
 add_test(NAME tls_route COMMAND test_tls_route)
 
+# cgroup filter core (task 7.1, Р48): glob matcher, id-set diff and the cgroupfs
+# resolver over a synthetic tree. Libbpf-free — links only the pure cgroup_match.c.
+add_executable(test_cgroup test_cgroup.c ${CMAKE_SOURCE_DIR}/src/agent/cgroup_match.c)
+target_include_directories(test_cgroup PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
+add_test(NAME cgroup COMMAND test_cgroup)
+
 # Bounded cursor (Р18): header-only, so the test just includes pg_wire.h.
 add_executable(test_pg_wire test_pg_wire.c)
 target_include_directories(test_pg_wire PRIVATE ${CMAKE_SOURCE_DIR}/src/proto/pg)
