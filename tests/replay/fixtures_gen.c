@@ -15,7 +15,8 @@ struct bld {
     struct fx *x;
     size_t cap;
     __u64 cookie;
-    __u32 seq; /* per-conn event counter, as the kernel assigns it */
+    __u32 seq;     /* per-conn socket event counter, as the kernel assigns it */
+    __u32 tls_seq; /* decrypted-channel counter (Р38): its own kernel seq space */
     __u64 ts;
     struct lk_tuple tuple;
     __u32 dropped;
@@ -90,6 +91,38 @@ static void ev_data(struct bld *b, enum lk_dir dir, __u32 total, __u32 off, cons
 static void call(struct bld *b, enum lk_dir dir, const __u8 *p, __u32 n)
 {
     ev_data(b, dir, n, 0, p, n);
+}
+
+/* One decrypted data event (stage 6.4): an SSL_* uprobe chunk. It carries
+ * LK_F_DECRYPTED and draws its seq from the connection's own decrypted space
+ * (tls_seq), not the socket counter — exactly as the kernel emits it (Р35/Р38).
+ * SSL_read = frontend = RECV, SSL_write = backend = SEND. */
+static void ev_data_dec(struct bld *b, enum lk_dir dir, __u32 total, __u32 off, const __u8 *p,
+                        __u32 cap)
+{
+    __u8 raw[sizeof(struct lk_ev_data) + 8192];
+    struct lk_ev_data *d = (void *)raw;
+
+    memset(d, 0, sizeof(*d));
+    d->hdr.conn_id = b->cookie;
+    d->hdr.ts_ns = b->ts;
+    d->hdr.seq = b->tls_seq++;
+    d->hdr.type = LK_EV_DATA;
+    d->hdr.dir = dir;
+    d->hdr.flags = LK_F_DECRYPTED | (cap < total ? LK_F_TRUNC : 0);
+    b->ts += 10;
+    d->total_len = total;
+    d->off = off;
+    d->cap_len = cap;
+    if (cap)
+        memcpy(d->payload, p, cap);
+    put_rec(b, d, sizeof(*d) + cap);
+}
+
+/* A fully captured decrypted call in one chunk. */
+static void call_dec(struct bld *b, enum lk_dir dir, const __u8 *p, __u32 n)
+{
+    ev_data_dec(b, dir, n, 0, p, n);
 }
 
 static void expect(struct bld *b, enum lk_dir dir, char type, __u32 len, __u16 flags)
@@ -731,8 +764,11 @@ static void build_ssl_plain(struct fx *x)
     b.x->obs_text = "select 1";
 }
 
-/* SSL accepted: SSLRequest -> 'S' -> the connection goes TLS, and every later
- * event (the ciphertext handshake and beyond) is silently discarded. */
+/* SSL accepted: SSLRequest -> 'S' -> the connection goes TLS. The ciphertext
+ * socket events are dropped (Р38), but the real session now travels the
+ * decrypted uprobe channel (LK_F_DECRYPTED, own seq space) — the framer is reset
+ * to startup on the 'S' (Р36), so the StartupMessage inside TLS parses, and the
+ * observation is indistinguishable from the plaintext ssl_plain twin. */
 static void build_ssl_tls(struct fx *x)
 {
     struct bld b;
@@ -742,6 +778,7 @@ static void build_ssl_tls(struct fx *x)
     bld_init(&b, x);
     ev_open(&b, false);
 
+    /* Socket-path negotiation: SSLRequest -> 'S'. */
     n = pgstartup(w, LK_PG_SSL_REQUEST, NULL, 0);
     call(&b, LK_DIR_RECV, w, n);
     expect(&b, LK_DIR_RECV, 0, 8, LK_MSG_STARTUP);
@@ -751,13 +788,53 @@ static void build_ssl_tls(struct fx *x)
     call(&b, LK_DIR_SEND, w, 6);
     expect(&b, LK_DIR_SEND, 'S', 0, 0);
 
-    /* TLS ClientHello and application data — all discarded, no messages. */
+    /* Ciphertext handshake on the socket — every raw event now dropped, no
+     * messages, no dirty counters. */
     memset(w, 0xa5, 64);
     call(&b, LK_DIR_RECV, w, 64);
     call(&b, LK_DIR_SEND, w, 64);
+
+    /* Decrypted channel: the real StartupMessage and the whole session. */
+    n = pgstartup(w, LK_PG_PROTO_V3, startup_params, sizeof(startup_params));
+    call_dec(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0, sizeof(startup_params) + 8, LK_MSG_STARTUP);
+    n = pgmsg(w, 'R', auth_ok, sizeof(auth_ok));
+    call_dec(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'R', 8, 0);
+    n = pgmsg(w, 'Z', "I", 1);
+    call_dec(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'Z', 5, 0);
+    b.x->sessions = 1; /* the decrypted startup completes: one session */
+    b.x->sess_user = "postgres";
+    b.x->sess_db = "postgres";
+
+    n = pgmsg(w, 'Q', "select 1", 9);
+    call_dec(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'Q', 13, 0);
+    n = pgmsg(w, 'C', "SELECT 1", 9);
+    call_dec(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'C', 13, 0);
+    n = pgmsg(w, 'Z', "I", 1);
+    call_dec(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 'Z', 5, 0);
+
+    n = pgmsg(w, 'X', NULL, 0);
+    call_dec(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 'X', 4, 0);
+
+    /* A trailing ciphertext close-notify on the socket — dropped — then CLOSE. */
+    memset(w, 0x5a, 32);
+    call(&b, LK_DIR_SEND, w, 32);
     ev_close(&b);
 
     b.x->tls_conns = 1;
+
+    /* One SIMPLE unit over the decrypted channel, same as ssl_plain. */
+    b.x->queries = 1;
+    b.x->obs_kind = LK_Q_SIMPLE;
+    b.x->obs_rows = 1;
+    b.x->obs_flags = 0;
+    b.x->obs_text = "select 1";
 }
 
 /* Agent attached mid-session (synthetic OPEN, startup never seen): both

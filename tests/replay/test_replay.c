@@ -253,7 +253,9 @@ static const struct metric_expect metric_expects[] = {
     /* NO_TEXT (Bind on an un-Parsed name): honest latency under query="other". */
     {"bind_unknown", "other", "ok", 1, 5, 1, 1, NULL},
     {"ssl_plain", "select ?", "ok", 1, 1, 1, 0, NULL},
-    {"ssl_tls", NULL, NULL, 0, 0, 0, 0, NULL},
+    /* Decrypted channel now carries the whole session (stage 6.4): the same
+     * observation as its plaintext twin ssl_plain. */
+    {"ssl_tls", "select ?", "ok", 1, 1, 1, 0, NULL},
     {"synthetic_midsession", NULL, NULL, 0, 0, 0, 0, NULL},
 };
 

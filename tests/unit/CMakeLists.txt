@@ -17,6 +17,18 @@ target_include_directories(test_reassembly PRIVATE
     ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
 add_test(NAME reassembly COMMAND test_reassembly)
 
+# TLS decrypted-channel routing (task 6.4): the shared pipeline over synthetic
+# records — ciphertext drop, decrypted framing, framer reset, separate seq
+# space. Libbpf-free, links the same agent modules as the replay harness.
+add_executable(test_tls_route test_tls_route.c
+    ${CMAKE_SOURCE_DIR}/src/agent/pipeline.c
+    ${CMAKE_SOURCE_DIR}/src/agent/decode.c
+    ${CMAKE_SOURCE_DIR}/src/agent/conn_table.c
+    ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
+target_include_directories(test_tls_route PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
+add_test(NAME tls_route COMMAND test_tls_route)
+
 # Bounded cursor (Р18): header-only, so the test just includes pg_wire.h.
 add_executable(test_pg_wire test_pg_wire.c)
 target_include_directories(test_pg_wire PRIVATE ${CMAKE_SOURCE_DIR}/src/proto/pg)

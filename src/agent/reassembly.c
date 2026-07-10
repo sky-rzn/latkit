@@ -355,9 +355,15 @@ void lk_reasm_data(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir,
 {
     struct lk_frame *f = &c->frame[dir];
     __u32 total = ev->total_len, off = ev->off;
+    bool decrypted = ev->hdr.flags & LK_F_DECRYPTED;
 
-    if (c->flags & (LK_CONN_TLS | LK_CONN_CANCEL))
-        return; /* encrypted / cancel: socket events are discarded wholesale */
+    if (c->flags & LK_CONN_CANCEL)
+        return; /* cancel: nothing else travels this connection, discard it all */
+    if ((c->flags & LK_CONN_TLS) && !decrypted)
+        return; /* ciphertext on a TLS connection: dropped (Р38). The router
+                   already drops it before the seq detector; this guards the
+                   direct callers — the plaintext source is the uprobe channel,
+                   whose events carry LK_F_DECRYPTED and are framed below. */
 
     if (off == 0) {
         /* New call. The previous one ended under-captured (budget cut or

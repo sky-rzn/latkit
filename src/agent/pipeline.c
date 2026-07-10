@@ -56,15 +56,47 @@ void lk_pipeline_feed(struct lk_pipeline *p, const void *data, size_t size,
         }
         break;
     case LK_DEC_DATA: {
-        struct lk_conn *c =
-            lk_conn_table_data(p->conns, v->hdr->conn_id, v->hdr->seq, v->hdr->ts_ns, &lost);
+        bool decrypted = v->hdr->flags & LK_F_DECRYPTED;
+        struct lk_conn *c = lk_conn_table_peek(p->conns, v->hdr->conn_id);
 
+        /* Ciphertext socket event of a TLS connection: drop it before the seq
+         * detector runs (Р38), so a ciphertext gap never dirties the decrypted
+         * framer through the shared seq bookkeeping. The uprobe channel is the
+         * sole data source from the moment the connection went TLS. */
+        if (c && (c->flags & LK_CONN_TLS) && !decrypted) {
+            out->conn = c;
+            out->tls_socket_dropped = true;
+            lk_conn_table_note_tls_drop(p->conns);
+            break;
+        }
+
+        if (decrypted) {
+            /* Plaintext from an SSL_* uprobe: its own seq space (Р38), framed
+             * into the entry the socket path already opened by cookie. */
+            c = lk_conn_table_data_decrypted(p->conns, v->hdr->conn_id, v->hdr->seq, v->hdr->ts_ns,
+                                             &lost);
+            out->conn = c;
+            if (c) {
+                /* Р38 order has 'S' happen-before any decrypted byte; a
+                 * decrypted event on a still-plaintext conn means that broke. */
+                out->decrypted_early = !(c->flags & LK_CONN_TLS);
+                lk_reasm_data(&p->reasm, c, v->hdr->dir, v->data, v->cap_len);
+            }
+            break;
+        }
+
+        /* Plaintext socket event of a non-TLS connection: the normal path. The
+         * 'S' reply flows through here (the conn is not yet TLS) and flips it,
+         * whereupon the framer is reset to startup for the decrypted stream. */
+        c = lk_conn_table_data(p->conns, v->hdr->conn_id, v->hdr->seq, v->hdr->ts_ns, &lost);
         out->conn = c;
         if (c) { /* NULL only on alloc failure: degrade to no framing */
             bool was_tls = c->flags & LK_CONN_TLS;
 
             lk_reasm_data(&p->reasm, c, v->hdr->dir, v->data, v->cap_len);
             out->tls_now = !was_tls && (c->flags & LK_CONN_TLS);
+            if (out->tls_now)
+                lk_conn_tls_reset_framing(c);
         }
         break;
     }

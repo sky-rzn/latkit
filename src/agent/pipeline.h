@@ -29,6 +29,8 @@ struct lk_pipeline_ev {
     struct lk_conn *conn;         /* entry touched by a data/open event, else NULL */
     __u32 lost;                   /* events lost in a seq gap before this one */
     bool tls_now;                 /* this data event flipped the conn to TLS */
+    bool tls_socket_dropped;      /* ciphertext socket event dropped on a TLS conn (Р38) */
+    bool decrypted_early;         /* decrypted event before 'S' — should not happen (Р38) */
 };
 
 /* Build the table (max_conns / idle timeout as in conn_table) and init the

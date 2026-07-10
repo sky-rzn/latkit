@@ -173,6 +173,74 @@ struct lk_conn *lk_conn_table_data(struct lk_conn_table *t, __u64 cookie, __u32 
     return c;
 }
 
+/* Decrypted-channel twin of touch(): the seq-hole detector on tls_last_seq. The
+ * first event seeds the baseline (no baseline, no loss — as for a lazily created
+ * raw entry); a genuine gap dirties both framer directions, because the framed
+ * stream on a TLS connection *is* the decrypted one (Р38). */
+static void touch_tls(struct lk_conn_table *t, struct lk_conn *c, __u32 seq, __u64 ts_ns,
+                      __u32 *lost)
+{
+    if (!c->tls_seq_seen) {
+        c->tls_seq_seen = 1;
+        c->tls_last_seq = seq;
+    } else if (seq > c->tls_last_seq + 1) {
+        *lost = seq - (c->tls_last_seq + 1);
+        c->tls_dropped += *lost;
+        t->st.seq_gaps++;
+        t->st.lost_events += *lost;
+        mark_dirty(c);
+    }
+    if (seq > c->tls_last_seq)
+        c->tls_last_seq = seq;
+    c->last_activity_ns = ts_ns;
+    lru_unlink(t, c);
+    lru_push_front(t, c);
+}
+
+struct lk_conn *lk_conn_table_peek(struct lk_conn_table *t, __u64 cookie)
+{
+    return lookup(t, cookie);
+}
+
+struct lk_conn *lk_conn_table_data_decrypted(struct lk_conn_table *t, __u64 cookie, __u32 seq,
+                                             __u64 ts_ns, __u32 *lost)
+{
+    struct lk_conn *c = lookup(t, cookie);
+
+    *lost = 0;
+    if (c) {
+        touch_tls(t, c, seq, ts_ns, lost);
+        return c;
+    }
+    /* Unknown cookie on the decrypted channel: the socket entry was evicted or
+     * its OPEN was lost. Re-create dirty (no tuple, no raw baseline) and seed
+     * the decrypted seq space from this event — the same degrade-not-exit
+     * contract as lk_conn_table_data. */
+    c = create(t, cookie, seq, ts_ns);
+    if (!c)
+        return NULL;
+    c->tls_seq_seen = 1;
+    c->tls_last_seq = seq;
+    mark_dirty(c);
+    return c;
+}
+
+void lk_conn_table_note_tls_drop(struct lk_conn_table *t)
+{
+    t->st.tls_socket_dropped++;
+}
+
+void lk_conn_tls_reset_framing(struct lk_conn *c)
+{
+    for (int i = 0; i < 2; i++) {
+        free(c->frame[i].buf);
+        /* Zeroing yields the startup state: st == LK_FR_HEADER, startup_done ==
+         * 0, no partial message — RECV re-enters startup framing for the real
+         * StartupMessage, SEND stays in normal framing (Р36). */
+        memset(&c->frame[i], 0, sizeof(c->frame[i]));
+    }
+}
+
 void lk_conn_table_close(struct lk_conn_table *t, __u64 cookie, __u32 seq, __u64 ts_ns, __u32 *lost)
 {
     struct lk_conn *c = lookup(t, cookie);

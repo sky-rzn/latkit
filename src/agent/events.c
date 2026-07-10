@@ -318,11 +318,12 @@ void lk_events_print_stats(struct lk_events *e)
 
     fprintf(stderr,
             "latkit: conns active=%u created=%llu closed=%llu "
-            "evicted=%llu (lru %llu, idle %llu) gaps=%llu lost=%llu\n",
+            "evicted=%llu (lru %llu, idle %llu) gaps=%llu lost=%llu tls_drop=%llu\n",
             cs->active, (unsigned long long)cs->created, (unsigned long long)cs->closed,
             (unsigned long long)(cs->evicted_lru + cs->evicted_idle),
             (unsigned long long)cs->evicted_lru, (unsigned long long)cs->evicted_idle,
-            (unsigned long long)cs->seq_gaps, (unsigned long long)cs->lost_events);
+            (unsigned long long)cs->seq_gaps, (unsigned long long)cs->lost_events,
+            (unsigned long long)cs->tls_socket_dropped);
 
     const struct lk_reasm_stats *rs = &e->pipe.reasm.st;
 
@@ -510,9 +511,15 @@ static int handle_event(void *ctx, void *data, size_t size)
             print_data_event(ev.view.data, ev.view.cap_len, e->cfg.hexdump);
         if (ev.tls_now)
             /* One-time log; the HEADERS flip itself is apply_cap_policy's job
-             * (LK_CONN_TLS is set by now). The plaintext source becomes the
-             * stage-6 uprobe channel. */
-            fprintf(stderr, "latkit: conn=%llx TLS detected, framing off\n",
+             * (LK_CONN_TLS is set by now). Ciphertext socket events are dropped
+             * from here on and the framer has been reset to startup — the
+             * plaintext source is now the stage-6 uprobe channel (Р38). */
+            fprintf(stderr, "latkit: conn=%llx TLS detected, switching to decrypted channel\n",
+                    (unsigned long long)ev.view.hdr->conn_id);
+        if (ev.decrypted_early)
+            /* Р38 says 'S' precedes any decrypted byte; if this fires the
+             * correlation or ordering assumption broke — frame it best-effort. */
+            fprintf(stderr, "latkit: conn=%llx decrypted event before TLS handshake\n",
                     (unsigned long long)ev.view.hdr->conn_id);
         /* TLS / CANCEL / replication -> HEADERS (Р21). The PG parser ran inside
          * lk_pipeline_feed above, so a CopyBoth this event carried already set

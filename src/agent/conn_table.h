@@ -89,6 +89,13 @@ struct lk_conn {
     __u16 flags;           /* LK_CONN_* */
     __u32 last_seq;
     __u32 dropped; /* events lost on this connection (userspace-detected) */
+    /* Decrypted-channel seq space (Р38, stage 6.4): the plaintext uprobe events
+     * carry their own kernel seq counter (tls_seq), independent of the socket
+     * path's. Tracked apart from last_seq/dropped so a ciphertext gap never
+     * fakes a hole in the plaintext stream, nor a plaintext gap in ciphertext. */
+    __u32 tls_last_seq;
+    __u32 tls_dropped;
+    __u8 tls_seq_seen; /* tls_last_seq seeded from a first decrypted event */
     __u64 last_activity_ns;
     struct lk_frame frame[2]; /* index: enum lk_dir */
     void *proto_state;        /* owned by the protocol handler (Р15, STAGE3):
@@ -105,6 +112,9 @@ struct lk_conn_table_stats {
     __u64 evicted_idle; /* collected by the idle sweep */
     __u64 seq_gaps;     /* holes detected (connections dirtied) */
     __u64 lost_events;  /* events lost in those holes, summed */
+    __u64 tls_socket_dropped; /* ciphertext socket events dropped on TLS conns
+                                 (Р38, stage 6.4): the decrypted uprobe channel
+                                 is the only data source once a conn goes TLS */
     __u32 active;
 };
 
@@ -140,6 +150,34 @@ struct lk_conn *lk_conn_table_data(struct lk_conn_table *t, __u64 cookie, __u32 
                                    __u32 *lost);
 void lk_conn_table_close(struct lk_conn_table *t, __u64 cookie, __u32 seq, __u64 ts_ns,
                          __u32 *lost);
+
+/* --- TLS decrypted-channel routing (Р38, stage 6.4) ------------------------ */
+
+/* Non-touching lookup: return the entry for cookie or NULL, with no seq check,
+ * no LRU bump and no lazy creation. The TLS router uses it to test LK_CONN_TLS
+ * before deciding to drop a ciphertext socket event — that drop must land
+ * before any seq bookkeeping, so a ciphertext gap can never dirty the decrypted
+ * framer through the shared seq detector. */
+struct lk_conn *lk_conn_table_peek(struct lk_conn_table *t, __u64 cookie);
+
+/* Decrypted-channel data event (Р38): like lk_conn_table_data, but the seq-hole
+ * detector runs against the connection's own decrypted seq space (tls_last_seq)
+ * rather than last_seq. A hole here still dirties both framer directions — the
+ * decrypted stream is the framed one — but a raw-space gap leaves it alone. The
+ * first decrypted event seeds the baseline and reports no loss. */
+struct lk_conn *lk_conn_table_data_decrypted(struct lk_conn_table *t, __u64 cookie, __u32 seq,
+                                             __u64 ts_ns, __u32 *lost);
+
+/* Count one ciphertext socket event dropped on a TLS connection (Р38/Р41):
+ * exposed as latkit_tls_socket_events_dropped_total. */
+void lk_conn_table_note_tls_drop(struct lk_conn_table *t);
+
+/* Reset both directions' framer state to a fresh startup (Р36), called once by
+ * the router when a connection flips to LK_CONN_TLS. The real StartupMessage
+ * arrives inside TLS, so the decrypted frontend stream must begin in startup
+ * framing exactly like a fresh plaintext connection. Frees the partial-message
+ * buffers; cookie, tuple, seq spaces and flags are kept. */
+void lk_conn_tls_reset_framing(struct lk_conn *c);
 
 /* Evict entries with last_activity_ns + idle_timeout <= now_ns; returns how
  * many were evicted. The LRU order makes this a tail walk, not a full scan.
