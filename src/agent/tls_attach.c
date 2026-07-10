@@ -1,24 +1,32 @@
 // SPDX-License-Identifier: GPL-2.0
-/* TLS uprobe attach lifecycle (stage 6, Р39). Attaches, to one explicit libssl
- * path (--libssl), pid=-1 so every process mapping that file — present and future
- * postgres backends — is covered: the SSL_read/SSL_write(_ex) data probes (6.1)
- * plus the SSL_set_fd/rfd/wfd and SSL_free bridge probes (6.2, the SSL*->cookie
- * correlation). Scanning /proc, container path resolution and the rescan timer
- * are stage 6.3. */
+/* TLS uprobe attach lifecycle (stage 6, Р39). Attaches the SSL_read/SSL_write(_ex)
+ * data probes (6.1) and the SSL_set_fd/rfd/wfd + SSL_free bridge probes (6.2) to
+ * libssl, pid=-1 so every process mapping that file — present and future postgres
+ * backends — is covered. The libssl is either an explicit --libssl path or, under
+ * --tls auto, discovered by scanning /proc (6.3): the maps of every comm-matching
+ * process are searched for a libssl.so mapping, each in-container path is resolved
+ * through /proc/<pid>/root, and distinct files (by device+inode) are attached
+ * once. A periodic rescan picks up libssl paths that appear later (a cluster
+ * restart or a second install); forked backends need no rescan thanks to pid=-1. */
+#include <dirent.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 #include <bpf/libbpf.h>
 
 #include "latkit.skel.h"
+#include "loop.h"
 #include "tls_attach.h"
 
 /* One uprobe target: a skeleton program, the libssl symbol it hooks, and
- * whether it is the return probe. `optional` symbols (the _ex calls) may be
- * absent on an older OpenSSL and are skipped without downgrading to error. */
+ * whether it is the return probe. `optional` symbols (the _ex calls, the rfd/wfd
+ * setters) may be absent on an older/minimal OpenSSL and are skipped without
+ * downgrading to error. */
 struct lk_tls_probe {
     struct bpf_program *(*prog)(struct latkit_bpf *);
     const char *symbol;
@@ -63,50 +71,67 @@ static const struct lk_tls_probe tls_probes[] = {
 };
 #define TLS_NPROBES (sizeof(tls_probes) / sizeof(tls_probes[0]))
 
+/* Ceiling on distinct libssl files attached — several postgres installs on one
+ * host is unusual; more than this is almost certainly a scan gone wrong. */
+#define TLS_MAX_PATHS 32
+#define TLS_DEFAULT_COMM "postgres"
+
+/* An attached libssl, identified by its file so a rescan never double-attaches
+ * the same binary (many backends map it; its /proc/<pid>/root path differs per
+ * pid but the device+inode do not). */
+struct lk_tls_file {
+    dev_t dev;
+    ino_t ino;
+};
+
 struct lk_tls {
     struct latkit_bpf *skel;
     struct lk_tls_cfg cfg;
-    const char *binary_path; /* libssl to attach to; NULL when disabled */
-    struct bpf_link *links[TLS_NPROBES];
-    int nlinks;
+    bool enabled;              /* AUTO, or an explicit --libssl: SSL_* programs loaded */
+    const char *explicit_path; /* --libssl PATH, or NULL for the /proc scan */
+    const char *comm;          /* comm to scan for (never empty; defaults to postgres) */
+    struct bpf_link **links;   /* grown as paths are attached */
+    int nlinks, links_cap;
+    struct lk_tls_file files[TLS_MAX_PATHS];
+    int nfiles;
+    bool any_partial; /* an attached file was missing a mandatory/optional symbol */
     enum lk_tls_state state;
 };
 
-struct lk_tls *lk_tls_new(struct latkit_bpf *skel, const struct lk_tls_cfg *cfg)
+/* Append one link to the growable array; on OOM the link is destroyed (its
+ * uprobe would otherwise leak and outlive the handle). */
+static int link_append(struct lk_tls *t, struct bpf_link *link)
 {
-    struct lk_tls *t = calloc(1, sizeof(*t));
+    if (t->nlinks == t->links_cap) {
+        int cap = t->links_cap ? t->links_cap * 2 : (int)TLS_NPROBES;
+        struct bpf_link **p = realloc(t->links, (size_t)cap * sizeof(*p));
 
-    if (!t)
-        return NULL;
-    t->skel = skel;
-    t->cfg = *cfg;
-    t->state = LK_TLS_STATE_NONE;
-
-    /* Stage 6.1: only the explicit path attaches. AUTO scanning arrives in
-     * 6.3; until then AUTO without --libssl attaches nothing (soft none). */
-    if (cfg->libssl_override)
-        t->binary_path = cfg->libssl_override;
-
-    /* libbpf never auto-attaches a bare SEC("uprobe") (no target in the section
-     * name), but be explicit; we attach these by hand in lk_tls_attach. When no
-     * uprobes will be attached at all, drop them from the load entirely so the
-     * verifier does not even see them. */
-    for (size_t i = 0; i < TLS_NPROBES; i++) {
-        struct bpf_program *p = tls_probes[i].prog(skel);
-
-        bpf_program__set_autoattach(p, false);
-        if (!t->binary_path)
-            bpf_program__set_autoload(p, false);
+        if (!p) {
+            bpf_link__destroy(link);
+            return -1;
+        }
+        t->links = p;
+        t->links_cap = cap;
     }
-    return t;
+    t->links[t->nlinks++] = link;
+    return 0;
 }
 
-int lk_tls_attach(struct lk_tls *t)
+static bool file_known(const struct lk_tls *t, dev_t dev, ino_t ino)
+{
+    for (int i = 0; i < t->nfiles; i++)
+        if (t->files[i].dev == dev && t->files[i].ino == ino)
+            return true;
+    return false;
+}
+
+/* Attach the whole probe set to one libssl binary at `path`. Returns the number
+ * of probes attached (0 if none — e.g. not actually a libssl); sets *full when
+ * every probe attached. Absent optional symbols are skipped silently; a mandatory
+ * symbol that fails to attach warns and drops the file to partial. */
+static unsigned attach_path(struct lk_tls *t, const char *path, bool *full)
 {
     unsigned attached = 0, mandatory = 0, mandatory_ok = 0;
-
-    if (!t || !t->binary_path)
-        return 0; /* disabled: soft none, not an error (Р39) */
 
     for (size_t i = 0; i < TLS_NPROBES; i++) {
         const struct lk_tls_probe *pr = &tls_probes[i];
@@ -118,34 +143,233 @@ int lk_tls_attach(struct lk_tls *t)
 
         /* pid = -1: attach to every process mapping this libssl, including
          * backends forked after us — no rescan needed for fork coverage. */
-        link = bpf_program__attach_uprobe_opts(pr->prog(t->skel), -1, t->binary_path, 0, &opts);
+        link = bpf_program__attach_uprobe_opts(pr->prog(t->skel), -1, path, 0, &opts);
         if (!link) {
-            /* A missing symbol (old OpenSSL without _ex) is expected; anything
-             * else on a mandatory symbol is worth a warning. */
             if (!pr->optional)
                 fprintf(stderr, "warn: TLS uprobe %s%s on %s failed: %s\n", pr->symbol,
-                        pr->retprobe ? " (ret)" : "", t->binary_path, strerror(errno));
+                        pr->retprobe ? " (ret)" : "", path, strerror(errno));
             continue;
         }
-        t->links[t->nlinks++] = link;
+        if (link_append(t, link)) {
+            fprintf(stderr, "warn: TLS uprobe bookkeeping OOM\n");
+            break;
+        }
         attached++;
         if (!pr->optional)
             mandatory_ok++;
     }
 
-    if (attached == 0)
-        t->state = LK_TLS_STATE_NONE;
-    else if (mandatory_ok == mandatory && attached == TLS_NPROBES)
-        t->state = LK_TLS_STATE_OK;
-    else
-        t->state = LK_TLS_STATE_PARTIAL;
+    *full = (mandatory_ok == mandatory && attached == TLS_NPROBES);
+    return attached;
+}
 
-    if (t->state == LK_TLS_STATE_NONE)
-        fprintf(stderr, "latkit: TLS uprobes: no SSL_* symbols attached on %s\n", t->binary_path);
-    else
-        fprintf(stderr, "latkit: TLS uprobes attached on %s (%u probes)\n", t->binary_path,
-                attached);
+/* Record and attach one discovered/explicit libssl file. Deduped by device+inode
+ * so a rescan (or several backends sharing the file) attaches it once. Returns 1
+ * if newly attached, 0 if already known or not attachable, <0 on the file table
+ * being full. */
+static int attach_file(struct lk_tls *t, const char *host_path)
+{
+    struct stat st;
+    unsigned n;
+    bool full;
+
+    if (stat(host_path, &st))
+        return 0; /* vanished between scan and attach: ignore */
+    if (file_known(t, st.st_dev, st.st_ino))
+        return 0;
+    if (t->nfiles == TLS_MAX_PATHS) {
+        fprintf(stderr, "warn: TLS: too many libssl paths (>%d), ignoring %s\n", TLS_MAX_PATHS,
+                host_path);
+        return -1;
+    }
+
+    n = attach_path(t, host_path, &full);
+    if (n == 0)
+        return 0; /* nothing attached: not a usable libssl */
+
+    t->files[t->nfiles].dev = st.st_dev;
+    t->files[t->nfiles].ino = st.st_ino;
+    t->nfiles++;
+    if (!full)
+        t->any_partial = true;
+    fprintf(stderr, "latkit: TLS uprobes attached on %s (%u probes%s)\n", host_path, n,
+            full ? "" : ", partial");
+    return 1;
+}
+
+/* Read /proc/<pid>/comm into buf (newline stripped). Returns 0 on success. */
+static int read_comm(const char *pid, char *buf, size_t sz)
+{
+    char path[64];
+    FILE *f;
+    size_t n;
+
+    snprintf(path, sizeof(path), "/proc/%s/comm", pid);
+    f = fopen(path, "re");
+    if (!f)
+        return -1;
+    n = fread(buf, 1, sz - 1, f);
+    fclose(f);
+    if (n == 0)
+        return -1;
+    if (buf[n - 1] == '\n')
+        n--;
+    buf[n] = '\0';
     return 0;
+}
+
+/* Scan one process's maps for a libssl.so mapping and attach it (via its
+ * /proc/<pid>/root view, so a container's copy is reachable from the host). A
+ * process may map libssl in several segments; attach_file's inode dedup collapses
+ * them. Returns the number of newly attached files. */
+static int scan_pid_maps(struct lk_tls *t, const char *pid)
+{
+    char path[64], line[512];
+    int newly = 0;
+    FILE *f;
+
+    snprintf(path, sizeof(path), "/proc/%s/maps", pid);
+    f = fopen(path, "re");
+    if (!f)
+        return 0;
+
+    while (fgets(line, sizeof(line), f)) {
+        char host[PATH_MAX];
+        char *p = strchr(line, '/'); /* the pathname is the first '/' on the line */
+        size_t len;
+
+        if (!p || !strstr(p, "libssl.so"))
+            continue;
+        len = strlen(p);
+        if (len && p[len - 1] == '\n')
+            p[--len] = '\0';
+
+        /* The path is in the target's mount namespace; reach it from the host
+         * through /proc/<pid>/root (identity on a host process). */
+        if ((size_t)snprintf(host, sizeof(host), "/proc/%s/root%s", pid, p) >= sizeof(host))
+            continue;
+        if (attach_file(t, host) == 1)
+            newly++;
+    }
+    fclose(f);
+    return newly;
+}
+
+/* Walk /proc, attach the libssl of every comm-matching process not yet attached.
+ * Returns the number of newly attached files. */
+static int scan_proc(struct lk_tls *t)
+{
+    struct dirent *de;
+    int newly = 0;
+    DIR *proc;
+
+    proc = opendir("/proc");
+    if (!proc) {
+        fprintf(stderr, "warn: TLS scan: cannot open /proc: %s\n", strerror(errno));
+        return 0;
+    }
+    while ((de = readdir(proc))) {
+        char comm[32];
+
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') /* pid dirs only */
+            continue;
+        if (read_comm(de->d_name, comm, sizeof(comm)) || strcmp(comm, t->comm))
+            continue;
+        newly += scan_pid_maps(t, de->d_name);
+    }
+    closedir(proc);
+    return newly;
+}
+
+static void update_state(struct lk_tls *t)
+{
+    if (t->nfiles == 0)
+        t->state = LK_TLS_STATE_NONE;
+    else if (t->any_partial)
+        t->state = LK_TLS_STATE_PARTIAL;
+    else
+        t->state = LK_TLS_STATE_OK;
+}
+
+struct lk_tls *lk_tls_new(struct latkit_bpf *skel, const struct lk_tls_cfg *cfg)
+{
+    struct lk_tls *t = calloc(1, sizeof(*t));
+
+    if (!t)
+        return NULL;
+    t->skel = skel;
+    t->cfg = *cfg;
+    t->state = LK_TLS_STATE_NONE;
+    t->explicit_path = cfg->libssl_override;
+    t->comm = (cfg->comm_filter && cfg->comm_filter[0]) ? cfg->comm_filter : TLS_DEFAULT_COMM;
+    /* Enabled when there is anything to attach to: an explicit path always, or
+     * AUTO which will scan. OFF with no --libssl loads none of the SSL_* programs
+     * so the verifier never sees them. */
+    t->enabled = cfg->libssl_override || cfg->mode == LK_TLS_AUTO;
+
+    /* libbpf never auto-attaches a bare SEC("uprobe") (no target in the section
+     * name), but be explicit; we attach these by hand. When disabled, drop them
+     * from the load entirely. */
+    for (size_t i = 0; i < TLS_NPROBES; i++) {
+        struct bpf_program *p = tls_probes[i].prog(skel);
+
+        bpf_program__set_autoattach(p, false);
+        if (!t->enabled)
+            bpf_program__set_autoload(p, false);
+    }
+    return t;
+}
+
+int lk_tls_attach(struct lk_tls *t)
+{
+    if (!t || !t->enabled)
+        return 0; /* OFF: soft none, not an error (Р39) */
+
+    if (t->explicit_path) {
+        /* An explicit --libssl must resolve: a bad path is fatal on start, like a
+         * failed port bind (Р39/Р29). */
+        struct stat st;
+
+        if (stat(t->explicit_path, &st)) {
+            fprintf(stderr, "latkit: --libssl %s: %s\n", t->explicit_path, strerror(errno));
+            return -1;
+        }
+        if (attach_file(t, t->explicit_path) != 1 || t->nfiles == 0) {
+            fprintf(stderr, "latkit: --libssl %s: no SSL_* symbols attached\n", t->explicit_path);
+            return -1;
+        }
+        update_state(t);
+        return 0;
+    }
+
+    /* AUTO: scanning is best effort — no libssl found is a soft none (the agent
+     * still serves plaintext), logged so the operator can tell why TLS is dark. */
+    scan_proc(t);
+    update_state(t);
+    if (t->nfiles == 0)
+        fprintf(stderr, "latkit: TLS uprobes: no libssl found for comm '%s', "
+                        "TLS connections will be dropped\n",
+                t->comm);
+    return 0;
+}
+
+/* Rescan timer body: attach any libssl that showed up since the last pass. */
+static void tls_rescan(void *ctx)
+{
+    struct lk_tls *t = ctx;
+    int newly = scan_proc(t);
+
+    if (newly > 0)
+        update_state(t);
+}
+
+int lk_tls_register(struct lk_tls *t, struct lk_loop *loop)
+{
+    /* Only AUTO rescans: an explicit --libssl is a fixed target, and pid=-1
+     * already covers backends forked into it. */
+    if (!t || !t->enabled || t->explicit_path || t->cfg.rescan_sec == 0)
+        return 0;
+    return lk_loop_every(loop, t->cfg.rescan_sec, tls_rescan, t);
 }
 
 void lk_tls_free(struct lk_tls *t)
@@ -154,6 +378,7 @@ void lk_tls_free(struct lk_tls *t)
         return;
     for (int i = 0; i < t->nlinks; i++)
         bpf_link__destroy(t->links[i]);
+    free(t->links);
     free(t);
 }
 

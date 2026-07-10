@@ -57,8 +57,10 @@ static double opt_otlp_span_ratio;   /* --otlp-spans RATIO; 0 = off */
 static __u64 opt_otlp_span_slow_ms;  /* --otlp-spans-slow-ms; 0 = off */
 static __u64 opt_otlp_span_text_max; /* --otlp-span-text-max; 0 = default */
 static bool opt_otlp_span_masked;
-static enum lk_tls_mode opt_tls_mode = LK_TLS_OFF; /* --tls; default off in stage 6.1 */
+static enum lk_tls_mode opt_tls_mode = LK_TLS_OFF; /* --tls; default off */
 static const char *opt_libssl;                     /* --libssl PATH: explicit uprobe target */
+static char opt_tls_comm[16];                      /* --tls-comm: comm to scan for (default postgres) */
+#define LK_TLS_RESCAN_SEC 30 /* --tls auto: rescan /proc for new libssl paths every N s (Р39) */
 /* Env-derived header/resource arrays (freed at exit for ASAN cleanliness). */
 static char **env_headers, **env_resource;
 static int env_nheaders, env_nresource;
@@ -138,10 +140,13 @@ static void usage(const char *argv0)
             "                        send the normalised (literal-free) SQL as\n"
             "                        db.query.text instead of the raw text\n"
             "      --tls auto|off    capture TLS plaintext via libssl uprobes\n"
-            "                        (default: off). 'auto' scans for libssl in\n"
-            "                        stage 6.3; for now use --libssl.\n"
+            "                        (default: off). 'auto' scans /proc for the\n"
+            "                        libssl of the matching processes and rescans\n"
+            "                        periodically for new ones\n"
             "      --libssl PATH     attach the SSL_* uprobes to this libssl,\n"
             "                        skipping the scan (e.g. a container's copy)\n"
+            "      --tls-comm NAME   with --tls auto, scan only processes with\n"
+            "                        this comm (default: postgres)\n"
             "      --print-config    resolve config (flag > LATKIT_* env > default)\n"
             "                        to stdout and exit; every flag has a LATKIT_*\n"
             "                        env equivalent (see README)\n"
@@ -195,6 +200,7 @@ enum {
     OPT_OTLP_SPAN_MASKED,
     OPT_TLS,
     OPT_LIBSSL,
+    OPT_TLS_COMM,
     OPT_PRINT_CONFIG,
 };
 
@@ -365,6 +371,13 @@ static int set_option(int c, char *optarg)
     case OPT_LIBSSL:
         opt_libssl = optarg;
         break;
+    case OPT_TLS_COMM:
+        if (strlen(optarg) >= sizeof(opt_tls_comm)) {
+            fprintf(stderr, "--tls-comm: name longer than %zu chars\n", sizeof(opt_tls_comm) - 1);
+            return -1;
+        }
+        strncpy(opt_tls_comm, optarg, sizeof(opt_tls_comm) - 1);
+        break;
     case 'x':
         opt_hexdump = true;
         break;
@@ -426,6 +439,7 @@ static const struct env_opt env_opts[] = {
     {"LATKIT_OTLP_SPAN_MASKED", OPT_OTLP_SPAN_MASKED, false, false},
     {"LATKIT_TLS", OPT_TLS, true, false},
     {"LATKIT_LIBSSL", OPT_LIBSSL, true, false},
+    {"LATKIT_TLS_COMM", OPT_TLS_COMM, true, false},
 };
 
 /* Apply LATKIT_* env variables to flags not given on the CLI (Р34): flag > env
@@ -503,6 +517,7 @@ static int parse_args(int argc, char **argv)
         {"otlp-span-masked", no_argument, NULL, OPT_OTLP_SPAN_MASKED},
         {"tls", required_argument, NULL, OPT_TLS},
         {"libssl", required_argument, NULL, OPT_LIBSSL},
+        {"tls-comm", required_argument, NULL, OPT_TLS_COMM},
         {"print-config", no_argument, NULL, OPT_PRINT_CONFIG},
         {"hexdump", no_argument, NULL, 'x'},
         {},
@@ -607,6 +622,7 @@ static void print_config(void)
     printf("otlp_span_masked=%d\n", opt_otlp_span_masked);
     printf("tls=%s\n", opt_tls_mode == LK_TLS_AUTO ? "auto" : "off");
     printf("libssl=%s\n", opt_libssl ? opt_libssl : "");
+    printf("tls_comm=%s\n", opt_tls_comm);
 }
 
 /* The `ports` map exists only after load; attach happens after this, so the
@@ -655,9 +671,24 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* The effective comm to gate the TLS uprobes on (Р39): --tls-comm, else the
+     * general --comm, else the postgres default. Attaching on pid=-1 hooks every
+     * process mapping a shared libssl — including a psql client that maps the same
+     * file — so the in-program comm filter is what keeps foreign SSL traffic out.
+     * When --comm was not set, adopt this comm for the whole BPF filter; the
+     * socket path is port-filtered to the server side anyway, so narrowing it to
+     * the postgres comm changes nothing there. */
+    bool tls_enabled = opt_tls_mode == LK_TLS_AUTO || opt_libssl;
+    const char *tls_comm =
+        opt_tls_comm[0] ? opt_tls_comm : (opt_comm[0] ? opt_comm : "postgres");
+
     /* .rodata and map sizes are frozen at load time. */
     skel->rodata->cfg_capture_limit = opt_capture_limit;
-    memcpy((char *)skel->rodata->cfg_comm_filter, opt_comm, sizeof(opt_comm));
+    if (opt_comm[0])
+        memcpy((char *)skel->rodata->cfg_comm_filter, opt_comm, sizeof(opt_comm));
+    else if (tls_enabled)
+        strncpy((char *)skel->rodata->cfg_comm_filter, tls_comm,
+                sizeof(skel->rodata->cfg_comm_filter) - 1);
     err = bpf_map__set_max_entries(skel->maps.events, opt_ringbuf_bytes);
     if (err) {
         fprintf(stderr, "failed to size ringbuf: %d\n", err);
@@ -669,8 +700,8 @@ int main(int argc, char **argv)
     struct lk_tls_cfg tlscfg = {
         .mode = opt_tls_mode,
         .libssl_override = opt_libssl,
-        .comm_filter = NULL, /* --tls-comm: stage 6.3 */
-        .rescan_sec = 0,     /* rescan: stage 6.3 */
+        .comm_filter = tls_comm,
+        .rescan_sec = tls_enabled && !opt_libssl ? LK_TLS_RESCAN_SEC : 0,
     };
 
     tls = lk_tls_new(skel, &tlscfg);
@@ -744,6 +775,12 @@ int main(int argc, char **argv)
         goto cleanup;
     }
     err = lk_events_register(events, loop);
+    if (err)
+        goto cleanup;
+
+    /* AUTO only: periodically rescan /proc so a postgres cluster that starts (or
+     * pulls in a new libssl) after us gets attached without an agent restart. */
+    err = lk_tls_register(tls, loop);
     if (err)
         goto cleanup;
 

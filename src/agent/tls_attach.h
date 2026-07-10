@@ -5,16 +5,20 @@
  * plaintext with LK_F_DECRYPTED; this module decides where the SSL_* uprobes
  * land and owns their bpf_link lifetime.
  *
- * Stage 6.1 implements only the explicit-path form: --libssl PATH attaches the
- * uprobes to one given libssl, no /proc scanning. Auto-detection, container
- * path resolution and the periodic rescan are stage 6.3; the config carries the
- * fields already so the API does not churn.
+ * Two ways to pick the libssl: --libssl PATH attaches to one given binary (no
+ * scanning); --tls auto scans /proc for the libssl mapped by the postgres
+ * processes (comm-filtered), resolving each container path through
+ * /proc/<pid>/root and deduping by inode, then rescans on a timer to pick up
+ * newly started clusters. pid=-1 on every attach covers forked backends without
+ * a rescan.
  *
- * No I/O beyond libbpf attach; the caller (main.c) drives load order. */
+ * No I/O beyond libbpf attach and reading /proc; the caller (main.c) drives load
+ * order and registers the rescan timer. */
 #ifndef LATKIT_TLS_ATTACH_H
 #define LATKIT_TLS_ATTACH_H
 
 struct latkit_bpf; /* the generated skeleton (latkit.skel.h) */
+struct lk_loop;    /* the event loop (loop.h), for the rescan timer */
 struct lk_tls;
 
 enum lk_tls_mode { LK_TLS_OFF = 0, LK_TLS_AUTO };
@@ -24,10 +28,10 @@ enum lk_tls_mode { LK_TLS_OFF = 0, LK_TLS_AUTO };
 enum lk_tls_state { LK_TLS_STATE_NONE = 0, LK_TLS_STATE_PARTIAL, LK_TLS_STATE_OK };
 
 struct lk_tls_cfg {
-    enum lk_tls_mode mode;       /* --tls: OFF (default, 6.1) or AUTO (scan, 6.3) */
+    enum lk_tls_mode mode;       /* --tls: OFF (default) or AUTO (scan /proc) */
     const char *libssl_override; /* --libssl PATH: attach here, skip the scan */
-    const char *comm_filter;     /* --tls-comm: reserved for 6.3 */
-    unsigned rescan_sec;         /* periodic rescan period; reserved for 6.3 */
+    const char *comm_filter;     /* --tls-comm: which comm to scan for; NULL => postgres */
+    unsigned rescan_sec;         /* AUTO rescan period for new libssl paths (0 => no rescan) */
 };
 
 /* Create the handle and decide autoload of the SSL_* programs. MUST be called
@@ -44,6 +48,13 @@ struct lk_tls *lk_tls_new(struct latkit_bpf *skel, const struct lk_tls_cfg *cfg)
  * 0 (a soft miss — no libssl, nothing attached — is not an error, Р39), <0 only
  * on a hard failure. */
 int lk_tls_attach(struct lk_tls *t);
+
+/* Register the AUTO-mode rescan timer on the event loop, so libssl paths that
+ * appear after startup (a cluster restart, a second install) get attached
+ * without an agent restart. No-op for OFF or an explicit --libssl (a fixed
+ * target; pid=-1 already covers its forked backends). Call after lk_tls_attach
+ * and once the loop exists. Returns 0, or <0 if the timer could not be armed. */
+int lk_tls_register(struct lk_tls *t, struct lk_loop *loop);
 
 /* Detach every uprobe link and free the handle. NULL-safe. */
 void lk_tls_free(struct lk_tls *t);
