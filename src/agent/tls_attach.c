@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0
-/* TLS uprobe attach lifecycle (stage 6, Р39). Stage 6.1 scope: attach the
- * SSL_read/SSL_write(_ex) uprobe+uretprobe pairs to one explicit libssl path
- * (--libssl), pid=-1 so every process mapping that file — present and future
- * postgres backends — is covered. Scanning /proc, container path resolution and
- * the rescan timer are stage 6.3. */
+/* TLS uprobe attach lifecycle (stage 6, Р39). Attaches, to one explicit libssl
+ * path (--libssl), pid=-1 so every process mapping that file — present and future
+ * postgres backends — is covered: the SSL_read/SSL_write(_ex) data probes (6.1)
+ * plus the SSL_set_fd/rfd/wfd and SSL_free bridge probes (6.2, the SSL*->cookie
+ * correlation). Scanning /proc, container path resolution and the rescan timer
+ * are stage 6.3. */
 #include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -37,6 +38,10 @@ P(lk_ssl_read)
 P(lk_ssl_read_ret)
 P(lk_ssl_read_ex)
 P(lk_ssl_read_ex_ret)
+P(lk_ssl_set_fd)
+P(lk_ssl_set_rfd)
+P(lk_ssl_set_wfd)
+P(lk_ssl_free)
 #undef P
 
 static const struct lk_tls_probe tls_probes[] = {
@@ -48,6 +53,13 @@ static const struct lk_tls_probe tls_probes[] = {
     {tls_prog_lk_ssl_read_ret, "SSL_read", true, false},
     {tls_prog_lk_ssl_read_ex, "SSL_read_ex", false, true},
     {tls_prog_lk_ssl_read_ex_ret, "SSL_read_ex", true, true},
+    /* Bridge probes (stage 6.2): SSL_set_fd is the primary SSL*->cookie link,
+     * SSL_free the cleanup — both present in every OpenSSL. The rfd/wfd variants
+     * are rarely used (separate read/write fds) and tolerated absent. */
+    {tls_prog_lk_ssl_set_fd, "SSL_set_fd", false, false},
+    {tls_prog_lk_ssl_set_rfd, "SSL_set_rfd", false, true},
+    {tls_prog_lk_ssl_set_wfd, "SSL_set_wfd", false, true},
+    {tls_prog_lk_ssl_free, "SSL_free", false, false},
 };
 #define TLS_NPROBES (sizeof(tls_probes) / sizeof(tls_probes[0]))
 

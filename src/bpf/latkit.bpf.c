@@ -571,6 +571,110 @@ static __always_inline void emit_data_chunks(__u64 cookie, struct lk_conn_state 
     ONCE(cur->busy) = 0;
 }
 
+/* ------------------------------------------------------------------------- *
+ * TLS SSL* -> socket-cookie bridge (stage 6.2, Р36/Р37). Shared state that both
+ * the socket data path (the nested-syscall fallback below) and the SSL_* uprobes
+ * (further down) touch, so it is declared here, ahead of tcp_sendmsg.
+ *
+ * A decrypted event must land in the SAME conn_table entry the socket path
+ * created on CONN_OPEN — that entry carries the tuple/labels and has already seen
+ * the SSLRequest/'S'. So the uprobe channel has to stamp events with the socket
+ * cookie, but a uprobe sees SSL* and userspace registers, not a struct sock. Two
+ * independent ways fill ssl_to_conn, keyed by SSL*:
+ *   - primary: uprobe on SSL_set_fd/rfd/wfd walks fd -> socket -> sk and reads
+ *     the cookie straight out of sk (skc_cookie, already assigned by the socket
+ *     path at TCP_ESTABLISHED). Deterministic and before any data. Note a uprobe
+ *     cannot call bpf_get_socket_cookie (helper is tracing-only), hence the
+ *     direct field read, guarded by bpf_core_field_exists.
+ *   - fallback: within a live SSL_read/SSL_write the same thread synchronously
+ *     drives tcp_recvmsg/tcp_sendmsg; those fentries run in tracing context, can
+ *     call bpf_get_socket_cookie, and bind SSL* -> cookie there (ssl_nested_link).
+ * One correlation is enough — the mapping is persistent until SSL_free. */
+
+/* In-flight SSL_write/SSL_read arguments, saved on entry (ssl_entry), consumed on
+ * return (ssl_ret). written_ptr is the _ex out-param (userspace size_t*), 0 for
+ * the classic calls. Split wr/rd because a thread can have one of each in flight
+ * and the two return probes must not collide on the pid_tgid key; the fallback
+ * bridge also reads them (wr from tcp_sendmsg, rd from tcp_recvmsg). */
+struct lk_ssl_call {
+    __u64 ssl;
+    __u64 buf;
+    __u64 written_ptr;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64); /* pid_tgid */
+    __type(value, struct lk_ssl_call);
+} active_ssl_wr SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64); /* pid_tgid */
+    __type(value, struct lk_ssl_call);
+} active_ssl_rd SEC(".maps");
+
+/* The bridge itself (Р37), key = SSL* as u64. value = the socket cookie the
+ * decrypted events must carry, plus the tuple (snapshotted for parity with the
+ * socket path / future synthetic use). LRU_HASH with its own ceiling so a missed
+ * SSL_free ages out. */
+struct lk_ssl_conn {
+    __u64 cookie;
+    struct lk_tuple tuple;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64); /* SSL* */
+    __type(value, struct lk_ssl_conn);
+} ssl_to_conn SEC(".maps");
+
+/* Per-connection seq space of the decrypted channel (Р38), key = socket cookie.
+ * Kept apart from conns.seq: ciphertext socket events are dropped in userspace
+ * for a TLS connection, so mixing the two seq spaces would fake holes. LRU so a
+ * missed cleanup ages out. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u64);
+    __type(value, __u32);
+} tls_seq SEC(".maps");
+
+/* Record SSL* -> {cookie, tuple}. First writer wins: the primary walk usually
+ * lands before any data, and re-linking to the same socket would only churn the
+ * map. cookie 0 (socket path has not assigned skc_cookie yet, or the walk
+ * missed) is not stored — better to fall through to the other mechanism than to
+ * pin a bogus mapping. */
+static __always_inline void ssl_conn_set(__u64 ssl, __u64 cookie, struct sock *sk)
+{
+    struct lk_ssl_conn v = {};
+
+    if (!ssl || !cookie)
+        return;
+    if (bpf_map_lookup_elem(&ssl_to_conn, &ssl))
+        return;
+    v.cookie = cookie;
+    fill_tuple(&v.tuple, sk);
+    bpf_map_update_elem(&ssl_to_conn, &ssl, &v, BPF_ANY);
+}
+
+/* Fallback bridge (Р37), called from tcp_sendmsg/tcp_recvmsg. If an SSL_* call
+ * of the matching direction is in flight for this thread, this tcp_* is the
+ * nested syscall OpenSSL issued inside it — bind that SSL* to this socket. The
+ * cookie is taken via bpf_get_socket_cookie (legal here, tracing context) so it
+ * is identical to the socket path's. */
+static __always_inline void ssl_nested_link(void *active_map, __u64 id, struct sock *sk)
+{
+    struct lk_ssl_call *c = bpf_map_lookup_elem(active_map, &id);
+
+    if (!c || !c->ssl)
+        return;
+    ssl_conn_set(c->ssl, bpf_get_socket_cookie(sk), sk);
+}
+
 SEC("fentry/tcp_sendmsg")
 int BPF_PROG(lk_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
 {
@@ -585,6 +689,10 @@ int BPF_PROG(lk_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
     st = conn_get(sk, cookie);
     if (!st)
         return 0;
+
+    /* Fallback SSL*->cookie bridge (Р37): if this send is the nested syscall of
+     * a live SSL_write on this thread, bind that SSL* to this connection. */
+    ssl_nested_link(&active_ssl_wr, bpf_get_current_pid_tgid(), sk);
 
     /* Data is still in the caller's buffer on entry to tcp_sendmsg; snapshot
      * msg->msg_iter and read straight from userspace. On an unsupported
@@ -607,6 +715,10 @@ int BPF_PROG(lk_tcp_recvmsg_entry, struct sock *sk, struct msghdr *msg, size_t l
      * program bails out before emitting anything. */
     if (!sk_port_match(sk) || !comm_allowed())
         return 0;
+
+    /* Fallback SSL*->cookie bridge (Р37): if this recv is the nested syscall of
+     * a live SSL_read on this thread, bind that SSL* to this connection. */
+    ssl_nested_link(&active_ssl_rd, pid_tgid, sk);
 
     /* The destination buffers are empty now, but msg->msg_iter already
      * points at them. By fexit iov_iter has been advanced past the copied
@@ -667,46 +779,14 @@ int BPF_PROG(lk_tcp_recvmsg_exit, struct sock *sk, struct msghdr *msg, size_t le
  * per connection and never nest SSL_read/SSL_write, so pid_tgid uniquely keys
  * the in-flight call.
  *
- * Correlating SSL* to a socket cookie is stage 6.2; here cookie stays 0 and the
- * decrypted events are only meaningful for --events/--hexdump inspection. The
- * per-cookie seq lives in tls_seq (its own space, Р38), independent of the
- * socket path's conns.seq. Attach lifecycle and comm/path selection live in
- * userspace (tls_attach.c); these programs auto-attach nothing. */
-
-/* In-flight SSL_write/SSL_read arguments, saved on entry, consumed on return.
- * written_ptr is the _ex out-param (userspace size_t*), 0 for the classic
- * calls. Split wr/rd maps because a thread can have one of each in flight and
- * the two return probes must not collide on the pid_tgid key. */
-struct lk_ssl_call {
-    __u64 ssl;
-    __u64 buf;
-    __u64 written_ptr;
-};
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
-    __type(key, __u64); /* pid_tgid */
-    __type(value, struct lk_ssl_call);
-} active_ssl_wr SEC(".maps");
-
-struct {
-    __uint(type, BPF_MAP_TYPE_HASH);
-    __uint(max_entries, 10240);
-    __type(key, __u64); /* pid_tgid */
-    __type(value, struct lk_ssl_call);
-} active_ssl_rd SEC(".maps");
-
-/* Per-connection seq space of the decrypted channel (Р38), key = socket cookie.
- * Kept apart from conns.seq: ciphertext socket events are dropped in userspace
- * for a TLS connection, so mixing the two seq spaces would fake holes. LRU so a
- * missed cleanup ages out. Cookie is 0 until the stage-6.2 bridge lands. */
-struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 65536);
-    __type(key, __u64);
-    __type(value, __u32);
-} tls_seq SEC(".maps");
+ * SSL* is correlated to the socket cookie by the bridge above (ssl_to_conn); the
+ * return probe stamps each decrypted event with that cookie, so it lands in the
+ * socket path's own conn_table entry. The per-cookie seq lives in tls_seq (its
+ * own space, Р38), independent of the socket path's conns.seq. The in-flight
+ * argument maps (active_ssl_wr/rd) and ssl_to_conn are declared with the bridge
+ * above, since the socket data path reads them too. Attach lifecycle and
+ * comm/path selection live in userspace (tls_attach.c); these programs
+ * auto-attach nothing. */
 
 /* Next decrypted-channel seq for this cookie, lazily starting the counter at 0.
  * Like conns.seq, consumed before the reserve so a lost event leaves a hole. */
@@ -856,8 +936,11 @@ static __always_inline int ssl_entry(void *active_map, __u64 ssl, __u64 buf, __u
 
 /* Return: recover the saved buffer, resolve the real length (ret for the
  * classic calls, *written for _ex) and emit it. ret <= 0 (WANT_READ/WRITE,
- * error, EOF) yields nothing (Р35). The entry is always dropped so the map
- * cannot leak. */
+ * error, EOF) yields nothing (Р35). The event is stamped with the socket cookie
+ * looked up in ssl_to_conn (Р37); without a correlation the plaintext has no
+ * address and is useless, so it is dropped and counted (LK_ST_TLS_CORR_MISS)
+ * rather than sent to nowhere. The entry is always dropped so the map cannot
+ * leak. */
 static __always_inline int ssl_ret(void *active_map, __u8 dir, long ret, int is_ex)
 {
     __u64 id = bpf_get_current_pid_tgid();
@@ -879,8 +962,14 @@ static __always_inline int ssl_ret(void *active_map, __u8 dir, long ret, int is_
     if (len > 0xffffffffULL)
         len = 0xffffffffULL; /* total_len is u32; a single SSL call never nears this */
 
-    if (len > 0)
-        emit_ssl_data(0 /* cookie: stage 6.2 bridge */, dir, (__u32)len, call->buf);
+    if (len > 0) {
+        struct lk_ssl_conn *c = bpf_map_lookup_elem(&ssl_to_conn, &call->ssl);
+
+        if (c)
+            emit_ssl_data(c->cookie, dir, (__u32)len, call->buf);
+        else
+            stat_add(LK_ST_TLS_CORR_MISS, 1);
+    }
 
     bpf_map_delete_elem(active_map, &id);
     return 0;
@@ -940,4 +1029,91 @@ SEC("uretprobe")
 int BPF_URETPROBE(lk_ssl_read_ex_ret, int ret)
 {
     return ssl_ret(&active_ssl_rd, LK_DIR_RECV, ret, 1);
+}
+
+/* Primary SSL*->cookie bridge (Р37): resolve a userspace fd of the current task
+ * to its struct sock. The fd-table walk (task->files->fdt->fd[fd]->private_data
+ * -> struct socket -> sk) is a known bcc idiom but version-fragile, so every hop
+ * is a bpf_probe_read that fails soft (returns NULL); the caller then falls
+ * through to the nested-syscall mechanism. Reads the fd array element by hand
+ * because fd is a variable index into struct file **. */
+static __always_inline struct sock *fd_to_sock(int fd)
+{
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    struct file **fdarr = BPF_CORE_READ(task, files, fdt, fd);
+    struct file *f = NULL;
+    struct socket *sock;
+    struct sock *sk;
+    unsigned int maxfd;
+
+    if (fd < 0 || !fdarr)
+        return NULL;
+    maxfd = BPF_CORE_READ(task, files, fdt, max_fds);
+    if ((unsigned int)fd >= maxfd)
+        return NULL;
+    if (bpf_probe_read_kernel(&f, sizeof(f), &fdarr[fd]) || !f)
+        return NULL;
+    /* file->private_data is the struct socket for a socket fd; sock->sk is the
+     * struct sock. A non-socket fd yields a bogus sk whose cookie read below is
+     * meaningless — the family/cookie guards in ssl_set_fd_link discard it. */
+    sock = BPF_CORE_READ(f, private_data);
+    sk = BPF_CORE_READ(sock, sk);
+    return sk;
+}
+
+/* SSL_set_fd(SSL *ssl, int fd) and the rfd/wfd variants: postgres calls
+ * SSL_set_fd(port->ssl, port->sock) in be_tls_open_server, before the handshake
+ * and any data. Walk fd -> sk, read the socket cookie straight out of sk
+ * (skc_cookie — the socket path assigned it at TCP_ESTABLISHED, well before
+ * this) and record the SSL*->cookie mapping. A uprobe may not call
+ * bpf_get_socket_cookie, so the field is read directly, guarded by
+ * bpf_core_field_exists; a family sanity check rejects a non-socket fd. */
+static __always_inline int ssl_set_fd_link(void *ssl, int fd)
+{
+    struct sock *sk;
+    __u64 cookie = 0;
+    __u16 family;
+
+    if (!comm_allowed())
+        return 0;
+    sk = fd_to_sock(fd);
+    if (!sk)
+        return 0;
+    family = BPF_CORE_READ(sk, __sk_common.skc_family);
+    if (family != AF_INET && family != AF_INET6)
+        return 0;
+    if (bpf_core_field_exists(sk->__sk_common.skc_cookie))
+        cookie = BPF_CORE_READ(sk, __sk_common.skc_cookie.counter);
+    ssl_conn_set((__u64)ssl, cookie, sk);
+    return 0;
+}
+
+SEC("uprobe")
+int BPF_UPROBE(lk_ssl_set_fd, void *ssl, int fd)
+{
+    return ssl_set_fd_link(ssl, fd);
+}
+
+SEC("uprobe")
+int BPF_UPROBE(lk_ssl_set_rfd, void *ssl, int fd)
+{
+    return ssl_set_fd_link(ssl, fd);
+}
+
+SEC("uprobe")
+int BPF_UPROBE(lk_ssl_set_wfd, void *ssl, int fd)
+{
+    return ssl_set_fd_link(ssl, fd);
+}
+
+/* SSL_free(SSL *ssl): the connection is done, drop its bridge entry (Р37). The
+ * LRU ceiling of ssl_to_conn is the backstop for a missed SSL_free (client
+ * crash); this is the common-case cleanup. */
+SEC("uprobe")
+int BPF_UPROBE(lk_ssl_free, void *ssl)
+{
+    __u64 key = (__u64)ssl;
+
+    bpf_map_delete_elem(&ssl_to_conn, &key);
+    return 0;
 }
