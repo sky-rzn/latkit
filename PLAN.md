@@ -148,10 +148,11 @@ latkit/
 - [x] OpenTelemetry: OTLP/HTTP protobuf в Collector — метрики (`Sum`/`Gauge`/`ExponentialHistogram`, ручной `pbuf.c`), спаны на сэмплированные запросы (точные тайминги + полный SQL, `spans.c`). Конфиг: endpoint, headers, интервал, resource-атрибуты, ratio/slow-ms.
 - [x] Оба экспортера независимо включаемы; конфиг — **флаги + env** (`LATKIT_*` + стандартные `OTEL_*`, приоритет флаг > env > дефолт); **YAML отложен** (Р34, по реальному спросу).
 
-### Этап 6 — TLS (~1–2 недели)
-- [ ] uprobes на `SSL_read/SSL_write(_ex)` в `libssl.so` (путь автодетектом через `/proc/<pid>/maps` процессов postgres); сопоставление SSL* ↔ fd ↔ conn_id (uprobe на `SSL_set_fd` или чтение fd из `BIO`).
-- [ ] Дедупликация: если соединение TLS — источник данных только uprobes, socket-события отбрасываются (флаг ставится при виде ответа 'S' на SSLRequest).
-- [ ] Ограничение зафиксировать в docs: статически слинкованный TLS и не-OpenSSL (GnuTLS) — вне scope v1.
+### Этап 6 — TLS (~1–2 недели) — детализация в [STAGE6.md](STAGE6.md), заметки [docs/notes-tls.md](docs/notes-tls.md)
+- [x] uprobes на `SSL_read/SSL_write(_ex)` в `libssl.so` (путь автодетектом через `/proc/<pid>/maps` процессов postgres); сопоставление SSL* ↔ fd ↔ conn_id (`SSL_set_fd`-walk `fd→sock→cookie` как основной мост + nested-syscall корреляция в `tcp_*` как fallback, Р37); плейнтекст едет через тот же framer→парсер→метрики без правок `src/proto|norm|metrics|export`.
+- [x] Дедупликация: если соединение TLS — источник данных только uprobes (`LK_F_DECRYPTED`), ciphertext socket-события отбрасываются и считаются (`latkit_tls_socket_events_dropped_total`); флаг `LK_CONN_TLS` ставится при виде ответа 'S'/'G'; раздельные seq-пространства (Р38), сброс framer'а в startup внутри TLS (Р36).
+- [x] Автодетект libssl и жизненный цикл (`--tls auto|off`, `--libssl`, `--tls-comm`, +env; контейнеры через `/proc/<pid>/root`; ре-скан новых путей; `pid=-1` покрывает fork'и); self-метрики Р41; e2e `ssl=on`+`sslmode=require` (`tests/e2e/verify-tls.sh`).
+- [x] Ограничения зафиксированы в docs (`docs/notes-tls.md` §6, README): статически слинкованный OpenSSL, не-OpenSSL (GnuTLS/NSS), BoringSSL (untested), GSSENC — вне scope v1, с явным поведением «детект TLS + drop-and-count», не тихая порча.
 
 ### Этап 7 — Grafana, упаковка, документация (~1 неделя)
 - [ ] Дашборды (JSON в `dashboards/`): обзор (QPS, p50/p95/p99, error rate, соединения), top-N запросов по p99/времени/частоте, детализация по db/user, health агента. Datasource — переменная (Prometheus/Mimir).
@@ -176,8 +177,9 @@ latkit/
 | Чтение `iov_iter` в BPF хрупко между версиями ядра | CO-RE + `bpf_core_field_exists`; fallback-вариант на sockmap/sk_msg; снять риск в PoC (этап 0) |
 | Потери событий ringbuf под нагрузкой → битые измерения | бюджет захвата (только заголовки + префиксы), счётчики drop, ресинхронизация парсера, метрика честности данных |
 | Взрыв кардинальности метрик | нормализация + top-K LRU + `other`; лимит на длину лейбла |
-| TLS повсеместен в проде | этап 6 обязателен для v1.0; ограничения документируем |
-| Unix domain sockets (локальные клиенты идут через `unix_stream_sendmsg`, не tcp_*) | v1.1: отдельные хуки на `unix_stream_sendmsg/recvmsg`; зафиксировать как known gap |
+| TLS повсеместен в проде | ✅ этап 6 закрыт: uprobes на `libssl` (`--tls auto`, host+контейнер), плейнтекст через тот же пайплайн; ограничения (статик OpenSSL / GnuTLS / BoringSSL / GSSENC) документированы с явным «детект+drop» ([docs/notes-tls.md](docs/notes-tls.md)) |
+| Unix domain sockets (локальные клиенты идут через `unix_stream_sendmsg`, не tcp_*) | **known gap v1.1**: отдельные хуки на `unix_stream_sendmsg/recvmsg` |
+| GSSENC (ответ `'G'`, Kerberos-шифрование через libgssapi) | **known gap v1.1**: детектится (флаг TLS ставится и на `'G'`), ciphertext дропается и считается; uprobe-путь для libgssapi отложен |
 | Точность: измеряем на сервере, но в тайминг входит ядро/сеть до userspace PG | честно описать модель измерения; сравнение с pg_stat_statements в этапе 8 |
 
 ## 6. Вехи

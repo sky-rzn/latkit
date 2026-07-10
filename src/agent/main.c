@@ -736,6 +736,7 @@ int main(int argc, char **argv)
         .ringbuf = skel->maps.events,
         .stats = skel->maps.stats,
         .capmode = skel->maps.capmode,
+        .tls = tls, /* attach-state gauge source (latkit_tls_attached) */
         .max_conns = opt_max_conns,
         .conn_idle_timeout_sec = opt_conn_idle_timeout,
         .record_path = opt_record,

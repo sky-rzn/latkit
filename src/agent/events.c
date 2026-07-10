@@ -31,6 +31,7 @@
 #include "reassembly.h"
 #include "record.h"
 #include "selfstats.h"
+#include "tls_attach.h"
 
 #define LK_STATS_INTERVAL_SEC 10
 #define LK_SWEEP_INTERVAL_SEC 60
@@ -217,6 +218,48 @@ static bool sum_kernel_stats(struct lk_events *e, __u64 sum[LK_ST_MAX])
     return true;
 }
 
+/* --- TLS self-metrics (Р41, stage 6.5) ------------------------------------
+ * The stage-6 TLS observability series, poured from the same three sources the
+ * plaintext self-metrics use: the kernel per-CPU counters (uprobe events,
+ * decrypted bytes, correlation misses — `sum`, NULL if the map read failed),
+ * the conn table (live/lifetime TLS connection counts, ciphertext drops), and
+ * the uprobe manager (attach state). The two byte/event families carry no
+ * {fn}/{dir} label: the kernel counts them without that split (the same
+ * documented Р27 deviation as latkit_events_total), so the label the spec
+ * sketches would always be a single value — omitted rather than faked. */
+static void ev_provide_tls_stats(struct lk_events *e, struct lk_metrics *m, const __u64 *sum,
+                                 const struct lk_conn_table_stats *cs)
+{
+    static const char *const states[] = {"none", "partial", "ok"};
+    enum lk_tls_state st = e->cfg.tls ? lk_tls_status(e->cfg.tls) : LK_TLS_STATE_NONE;
+
+    /* One series per state, 1 on the live one — a Prometheus enum gauge. */
+    for (unsigned i = 0; i < 3; i++)
+        lk_metrics_set_gauge_l(m, "latkit_tls_attached",
+                               i == 0 ? "libssl uprobe attach state (1 on the active state)." : NULL,
+                               "state", states[i], (unsigned)st == i ? 1.0 : 0.0);
+
+    lk_metrics_set_gauge(m, "latkit_tls_connections", "TLS connections currently tracked.",
+                         (double)cs->tls_active);
+    lk_metrics_set_counter(m, "latkit_tls_connections_total",
+                           "TLS connections seen since start.", (double)cs->tls_opened);
+    lk_metrics_set_counter(m, "latkit_tls_socket_events_dropped_total",
+                           "Ciphertext socket events dropped on TLS connections.",
+                           (double)cs->tls_socket_dropped);
+
+    if (sum) {
+        lk_metrics_set_counter(m, "latkit_tls_uprobe_events_total",
+                               "Decrypted plaintext events submitted from SSL_* uprobes.",
+                               (double)sum[LK_ST_TLS_UPROBE_EVENTS]);
+        lk_metrics_set_counter(m, "latkit_tls_decrypted_bytes_total",
+                               "Decrypted plaintext bytes captured (cap_len).",
+                               (double)sum[LK_ST_TLS_DECRYPTED_BYTES]);
+        lk_metrics_set_counter(m, "latkit_tls_correlation_misses_total",
+                               "Decrypted events dropped for a missing SSL-to-cookie link.",
+                               (double)sum[LK_ST_TLS_CORR_MISS]);
+    }
+}
+
 /* --- self-metric provider (task 4.4, Р27) ---------------------------------
  * events.c is the only place that touches libbpf, so this is where the kernel
  * per-CPU counters, the framer/parser/conn-table stats become metric series;
@@ -227,8 +270,9 @@ static void ev_provide_stats(void *ctx, struct lk_metrics *m)
 {
     struct lk_events *e = ctx;
     __u64 sum[LK_ST_MAX];
+    bool sum_ok = sum_kernel_stats(e, sum);
 
-    if (sum_kernel_stats(e, sum)) {
+    if (sum_ok) {
         __u64 drops = sum[LK_ST_RESERVE_FAIL_DATA] + sum[LK_ST_RESERVE_FAIL_OPEN] +
                       sum[LK_ST_RESERVE_FAIL_CLOSE];
 
@@ -272,6 +316,8 @@ static void ev_provide_stats(void *ctx, struct lk_metrics *m)
                              "reason", "lru", (double)cs->evicted_lru);
     lk_metrics_set_counter_l(m, "latkit_conns_evicted_total", NULL, "reason", "idle",
                              (double)cs->evicted_idle);
+
+    ev_provide_tls_stats(e, m, sum_ok ? sum : NULL, cs);
 }
 
 /* /healthz liveness source (task 5.1): the Prometheus server lives in src/export

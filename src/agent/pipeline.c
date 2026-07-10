@@ -95,8 +95,10 @@ void lk_pipeline_feed(struct lk_pipeline *p, const void *data, size_t size,
 
             lk_reasm_data(&p->reasm, c, v->hdr->dir, v->data, v->cap_len);
             out->tls_now = !was_tls && (c->flags & LK_CONN_TLS);
-            if (out->tls_now)
+            if (out->tls_now) {
                 lk_conn_tls_reset_framing(c);
+                lk_conn_table_note_tls_open(p->conns);
+            }
         }
         break;
     }

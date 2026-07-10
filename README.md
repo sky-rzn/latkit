@@ -6,7 +6,7 @@ protocol into per-query latency metrics exported to Prometheus and
 OpenTelemetry. No backend of its own — Grafana reads the data from
 Prometheus / an OTel-compatible store.
 
-**Status: capture, framing, parser, metrics, and exporters done (milestones M1 + M2 + M3).**
+**Status: capture, framing, parser, metrics, exporters, and TLS done (milestones M1 + M2 + M3, stage 6).**
 The agent attaches to a live kernel, captures both directions of traffic on
 configured server ports as a stream of connection-scoped events, accounts for
 every lost event, and survives overload without touching the database. On top of
@@ -24,14 +24,21 @@ text exposition. Stage 5 serves that exposition over HTTP `/metrics`
 (`--prom-listen`) and pushes the same registry to an OTel Collector as OTLP/HTTP
 protobuf (`--otlp-endpoint`) — `Sum`s, `Gauge`s, and `ExponentialHistogram`s —
 plus optional sampled **spans** carrying the exact per-query timings and full
-SQL. See [PLAN.md](PLAN.md) (Russian) for the roadmap,
+SQL. Stage 6 adds **TLS**: for `sslmode=require` sessions the socket bytes are
+ciphertext, so the plaintext is read one layer up via uprobes on
+`SSL_read`/`SSL_write` in the postgres `libssl`, bridged back to the same
+connection and fed through the identical framer → parser → metrics pipeline —
+`--tls auto` finds the library itself (host or container). See
+[PLAN.md](PLAN.md) (Russian) for the roadmap,
 [STAGE1.md](STAGE1.md) for the capture-layer decisions, [STAGE2.md](STAGE2.md) /
 [docs/notes-reassembly.md](docs/notes-reassembly.md) for the framing model,
 [STAGE3.md](STAGE3.md) / [docs/notes-pgproto.md](docs/notes-pgproto.md) for the
 parser, [STAGE4.md](STAGE4.md) / [docs/notes-metrics.md](docs/notes-metrics.md)
 for normalisation, the metric nomenclature, the duration model, and cardinality
 control, and [STAGE5.md](STAGE5.md) / [docs/notes-export.md](docs/notes-export.md)
-for the exporters, the OTLP mapping, spans, and the config/env layer.
+for the exporters, the OTLP mapping, spans, and the config/env layer, and
+[STAGE6.md](STAGE6.md) / [docs/notes-tls.md](docs/notes-tls.md) for the TLS
+capture scheme, the `SSL*`→connection bridge, and the v1 TLS limits.
 
 ## How it works
 
@@ -74,6 +81,11 @@ the test fixtures — see `tests/replay`).
   but untested).
 - clang (BPF target), CMake ≥ 3.16, `bpftool`, `libelf`, `zlib`.
 - Root (or `CAP_BPF` + `CAP_PERFMON`) to run.
+- For **TLS** capture (`--tls`), additionally read access to the postgres
+  backends' `/proc/<pid>/maps` and `/proc/<pid>/root` — in a container that
+  means **`hostPID: true`** and a readable `/proc`. Without it the libssl scan
+  finds nothing and TLS degrades to `state=none` (the agent stays up on
+  plaintext).
 
 ## Build
 
@@ -112,6 +124,9 @@ sudo ./build/latkit                    # captures local port 5432
 | `--first-row-hist` | off | also record `latkit_query_first_row_seconds` (doubles the query-labelled series) |
 | `--dump-metrics[=FILE]` | off | write the Prometheus exposition on `SIGUSR1` and at exit, to FILE (default: stderr) |
 | `-x, --hexdump` | off | dump event payload (`--events`) and the captured message body prefix (`--messages`) |
+| `--tls auto\|off` | off | capture TLS plaintext via `libssl` uprobes; `auto` scans `/proc` for the matching processes' libssl and rescans for new ones. Needs `/proc` access (hostPID in a container) |
+| `--libssl PATH` | off | attach the `SSL_*` uprobes to this libssl, skipping the scan (e.g. a container's copy); a missing file is fatal |
+| `--tls-comm NAME` | postgres | with `--tls auto`, scan only processes with this exact comm |
 
 Dev environment (PostgreSQL 16 in docker + pgbench load):
 
@@ -188,7 +203,11 @@ nomenclature, the duration model, and the top-K / `other` behaviour.
 by construction: normalisation turns every string and numeric literal into `?`
 before it can reach a metric label, and raw SQL never enters the registry — only
 the normalised, masked prefix does. Full SQL is available only to OTel spans,
-opt-in (see below).
+opt-in (see below). **This holds for TLS sessions too:** with `--tls`, latkit
+reads the decrypted SQL from `libssl`, so an encrypted connection is exactly as
+visible to the agent as a plaintext one — the same masking default and the same
+opt-in raw-SQL spans apply. Encryption on the wire is not a privacy boundary
+against an agent running on the DB host.
 
 ## Exporters (Prometheus + OpenTelemetry)
 
@@ -221,7 +240,10 @@ curl -s localhost:9752/healthz                             # uptime/events/drops
 
 A quick end-to-end stack (postgres + pgbench + latkit + Prometheus + Collector)
 lives in [tests/e2e/](tests/e2e) — `./tests/e2e/verify.sh` builds the agent,
-brings it up, and asserts both paths (milestone M3).
+brings it up, and asserts both paths (milestone M3). `./tests/e2e/verify-tls.sh`
+runs the same stand with `ssl=on` + `sslmode=require` + `--tls auto` and asserts
+the encrypted workload yields the identical query series plus a live
+`latkit_tls_connections`.
 
 ### Configuration & environment
 
@@ -240,6 +262,9 @@ flag, so an agent deployed beside other OTel tooling inherits the ambient config
 | `--otlp-header` | `LATKIT_OTLP_HEADERS` | `OTEL_EXPORTER_OTLP_HEADERS` |
 | `--otlp-resource` | `LATKIT_OTLP_RESOURCE` | `OTEL_RESOURCE_ATTRIBUTES` |
 | (`service.name`) | `LATKIT_OTLP_SERVICE_NAME` | `OTEL_SERVICE_NAME` |
+| `--tls` | `LATKIT_TLS` | — |
+| `--libssl` | `LATKIT_LIBSSL` | — |
+| `--tls-comm` | `LATKIT_TLS_COMM` | — |
 
 No YAML config in v1 — flags + env only (see [docs/notes-export.md](docs/notes-export.md)).
 
@@ -259,8 +284,13 @@ No YAML config in v1 — flags + env only (see [docs/notes-export.md](docs/notes
 
 ## Known limitations (v1 scope)
 
-- TLS traffic is opaque at the socket level — the uprobe channel on
-  `SSL_read`/`SSL_write` is stage 6.
+- **TLS** is captured via `libssl` uprobes (`--tls`), but only for
+  **dynamically linked OpenSSL**. Other cases are detected and their ciphertext
+  dropped-and-counted (never silently corrupted), but not decrypted:
+  GnuTLS/NSS, statically linked OpenSSL, and **GSSENC** (Kerberos `'G'` reply,
+  via libgssapi) are out of scope; BoringSSL may work through the
+  offset-independent bridge but is untested. See
+  [docs/notes-tls.md](docs/notes-tls.md) §6.
 - Unix-domain sockets are invisible (`tcp_*` is not on that path) — v1.1.
 - `splice()`-relayed traffic (e.g. docker-proxy) arrives with kernel-page
   iterators: sends degrade to honest `cap_len=0` events, receives bypass

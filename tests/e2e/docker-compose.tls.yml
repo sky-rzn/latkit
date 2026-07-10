@@ -1,0 +1,90 @@
+# TLS variant of the M3 e2e stand (STAGE6.md task 6.5). Layered over the base
+# docker-compose.yml as a Compose override:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+#
+# or just run ./verify-tls.sh, which does the build + up + assert + down.
+#
+# What it changes versus the plaintext stand:
+#   - a one-shot pg-cert-init generates a self-signed server cert/key into a
+#     named volume, owned by the postgres uid (999) with 0600 on the key so the
+#     server accepts it;
+#   - postgres runs with ssl=on pointing at that cert;
+#   - pgbench (init + load) connects with PGSSLMODE=require, so every backend
+#     session is TLS and the socket bytes are ciphertext;
+#   - latkit runs with --tls auto: it scans /proc (pid:host) for the postgres
+#     libssl and attaches the SSL_* uprobes, so the decrypted plaintext still
+#     flows through the same framer -> parser -> metrics pipeline.
+#
+# The exit criterion (verify-tls.sh): the very same query series appear as in
+# the plaintext run, plus latkit_tls_connections > 0 and the attach-state gauge
+# latkit_tls_attached{state="ok"} == 1 — proof the TLS path is the data source.
+
+services:
+  # Generate a throwaway self-signed cert into the shared volume. Runs as root
+  # so it can chown the key to the postgres uid (999); the server refuses a key
+  # that is not owned by its user (or root) or is group/world readable.
+  pg-cert-init:
+    image: postgres:16
+    user: root
+    volumes:
+      - pgcerts:/certs
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        set -e
+        openssl req -new -x509 -days 365 -nodes -text \
+          -out /certs/server.crt -keyout /certs/server.key -subj "/CN=postgres"
+        chmod 600 /certs/server.key
+        chown 999:999 /certs/server.key /certs/server.crt
+        echo "cert generated"
+    restart: "no"
+
+  postgres:
+    depends_on:
+      pg-cert-init:
+        condition: service_completed_successfully
+    volumes:
+      - pgcerts:/certs:ro
+    # ssl=on now — the encrypted socket bytes are opaque; the plaintext source
+    # is the stage-6 uprobe channel.
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/certs/server.crt
+      - -c
+      - ssl_key_file=/certs/server.key
+
+  # PGSSLMODE=require forces TLS for the dataset load and the steady load; the
+  # base service already carries PGPASSWORD, and environment maps merge.
+  pgbench-init:
+    environment:
+      PGSSLMODE: require
+
+  pgbench:
+    environment:
+      PGSSLMODE: require
+
+  # Same agent, now with --tls auto so it discovers the postgres libssl via
+  # /proc (pid:host, privileged) and attaches the SSL_* uprobes.
+  latkit:
+    command:
+      - "-p"
+      - "5432"
+      - "--tls"
+      - "auto"
+      - "--prom-listen"
+      - "0.0.0.0:9752"
+      - "--otlp-endpoint"
+      - "http://otel-collector:4318"
+      - "--otlp-interval"
+      - "5"
+      - "--otlp-spans"
+      - "0.1"
+      - "--otlp-spans-slow-ms"
+      - "100"
+
+volumes:
+  pgcerts:

@@ -115,6 +115,11 @@ struct lk_conn_table_stats {
     __u64 tls_socket_dropped; /* ciphertext socket events dropped on TLS conns
                                  (Р38, stage 6.4): the decrypted uprobe channel
                                  is the only data source once a conn goes TLS */
+    __u64 tls_opened;         /* connections that ever went TLS (LK_CONN_TLS) —
+                                 latkit_tls_connections_total (Р41, stage 6.5) */
+    __u32 tls_active;         /* TLS connections currently tracked — the gauge
+                                 latkit_tls_connections; ++ on the flip, -- when
+                                 the entry is destroyed */
     __u32 active;
 };
 
@@ -171,6 +176,12 @@ struct lk_conn *lk_conn_table_data_decrypted(struct lk_conn_table *t, __u64 cook
 /* Count one ciphertext socket event dropped on a TLS connection (Р38/Р41):
  * exposed as latkit_tls_socket_events_dropped_total. */
 void lk_conn_table_note_tls_drop(struct lk_conn_table *t);
+
+/* Note a connection flipping to LK_CONN_TLS (Р41): bumps the lifetime counter
+ * (latkit_tls_connections_total) and the live gauge (latkit_tls_connections),
+ * the latter decremented when the entry is destroyed. Called once per flip by
+ * the router, alongside lk_conn_tls_reset_framing. */
+void lk_conn_table_note_tls_open(struct lk_conn_table *t);
 
 /* Reset both directions' framer state to a fresh startup (Р36), called once by
  * the router when a connection flips to LK_CONN_TLS. The real StartupMessage

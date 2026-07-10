@@ -73,6 +73,8 @@ static void destroy(struct lk_conn_table *t, struct lk_conn *c)
         ;
     *slot = c->hnext;
     lru_unlink(t, c);
+    if (c->flags & LK_CONN_TLS)
+        t->st.tls_active--; /* mirrors the ++ at the TLS flip (Р41) */
     free(c->frame[0].buf);
     free(c->frame[1].buf);
     free(c);
@@ -228,6 +230,12 @@ struct lk_conn *lk_conn_table_data_decrypted(struct lk_conn_table *t, __u64 cook
 void lk_conn_table_note_tls_drop(struct lk_conn_table *t)
 {
     t->st.tls_socket_dropped++;
+}
+
+void lk_conn_table_note_tls_open(struct lk_conn_table *t)
+{
+    t->st.tls_opened++;
+    t->st.tls_active++;
 }
 
 void lk_conn_tls_reset_framing(struct lk_conn *c)
