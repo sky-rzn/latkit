@@ -140,14 +140,16 @@ int cg_path_id(const char *path, __u64 *id)
     /* name_to_handle_at on cgroupfs returns an 8-byte handle equal to the
      * kernfs id — the same value bpf_get_current_cgroup_id() reports. Requesting
      * exactly 8 bytes keeps the handle to that id (no privilege needed; only
-     * open_by_handle_at is privileged). */
-    struct {
+     * open_by_handle_at is privileged). The union (not a wrapping struct)
+     * reserves room past the flexible f_handle[] without tripping clang's
+     * -Wgnu-variable-sized-type-not-at-end. */
+    union {
         struct file_handle fh;
-        char buf[8];
+        char storage[sizeof(struct file_handle) + 8];
     } h;
     int mount_id;
 
-    h.fh.handle_bytes = sizeof(h.buf);
+    h.fh.handle_bytes = sizeof(h.storage) - sizeof(struct file_handle);
     if (name_to_handle_at(AT_FDCWD, path, &h.fh, &mount_id, 0))
         return -1;
     if (h.fh.handle_bytes < sizeof(__u64))

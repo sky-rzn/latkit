@@ -1,0 +1,7 @@
+# Keep the release-image build context (deploy/docker/Dockerfile) to the
+# sources: no local build trees or scratch files. .git stays in — the builder
+# stamps the version from `git describe`.
+build/
+build-*/
+demo/
+dump.txt

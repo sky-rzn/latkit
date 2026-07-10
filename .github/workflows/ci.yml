@@ -21,6 +21,34 @@ jobs:
       - name: Build
         run: cmake --build build -j"$(nproc)"
 
+  # Builds the release artifact (Р45: musl full-static in the Alpine builder
+  # stage, scratch image) on every push so a broken static link surfaces long
+  # before a release tag. Uploads the binary as an artifact; publishes nothing.
+  release-binary:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0 # full history + tags: the version stamp is `git describe`
+      - name: Build release image
+        run: docker build -f deploy/docker/Dockerfile -t latkit:ci .
+      - name: Extract binary
+        run: |
+          docker create --name lk latkit:ci
+          docker cp lk:/latkit latkit
+          docker rm lk
+      - name: Smoke-check the binary
+        run: |
+          file latkit
+          file latkit | grep -q 'statically linked'
+          ./latkit --version
+          ./latkit --print-config | grep -q '^port=5432'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: latkit-static-x86_64
+          path: latkit
+
   lint:
     runs-on: ubuntu-24.04
     steps:

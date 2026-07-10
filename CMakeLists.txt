@@ -5,6 +5,32 @@ set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 add_compile_options(-Wall -Wextra -Werror)
 
+# --- version (Р45) ----------------------------------------------------------
+# One source for --version, the --help header, the startup banner and the OTLP
+# resource (service.version): git describe at configure time, overridable with
+# -DLATKIT_VERSION= for builds without a .git (release tarballs). Configure-time
+# capture means an incremental build after new commits keeps the old string
+# until re-configure — acceptable for dev, and release builds always configure
+# fresh.
+set(LATKIT_VERSION "" CACHE STRING
+    "Version string for --version and OTLP service.version (default: git describe)")
+if(NOT LATKIT_VERSION)
+    execute_process(COMMAND git describe --tags --always --dirty
+                    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+                    RESULT_VARIABLE _git_rc OUTPUT_VARIABLE _git_ver
+                    OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(_git_rc EQUAL 0)
+        set(LATKIT_VERSION ${_git_ver})
+    else()
+        set(LATKIT_VERSION "unknown")
+    endif()
+endif()
+message(STATUS "latkit version: ${LATKIT_VERSION}")
+# Only the two consumers of version.h get the define, so a version bump does
+# not rebuild the world.
+set_property(SOURCE src/agent/main.c src/export/otlp.c APPEND PROPERTY
+             COMPILE_DEFINITIONS LATKIT_VERSION="${LATKIT_VERSION}")
+
 option(LATKIT_SYSTEM_LIBBPF "Link against system libbpf instead of the bundled submodule" OFF)
 set(LATKIT_BPFTOOL "" CACHE FILEPATH "Path to bpftool (auto-detected when empty)")
 set(LATKIT_VMLINUX_H "" CACHE FILEPATH
@@ -202,6 +228,16 @@ target_include_directories(latkit PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/export ${CMAKE_CURRENT_SOURCE_DIR}/src/common
     ${LIBBPF_INCLUDE_DIR})
 target_link_libraries(latkit latkit_proto latkit_metrics latkit_export ${LATKIT_LIBBPF_LIBS})
+
+# Release builds (Р45): fully static musl binary, built in the Alpine builder
+# stage of deploy/docker/Dockerfile. Only the agent goes static; tests and dev
+# builds stay dynamic (sanitizers do not mix with musl -static).
+option(LATKIT_STATIC "Link the agent fully static (musl toolchain; release builds)" OFF)
+if(LATKIT_STATIC)
+    target_link_options(latkit PRIVATE -static)
+    # Alpine's static libelf is built with zstd support for compressed sections.
+    target_link_libraries(latkit zstd)
+endif()
 
 # --- tests -----------------------------------------------------------------
 enable_testing()

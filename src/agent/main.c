@@ -25,6 +25,7 @@
 #include "otel_env.h"
 #include "spans.h"
 #include "tls_attach.h"
+#include "version.h"
 
 #define LK_OTLP_MAX_KV 32 /* --otlp-header / --otlp-resource entries accepted */
 
@@ -69,6 +70,7 @@ static char opt_tls_comm[16];                      /* --tls-comm: comm to scan f
 static char **env_headers, **env_resource;
 static int env_nheaders, env_nresource;
 static bool opt_print_config; /* --print-config: resolve config, print it, exit 0 */
+static bool opt_version;      /* --version: print the version string, exit 0 */
 /* Which options were given on the CLI, indexed by getopt id (< 512: ASCII ids
  * plus the OPT_* enum below). The env layer (Р34) fills only the unseen ones,
  * so a flag always wins over its LATKIT_* environment equivalent. */
@@ -84,6 +86,7 @@ static int libbpf_print(enum libbpf_print_level level, const char *fmt, va_list 
 static void usage(const char *argv0)
 {
     fprintf(stderr,
+            "latkit %s\n"
             "usage: %s [options]\n"
             "  -p, --port PORT       local (server) port to capture; repeatable,\n"
             "                        up to %d ports (default: %d)\n"
@@ -158,9 +161,10 @@ static void usage(const char *argv0)
             "      --print-config    resolve config (flag > LATKIT_* env > default)\n"
             "                        to stdout and exit; every flag has a LATKIT_*\n"
             "                        env equivalent (see README)\n"
+            "      --version         print the agent version and exit\n"
             "  -x, --hexdump         dump payload of events (--events) and the\n"
             "                        captured body prefix (--messages)\n",
-            argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT,
+            LK_VERSION, argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT,
             LK_MAX_CHUNKS * LK_CHUNK_FULL, LK_CAP_HEADERS_LIMIT, LK_MAX_CONNS_DEFAULT,
             LK_CONN_IDLE_TIMEOUT_SEC, LK_TOP_QUERIES_DEFAULT, LK_QUERY_LABEL_LEN_DEFAULT,
             LK_PROM_LISTEN_DEFAULT, LK_SPAN_TEXT_MAX_DEF);
@@ -211,6 +215,7 @@ enum {
     OPT_LIBSSL,
     OPT_TLS_COMM,
     OPT_PRINT_CONFIG,
+    OPT_VERSION,
 };
 
 /* Apply one parsed option, from the CLI or (via apply_env_defaults) from the
@@ -413,6 +418,9 @@ static int set_option(int c, char *optarg)
     case OPT_PRINT_CONFIG:
         opt_print_config = true;
         break;
+    case OPT_VERSION:
+        opt_version = true;
+        break;
     default:
         return -1;
     }
@@ -550,6 +558,7 @@ static int parse_args(int argc, char **argv)
         {"libssl", required_argument, NULL, OPT_LIBSSL},
         {"tls-comm", required_argument, NULL, OPT_TLS_COMM},
         {"print-config", no_argument, NULL, OPT_PRINT_CONFIG},
+        {"version", no_argument, NULL, OPT_VERSION},
         {"hexdump", no_argument, NULL, 'x'},
         {},
     };
@@ -687,6 +696,10 @@ int main(int argc, char **argv)
 
     if (parse_args(argc, argv))
         return 1;
+    if (opt_version) {
+        printf("latkit %s\n", LK_VERSION);
+        return 0;
+    }
     apply_otlp_env_defaults();
     if (opt_print_config) {
         print_config();
@@ -844,7 +857,7 @@ int main(int argc, char **argv)
     if (err)
         goto cleanup;
 
-    fprintf(stderr, "latkit: attached, capturing local port(s)");
+    fprintf(stderr, "latkit %s: attached, capturing local port(s)", LK_VERSION);
     for (int i = 0; i < opt_nports; i++)
         fprintf(stderr, " %u", opt_ports[i]);
     if (opt_comm[0])
