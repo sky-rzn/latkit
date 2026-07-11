@@ -1,0 +1,126 @@
+# latkit DaemonSet (Р47) — one agent per node, capturing every postgres on the
+# node kernel-side. Single file, no Helm (v1 scope); configuration is the
+# LATKIT_* env layer (Р34) right in this manifest.
+#
+#   kubectl apply -f latkit-daemonset.yaml
+#
+# Image: the manifest expects a locally available release image (built with
+# `docker build -f deploy/docker/Dockerfile -t latkit:latest .`); replace with
+# your registry copy, or with the ghcr.io release image once tags are published
+# (task 7.6). On kind: `kind load docker-image latkit:latest`.
+#
+# Pod Security Admission: this pod needs hostPID and extra capabilities, so on
+# PSA-enforced clusters the target namespace must allow it:
+#   kubectl label ns <ns> pod-security.kubernetes.io/enforce=privileged
+#
+# Operator notes (capability rationale, cgroup globs, kind specifics):
+# docs/deploy.md.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: latkit
+  labels:
+    app.kubernetes.io/name: latkit
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: latkit
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: latkit
+      annotations:
+        # Plain-Prometheus discovery. Running prometheus-operator instead?
+        # Use a PodMonitor selecting app.kubernetes.io/name=latkit on port
+        # `metrics` — we do not ship the CRD.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9752"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Mandatory for TLS capture (Р39): the libssl autodetect reads
+      # /proc/<pid>/maps and opens /proc/<pid>/root/... of the postgres
+      # processes, which must be visible in the agent's PID namespace.
+      # Plaintext-only capture works without it, but keeping it on is simpler
+      # and costs nothing.
+      hostPID: true
+      # hostNetwork is NOT needed: fentry capture sees every netns of the node
+      # kernel by definition, and /metrics is a normal pod port.
+      containers:
+        - name: latkit
+          image: latkit:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            # The image default binds loopback (Р29); a pod must listen on the
+            # pod IP for the kubelet probes and Prometheus to reach it.
+            - name: LATKIT_PROM_LISTEN
+              value: "0.0.0.0:9752"
+            - name: LATKIT_PORT
+              value: "5432"
+            # TLS capture of postgres running with ssl=on (stage 6). Needs the
+            # SYS_PTRACE + SYS_ADMIN capabilities below.
+            - name: LATKIT_TLS
+              value: "auto"
+            # Capture only the postgres pods you mean, not every 5432 talker on
+            # the node (Р48): comma-separated globs over /sys/fs/cgroup — on a
+            # systemd-cgroup-driver node a pod lives under
+            #   kubepods.slice/kubepods-<qos>.slice/kubepods-<qos>-pod<uid>.slice/cri-containerd-<cid>.scope
+            # (see docs/deploy.md for cgroupfs-driver and kind paths), so e.g.:
+            #- name: LATKIT_CGROUP
+            #  value: "kubepods.slice/**"
+          ports:
+            - name: metrics
+              containerPort: 9752
+          securityContext:
+            capabilities:
+              add:
+                # Measured minimal set (docs/deploy.md "Minimal capabilities"):
+                #   BPF + PERFMON        programs, maps, fentry attach
+                #   SYS_RESOURCE         memlock rlimit on kernels < 5.11 only
+                #   SYS_PTRACE+SYS_ADMIN TLS uprobes (LATKIT_TLS=auto); the
+                #                        kernel wants full CAP_SYS_ADMIN for
+                #                        uprobes. Plaintext-only? Drop both.
+                - BPF
+                - PERFMON
+                - SYS_RESOURCE
+                - SYS_PTRACE
+                - SYS_ADMIN
+            # Fallback for runtimes/kernels that cannot express the fine-grained
+            # set (older runc, exotic LSM policies): replace `capabilities`
+            # with:
+            #privileged: true
+          volumeMounts:
+            # cgroup-path resolution for the LATKIT_CGROUP filter (Р48): the
+            # agent globs /sys/fs/cgroup and maps matches to cgroup ids.
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 5
+          resources:
+            # Working hypothesis pending the stage-8 load budget: the agent is
+            # a single thread + BPF maps; RSS grows with connection count and
+            # tracked query cardinality (LATKIT_TOP_QUERIES).
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+      volumes:
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+      # Pin to the nodes that actually run postgres if you label them:
+      #nodeSelector:
+      #  latkit.io/capture: "true"
+      # No control-plane tolerations on purpose — postgres does not live there.

@@ -239,6 +239,12 @@ if(LATKIT_STATIC)
     target_link_libraries(latkit zstd)
 endif()
 
+# Install (Р47): just the binary, /usr/local/bin by default. The systemd unit
+# and env file are copied by hand from deploy/systemd/ (see the header of
+# latkit.service) — no deb/rpm in v1, so no point pretending CMake owns /etc.
+include(GNUInstallDirs)
+install(TARGETS latkit RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
 # --- tests -----------------------------------------------------------------
 enable_testing()
 add_subdirectory(tests/unit)

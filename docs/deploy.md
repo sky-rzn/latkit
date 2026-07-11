@@ -1,8 +1,9 @@
 # Deployment notes
 
 Operator-facing detail that does not belong in the README: the release
-binary, the Docker image, and the **measured** minimal capability set with
-its kernel/LSM caveats. Design decisions are Р45–Р47 in
+binary, the Docker image, the **measured** minimal capability set with its
+kernel/LSM caveats, the systemd unit and the k8s DaemonSet (with the cgroup
+filter's kubepods globs). Design decisions are Р45–Р48 in
 [STAGE7.md](../STAGE7.md).
 
 ## The release binary
@@ -109,10 +110,102 @@ Notes:
   cap set does not, an LSM is in the way), or on runtimes that cannot
   express fine-grained caps.
 
-## systemd unit and k8s DaemonSet
+## systemd unit
 
-Shipped under `deploy/systemd/` and `deploy/k8s/` (task 7.5). The
-capability findings above apply as-is:
-`CapabilityBoundingSet`/`securityContext.capabilities.add` need
-`SYS_ADMIN` whenever TLS capture is on, and `hostPID: true` is mandatory
-for the libssl autodetect (Р39).
+[`deploy/systemd/latkit.service`](../deploy/systemd/latkit.service) +
+[`latkit.env.example`](../deploy/systemd/latkit.env.example); install steps in
+the unit header. The env file is the **only** configuration surface (Р34/Р47) —
+every `LATKIT_*` variable is documented in the example, and the resolved
+config can be checked without touching BPF:
+
+```
+sudo env $(grep -v '^#' /etc/latkit/latkit.env | xargs) latkit --print-config
+```
+
+Verified on the dev host (kernel 7.0, systemd 257):
+
+- the sandbox (`ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`,
+  `NoNewPrivileges=yes`) does **not** interfere with capture, including TLS:
+  uprobe attach opens `/proc/<pid>/root/...libssl.so.3` of a foreign
+  container's mount namespace, and those procfs magic links resolve in the
+  *target's* namespace, outside the unit's mount sandbox. Confirmed by
+  attaching to an alpine container's libssl from the sandboxed unit;
+- the capability findings above apply as-is: the shipped
+  `CapabilityBoundingSet` carries the TLS set including `CAP_SYS_ADMIN`
+  (uprobes); running plaintext-only, delete `CAP_SYS_PTRACE CAP_SYS_ADMIN`
+  from it for a tighter unit;
+- `Restart=on-failure` verified with `kill -9`: a fresh agent is up after
+  `RestartSec=5`, re-attaches, capture continues (counters restart from zero —
+  they are process-local; `rate()` in Grafana absorbs the reset);
+- `systemctl restart` is clean — BPF links are kernel-side per-fd objects and
+  die with the process, nothing leaks between generations;
+- `--record` under `ProtectSystem=strict` needs its target directory
+  whitelisted via `ReadWritePaths=` (comment in the unit).
+
+Non-root + `AmbientCapabilities` stays a v1.1 experiment (Р47):
+`/proc/<pid>/root` of other uids' processes from non-root needs its own
+verification round.
+
+## k8s DaemonSet
+
+[`deploy/k8s/latkit-daemonset.yaml`](../deploy/k8s/latkit-daemonset.yaml) —
+one file, no Helm (v1 scope). `hostPID: true` (mandatory for the libssl
+autodetect, Р39), the measured capability set from the table above,
+`hostNetwork` deliberately absent (fentry sees every netns of the node;
+`/metrics` is a normal pod port). Verified end-to-end on kind v0.29
+(kubernetes 1.33, containerd, cgroup v2): DaemonSet Ready with green
+`/healthz` probes, pgbench Job traffic lands in `latkit_queries_total`,
+in-cluster scrape by pod IP works, and the fine-grained capability set is
+sufficient — no `privileged: true` needed on kind/containerd.
+
+kind/k8s specifics that came out of the run:
+
+- **Pod Security Admission**: hostPID + added capabilities require the
+  namespace to be labelled
+  `pod-security.kubernetes.io/enforce=privileged` on PSA-enforced clusters;
+- **BTF**: `/sys/kernel/btf/vmlinux` is visible inside the kind node (and any
+  normal container) without an extra hostPath — sysfs is mounted by default;
+- **image**: kind does not pull local images — `kind load docker-image
+  latkit:latest --name <cluster>`.
+
+### cgroup filter in k8s (Р48)
+
+The scenario the filter exists for: several postgres pods on one node, all on
+port 5432 — the port and comm filters cannot tell them apart. Confirmed on
+kind with two postgres pods (different QoS classes) and a guaranteed-only
+glob: only the target pod's queries are counted, the other pod produces no
+series at all; `latkit_cgroup_filter_paths` reports the matched-path count
+(0 = misconfigured glob, warn-logged).
+
+Where pods live under `/sys/fs/cgroup` depends on the cgroup driver and the
+kubelet's cgroup root — **check the node, then write the glob**:
+
+| Node flavour | Pod cgroup path (relative to /sys/fs/cgroup) |
+|---|---|
+| systemd driver (kubeadm default) | `kubepods.slice/kubepods-<qos>.slice/kubepods-<qos>-pod<uid>.slice/cri-containerd-<cid>.scope` |
+| … guaranteed QoS pods | `kubepods.slice/kubepods-pod<uid>.slice/…` (no qos sub-slice) |
+| kind (kubelet cgroup root `/kubelet`) | `kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-pod<uid>.slice/…` |
+| cgroupfs driver | `kubepods/<qos>/pod<uid>/<cid>` |
+
+Pod uid dashes become underscores in the systemd slice names
+(`pod6187d742_9023_…`).
+
+Glob rules that matter here:
+
+- the predicate compares `bpf_get_current_cgroup_id()` — the **leaf** cgroup
+  of the postgres process — against exact matched directories, so patterns
+  must reach the leaves: end them with `/**` (matches the directory itself
+  and everything below);
+- a glob pinned to a pod **uid** goes stale when the pod is recreated — the
+  replacement gets a new uid. The 30 s re-resolve handles churn only if the
+  *pattern* still matches the new path: select structurally (all of
+  `kubepods.slice/**`, a QoS class, `kubelet-kubepods-pod*.slice/**`) rather
+  than by uid. Verified: pod delete + recreate under a structural glob is
+  picked up by the next re-resolve tick (old ids removed, new added, capture
+  resumes; the first seconds before the tick are lost — documented Р48 gap);
+- combine with the port/comm filters (AND semantics) to narrow *what* within
+  the matched cgroups is captured.
+
+`resources` in the manifest (100m/64Mi requests, 500m/256Mi limits) are a
+working hypothesis until the stage-8 load budget; RSS scales with connection
+count and `LATKIT_TOP_QUERIES`.

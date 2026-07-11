@@ -1,0 +1,58 @@
+# latkit — eBPF PostgreSQL latency agent (Р47).
+#
+# Install:
+#   cmake --build build && sudo cmake --install build     # /usr/local/bin/latkit
+#   sudo mkdir -p /etc/latkit
+#   sudo cp deploy/systemd/latkit.env.example /etc/latkit/latkit.env   # then edit
+#   sudo cp deploy/systemd/latkit.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now latkit
+#
+# Configuration is the LATKIT_* env layer only (Р34): edit /etc/latkit/latkit.env,
+# then `systemctl restart latkit`. Every variable is documented in
+# latkit.env.example; flags and defaults in `latkit --help`.
+
+[Unit]
+Description=latkit eBPF PostgreSQL latency agent
+# Operator documentation: docs/deploy.md in the source tree.
+# BPF needs a fully booted kernel side; network-online is NOT required — the
+# agent's fentry capture is not a network client, and the /metrics listener
+# binds whenever its address exists.
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/latkit
+# Missing env file is fine ("-"): the agent then runs on pure defaults
+# (port 5432, /metrics on 127.0.0.1:9752).
+EnvironmentFile=-/etc/latkit/latkit.env
+Restart=on-failure
+RestartSec=5
+
+# --- sandbox (Р47) ----------------------------------------------------------
+# Root, but stripped to the capabilities the agent actually uses
+# (measured set — docs/deploy.md "Minimal capabilities"):
+#   CAP_BPF          bpf(): programs, maps
+#   CAP_PERFMON      loading tracing programs (fentry)
+#   CAP_SYS_RESOURCE memlock rlimit on kernels < 5.11 (no-op cost on newer)
+#   CAP_SYS_PTRACE   /proc/<pid>/maps + /proc/<pid>/root of postgres processes
+#                    (libssl autodetect, LATKIT_TLS=auto)
+#   CAP_SYS_ADMIN    creating *u*probes: the kernel demands full CAP_SYS_ADMIN
+#                    for perf_uprobe_init() (CAP_PERFMON covers fentry only).
+#                    Running plaintext-only (LATKIT_TLS unset)? Delete
+#                    CAP_SYS_PTRACE and CAP_SYS_ADMIN from this line.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SYS_PTRACE CAP_SYS_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# The agent writes nothing to disk. If you enable LATKIT_RECORD=/path/trace.lkt,
+# whitelist its directory here, e.g.:
+#   ReadWritePaths=/var/lib/latkit
+#ReadWritePaths=
+
+# Non-root + AmbientCapabilities would be nicer still, but opening
+# /proc/<pid>/root/... of other uids' processes from a non-root user needs its
+# own verification round — v1.1 experiment (Р47), keep root for now.
+
+[Install]
+WantedBy=multi-user.target
