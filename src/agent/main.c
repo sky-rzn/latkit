@@ -83,9 +83,9 @@ static int libbpf_print(enum libbpf_print_level level, const char *fmt, va_list 
     return vfprintf(stderr, fmt, args);
 }
 
-static void usage(const char *argv0)
+static void usage(FILE *out, const char *argv0)
 {
-    fprintf(stderr,
+    fprintf(out,
             "latkit %s\n"
             "usage: %s [options]\n"
             "  -p, --port PORT       local (server) port to capture; repeatable,\n"
@@ -163,7 +163,8 @@ static void usage(const char *argv0)
             "                        env equivalent (see README)\n"
             "      --version         print the agent version and exit\n"
             "  -x, --hexdump         dump payload of events (--events) and the\n"
-            "                        captured body prefix (--messages)\n",
+            "                        captured body prefix (--messages)\n"
+            "  -h, --help            print this help and exit\n",
             LK_VERSION, argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT,
             LK_MAX_CHUNKS * LK_CHUNK_FULL, LK_CAP_HEADERS_LIMIT, LK_MAX_CONNS_DEFAULT,
             LK_CONN_IDLE_TIMEOUT_SEC, LK_TOP_QUERIES_DEFAULT, LK_QUERY_LABEL_LEN_DEFAULT,
@@ -560,13 +561,18 @@ static int parse_args(int argc, char **argv)
         {"print-config", no_argument, NULL, OPT_PRINT_CONFIG},
         {"version", no_argument, NULL, OPT_VERSION},
         {"hexdump", no_argument, NULL, 'x'},
+        {"help", no_argument, NULL, 'h'},
         {},
     };
     int c;
 
-    while ((c = getopt_long(argc, argv, "p:x", opts, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "p:xh", opts, NULL)) != -1) {
+        if (c == 'h') {
+            usage(stdout, argv[0]);
+            exit(0);
+        }
         if (c == '?') { /* unknown option or missing argument: getopt printed it */
-            usage(argv[0]);
+            usage(stderr, argv[0]);
             return -1;
         }
         if (set_option(c, optarg))
@@ -575,7 +581,7 @@ static int parse_args(int argc, char **argv)
     }
     if (optind < argc) {
         fprintf(stderr, "unexpected argument '%s'\n", argv[optind]);
-        usage(argv[0]);
+        usage(stderr, argv[0]);
         return -1;
     }
 

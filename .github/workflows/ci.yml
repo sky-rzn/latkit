@@ -89,10 +89,9 @@ jobs:
               linux-tools-common linux-tools-generic
       - name: Configure
         run: cmake -B build
-      - name: Build tests
-        run: |
-          cmake --build build --target test_smoke test_decode test_conn_table \
-              test_reassembly test_pg_wire test_pg_session test_pg_query \
-              test_pg_prep test_norm_sql test_replay -j"$(nproc)"
+      # Everything, not a target list: ctest runs the whole suite, and two of
+      # the tests (config_priority, readme_flags) exec the agent binary itself.
+      - name: Build agent + tests
+        run: cmake --build build -j"$(nproc)"
       - name: Run tests
         run: ctest --test-dir build --output-on-failure

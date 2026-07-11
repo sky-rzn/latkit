@@ -143,6 +143,13 @@ add_test(NAME spans COMMAND test_spans)
 add_test(NAME config_priority
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/config_priority.sh $<TARGET_FILE:latkit>)
 
+# README ↔ --help ↔ env-layer consistency (task 7.6, Р44): the configuration
+# tables in README.md are checked against the binary's usage text and the
+# LATKIT_* names in main.c, so a flag or env rename turns CI red.
+add_test(NAME readme_flags
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/readme_flags.sh $<TARGET_FILE:latkit>
+                 ${CMAKE_SOURCE_DIR}/README.md ${CMAKE_SOURCE_DIR}/src/agent/main.c)
+
 # OTLP client end-to-end on loopback (task 5.2): drives the real connect/write/
 # read state machine in the loop against a bare TCP listener, no BPF. Pulls in
 # loop.c like test_http and links the export + metrics libs.

@@ -154,12 +154,12 @@ latkit/
 - [x] Автодетект libssl и жизненный цикл (`--tls auto|off`, `--libssl`, `--tls-comm`, +env; контейнеры через `/proc/<pid>/root`; ре-скан новых путей; `pid=-1` покрывает fork'и); self-метрики Р41; e2e `ssl=on`+`sslmode=require` (`tests/e2e/verify-tls.sh`).
 - [x] Ограничения зафиксированы в docs (`docs/notes-tls.md` §6, README): статически слинкованный OpenSSL, не-OpenSSL (GnuTLS/NSS), BoringSSL (untested), GSSENC — вне scope v1, с явным поведением «детект TLS + drop-and-count», не тихая порча.
 
-### Этап 7 — Grafana, упаковка, документация (~1 неделя)
-- [ ] Дашборды (JSON в `dashboards/`): обзор (QPS, p50/p95/p99, error rate, соединения), top-N запросов по p99/времени/частоте, детализация по db/user, health агента. Datasource — переменная (Prometheus/Mimir).
-- [ ] `docker-compose` demo-стек: postgres + pgbench + latkit + prometheus + grafana с provisioned-дашбордами — «увидеть ценность за 5 минут».
-- [ ] Упаковка: статический бинарник (musl или glibc + static libbpf/libelf/zlib); Dockerfile (privileged либо `CAP_BPF+CAP_PERFMON+CAP_SYS_RESOURCE`, hostPID для uprobes); systemd unit; k8s DaemonSet.
-- [ ] Фильтр захвата по cgroup — отложен из этапа 1 (задача 1.3): нужен для k8s (несколько postgres на хосте, порты совпадают); в v1 фильтр — локальный порт + опционально comm.
-- [ ] README: требования к ядру, capabilities, конфигурация, ограничения, security-замечание (агент видит текст SQL — маскирование литералов включено по умолчанию).
+### Этап 7 — Grafana, упаковка, документация (~1 неделя) — детализация в [STAGE7.md](STAGE7.md)
+- [x] Дашборды (JSON в `dashboards/`): обзор (QPS, p50/p95/p99, error rate, соединения), top-N запросов по p99/времени/частоте, детализация по db/user, health агента. Datasource — переменная (Prometheus/Mimir). → четыре дашборда с фиксированными uid (Р42), top-N только через `topk()`; `dashboards/lint.sh` в CI сверяет имена метрик из `expr` с живым реестром.
+- [x] `docker-compose` demo-стек: postgres + pgbench + latkit + prometheus + grafana с provisioned-дашбордами — «увидеть ценность за 5 минут». → `deploy/demo/` (Р43), профиль `tls` включает демонстрацию этапа 6 одной строчкой; требования и хронометраж — в `deploy/demo/README.md`.
+- [x] Упаковка: статический бинарник (musl или glibc + static libbpf/libelf/zlib); Dockerfile (privileged либо `CAP_BPF+CAP_PERFMON+CAP_SYS_RESOURCE`, hostPID для uprobes); systemd unit; k8s DaemonSet. → musl full-static (Р45, glibc-fallback не понадобился), scratch-образ ≈4 МБ (Р46), unit с песочницей + DaemonSet (Р47); минимальный CAP-набор измерен опытным путём (uprobes требуют `CAP_SYS_ADMIN` — см. `docs/deploy.md`); релиз по тегу `v*` — `release.yml` (тарбол + ghcr.io).
+- [x] Фильтр захвата по cgroup — отложен из этапа 1 (задача 1.3): нужен для k8s (несколько postgres на хосте, порты совпадают); в v1 фильтр — локальный порт + опционально comm. → закрыт (Р48): карта cgroup id + глоб-пути + ре-резолв 30 с; «и»-семантика с портом/comm; требует cgroup v2 (v1-хост — фатальная ошибка); подтверждён на kind с двумя postgres-подами на одном порту.
+- [x] README: требования к ядру, capabilities, конфигурация, ограничения, security-замечание (агент видит текст SQL — маскирование литералов включено по умолчанию). → переписан по Р44 (quickstart, установка ×4, модель измерения, security, консолидированные ограничения v1); таблица флагов/env сверяется с `--help` тестом `tests/unit/readme_flags.sh` — расхождение красит CI.
 
 ### Этап 8 — hardening и производительность (~1–2 недели)
 - [ ] Нагрузочное тестирование: pgbench (TPC-B и select-only, 100+ соединений), измерить overhead на TPS/латентность БД с агентом и без. Бюджет: <3% TPS, <1 CPU core на ~50k qps.
@@ -176,7 +176,7 @@ latkit/
 |---|---|
 | Чтение `iov_iter` в BPF хрупко между версиями ядра | CO-RE + `bpf_core_field_exists`; fallback-вариант на sockmap/sk_msg; снять риск в PoC (этап 0) |
 | Потери событий ringbuf под нагрузкой → битые измерения | бюджет захвата (только заголовки + префиксы), счётчики drop, ресинхронизация парсера, метрика честности данных |
-| Взрыв кардинальности метрик | нормализация + top-K LRU + `other`; лимит на длину лейбла |
+| Взрыв кардинальности метрик | нормализация + top-K LRU + `other`; лимит на длину лейбла; со стороны потребителя — дашборды строятся только на `topk()` поверх агрегатов, ни одной панели с неограниченным множеством рядов (Р42) |
 | TLS повсеместен в проде | ✅ этап 6 закрыт: uprobes на `libssl` (`--tls auto`, host+контейнер), плейнтекст через тот же пайплайн; ограничения (статик OpenSSL / GnuTLS / BoringSSL / GSSENC) документированы с явным «детект+drop» ([docs/notes-tls.md](docs/notes-tls.md)) |
 | Unix domain sockets (локальные клиенты идут через `unix_stream_sendmsg`, не tcp_*) | **known gap v1.1**: отдельные хуки на `unix_stream_sendmsg/recvmsg` |
 | GSSENC (ответ `'G'`, Kerberos-шифрование через libgssapi) | **known gap v1.1**: детектится (флаг TLS ставится и на `'G'`), ciphertext дропается и считается; uprobe-путь для libgssapi отложен |

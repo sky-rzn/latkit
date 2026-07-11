@@ -17,7 +17,7 @@ one `docker compose up` away.
 ## Run
 
 ```sh
-git clone --recurse-submodules <repo-url> latkit
+git clone --recurse-submodules https://github.com/sky-rzn/latkit.git
 cd latkit/deploy/demo
 docker compose up --build -d
 ```

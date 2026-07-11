@@ -1,0 +1,79 @@
+name: Release
+
+# Р45: releases are cut by tag only — no nightlies. A `v*` tag builds the
+# static binary through the same Dockerfile CI smoke-builds on every push
+# (so a broken static link never first surfaces here), assembles the tarball
+# (binary + LICENSE + dashboards + systemd unit + k8s DaemonSet), publishes
+# a GitHub Release with a checksum file, and pushes the image to ghcr.io
+# (`vX.Y.Z` + `latest`; a pre-release tag such as v1.0.0-rc1 is marked
+# prerelease and does not move `latest`).
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write # gh release create
+  packages: write # ghcr.io push
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0 # the version stamp is `git describe --tags`
+
+      - name: Build the release image
+        run: docker build -f deploy/docker/Dockerfile -t latkit:release .
+
+      - name: Extract the binary
+        run: |
+          docker create --name lk latkit:release
+          docker cp lk:/latkit latkit
+          docker rm lk
+
+      - name: Check the artifact against the tag
+        run: |
+          file latkit
+          file latkit | grep -q 'statically linked'
+          v="$(./latkit --version)"
+          echo "binary reports: $v"
+          [ "$v" = "latkit ${GITHUB_REF_NAME}" ]
+
+      - name: Assemble the tarball
+        run: |
+          d="latkit-${GITHUB_REF_NAME}-linux-x86_64"
+          mkdir "$d" "$d/dashboards" "$d/systemd" "$d/k8s"
+          cp latkit LICENSE README.md "$d/"
+          cp dashboards/*.json "$d/dashboards/"
+          cp deploy/systemd/latkit.service deploy/systemd/latkit.env.example "$d/systemd/"
+          cp deploy/k8s/latkit-daemonset.yaml "$d/k8s/"
+          tar czf "$d.tar.gz" "$d"
+          sha256sum "$d.tar.gz" > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Push the image to ghcr.io
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          img="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker tag latkit:release "$img:${GITHUB_REF_NAME}"
+          docker push "$img:${GITHUB_REF_NAME}"
+          case "$GITHUB_REF_NAME" in
+            *-*) echo "pre-release tag: not moving :latest" ;;
+            *)   docker tag latkit:release "$img:latest"
+                 docker push "$img:latest" ;;
+          esac
+
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=""
+          case "$GITHUB_REF_NAME" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" $prerelease \
+              --title "latkit ${GITHUB_REF_NAME}" \
+              --generate-notes \
+              "latkit-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" SHA256SUMS
