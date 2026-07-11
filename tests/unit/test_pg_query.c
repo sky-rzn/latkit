@@ -120,10 +120,10 @@ static void ready(const struct lk_msg_sink *sink, struct lk_conn *c, char status
  * the query phase is exercised on a non-degraded connection. */
 static void handshake(const struct lk_msg_sink *sink, struct lk_conn *c)
 {
-    static const __u8 startup[] = {0,   0x03, 0,    0,   'u', 's', 'e', 'r',
-                                   0,   'm',  'e',  0,   'd', 'a', 't', 'a',
-                                   'b', 'a',  's',  'e', 0,   'd', 'b', 0,
-                                   0}; /* code 0x00030000 + user=me + database=db */
+    static const __u8 startup[] = {
+        0,   0x03, 0,   0,   'u', 's', 'e', 'r', 0,   'm', 'e', 0, 'd',
+        'a', 't',  'a', 'b', 'a', 's', 'e', 0,   'd', 'b', 0,   0}; /* code 0x00030000 + user=me +
+                                                                       database=db */
     static const __u8 auth_ok[4] = {0};
 
     feed_ts(sink, c, LK_DIR_RECV, 0, LK_MSG_STARTUP, startup, sizeof(startup), 100);
@@ -208,9 +208,9 @@ static int test_happy_path(void)
     handshake(sink, &c);
 
     q_simple(sink, &c, "select 1", 1000);
-    feed_ts(sink, &c, LK_DIR_SEND, 'T', 0, "", 0, 1010);    /* RowDescription */
-    feed_ts(sink, &c, LK_DIR_SEND, 'D', 0, "", 0, 1020);    /* DataRow: first row */
-    feed_ts(sink, &c, LK_DIR_SEND, 'D', 0, "", 0, 1030);    /* second row */
+    feed_ts(sink, &c, LK_DIR_SEND, 'T', 0, "", 0, 1010); /* RowDescription */
+    feed_ts(sink, &c, LK_DIR_SEND, 'D', 0, "", 0, 1020); /* DataRow: first row */
+    feed_ts(sink, &c, LK_DIR_SEND, 'D', 0, "", 0, 1030); /* second row */
     complete(sink, &c, "SELECT 1", 1040);
     CHECK(r.nqueries == 0); /* not until Z */
     ready(sink, &c, 'I', 1050);
@@ -468,9 +468,9 @@ static int test_tag_table(void)
         const char *tag;
         __u64 rows;
     } cases[] = {
-        {"SELECT 42", 42}, {"INSERT 0 5", 5}, {"UPDATE 7", 7},  {"DELETE 3", 3},
-        {"MOVE 9", 9},     {"FETCH 10", 10},  {"MERGE 4", 4},   {"COPY 100", 100},
-        {"BEGIN", 0},      {"SET", 0},        {"COMMIT", 0},    {"CREATE TABLE", 0},
+        {"SELECT 42", 42}, {"INSERT 0 5", 5}, {"UPDATE 7", 7}, {"DELETE 3", 3},
+        {"MOVE 9", 9},     {"FETCH 10", 10},  {"MERGE 4", 4},  {"COPY 100", 100},
+        {"BEGIN", 0},      {"SET", 0},        {"COMMIT", 0},   {"CREATE TABLE", 0},
     };
     __u64 ts = 8000;
 
@@ -549,7 +549,7 @@ static int test_extended_basic(void)
     CHECK(r.last.kind == LK_Q_EXTENDED);
     CHECK(strcmp(r.last_text, "select $1") == 0);
     CHECK(r.last.rows == 1);
-    CHECK(r.last.flags == 0); /* not pipelined, no error */
+    CHECK(r.last.flags == 0);          /* not pipelined, no error */
     CHECK(r.last.ts_start_ns == 1010); /* the Bind, not the Parse */
     CHECK(r.last.ts_first_row_ns == 1030);
     CHECK(r.last.ts_complete_ns == 1040);
@@ -614,11 +614,11 @@ static int test_pipelining(void)
 
     complete(sink, &c, "SELECT 10", 3070); /* closes unit a (head) */
     complete(sink, &c, "SELECT 20", 3080); /* closes unit b */
-    CHECK(r.nqueries == 0);                 /* both wait for the batch's Z */
+    CHECK(r.nqueries == 0);                /* both wait for the batch's Z */
 
     ready(sink, &c, 'I', 3090); /* emits the whole batch, FIFO */
     CHECK(r.nqueries == 2);
-    CHECK(r.npipelined == 2); /* both units flagged pipelined */
+    CHECK(r.npipelined == 2);              /* both units flagged pipelined */
     CHECK(r.last.flags & LK_QO_PIPELINED); /* unit b, last emitted */
     CHECK(strcmp(r.last_text, "select 2") == 0);
     CHECK(r.last.rows == 20);
@@ -766,8 +766,8 @@ static int test_function_call(void)
     handshake(sink, &c);
 
     feed_ts(sink, &c, LK_DIR_RECV, 'F', 0, "\0\0\0\1\0\0", 6, 7000); /* FunctionCall */
-    feed_ts(sink, &c, LK_DIR_SEND, 'V', 0, "", 0, 7010);            /* FunctionCallResponse */
-    CHECK(r.nqueries == 0);                                         /* waits for Z */
+    feed_ts(sink, &c, LK_DIR_SEND, 'V', 0, "", 0, 7010);             /* FunctionCallResponse */
+    CHECK(r.nqueries == 0);                                          /* waits for Z */
     ready(sink, &c, 'I', 7020);
 
     CHECK(r.nqueries == 1);
@@ -801,7 +801,7 @@ static int test_copy_in(void)
     feed_ts(sink, &c, LK_DIR_SEND, 'G', 0, gbody, sizeof(gbody), 1010); /* CopyInResponse */
     feed_ts(sink, &c, LK_DIR_RECV, 'd', 0, dbody, sizeof(dbody), 1020); /* CopyData: len 12 */
     feed_ts(sink, &c, LK_DIR_RECV, 'd', 0, dbody, sizeof(dbody), 1030); /* len 12 */
-    feed_ts(sink, &c, LK_DIR_RECV, 'c', 0, "", 0, 1040);               /* CopyDone */
+    feed_ts(sink, &c, LK_DIR_RECV, 'c', 0, "", 0, 1040);                /* CopyDone */
     complete(sink, &c, "COPY 2", 1050);
     CHECK(r.nqueries == 0); /* simple COPY emits at its Z */
     ready(sink, &c, 'I', 1060);
@@ -966,9 +966,9 @@ int main(void)
     if (test_happy_path() || test_error() || test_multi_stmt() || test_empty_query() ||
         test_transaction() || test_resync_drops_unit() || test_synthetic_degraded() ||
         test_tag_table() || test_truncated_text() || test_extended_basic() || test_bind_no_text() ||
-        test_pipelining() || test_batch_error_abort() || test_overflow_lossy() || test_suspended() ||
-        test_function_call() || test_copy_in() || test_copy_out() || test_replication() ||
-        test_corrupt_body() || test_close_drops_inflight())
+        test_pipelining() || test_batch_error_abort() || test_overflow_lossy() ||
+        test_suspended() || test_function_call() || test_copy_in() || test_copy_out() ||
+        test_replication() || test_corrupt_body() || test_close_drops_inflight())
         return 1;
     printf("ok\n");
     return 0;

@@ -1062,8 +1062,9 @@ void lk_reg_iter(const struct lk_registry *r, lk_metrics_iter_fn fn, void *ctx)
 
         for (uint32_t st = 0; st < 2; st++) {
             const struct lk_hist *h = &r->txn[d * 2 + st];
-            struct lk_label lbl[3] = {
-                {"db", r->dims[d].db}, {"user", r->dims[d].user}, {"status", st ? "aborted" : "ok"}};
+            struct lk_label lbl[3] = {{"db", r->dims[d].db},
+                                      {"user", r->dims[d].user},
+                                      {"status", st ? "aborted" : "ok"}};
             struct lk_metric_view v = {
                 .name = LK_TXN_METRIC,
                 .help = "Transaction duration in seconds.",

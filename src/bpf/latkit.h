@@ -6,7 +6,7 @@
 
 #define LK_RINGBUF_SZ (8 * 1024 * 1024) /* default; --ringbuf-bytes overrides */
 
-#define LK_MAX_PORTS 16      /* capacity of the `ports` filter map */
+#define LK_MAX_PORTS    16   /* capacity of the `ports` filter map */
 #define LK_DEFAULT_PORT 5432 /* used when no --port is given */
 
 /* Capacity of the `cgroups` filter map (task 7.1, Р48): a handful of postgres
@@ -23,14 +23,14 @@
  * picked per chunk from the actual capture size, so small control messages do
  * not burn 4 KiB of ringbuf each. */
 #define LK_CHUNK_SMALL 256
-#define LK_CHUNK_FULL 4096
+#define LK_CHUNK_FULL  4096
 
 /* Hard per-call bounds of the data path (task 1.4). Both are verifier loop
  * bounds, so they must be compile-time constants: at most LK_MAX_SEGS iovec
  * segments are captured per send/recv call, and at most LK_MAX_CHUNKS data
  * events emitted. The effective --capture-limit ceiling is therefore
  * LK_MAX_CHUNKS * LK_CHUNK_FULL; the CLI rejects larger values. */
-#define LK_MAX_SEGS 8
+#define LK_MAX_SEGS   8
 #define LK_MAX_CHUNKS 8
 
 /* Global loss/volume statistics (design decision Р5): indices into the
@@ -58,18 +58,19 @@ enum lk_ev_type { LK_EV_DATA = 0, LK_EV_CONN_OPEN = 1, LK_EV_CONN_CLOSE = 2 };
 enum lk_dir { LK_DIR_SEND = 0, LK_DIR_RECV = 1 };
 
 /* lk_ev_hdr.flags */
-#define LK_F_TRUNC (1 << 0)     /* cap_len < total_len: cut by capture budget */
-#define LK_F_GAP (1 << 1)       /* events for this conn were lost before this one */
+#define LK_F_TRUNC     (1 << 0) /* cap_len < total_len: cut by capture budget */
+#define LK_F_GAP       (1 << 1) /* events for this conn were lost before this one */
 #define LK_F_SYNTHETIC (1 << 2) /* CONN_OPEN created lazily; startup not seen */
-#define LK_F_DECRYPTED (1 << 3) /* payload came from an SSL_* uprobe (stage 6, Р35):
-                                   plaintext of a TLS connection, framed like a
-                                   normal stream but sourced from userspace */
+#define LK_F_DECRYPTED                                                                             \
+    (1 << 3) /* payload came from an SSL_* uprobe (stage 6, Р35):                                 \
+                plaintext of a TLS connection, framed like a                                       \
+                normal stream but sourced from userspace */
 
 struct lk_tuple {
     __u8 family; /* AF_INET / AF_INET6 */
     __u8 _pad[3];
-    __u32 netns;                /* netns inode: skc_net.net->ns.inum */
-    __u8 saddr[16], daddr[16];  /* v4 in the first 4 bytes */
+    __u32 netns;               /* netns inode: skc_net.net->ns.inum */
+    __u8 saddr[16], daddr[16]; /* v4 in the first 4 bytes */
     __u16 sport, dport;
 };
 

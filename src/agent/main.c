@@ -44,7 +44,7 @@ static const char *opt_record;
 static char opt_comm[16];
 static const char *opt_cgroup[LK_MAX_CGROUPS]; /* --cgroup glob patterns */
 static int opt_ncgroup;
-#define LK_CGROUP_RESCAN_SEC 30 /* re-resolve cgroup globs every N s (Р48; same ritm as TLS) */
+#define LK_CGROUP_RESCAN_SEC 30   /* re-resolve cgroup globs every N s (Р48; same ritm as TLS) */
 static __u32 opt_top_queries;     /* 0 = metrics default (K = 500) */
 static __u32 opt_query_label_len; /* 0 = metrics default (256) */
 static bool opt_first_row_hist;
@@ -64,8 +64,8 @@ static __u64 opt_otlp_span_text_max; /* --otlp-span-text-max; 0 = default */
 static bool opt_otlp_span_masked;
 static enum lk_tls_mode opt_tls_mode = LK_TLS_OFF; /* --tls; default off */
 static const char *opt_libssl;                     /* --libssl PATH: explicit uprobe target */
-static char opt_tls_comm[16];                      /* --tls-comm: comm to scan for (default postgres) */
-#define LK_TLS_RESCAN_SEC 30 /* --tls auto: rescan /proc for new libssl paths every N s (Р39) */
+static char opt_tls_comm[16]; /* --tls-comm: comm to scan for (default postgres) */
+#define LK_TLS_RESCAN_SEC 30  /* --tls auto: rescan /proc for new libssl paths every N s (Р39) */
 /* Env-derived header/resource arrays (freed at exit for ASAN cleanliness). */
 static char **env_headers, **env_resource;
 static int env_nheaders, env_nresource;
@@ -732,8 +732,7 @@ int main(int argc, char **argv)
      * socket path is port-filtered to the server side anyway, so narrowing it to
      * the postgres comm changes nothing there. */
     bool tls_enabled = opt_tls_mode == LK_TLS_AUTO || opt_libssl;
-    const char *tls_comm =
-        opt_tls_comm[0] ? opt_tls_comm : (opt_comm[0] ? opt_comm : "postgres");
+    const char *tls_comm = opt_tls_comm[0] ? opt_tls_comm : (opt_comm[0] ? opt_comm : "postgres");
 
     /* .rodata and map sizes are frozen at load time. */
     skel->rodata->cfg_capture_limit = opt_capture_limit;
@@ -869,8 +868,7 @@ int main(int argc, char **argv)
     if (opt_comm[0])
         fprintf(stderr, ", comm=%s", opt_comm);
     if (opt_ncgroup)
-        fprintf(stderr, ", cgroup=%d pattern(s)/%d path(s)", opt_ncgroup,
-                lk_cgroup_paths(cgroup));
+        fprintf(stderr, ", cgroup=%d pattern(s)/%d path(s)", opt_ncgroup, lk_cgroup_paths(cgroup));
     fprintf(stderr, " (Ctrl-C to exit)\n");
 
     err = lk_loop_run(loop);

@@ -7,12 +7,12 @@
 #include <time.h>
 
 static int failures;
-#define EXPECT(cond, msg)                                                                         \
-    do {                                                                                          \
-        if (!(cond)) {                                                                            \
-            printf("FAIL: %s\n", msg);                                                            \
+#define EXPECT(cond, msg)                                                                          \
+    do {                                                                                           \
+        if (!(cond)) {                                                                             \
+            printf("FAIL: %s\n", msg);                                                             \
             failures++;                                                                            \
-        }                                                                                         \
+        }                                                                                          \
     } while (0)
 
 int main(void)

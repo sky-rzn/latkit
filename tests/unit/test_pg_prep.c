@@ -253,8 +253,8 @@ static int test_lru_eviction(void)
     struct pg_conn *pc = c.proto_state;
 
     CHECK(pc && pc->prep);
-    CHECK(pc->prep->count == LK_PG_PREP_CACHE);          /* capped */
-    CHECK(lk_proto_stats(p)->prep_evictions == 1);       /* one over the ceiling */
+    CHECK(pc->prep->count == LK_PG_PREP_CACHE);    /* capped */
+    CHECK(lk_proto_stats(p)->prep_evictions == 1); /* one over the ceiling */
 
     /* The evicted "s0" is a miss now -> NO_TEXT; a survivor is still a hit. */
     bind_stmt(sink, &c, "s0");

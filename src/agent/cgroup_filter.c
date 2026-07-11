@@ -27,10 +27,10 @@ struct lk_cgroup {
     struct bpf_map *cgroups;   /* id -> u8, the filter set */
     struct bpf_map *cgroup_on; /* 1-entry array: 1 while `cgroups` is non-empty */
     struct lk_cgroup_cfg cfg;
-    bool enabled;             /* --cgroup given (npatterns > 0) */
-    struct cg_idset current;  /* ids currently in the map (userspace mirror) */
-    int npaths;               /* matched cgroupfs paths at the last resolve */
-    bool warned_empty;        /* rate-limit the "matched nothing" warning */
+    bool enabled;            /* --cgroup given (npatterns > 0) */
+    struct cg_idset current; /* ids currently in the map (userspace mirror) */
+    int npaths;              /* matched cgroupfs paths at the last resolve */
+    bool warned_empty;       /* rate-limit the "matched nothing" warning */
 };
 
 struct lk_cgroup *lk_cgroup_new(struct bpf_map *cgroups, struct bpf_map *cgroup_on,

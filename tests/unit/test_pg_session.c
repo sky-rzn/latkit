@@ -280,8 +280,8 @@ static int test_truncated_startup(void)
 
     CHECK(pc->phase == PG_PH_AUTH);
     CHECK(strcmp(pc->session.user, "postgres") == 0); /* fully captured pair */
-    CHECK(strcmp(pc->session.database, "myd") == 0);   /* salvaged prefix */
-    CHECK(pc->session.app[0] == '\0');                 /* never reached */
+    CHECK(strcmp(pc->session.database, "myd") == 0);  /* salvaged prefix */
+    CHECK(pc->session.app[0] == '\0');                /* never reached */
     CHECK(!pc->session.complete);
 
     /* AuthenticationOk still establishes the (partial) session. */
@@ -316,7 +316,7 @@ static int test_synthetic_no_session(void)
     struct pg_conn *pc = pc_of(&c);
 
     CHECK(pc && pc->phase == PG_PH_READY);
-    CHECK(r.nsessions == 0);           /* no on_session without startup */
+    CHECK(r.nsessions == 0);            /* no on_session without startup */
     CHECK(pc->session.user[0] == '\0'); /* labels unknown */
     CHECK(!pc->session.complete);
 

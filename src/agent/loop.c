@@ -46,8 +46,8 @@ struct lk_loop_task {
 struct lk_loop {
     int epfd, sigfd, tfd;
     bool stop;
-    bool dispatching;               /* true while inside a dispatch batch */
-    uint64_t gen;                   /* advances once per epoll_wait batch */
+    bool dispatching; /* true while inside a dispatch batch */
+    uint64_t gen;     /* advances once per epoll_wait batch */
     struct lk_loop_fd fds[LK_LOOP_MAX_FDS];
     int ntasks;
     struct lk_loop_task tasks[LK_LOOP_MAX_TASKS];

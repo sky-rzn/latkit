@@ -74,7 +74,7 @@ struct lk_frame {
                 on this connection, discard until CLOSE */
 #define LK_CONN_REPLICATION                                                                        \
     (1 << 4) /* CopyBothResponse: walsender/logical                                                \
-                replication (set by the PG parser, Р20);                                           \
+                replication (set by the PG parser, Р20);                                          \
                 payload is never needed -> HEADERS (Р21) */
 #define LK_CONN_CAP_HEADERS                                                                        \
     (1 << 5) /* userspace already flipped this connection                                          \
@@ -107,11 +107,11 @@ struct lk_conn {
  * 10 s stats line; stage 4 turns them into metrics. */
 struct lk_conn_table_stats {
     __u64 created;
-    __u64 closed;       /* removed by CONN_CLOSE */
-    __u64 evicted_lru;  /* pushed out by the max_conns ceiling */
-    __u64 evicted_idle; /* collected by the idle sweep */
-    __u64 seq_gaps;     /* holes detected (connections dirtied) */
-    __u64 lost_events;  /* events lost in those holes, summed */
+    __u64 closed;             /* removed by CONN_CLOSE */
+    __u64 evicted_lru;        /* pushed out by the max_conns ceiling */
+    __u64 evicted_idle;       /* collected by the idle sweep */
+    __u64 seq_gaps;           /* holes detected (connections dirtied) */
+    __u64 lost_events;        /* events lost in those holes, summed */
     __u64 tls_socket_dropped; /* ciphertext socket events dropped on TLS conns
                                  (Р38, stage 6.4): the decrypted uprobe channel
                                  is the only data source once a conn goes TLS */

@@ -29,7 +29,7 @@
 char LICENSE[] SEC("license") = "GPL";
 
 /* Not exposed as macros by vmlinux.h. */
-#define AF_INET 2
+#define AF_INET  2
 #define AF_INET6 10
 
 /* Force a real load/store, no clang store-to-load forwarding. The chunk loop
@@ -252,8 +252,7 @@ static __always_inline void fill_tuple(struct lk_tuple *t, struct sock *sk)
     t->sport = BPF_CORE_READ(sk, __sk_common.skc_num);
     t->dport = bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
 
-    if (family == AF_INET6 &&
-        bpf_core_field_exists(sk->__sk_common.skc_v6_rcv_saddr)) {
+    if (family == AF_INET6 && bpf_core_field_exists(sk->__sk_common.skc_v6_rcv_saddr)) {
         BPF_CORE_READ_INTO(&t->saddr, sk, __sk_common.skc_v6_rcv_saddr);
         BPF_CORE_READ_INTO(&t->daddr, sk, __sk_common.skc_v6_daddr);
     } else {
@@ -547,8 +546,8 @@ static __always_inline void emit_data_chunks(__u64 cookie, struct lk_conn_state 
     if (__sync_lock_test_and_set(&cur->busy, 1)) {
         /* Preempted another chain on this CPU: do not touch its cursor;
          * degrade to a single empty event, total_len stays honest. */
-        emit_chunk(cookie, st, dir, total_len, 0, 0, 0,
-                   total_len ? LK_F_TRUNC : flags, LK_CHUNK_SMALL);
+        emit_chunk(cookie, st, dir, total_len, 0, 0, 0, total_len ? LK_F_TRUNC : flags,
+                   LK_CHUNK_SMALL);
         return;
     }
     ONCE(cur->si) = 0;
@@ -596,11 +595,9 @@ static __always_inline void emit_data_chunks(__u64 cookie, struct lk_conn_state 
 
         /* Size class by the actual capture size, decided before reserve. */
         if (cap <= LK_CHUNK_SMALL)
-            done = emit_chunk(cookie, st, dir, total_len, pos, base, cap, flags,
-                              LK_CHUNK_SMALL);
+            done = emit_chunk(cookie, st, dir, total_len, pos, base, cap, flags, LK_CHUNK_SMALL);
         else
-            done = emit_chunk(cookie, st, dir, total_len, pos, base, cap, flags,
-                              LK_CHUNK_FULL);
+            done = emit_chunk(cookie, st, dir, total_len, pos, base, cap, flags, LK_CHUNK_FULL);
         if (done <= 0)
             break; /* ringbuf full or the user page went away */
         ONCE(cur->si) = si;
@@ -927,8 +924,8 @@ static __always_inline void emit_ssl_data(__u64 cookie, __u8 dir, __u32 total_le
         return;
     if (__sync_lock_test_and_set(&cur->busy, 1)) {
         /* Preempted another chain on this CPU: degrade to a single event. */
-        emit_ssl_chunk(cookie, dir, total_len, 0, 0, 0,
-                       total_len ? LK_F_TRUNC : flags, LK_CHUNK_SMALL);
+        emit_ssl_chunk(cookie, dir, total_len, 0, 0, 0, total_len ? LK_F_TRUNC : flags,
+                       LK_CHUNK_SMALL);
         return;
     }
     ONCE(cur->pos) = 0;

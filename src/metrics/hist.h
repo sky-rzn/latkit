@@ -73,7 +73,6 @@ double lk_hist_bound(int k);
  *
  * `labelset` is the already-escaped `k="v",...` pairs without braces (may be
  * ""), so the histogram owns the le label but not the series identity. */
-void lk_hist_write(const struct lk_hist *h, FILE *f, const char *metric,
-                   const char *labelset);
+void lk_hist_write(const struct lk_hist *h, FILE *f, const char *metric, const char *labelset);
 
 #endif /* LATKIT_METRICS_HIST_H */

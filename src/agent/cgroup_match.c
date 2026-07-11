@@ -27,10 +27,10 @@ static bool seg_match(const char *pat, size_t patlen, const char *seg, size_t se
             p++;
             s++;
         } else if (p < patlen && pat[p] == '*') {
-            star_p = p++;    /* remember the star and the input position ... */
-            star_s = s;      /* ... to backtrack to on a later mismatch */
+            star_p = p++; /* remember the star and the input position ... */
+            star_s = s;   /* ... to backtrack to on a later mismatch */
         } else if (star_p != (size_t)-1) {
-            p = star_p + 1;  /* the star swallows one more input char */
+            p = star_p + 1; /* the star swallows one more input char */
             s = ++star_s;
         } else {
             return false;
@@ -58,7 +58,7 @@ static bool glob_rec(const char *pat, const char *path)
         /* Otherwise "**" consumes zero or more whole segments: try to match the
          * rest of the pattern at the current position and at every subsequent
          * segment start. */
-        for (const char *p = path;; ) {
+        for (const char *p = path;;) {
             const char *slash;
 
             if (glob_rec(pnext, p))

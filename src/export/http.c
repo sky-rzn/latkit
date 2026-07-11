@@ -327,7 +327,7 @@ static int conn_write(struct http_conn *c)
         if (n < 0 && errno == EINTR)
             continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-            return 0; /* wait for the next EPOLLOUT */
+            return 0;  /* wait for the next EPOLLOUT */
         conn_close(c); /* peer gone or write error */
         return 0;
     }

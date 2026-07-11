@@ -78,15 +78,15 @@ struct pg_unit {
  * generation is bumped every time the slot is reused, so a stale unit reference
  * (one that missed its eviction rescue) is detected rather than followed. */
 struct pg_prep {
-    bool used;       /* slot occupied */
-    bool trunc;      /* text is a truncated prefix (-> LK_QO_TEXT_TRUNC) */
-    __u32 gen;       /* bumped on slot reuse; a unit stores the gen it saw */
-    __u64 lru;       /* last-access stamp (pg_prep_cache.clock) for eviction */
-    __u16 name_len;  /* length of name (may be < the real name if truncated) */
-    char name[64];   /* statement name; "" is the unnamed statement */
-    char *text;      /* owned SQL prefix, <= LK_MSG_BODY_MAX; NULL if none */
-    __u32 text_len;  /* length of text */
-    __u32 text_cap;  /* allocated capacity of text (kept across reuse) */
+    bool used;      /* slot occupied */
+    bool trunc;     /* text is a truncated prefix (-> LK_QO_TEXT_TRUNC) */
+    __u32 gen;      /* bumped on slot reuse; a unit stores the gen it saw */
+    __u64 lru;      /* last-access stamp (pg_prep_cache.clock) for eviction */
+    __u16 name_len; /* length of name (may be < the real name if truncated) */
+    char name[64];  /* statement name; "" is the unnamed statement */
+    char *text;     /* owned SQL prefix, <= LK_MSG_BODY_MAX; NULL if none */
+    __u32 text_len; /* length of text */
+    __u32 text_cap; /* allocated capacity of text (kept across reuse) */
 };
 
 /* Per-connection prepared-statement cache: a fixed LRU array, allocated lazily

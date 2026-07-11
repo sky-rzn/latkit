@@ -185,7 +185,7 @@ static void fill_text(struct pg_conn *pc, const struct pg_unit *u, struct lk_que
 static __u64 tag_rows(const char *tag, __u32 len)
 {
     static const char *const counted[] = {"SELECT", "INSERT", "UPDATE", "DELETE",
-                                           "MERGE",  "FETCH",  "MOVE",   "COPY"};
+                                          "MERGE",  "FETCH",  "MOVE",   "COPY"};
     __u32 cmd = 0, s, e;
     __u64 rows = 0;
     bool ok = false, any = false;

@@ -37,7 +37,10 @@ struct lk_tls_probe {
 /* Accessors: the skeleton exposes programs as direct struct fields, so a table
  * of member pointers needs these tiny getters. */
 #define P(field)                                                                                   \
-    static struct bpf_program *tls_prog_##field(struct latkit_bpf *s) { return s->progs.field; }
+    static struct bpf_program *tls_prog_##field(struct latkit_bpf *s)                              \
+    {                                                                                              \
+        return s->progs.field;                                                                     \
+    }
 P(lk_ssl_write)
 P(lk_ssl_write_ret)
 P(lk_ssl_write_ex)
@@ -73,7 +76,7 @@ static const struct lk_tls_probe tls_probes[] = {
 
 /* Ceiling on distinct libssl files attached — several postgres installs on one
  * host is unusual; more than this is almost certainly a scan gone wrong. */
-#define TLS_MAX_PATHS 32
+#define TLS_MAX_PATHS    32
 #define TLS_DEFAULT_COMM "postgres"
 
 /* An attached libssl, identified by its file so a rescan never double-attaches
@@ -347,8 +350,9 @@ int lk_tls_attach(struct lk_tls *t)
     scan_proc(t);
     update_state(t);
     if (t->nfiles == 0)
-        fprintf(stderr, "latkit: TLS uprobes: no libssl found for comm '%s', "
-                        "TLS connections will be dropped\n",
+        fprintf(stderr,
+                "latkit: TLS uprobes: no libssl found for comm '%s', "
+                "TLS connections will be dropped\n",
                 t->comm);
     return 0;
 }

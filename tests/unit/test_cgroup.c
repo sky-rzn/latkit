@@ -78,8 +78,8 @@ static int test_idset(void)
     for (int i = 0; i < LK_MAX_CGROUPS; i++)
         CHECK(cg_idset_add(&full, 1000 + i));
     CHECK(full.n == LK_MAX_CGROUPS);
-    CHECK(!cg_idset_add(&full, 999));      /* new id, no room */
-    CHECK(cg_idset_add(&full, 1000));      /* already present -> ok */
+    CHECK(!cg_idset_add(&full, 999)); /* new id, no room */
+    CHECK(cg_idset_add(&full, 1000)); /* already present -> ok */
     return 0;
 }
 

@@ -100,12 +100,24 @@ static const struct {
     int lt; /* cumulate grid buckets with index < lt */
     const char *le;
 } classic[] = {
-    {-52, "0.0001220703125"}, {-48, "0.000244140625"}, {-44, "0.00048828125"},
-    {-40, "0.0009765625"},    {-36, "0.001953125"},    {-32, "0.00390625"},
-    {-28, "0.0078125"},       {-24, "0.015625"},       {-20, "0.03125"},
-    {-16, "0.0625"},          {-12, "0.125"},          {-8, "0.25"},
-    {-4, "0.5"},              {0, "1"},                 {4, "2"},
-    {8, "4"},                 {12, "8"},                {16, "16"},
+    {-52, "0.0001220703125"},
+    {-48, "0.000244140625"},
+    {-44, "0.00048828125"},
+    {-40, "0.0009765625"},
+    {-36, "0.001953125"},
+    {-32, "0.00390625"},
+    {-28, "0.0078125"},
+    {-24, "0.015625"},
+    {-20, "0.03125"},
+    {-16, "0.0625"},
+    {-12, "0.125"},
+    {-8, "0.25"},
+    {-4, "0.5"},
+    {0, "1"},
+    {4, "2"},
+    {8, "4"},
+    {12, "8"},
+    {16, "16"},
     {20, "32"},
 };
 
@@ -119,8 +131,7 @@ static uint64_t cum_lt(const struct lk_hist *h, int lt)
     return c;
 }
 
-void lk_hist_write(const struct lk_hist *h, FILE *f, const char *metric,
-                   const char *labelset)
+void lk_hist_write(const struct lk_hist *h, FILE *f, const char *metric, const char *labelset)
 {
     /* With a labelset the le pair follows a comma; without one it stands alone
      * inside the braces. */

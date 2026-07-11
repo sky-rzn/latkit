@@ -56,8 +56,8 @@ static void on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struct l
 #define COOKIE 0xABCDEF01ULL
 
 static struct lk_pipeline pipe;
-static __u32 raw_seq;    /* socket seq space */
-static __u32 tls_seq;    /* decrypted seq space */
+static __u32 raw_seq; /* socket seq space */
+static __u32 tls_seq; /* decrypted seq space */
 static __u64 ts = 1000;
 
 static void reset_pipe(void)

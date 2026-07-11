@@ -34,9 +34,9 @@ static void check(const char *what, const struct pbuf *p, const uint8_t *want, s
 }
 
 #define CHECK(what, p, ...)                                                                        \
-    do {                                                                                          \
-        const uint8_t _w[] = {__VA_ARGS__};                                                       \
-        check(what, p, _w, sizeof(_w));                                                           \
+    do {                                                                                           \
+        const uint8_t _w[] = {__VA_ARGS__};                                                        \
+        check(what, p, _w, sizeof(_w));                                                            \
     } while (0)
 
 int main(void)

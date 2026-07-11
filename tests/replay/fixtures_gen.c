@@ -429,7 +429,7 @@ static void build_pipeline_error(struct fx *x)
         __u8 parse[32];
         __u32 pn = 0;
 
-        parse[pn++] = '\0'; /* unnamed statement */
+        parse[pn++] = '\0';              /* unnamed statement */
         memcpy(parse + pn, texts[i], 9); /* "select N\0" */
         pn += 9;
         parse[pn++] = '\0';
@@ -541,9 +541,9 @@ static __u32 copy_response(__u8 *out, char type)
 {
     __u8 body[8], *p = body;
 
-    *p++ = 0;         /* overall format: text */
-    p = be16(p, 1);   /* one column */
-    p = be16(p, 0);   /* column format: text */
+    *p++ = 0;       /* overall format: text */
+    p = be16(p, 1); /* one column */
+    p = be16(p, 0); /* column format: text */
     return pgmsg(out, type, body, (__u32)(p - body));
 }
 

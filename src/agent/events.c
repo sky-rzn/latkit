@@ -237,13 +237,14 @@ static void ev_provide_tls_stats(struct lk_events *e, struct lk_metrics *m, cons
     /* One series per state, 1 on the live one — a Prometheus enum gauge. */
     for (unsigned i = 0; i < 3; i++)
         lk_metrics_set_gauge_l(m, "latkit_tls_attached",
-                               i == 0 ? "libssl uprobe attach state (1 on the active state)." : NULL,
+                               i == 0 ? "libssl uprobe attach state (1 on the active state)."
+                                      : NULL,
                                "state", states[i], (unsigned)st == i ? 1.0 : 0.0);
 
     lk_metrics_set_gauge(m, "latkit_tls_connections", "TLS connections currently tracked.",
                          (double)cs->tls_active);
-    lk_metrics_set_counter(m, "latkit_tls_connections_total",
-                           "TLS connections seen since start.", (double)cs->tls_opened);
+    lk_metrics_set_counter(m, "latkit_tls_connections_total", "TLS connections seen since start.",
+                           (double)cs->tls_opened);
     lk_metrics_set_counter(m, "latkit_tls_socket_events_dropped_total",
                            "Ciphertext socket events dropped on TLS connections.",
                            (double)cs->tls_socket_dropped);

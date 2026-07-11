@@ -69,8 +69,8 @@ static void fz_on_session(void *ctx, const struct lk_conn *c, const struct lk_se
 {
     (void)ctx;
     (void)c;
-    g_sink += (unsigned char)s->user[0] + (unsigned char)s->database[0] +
-              (unsigned char)s->app[0] + (unsigned char)s->server_version[0] + s->complete;
+    g_sink += (unsigned char)s->user[0] + (unsigned char)s->database[0] + (unsigned char)s->app[0] +
+              (unsigned char)s->server_version[0] + s->complete;
 }
 
 static void fz_on_txn(void *ctx, const struct lk_conn *c, __u64 start_ns, __u64 end_ns,

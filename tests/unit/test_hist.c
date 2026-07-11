@@ -29,9 +29,9 @@ static int test_index_inverse(void)
     for (int k = LK_HIST_MIN_INDEX; k < LK_HIST_MAX_INDEX; k++) {
         double lo = lk_hist_bound(k);
 
-        CHECK(lk_hist_index(lo) == k);                 /* on the boundary -> k */
+        CHECK(lk_hist_index(lo) == k);                     /* on the boundary -> k */
         CHECK(lk_hist_index(nextafter(lo, 0.0)) == k - 1); /* just below -> k-1 */
-        CHECK(lk_hist_bound(k + 1) > lo);              /* strictly increasing */
+        CHECK(lk_hist_bound(k + 1) > lo);                  /* strictly increasing */
     }
     /* factor between adjacent boundaries is 2^(1/4). */
     CHECK(fabs(lk_hist_bound(4) / lk_hist_bound(0) - 2.0) < 1e-12);
@@ -111,7 +111,7 @@ static int test_classic_dump(void)
     size_t n;
 
     CHECK(f != NULL);
-    lk_hist_observe(&h, 0.2);  /* -> some mid-range bucket */
+    lk_hist_observe(&h, 0.2); /* -> some mid-range bucket */
     lk_hist_observe(&h, 0.2);
     lk_hist_observe(&h, 1e-9); /* underflow: shows up in every le bucket */
 
