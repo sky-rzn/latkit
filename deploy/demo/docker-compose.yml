@@ -1,26 +1,21 @@
-# DRAFT demo stack (task 7.3): postgres + load + latkit + prometheus + grafana,
-# wired so a `docker compose up` gives you live Grafana with the four dashboards
-# from ../../dashboards. This is the environment for making/reviewing dashboards
-# under live load; task 7.4 polishes it (real scratch image, tls profile, 5-min
-# timing, README requirements).
+# latkit demo stack (Р43): postgres + load + latkit + prometheus + grafana,
+# wired so `docker compose up` on a Linux host gives live Grafana with the four
+# dashboards from ../../dashboards in about a minute after the images are there.
+# See README.md for the requirements (Linux, kernel 5.15+ with BTF) and a tour.
 #
-#   cd deploy/demo
-#   ( cd ../.. && cmake --build build )   # produce build/latkit on the host
-#   docker compose up --build             # Ctrl-C to stop
-#   # Grafana:    http://localhost:3000   (anonymous, dashboards -> "latkit")
-#   # Prometheus: http://localhost:19090
-#   # raw metrics: curl http://localhost:9752/metrics
-#   docker compose down -v                # clean up
+#   docker compose up --build -d
+#   docker compose --profile tls up --build -d    # + an ssl=on postgres (stage 6)
+#   docker compose --profile tls down -v          # tear down either variant
 #
-# Capture hygiene (project memory / README known-limitations): load talks to
-# postgres over the compose network by service name — postgres publishes NO
-# port, so nothing crosses docker-proxy on localhost (which would splice() the
-# payload and defeat socket capture). latkit filters the server port 5432 it
-# sees kernel-wide.
+# Capture hygiene (README "Known limitations"): the load talks to postgres over
+# the compose network by service name — postgres publishes NO port, so nothing
+# crosses docker-proxy on localhost (which would splice() the payload and
+# defeat the socket capture). latkit filters the server port 5432 it sees
+# kernel-wide, which covers both postgres containers of the tls profile.
 
 services:
   postgres:
-    image: postgres:16
+    image: postgres:17-alpine
     environment:
       POSTGRES_USER: latkit
       POSTGRES_PASSWORD: latkit
@@ -32,68 +27,45 @@ services:
       timeout: 3s
       retries: 30
 
-  # One-shot: initialise the pgbench dataset (scale 10), then exit.
-  load-init:
-    image: postgres:16
+  # Steady, varied load so every panel is alive: pgbench TPC-B + select-only
+  # for QPS/latency/top-N, plus a slow/error loop (pg_sleep for the p99 tail;
+  # 1/0, a missing table and a unique violation for the error-rate and SQLSTATE
+  # panels). The script initialises its pgbench dataset itself.
+  load:
+    image: postgres:17-alpine
     depends_on:
       postgres:
         condition: service_healthy
     environment:
+      PGHOST: postgres
       PGPASSWORD: latkit
-    entrypoint: ["pgbench", "-h", "postgres", "-U", "latkit", "-i", "-s", "10", "latkit"]
-    restart: "no"
-
-  # Steady, varied load so every panel is alive: pgbench TPC-B + select-only for
-  # QPS/latency, and a slow/error loop (pg_sleep for the p99 tail, 1/0 and a
-  # missing table for the error-rate and SQLSTATE panels).
-  load:
-    image: postgres:16
-    depends_on:
-      load-init:
-        condition: service_completed_successfully
-    environment:
-      PGPASSWORD: latkit
+    volumes:
+      - ./load/load.sh:/load.sh:ro
+    command: ["bash", "/load.sh"]
     restart: unless-stopped
-    command:
-      - bash
-      - -c
-      - |
-        set -m
-        pgbench -h postgres -U latkit -c 8 -j 2 -T 36000 -P 30 latkit &
-        pgbench -h postgres -U latkit -c 4 -j 2 -S -T 36000 latkit &
-        while true; do
-          psql -h postgres -U latkit -d latkit -qtc "select pg_sleep(0.2)"      >/dev/null 2>&1 || true
-          psql -h postgres -U latkit -d latkit -qtc "select pg_sleep(0.6)"      >/dev/null 2>&1 || true
-          psql -h postgres -U latkit -d latkit -qtc "select 1/0"                >/dev/null 2>&1 || true
-          psql -h postgres -U latkit -d latkit -qtc "select * from no_such_tbl" >/dev/null 2>&1 || true
-          sleep 3
-        done
 
-  # The agent. DRAFT: built from the host binary (deploy/demo/Dockerfile). To use
-  # the real static scratch image instead, swap the two `build:` blocks below.
+  # The agent — the release scratch image (Р45/Р46, musl static), built from the
+  # repo root so the version stamp sees .git. Configured through the LATKIT_*
+  # env layer (Р34), nothing else. --tls auto is always on: with the plain
+  # profile it attaches the libssl uprobes and simply sees no TLS traffic; with
+  # --profile tls it decrypts the pg-tls sessions (latkit_tls_connections > 0).
   latkit:
     build:
       context: ../..
-      dockerfile: deploy/demo/Dockerfile
-    # build:
-    #   context: ../..
-    #   dockerfile: deploy/docker/Dockerfile   # Р46 scratch + musl static (7.4)
+      dockerfile: deploy/docker/Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
-    privileged: true        # demo simplicity; minimal CAP set documented in Р46/docs
+    # Demo simplicity. The measured minimal set instead (docs/deploy.md):
+    #   cap_add: [BPF, PERFMON, SYS_PTRACE, SYS_ADMIN]
+    # (SYS_PTRACE + SYS_ADMIN only for TLS uprobes; + SYS_RESOURCE on < 5.11)
+    privileged: true
     pid: host               # uprobes / /proc access need the host PID namespace
-    volumes:
-      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
-      # The host-built agent, bind-mounted (build/ is out of the build context
-      # via .dockerignore). Draft only — 7.4's scratch image carries the binary.
-      - ../../build/latkit:/usr/local/bin/latkit:ro
-    command:
-      - "-p"
-      - "5432"
-      - "--prom-listen"
-      - "0.0.0.0:9752"      # default is loopback (Р29); in a container listen out
-      - "--first-row-hist"  # so the drilldown "time to first row" panel has data
+    environment:
+      LATKIT_PORT: "5432"
+      LATKIT_PROM_LISTEN: "0.0.0.0:9752"  # default is loopback (Р29); a container must listen out
+      LATKIT_TLS: auto
+      LATKIT_FIRST_ROW_HIST: "1"          # feeds the drilldown "time to first row" panel
     ports: ["9752:9752"]    # convenience: curl http://localhost:9752/metrics
 
   prometheus:
@@ -121,3 +93,74 @@ services:
       # The dashboards repo dir is the single source (Р43) — mounted read-only.
       - ../../dashboards:/var/lib/grafana/dashboards:ro
     ports: ["3000:3000"]
+
+  # --- profile tls (additive): a second postgres with ssl=on and a client that
+  # --- forces TLS — the stage-6 demonstration. The plaintext pair keeps
+  # --- running, so the dashboards show both kinds of traffic side by side.
+
+  # One-shot: a throwaway self-signed cert into the shared volume. Runs as root
+  # so it can hand the key to the postgres uid (70 on alpine); the server
+  # refuses a key that is world-readable or foreign-owned.
+  pg-tls-cert:
+    image: alpine/openssl:3.5.7
+    profiles: ["tls"]
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        openssl req -new -x509 -days 365 -nodes \
+          -out /certs/server.crt -keyout /certs/server.key -subj "/CN=pg-tls"
+        chmod 600 /certs/server.key
+        chown 70:70 /certs/server.key /certs/server.crt
+    volumes:
+      - pg-tls-certs:/certs
+    restart: "no"
+
+  pg-tls:
+    image: postgres:17-alpine
+    profiles: ["tls"]
+    depends_on:
+      pg-tls-cert:
+        condition: service_completed_successfully
+    environment:
+      POSTGRES_USER: latkit
+      POSTGRES_PASSWORD: latkit
+      POSTGRES_DB: latkit
+    # Same in-container port 5432 — latkit's port filter is per-connection, not
+    # per-container, so both servers fall under LATKIT_PORT=5432.
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/certs/server.crt
+      - -c
+      - ssl_key_file=/certs/server.key
+    volumes:
+      - pg-tls-certs:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U latkit -d latkit"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Same load script, sslmode=require: every session is TLS, the socket bytes
+  # are ciphertext, and the plaintext on the dashboards comes from the libssl
+  # uprobe channel (stage 6).
+  load-tls:
+    image: postgres:17-alpine
+    profiles: ["tls"]
+    depends_on:
+      pg-tls:
+        condition: service_healthy
+    environment:
+      PGHOST: pg-tls
+      PGPASSWORD: latkit
+      PGSSLMODE: require
+    volumes:
+      - ./load/load.sh:/load.sh:ro
+    command: ["bash", "/load.sh"]
+    restart: unless-stopped
+
+volumes:
+  pg-tls-certs:
