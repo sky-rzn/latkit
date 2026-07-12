@@ -395,6 +395,30 @@ int BPF_PROG(lk_inet_sock_set_state, struct sock *sk, int oldstate, int newstate
     return 0;
 }
 
+/* CO-RE flavor for kernels before ~6.4, where the iovec pointer of iov_iter
+ * was still spelled `iov` (renamed `__iov` by the iter_iov() accessor rework).
+ * The ___old suffix is stripped during BTF matching, so reads through this
+ * shape relocate against the real struct iov_iter / struct msghdr; only the
+ * fields actually read need declaring. Selected at load time by
+ * bpf_core_field_exists in iter_iov_first() below. */
+struct iov_iter___old {
+    const struct iovec *iov;
+} __attribute__((preserve_access_index));
+
+struct msghdr___old {
+    struct iov_iter___old msg_iter;
+} __attribute__((preserve_access_index));
+
+/* First segment of an ITER_IOVEC iterator under either field spelling:
+ * `__iov` (~6.4+, the spelling of the build vmlinux.h) or `iov` (5.15/6.1).
+ * Whichever branch the target kernel lacks is dead code after relocation. */
+static __always_inline const struct iovec *iter_iov_first(struct msghdr *msg)
+{
+    if (bpf_core_field_exists(msg->msg_iter.__iov))
+        return BPF_CORE_READ(msg, msg_iter.__iov);
+    return BPF_CORE_READ((struct msghdr___old *)(void *)msg, msg_iter.iov);
+}
+
 /* Snapshot the userspace segments of msg->msg_iter into *s: the
  * generalization of stage-0 iter_first_seg (task 1.4). A snapshot instead of
  * a direct read because on the RECV path the iterator has been advanced past
@@ -405,10 +429,18 @@ int BPF_PROG(lk_inet_sock_set_state, struct sock *sk, int oldstate, int newstate
  * Two iterator shapes matter for socket traffic:
  *   ITER_UBUF  (~6.0+): a single userspace buffer. Current position is
  *              ubuf + iov_offset; `count` is the bytes still to transfer.
- *   ITER_IOVEC:         a vector of userspace buffers, __iov[0..nr_segs).
- *              The first segment is adjusted by iov_offset, the rest are
- *              taken whole; capture stops after LK_MAX_SEGS segments.
- *              The pre-~6.4 spelling of __iov (`iov`) is wired up in stage 8.
+ *   ITER_IOVEC:         a vector of userspace buffers, iov[0..nr_segs)
+ *              (spelled __iov since ~6.4, see iter_iov_first). The first
+ *              segment is adjusted by iov_offset, the rest are taken whole;
+ *              capture stops after LK_MAX_SEGS segments.
+ *
+ * The iter_type comparisons go through bpf_core_enum_value, not the build
+ * vmlinux.h constants: adding ITER_UBUF in ~6.0 gave it value 0 and pushed
+ * ITER_IOVEC from 0 to 1, so a hardcoded constant silently matches the wrong
+ * flavour on the other side of that kernel (on 5.15 every send/recv would be
+ * rejected as unsupported — task 8.4, Р52). On pre-6.0 kernels the
+ * enum_value_exists/field_exists guards are false at load time and the
+ * poisoned UBUF relocations behind them are dead code.
  *
  * KVEC/BVEC/FOLIOQ/XARRAY reference kernel-internal memory, not the
  * application's send/recv buffer, so they are rejected here. Returns 0 and
@@ -418,7 +450,9 @@ static __always_inline int iter_snapshot(struct msghdr *msg, struct lk_segs *s)
     __u8 type = BPF_CORE_READ(msg, msg_iter.iter_type);
     __u64 off = BPF_CORE_READ(msg, msg_iter.iov_offset);
 
-    if (bpf_core_field_exists(msg->msg_iter.ubuf) && type == ITER_UBUF) {
+    if (bpf_core_enum_value_exists(enum iter_type, ITER_UBUF) &&
+        bpf_core_field_exists(msg->msg_iter.ubuf) &&
+        type == bpf_core_enum_value(enum iter_type, ITER_UBUF)) {
         __u64 ubuf = (__u64)BPF_CORE_READ(msg, msg_iter.ubuf);
         __u64 count = BPF_CORE_READ(msg, msg_iter.count);
 
@@ -428,8 +462,8 @@ static __always_inline int iter_snapshot(struct msghdr *msg, struct lk_segs *s)
         return 0;
     }
 
-    if (type == ITER_IOVEC) {
-        const struct iovec *iov = BPF_CORE_READ(msg, msg_iter.__iov);
+    if (type == bpf_core_enum_value(enum iter_type, ITER_IOVEC)) {
+        const struct iovec *iov = iter_iov_first(msg);
         __u64 nr = BPF_CORE_READ(msg, msg_iter.nr_segs);
 
         if (nr > LK_MAX_SEGS)
@@ -493,11 +527,15 @@ static __always_inline int emit_chunk(__u64 cookie, struct lk_conn_state *st, __
      * to bpf_probe_read_user; 32-bit subregister copies lose that link.
      * barrier_var pins the clamped value to one register: clang otherwise
      * compares one copy of cap and passes another to the read, and the
-     * verifier rejects that copy as unbounded. */
+     * verifier rejects that copy as unbounded. The bound is re-stated AFTER
+     * the barrier: pre-5.19 verifiers do not link register copies by id, so
+     * only a check that dominates the call on the very value being passed
+     * convinces them (matrix kernel 5.15 rejected the id-linked form with
+     * "R2 unbounded memory access", task 8.4). */
     if (cap > chunk_sz)
         cap = chunk_sz;
     barrier_var(cap);
-    if (cap == 0 || base == 0)
+    if (cap == 0 || cap > chunk_sz || base == 0)
         cap = 0;
     else if (bpf_probe_read_user(ev->payload, cap, (const void *)base))
         cap = 0; /* unmapped or paged-out user page */
@@ -808,9 +846,16 @@ int BPF_PROG(lk_tcp_recvmsg_entry, struct sock *sk, struct msghdr *msg, size_t l
     return 0;
 }
 
-SEC("fexit/tcp_recvmsg")
-int BPF_PROG(lk_tcp_recvmsg_exit, struct sock *sk, struct msghdr *msg, size_t len, int flags,
-             int *addr_len, int ret)
+/* Body of fexit/tcp_recvmsg, shared by the signature variants below. The
+ * arity of tcp_recvmsg keeps changing: 5.15 has (sk, msg, len, nonblock,
+ * flags, addr_len) — `nonblock` removed in 5.19 (ec095263a965) — and recent
+ * kernels (~7.1) dropped `addr_len` too. In an fexit context the return value
+ * is the slot after the last argument, and CO-RE cannot relocate context
+ * slots, so a mismatched variant either reads the wrong slot or is rejected
+ * outright (5.15: "arg5 type INT is not a struct"; 7.1: "doesn't have 6-th
+ * argument" — both found live by the task 8.4 matrix). Userspace probes the
+ * kernel BTF for the arity and autoloads exactly one variant (main.c). */
+static __always_inline int recvmsg_exit(struct sock *sk, long ret)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     struct lk_conn_state *cs;
@@ -840,6 +885,31 @@ int BPF_PROG(lk_tcp_recvmsg_exit, struct sock *sk, struct msghdr *msg, size_t le
     /* Always drop the entry, including the ret <= 0 path, or the map leaks. */
     bpf_map_delete_elem(&recv_state, &pid_tgid);
     return 0;
+}
+
+/* 5.19..7.0 signature (5 args). Exactly one of the three variants is
+ * autoloaded, by the arity of tcp_recvmsg in the kernel BTF (recvmsg_exit). */
+SEC("fexit/tcp_recvmsg")
+int BPF_PROG(lk_tcp_recvmsg_exit, struct sock *sk, struct msghdr *msg, size_t len, int flags,
+             int *addr_len, int ret)
+{
+    return recvmsg_exit(sk, ret);
+}
+
+/* Pre-5.19 signature (6 args): the extra `nonblock` int between len and flags. */
+SEC("fexit/tcp_recvmsg")
+int BPF_PROG(lk_tcp_recvmsg_exit_a6, struct sock *sk, struct msghdr *msg, size_t len, int nonblock,
+             int flags, int *addr_len, int ret)
+{
+    return recvmsg_exit(sk, ret);
+}
+
+/* ~7.1+ signature (4 args): addr_len is gone. */
+SEC("fexit/tcp_recvmsg")
+int BPF_PROG(lk_tcp_recvmsg_exit_a4, struct sock *sk, struct msghdr *msg, size_t len, int flags,
+             int ret)
+{
+    return recvmsg_exit(sk, ret);
 }
 
 /* ------------------------------------------------------------------------- *
@@ -908,12 +978,13 @@ static __always_inline int emit_ssl_chunk(__u64 cookie, __u8 dir, __u32 total_le
     ev->off = off;
     ev->_pad = 0;
 
-    /* Same 64-bit clamp + barrier_var dance as emit_chunk: keep the bound the
-     * verifier propagates to bpf_probe_read_user pinned to one register. */
+    /* Same 64-bit clamp + barrier_var + post-barrier re-check dance as
+     * emit_chunk: the bound must sit on the exact register copy passed to the
+     * read for pre-5.19 verifiers (see the emit_chunk comment). */
     if (cap > chunk_sz)
         cap = chunk_sz;
     barrier_var(cap);
-    if (cap == 0 || base == 0)
+    if (cap == 0 || cap > chunk_sz || base == 0)
         cap = 0;
     else if (bpf_probe_read_user(ev->payload, cap, (const void *)base))
         cap = 0; /* unmapped or paged-out user page */

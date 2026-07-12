@@ -60,21 +60,61 @@ union { unsigned long nr_segs; ... };
 - `ITER_IOVEC`: `iov = __iov` (first segment); `base = iov->iov_base +
   iov_offset`, `len = iov->iov_len - iov_offset`.
 
-### Field-rename framework for older kernels (stage 8)
+### Field-rename framework for older kernels (filled in stage 8.4)
 
-The reads are wired for CO-RE so the object relocates, but the *spellings* below
-only exist in newer trees; filling in the old-kernel branches and testing on
-5.15 is deferred to stage 8:
+The reads are wired for CO-RE so the object relocates, but the *spellings*
+below only exist in some trees. Stage 8.4 filled in the old-kernel branches
+and validated the whole set on the 5.15/6.1/6.8/stable matrix (`kernels.yml`,
+Р52); the facts below are what the matrix actually established, not what the
+headers suggested.
 
-- `ubuf` appeared ~6.0. Guarded here with
-  `bpf_core_field_exists(msg->msg_iter.ubuf)`; pre-6.0 kernels have no UBUF path
-  and everything arrives as `ITER_IOVEC`.
-- `__iov` was named `iov` before ~6.4. We reference `__iov` (present in the
-  build vmlinux.h). A kernel whose BTF only has `iov` needs the alternate
-  spelling — not compiled in today.
-- `count` sat directly in `iov_iter` on older kernels rather than inside the
-  anonymous struct; the `BPF_CORE_READ(msg, msg_iter.count)` access relocates
-  across that move.
+- **`ubuf` and the `iter_type` renumbering (the load-bearing one).** `ubuf`
+  and `ITER_UBUF` appeared ~6.0. The trap: adding `ITER_UBUF=0` *renumbered*
+  the enum — `ITER_IOVEC` went from 0 (pre-6.0) to 1 (6.0+). The original code
+  compared `type` against the build vmlinux.h constant, which on a 5.15 target
+  would read `ITER_IOVEC` as 1 and mis-classify *every* iterator (`ITER_UBUF`
+  and `ITER_IOVEC` both effectively unhandled) → `iter_unsupported` on every
+  send/recv. Fixed by reading both the guard and the comparison values through
+  `bpf_core_enum_value_exists` / `bpf_core_enum_value(enum iter_type, …)`, so
+  the numbers come from the *target* BTF. The 5.15 smoke's `iter_unsupported=0`
+  assertion is exactly the regression detector for this.
+- **`__iov` vs `iov`.** Renamed ~6.4 (the `iter_iov()` accessor rework). The
+  build vmlinux.h has `__iov`; 5.15/6.1 have `iov`. `iter_iov_first()` picks
+  the spelling with `bpf_core_field_exists(msg->msg_iter.__iov)` and reads the
+  other through a `struct msghdr___old` CO-RE flavor. Confirmed byte-exact on
+  5.15 (the IOVEC path is the *only* path there — no UBUF).
+- **`count`** sat directly in `iov_iter` on older kernels rather than inside
+  the anonymous struct; `BPF_CORE_READ(msg, msg_iter.count)` relocates across
+  that move (unchanged, no special-casing needed).
+
+### `tcp_recvmsg` fexit arity drift (discovered on the matrix, stage 8.4)
+
+Not an `iov_iter` issue but the same class of CO-RE-can't-fix problem, found
+the moment the matrix first booted. `fexit` reads the return value from the
+context slot *after* the last argument, and CO-RE cannot relocate context
+slots — so a signature mismatch is fatal (the verifier rejects the read
+outright: 5.15 said "arg5 type INT is not a struct", 7.1 said "doesn't have
+6-th argument"). `tcp_recvmsg`'s arity changed twice:
+
+- **6 args** (≤ 5.18): `(sk, msg, len, nonblock, flags, addr_len)` — `nonblock`
+  removed in 5.19 (`ec095263a965`);
+- **5 args** (5.19 … ~7.0): `(sk, msg, len, flags, addr_len)`;
+- **4 args** (~7.1+): `addr_len` gone too.
+
+The BPF object carries all three `lk_tcp_recvmsg_exit*` variants; userspace
+reads the arity of `tcp_recvmsg` from the kernel BTF (`recvmsg_arity()` in
+`main.c`) and autoloads exactly one before `latkit_bpf__load`. A probe failure
+falls back to the 5-arg default and, if wrong, fails loudly at load rather than
+capturing half a stream.
+
+### Verifier note: the `cap` bound must survive to older verifiers
+
+`emit_chunk`/`emit_ssl_chunk` clamp `cap` to the chunk size, `barrier_var` it,
+then re-state `cap > chunk_sz` *after* the barrier. The post-barrier re-check
+is not redundant: pre-5.19 verifiers do not link register copies by id, so the
+bound has to sit on the exact copy passed to `bpf_probe_read_user`. Without it
+5.15 rejected the read with "R2 unbounded memory access" even though a
+dominating clamp existed (found on the matrix; 6.x+ accept either form).
 
 ## Length clipping and the verifier
 
@@ -187,8 +227,10 @@ unless noted; `dmesg` stayed empty across all loads.
   through `tcp_splice_read`, never enters `tcp_recvmsg`, and produces no
   events at all. Same class of gap as unix sockets (PLAN.md §5); irrelevant
   for the direct agent-on-PG-host deployment.
-- **Old kernels**: UBUF/`__iov`/`iov` rename branches are framed but only the
-  6.x spellings are compiled and tested; 5.15 validation is stage 8.
+- **Old kernels**: *resolved in stage 8.4* — the UBUF/`__iov`/`iov` and
+  `iter_type`-enum branches, plus the `tcp_recvmsg` fexit-arity variants, are
+  validated on the 5.15/6.1/6.8/stable matrix (see the two sections above).
+  Floor is 5.15 with BTF; below that is neither tested nor promised.
 - **Unix sockets invisible**: psql over the local socket (no `-h`) produced zero
   events — `tcp_sendmsg`/`tcp_recvmsg` are not on that path. Confirmed by
   probing with a marker; this is the known PLAN.md §5 gap.

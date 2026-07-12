@@ -12,7 +12,9 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/resource.h>
+#include <unistd.h>
 
+#include <bpf/btf.h>
 #include <bpf/libbpf.h>
 
 #include "cgroup_filter.h"
@@ -673,6 +675,33 @@ static void print_config(void)
     printf("tls_comm=%s\n", opt_tls_comm);
 }
 
+/* Argument count of this kernel's tcp_recvmsg, from its BTF; -1 when the
+ * probe fails. The arity has changed twice (6 args before 5.19, 5 until ~7.0,
+ * 4 after), each change moving the fexit return-value slot, which CO-RE
+ * cannot relocate — the BPF object carries one lk_tcp_recvmsg_exit* variant
+ * per shape and main() autoloads exactly one (task 8.4, Р52). On a probe
+ * failure or an arity without a variant the 5-arg default is loaded and, if
+ * wrong for the kernel, fails loudly at load rather than capturing half a
+ * stream. */
+static int recvmsg_arity(void)
+{
+    struct btf *btf = btf__load_vmlinux_btf();
+    const struct btf_type *t;
+    int id, nargs = -1;
+
+    if (!btf)
+        return -1;
+    id = btf__find_by_name_kind(btf, "tcp_recvmsg", BTF_KIND_FUNC);
+    if (id > 0) {
+        t = btf__type_by_id(btf, id);                 /* FUNC */
+        t = t ? btf__type_by_id(btf, t->type) : NULL; /* -> FUNC_PROTO */
+        if (t)
+            nargs = btf_vlen(t);
+    }
+    btf__free(btf);
+    return nargs;
+}
+
 /* The `ports` map exists only after load; attach happens after this, so the
  * filter is in place before the first event can fire. */
 static int fill_ports(struct latkit_bpf *skel)
@@ -710,6 +739,17 @@ int main(int argc, char **argv)
     if (opt_print_config) {
         print_config();
         return 0;
+    }
+
+    /* Hard floor (Р52, task 8.4): every program here is CO-RE and relocates
+     * against the running kernel's BTF, so a kernel without
+     * CONFIG_DEBUG_INFO_BTF cannot work — fail with one clear line instead of
+     * a wall of libbpf relocation errors. The no-BTF negative test of the
+     * kernel matrix (kernels.yml) asserts this exact behaviour. */
+    if (access("/sys/kernel/btf/vmlinux", R_OK)) {
+        fprintf(stderr, "latkit: kernel 5.15+ with BTF is required "
+                        "(/sys/kernel/btf/vmlinux is missing; CONFIG_DEBUG_INFO_BTF=y)\n");
+        return 1;
     }
 
     libbpf_set_print(libbpf_print);
@@ -763,6 +803,15 @@ int main(int argc, char **argv)
         err = -1;
         goto cleanup;
     }
+
+    /* Load the lk_tcp_recvmsg_exit variant matching this kernel's signature
+     * (see recvmsg_arity above); the other two stay out entirely. */
+    int recvmsg_args = recvmsg_arity();
+
+    bpf_program__set_autoload(skel->progs.lk_tcp_recvmsg_exit_a6, recvmsg_args == 6);
+    bpf_program__set_autoload(skel->progs.lk_tcp_recvmsg_exit_a4, recvmsg_args == 4);
+    bpf_program__set_autoload(skel->progs.lk_tcp_recvmsg_exit,
+                              recvmsg_args != 6 && recvmsg_args != 4);
 
     err = latkit_bpf__load(skel);
     if (err) {

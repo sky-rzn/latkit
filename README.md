@@ -130,9 +130,12 @@ binary is built differently (fully static musl, in a container):
 
 - **Linux kernel 5.15+ with BTF** (`/sys/kernel/btf/vmlinux`). The hard
   floors underneath: BPF ringbuf (5.8), `bpf_get_socket_cookie` in tracing
-  programs and BPF atomics (5.12), fentry/`tp_btf` trampolines. Developed
-  and verified on 6.x/7.x; pre-6.x validation is a stage-8 task. The agent
-  checks at startup and fails with a message naming the missing piece.
+  programs and BPF atomics (5.12), fentry/`tp_btf` trampolines. **5.15+ is
+  the supported floor — it is what the CI kernel matrix boots and asserts
+  (5.15, 6.1, 6.8, current stable; plaintext + TLS), so anything below is
+  neither tested nor promised.** Without BTF the agent refuses at startup
+  with a message naming the missing piece — it never runs blind. Full
+  version-by-version support: [docs/deploy.md](docs/deploy.md#kernel-support).
 - **x86_64** release artifacts (arm64 is a v1.1 target — CO-RE does not
   stand in the way, it is untested hardware).
 - **cgroup v2** (unified hierarchy) if you use `--cgroup`; a pure-v1 host

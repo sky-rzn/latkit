@@ -6,6 +6,35 @@ kernel/LSM caveats, the systemd unit and the k8s DaemonSet (with the cgroup
 filter's kubepods globs). Design decisions are Р45–Р48 in
 [STAGE7.md](../STAGE7.md).
 
+## Kernel support
+
+The floor is **Linux 5.15 with BTF** (`CONFIG_DEBUG_INFO_BTF=y`, i.e.
+`/sys/kernel/btf/vmlinux` present). Every program is CO-RE, so one binary
+relocates across kernels — but only the versions the CI kernel matrix
+(`kernels.yml`, Р52) actually boots are supported. Each is booted under
+[vmtest](https://github.com/danobi/vmtest) with prebuilt
+[cilium/ci-kernels](https://github.com/cilium/ci-kernels) images and run
+through `tests/kernel/smoke.sh` — the fixture byte streams replayed over a
+real loopback socket (`pgstream`) and a real libssl session (`tlspipe`),
+asserting OPEN/CLOSE, exact query/error counts, and zero parse-errors /
+resyncs / ringbuf-drops / `iter_unsupported`, in both plaintext and TLS.
+
+| Kernel | Status | Notes |
+|---|---|---|
+| < 5.15 | **unsupported** | ringbuf exists from 5.8, but not tested and not promised; the agent still tries to load and will fail loudly if a relocation is missing |
+| 5.15 LTS | ✅ matrix | IOVEC path (no `ITER_UBUF` yet); `tcp_recvmsg` has the pre-5.19 `nonblock` arg — a dedicated fexit variant is autoloaded |
+| 6.1 LTS | ✅ matrix | |
+| 6.8 | ✅ matrix | |
+| current stable | ✅ matrix | latest stable at CI time (7.x); `tcp_recvmsg` dropped `addr_len` — a third fexit variant covers it |
+| no BTF (any version) | **refused** | startup check fails with `kernel 5.15+ with BTF is required`; a `kernels.yml` negative test asserts the message and a clean exit (no segfault) |
+
+CO-RE handles the version drift internally (`src/bpf/latkit.bpf.c`,
+[notes-iov.md](notes-iov.md)): the `iov_iter` shape and field spellings
+(`ubuf`/`__iov`/`iov`), the `iter_type` enum renumbering across the
+`ITER_UBUF` addition, and the changing arity of `tcp_recvmsg` are all
+resolved at load time — the event format never changes. **arm64** is a v1.1
+target (CO-RE does not stand in the way; it is untested hardware).
+
 ## The release binary
 
 The release artifact is a **fully static musl binary** (Р45), built in the

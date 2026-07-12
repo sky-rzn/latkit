@@ -1,0 +1,96 @@
+name: Kernel matrix
+
+# Kernel matrix (task 8.4, Р52): boot the real 5.15/6.1/6.8/stable kernels in
+# vmtest (a qemu wrapper that shares the runner's rootfs over 9p) and run the
+# plaintext + TLS smoke of tests/kernel/smoke.sh on each, plus the no-BTF
+# negative test. This is deliberately NOT on the every-PR path: booting four
+# kernels is slow and flaky-prone (KVM in Actions), and the same smoke.sh runs
+# locally without CI. It fires on push to master, nightly, and on a PR only
+# when it carries the `kernel-matrix` label.
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "37 3 * * *"
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+# Prebuilt kernels come from the cilium/ci-kernels images (built with BTF,
+# virtio and 9p — everything vmtest needs); we never build a kernel here.
+env:
+  VMTEST_VERSION: v0.18.0
+
+jobs:
+  smoke:
+    name: smoke (kernel ${{ matrix.kernel }})
+    # push/schedule always; PRs only with the kernel-matrix label.
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'kernel-matrix')
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ["5.15", "6.1", "6.8", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # Build deps + qemu for vmtest (qemu-guest-agent provides qemu-ga,
+          # which vmtest spawns inside the guest over the shared rootfs).
+          sudo apt-get install -y clang libelf-dev zlib1g-dev libssl-dev \
+              linux-tools-common linux-tools-generic \
+              qemu-system-x86 qemu-guest-agent
+      - name: Configure
+        run: cmake -B build
+      - name: Build agent + replayers
+        run: cmake --build build --target latkit pgstream tlspipe -j"$(nproc)"
+      - name: Fetch vmtest
+        run: |
+          curl -sSLf -o vmtest \
+            "https://github.com/danobi/vmtest/releases/download/${VMTEST_VERSION}/vmtest-x86_64"
+          chmod +x vmtest
+      - name: Fetch kernel ${{ matrix.kernel }}
+        run: |
+          # Extract vmlinuz from the ci-kernels OCI image (docker is on the
+          # runner). The image tag is the version line of the matrix.
+          docker create --name k "ghcr.io/cilium/ci-kernels:${{ matrix.kernel }}" true
+          docker cp k:/boot/vmlinuz vmlinuz
+          docker rm k
+      - name: Smoke in VM
+        run: |
+          # KVM keeps the four boots inside the job timeout; vmtest shares the
+          # workspace, so smoke.sh finds the build tree at the same path.
+          ls -l /dev/kvm || echo "warning: no /dev/kvm, boots will be slow"
+          ./vmtest -k vmlinuz "$GITHUB_WORKSPACE/tests/kernel/smoke.sh" | tee smoke.out
+          # vmtest's exit code reflects qemu, not the guest command, so gate on
+          # the verdict smoke.sh prints.
+          grep -q 'all checks passed' smoke.out
+
+  nobtf:
+    name: no-BTF negative test
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'kernel-matrix')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libelf-dev zlib1g-dev \
+              linux-tools-common linux-tools-generic
+      - name: Configure
+        run: cmake -B build
+      - name: Build agent
+        run: cmake --build build --target latkit -j"$(nproc)"
+      # The test reproduces a no-BTF kernel by overmounting /sys/kernel/btf in a
+      # mount namespace (see the script header) — no separate kernel build. Root
+      # is for unshare -m only; the runner grants passwordless sudo.
+      - name: No-BTF diagnostic
+        run: sudo tests/kernel/nobtf.sh

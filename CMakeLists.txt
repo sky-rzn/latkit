@@ -249,6 +249,7 @@ install(TARGETS latkit RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 enable_testing()
 add_subdirectory(tests/unit)
 add_subdirectory(tests/replay)
+add_subdirectory(tests/kernel)
 
 # Accuracy cross-check (task 8.2, Р50): csvlog -> lk_norm_sql -> join with the
 # --dump-metrics exposition. Links the very normaliser/histogram code the agent
