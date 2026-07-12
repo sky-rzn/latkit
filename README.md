@@ -246,9 +246,22 @@ This is deliberately **not** the same number as `pg_stat_statements.
 mean_exec_time`, which times only the executor: latkit's span additionally
 contains parse/plan protocol handling, result serialisation and streaming,
 and the kernel socket path on the server side — i.e. what the *client*
-experiences minus the network RTT and the client itself. A controlled
-comparison of the two is a stage-8 task. Full rationale and the parser's
-blind spots: [docs/notes-pgproto.md](docs/notes-pgproto.md),
+experiences minus the network RTT and the client itself.
+
+The difference is **measured**, not assumed
+([docs/accuracy.md](docs/accuracy.md), reproducible via
+`tests/bench/accuracy/run.sh`): joined against PostgreSQL's own csvlog
+through latkit's normaliser, statement counts match **exactly** on a
+lossless run, per-SQLSTATE errors and row counts match injected ground
+truth, p50/p95 agree within the histogram-bucket arithmetic for queries
+≥ 1 ms, and the systematic offset (agent ≥ log, by the model above) is
+**+6…+10 µs per query on loopback** (simple protocol; +13…+25 µs
+extended, whose parse/bind/execute gaps land in latkit's span only —
+rising to tens of µs on multi-ms, row-heavy statements). For sub-100 µs
+queries that offset is a real fraction of the number: at that scale
+latkit and the executor timer measure genuinely different spans. Full
+rationale and the parser's blind spots:
+[docs/notes-pgproto.md](docs/notes-pgproto.md),
 [docs/notes-metrics.md](docs/notes-metrics.md).
 
 Honesty guarantees, since an observer that silently degrades is worse than

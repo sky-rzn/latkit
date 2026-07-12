@@ -250,6 +250,13 @@ enable_testing()
 add_subdirectory(tests/unit)
 add_subdirectory(tests/replay)
 
+# Accuracy cross-check (task 8.2, Р50): csvlog -> lk_norm_sql -> join with the
+# --dump-metrics exposition. Links the very normaliser/histogram code the agent
+# runs — that identity is the point of the tool (see its header). Built by
+# tests/bench/accuracy/run.sh; no libbpf, so it builds anywhere.
+add_executable(logjoin tests/bench/accuracy/logjoin.c)
+target_link_libraries(logjoin latkit_metrics)
+
 # Fuzz harness (task 3.6, stage-8 groundwork): off by default, built behind a
 # flag. See tests/fuzz/CMakeLists.txt for the sanitizer invocation CI uses.
 option(LATKIT_FUZZ "Build the PostgreSQL parser fuzz harness (stage-8 groundwork)" OFF)
