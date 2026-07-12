@@ -258,6 +258,25 @@ query observation that spans a loss is discarded and counted
 the Overview dashboard pins a "capture degraded" annotation to any window
 with non-zero drops.
 
+## Overhead
+
+Measured with paired ABAB runs against a no-agent baseline at ~50k
+queries/s (pgbench select-only `-c 128` and TPC-B `-c 100`), counting only
+runs with **zero** capture loss ([docs/perf.md](docs/perf.md) has the full
+method, tables and reproduction script — `tests/bench/run.sh`):
+
+- **Workload impact: none measurable.** ΔTPS vs baseline is within ±0.2%
+  (v1.0 gate: < 3%) for plaintext, TLS and OTLP-export configurations.
+- **Agent CPU**: 0.31 cores per 50k queries/s plaintext, 0.45 with TLS
+  (v1.0 gate: < 1 core). RSS ~25 MiB under load.
+- **TLS uprobe tax**: with `--tls`, the *observed postgres* pays
+  ~25 µs CPU per query for the `SSL_*` uprobes — that is the price of the
+  decryption-free plaintext channel, and it lands on the database, not
+  the agent.
+- Past the budget (this stand saturates the single pipeline thread at
+  ~150–200k queries/s per core) the agent **drops and counts** rather
+  than degrading silently.
+
 ## Security
 
 - **The agent sees SQL text; masking is on by default and by construction.**

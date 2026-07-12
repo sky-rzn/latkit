@@ -105,8 +105,18 @@ struct {
  * on the stack they stay precise per path, and the 8-chunk loop blows the
  * 1M-insn verification budget (measured, not theoretical). `busy` guards
  * against a preempting send/recv on the same CPU (CONFIG_PREEMPT) clobbering
- * the cursor mid-chain: the preemptor degrades to a single empty event and
- * the original chain stays intact. */
+ * the cursor mid-chain.
+ *
+ * A small pool of slots per CPU, not a single cursor: chains DO interleave on
+ * one CPU under load — a preempting task runs its own send/recv (or SSL_*)
+ * chain before the first one resumes. With one slot the preemptor had to
+ * degrade to a single empty TRUNC event, i.e. an artificial capture hole that
+ * dirtied the framer and cost a resync (measured on the TLS benchmark: a
+ * handful per minute at 50k qps, gone with the pool). Claiming scans for a
+ * free slot; only when all of them are mid-chain does the old degrade path
+ * kick in. */
+#define LK_CURSOR_SLOTS 4
+
 struct lk_cursor {
     __u32 busy;
     __u32 si;     /* current segment index */
@@ -117,10 +127,27 @@ struct lk_cursor {
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 1);
+    __uint(max_entries, LK_CURSOR_SLOTS);
     __type(key, __u32);
     __type(value, struct lk_cursor);
 } cursor SEC(".maps");
+
+/* First free cursor slot on this CPU, marked busy; NULL when all are taken by
+ * preempted chains (the caller then degrades to a single empty event). The
+ * test_and_set is atomic against a preemptor scanning the same slots. */
+static __always_inline struct lk_cursor *cursor_claim(void)
+{
+    for (__u32 i = 0; i < LK_CURSOR_SLOTS; i++) {
+        __u32 key = i;
+        struct lk_cursor *cur = bpf_map_lookup_elem(&cursor, &key);
+
+        if (!cur)
+            return NULL;
+        if (!__sync_lock_test_and_set(&cur->busy, 1))
+            return cur;
+    }
+    return NULL;
+}
 
 /* Global loss/volume statistics (design decision Р5), indexed by enum
  * lk_stat_id; the agent sums across CPUs and reports periodically. Per-CPU,
@@ -498,7 +525,7 @@ static __always_inline void emit_data_chunks(__u64 cookie, struct lk_conn_state 
                                              __u32 total_len, const struct lk_segs *segs)
 {
     __u64 avail_total = 0;
-    __u32 zero = 0, budget;
+    __u32 budget;
     struct lk_cursor *cur;
     __u16 flags = 0;
 
@@ -540,12 +567,10 @@ static __always_inline void emit_data_chunks(__u64 cookie, struct lk_conn_state 
         return;
     }
 
-    cur = bpf_map_lookup_elem(&cursor, &zero);
-    if (!cur)
-        return;
-    if (__sync_lock_test_and_set(&cur->busy, 1)) {
-        /* Preempted another chain on this CPU: do not touch its cursor;
-         * degrade to a single empty event, total_len stays honest. */
+    cur = cursor_claim();
+    if (!cur) {
+        /* Every slot belongs to a preempted chain on this CPU: do not touch
+         * them; degrade to a single empty event, total_len stays honest. */
         emit_chunk(cookie, st, dir, total_len, 0, 0, 0, total_len ? LK_F_TRUNC : flags,
                    LK_CHUNK_SMALL);
         return;
@@ -618,7 +643,7 @@ static __always_inline void emit_data_chunks(__u64 cookie, struct lk_conn_state 
  * created on CONN_OPEN — that entry carries the tuple/labels and has already seen
  * the SSLRequest/'S'. So the uprobe channel has to stamp events with the socket
  * cookie, but a uprobe sees SSL* and userspace registers, not a struct sock. Two
- * independent ways fill ssl_to_conn, keyed by SSL*:
+ * independent ways fill ssl_to_conn, keyed by {SSL*, tgid}:
  *   - primary: uprobe on SSL_set_fd/rfd/wfd walks fd -> socket -> sk and reads
  *     the cookie straight out of sk (skc_cookie, already assigned by the socket
  *     path at TCP_ESTABLISHED). Deterministic and before any data. Note a uprobe
@@ -654,10 +679,22 @@ struct {
     __type(value, struct lk_ssl_call);
 } active_ssl_rd SEC(".maps");
 
-/* The bridge itself (Р37), key = SSL* as u64. value = the socket cookie the
- * decrypted events must carry, plus the tuple (snapshotted for parity with the
- * socket path / future synthetic use). LRU_HASH with its own ceiling so a missed
- * SSL_free ages out. */
+/* The bridge itself (Р37), key = {SSL*, tgid}. A bare SSL* is NOT unique across
+ * processes: postgres backends are forks with a deterministic heap layout, so
+ * two concurrent backends routinely hold their SSL objects at the same address.
+ * With first-writer-wins that glued both backends to one socket cookie — their
+ * decrypted events interleaved in one conn (false "lost 1" gaps, resync churn,
+ * cross-session query attribution) while the other conn saw no decrypted data
+ * at all. The tgid disambiguates; every prober runs in the owning task's
+ * context, so bpf_get_current_pid_tgid() is the right scope at all five sites.
+ * value = the socket cookie the decrypted events must carry, plus the tuple
+ * (snapshotted for parity with the socket path / future synthetic use).
+ * LRU_HASH with its own ceiling so a missed SSL_free ages out. */
+struct lk_ssl_key {
+    __u64 ssl;
+    __u64 tgid;
+};
+
 struct lk_ssl_conn {
     __u64 cookie;
     struct lk_tuple tuple;
@@ -666,7 +703,7 @@ struct lk_ssl_conn {
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 65536);
-    __type(key, __u64); /* SSL* */
+    __type(key, struct lk_ssl_key);
     __type(value, struct lk_ssl_conn);
 } ssl_to_conn SEC(".maps");
 
@@ -688,15 +725,16 @@ struct {
  * pin a bogus mapping. */
 static __always_inline void ssl_conn_set(__u64 ssl, __u64 cookie, struct sock *sk)
 {
+    struct lk_ssl_key k = {.ssl = ssl, .tgid = bpf_get_current_pid_tgid() >> 32};
     struct lk_ssl_conn v = {};
 
     if (!ssl || !cookie)
         return;
-    if (bpf_map_lookup_elem(&ssl_to_conn, &ssl))
+    if (bpf_map_lookup_elem(&ssl_to_conn, &k))
         return;
     v.cookie = cookie;
     fill_tuple(&v.tuple, sk);
-    bpf_map_update_elem(&ssl_to_conn, &ssl, &v, BPF_ANY);
+    bpf_map_update_elem(&ssl_to_conn, &k, &v, BPF_ANY);
 }
 
 /* Fallback bridge (Р37), called from tcp_sendmsg/tcp_recvmsg. If an SSL_* call
@@ -900,7 +938,7 @@ static __always_inline int emit_ssl_chunk(__u64 cookie, __u8 dir, __u32 total_le
  * state exactly as emit_data_chunks needs it for the verifier. */
 static __always_inline void emit_ssl_data(__u64 cookie, __u8 dir, __u32 total_len, __u64 buf)
 {
-    __u32 zero = 0, budget;
+    __u32 budget;
     struct lk_cursor *cur;
     __u16 flags = 0;
 
@@ -919,11 +957,9 @@ static __always_inline void emit_ssl_data(__u64 cookie, __u8 dir, __u32 total_le
         return;
     }
 
-    cur = bpf_map_lookup_elem(&cursor, &zero);
-    if (!cur)
-        return;
-    if (__sync_lock_test_and_set(&cur->busy, 1)) {
-        /* Preempted another chain on this CPU: degrade to a single event. */
+    cur = cursor_claim();
+    if (!cur) {
+        /* Every slot taken by a preempted chain: degrade to a single event. */
         emit_ssl_chunk(cookie, dir, total_len, 0, 0, 0, total_len ? LK_F_TRUNC : flags,
                        LK_CHUNK_SMALL);
         return;
@@ -1004,7 +1040,8 @@ static __always_inline int ssl_ret(void *active_map, __u8 dir, long ret, int is_
         len = 0xffffffffULL; /* total_len is u32; a single SSL call never nears this */
 
     if (len > 0) {
-        struct lk_ssl_conn *c = bpf_map_lookup_elem(&ssl_to_conn, &call->ssl);
+        struct lk_ssl_key k = {.ssl = call->ssl, .tgid = id >> 32};
+        struct lk_ssl_conn *c = bpf_map_lookup_elem(&ssl_to_conn, &k);
 
         if (c)
             emit_ssl_data(c->cookie, dir, (__u32)len, call->buf);
@@ -1153,7 +1190,7 @@ int BPF_UPROBE(lk_ssl_set_wfd, void *ssl, int fd)
 SEC("uprobe")
 int BPF_UPROBE(lk_ssl_free, void *ssl)
 {
-    __u64 key = (__u64)ssl;
+    struct lk_ssl_key key = {.ssl = (__u64)ssl, .tgid = bpf_get_current_pid_tgid() >> 32};
 
     bpf_map_delete_elem(&ssl_to_conn, &key);
     return 0;

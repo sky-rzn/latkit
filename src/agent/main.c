@@ -739,8 +739,10 @@ int main(int argc, char **argv)
     if (opt_comm[0])
         memcpy((char *)skel->rodata->cfg_comm_filter, opt_comm, sizeof(opt_comm));
     else if (tls_enabled)
-        strncpy((char *)skel->rodata->cfg_comm_filter, tls_comm,
-                sizeof(skel->rodata->cfg_comm_filter) - 1);
+        /* .rodata starts zeroed, so a bounded memcpy stays NUL-terminated
+         * (strncpy of exactly size-1 trips gcc -Wstringop-truncation at -O2). */
+        memcpy((char *)skel->rodata->cfg_comm_filter, tls_comm,
+               strnlen(tls_comm, sizeof(skel->rodata->cfg_comm_filter) - 1));
     err = bpf_map__set_max_entries(skel->maps.events, opt_ringbuf_bytes);
     if (err) {
         fprintf(stderr, "failed to size ringbuf: %d\n", err);

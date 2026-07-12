@@ -174,8 +174,12 @@ struct lk_conn *lk_conn_table_data_decrypted(struct lk_conn_table *t, __u64 cook
                                              __u64 ts_ns, __u32 *lost);
 
 /* Count one ciphertext socket event dropped on a TLS connection (Р38/Р41):
- * exposed as latkit_tls_socket_events_dropped_total. */
-void lk_conn_table_note_tls_drop(struct lk_conn_table *t);
+ * exposed as latkit_tls_socket_events_dropped_total. Also advances the raw seq
+ * baseline and activity/LRU without a gap check — the dropped event consumed a
+ * seq number in the kernel, and leaving the baseline behind would make
+ * CONN_CLOSE read the whole ciphertext stream as lost. */
+void lk_conn_table_note_tls_drop(struct lk_conn_table *t, struct lk_conn *c, __u32 seq,
+                                 __u64 ts_ns);
 
 /* Note a connection flipping to LK_CONN_TLS (Р41): bumps the lifetime counter
  * (latkit_tls_connections_total) and the live gauge (latkit_tls_connections),

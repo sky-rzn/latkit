@@ -227,9 +227,18 @@ struct lk_conn *lk_conn_table_data_decrypted(struct lk_conn_table *t, __u64 cook
     return c;
 }
 
-void lk_conn_table_note_tls_drop(struct lk_conn_table *t)
+void lk_conn_table_note_tls_drop(struct lk_conn_table *t, struct lk_conn *c, __u32 seq, __u64 ts_ns)
 {
     t->st.tls_socket_dropped++;
+    /* The ciphertext is dropped before the seq detector on purpose (Р38), but
+     * these events still consumed seq numbers in the kernel — move the raw
+     * baseline along without counting a gap, or CONN_CLOSE reads every dropped
+     * ciphertext event as a loss and dirties the framer of a healthy conn. */
+    if (seq > c->last_seq)
+        c->last_seq = seq;
+    c->last_activity_ns = ts_ns;
+    lru_unlink(t, c);
+    lru_push_front(t, c);
 }
 
 void lk_conn_table_note_tls_open(struct lk_conn_table *t)

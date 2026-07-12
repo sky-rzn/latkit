@@ -66,7 +66,7 @@ void lk_pipeline_feed(struct lk_pipeline *p, const void *data, size_t size,
         if (c && (c->flags & LK_CONN_TLS) && !decrypted) {
             out->conn = c;
             out->tls_socket_dropped = true;
-            lk_conn_table_note_tls_drop(p->conns);
+            lk_conn_table_note_tls_drop(p->conns, c, v->hdr->seq, v->hdr->ts_ns);
             break;
         }
 

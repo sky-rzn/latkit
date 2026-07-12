@@ -106,14 +106,17 @@ spec:
               port: metrics
             periodSeconds: 5
           resources:
-            # Working hypothesis pending the stage-8 load budget: the agent is
-            # a single thread + BPF maps; RSS grows with connection count and
-            # tracked query cardinality (LATKIT_TOP_QUERIES).
+            # Measured (stage 8.1, docs/perf.md): 0.31 cores per 50k queries/s
+            # plaintext, 0.45 with TLS; RSS ~25 MiB under load at the default
+            # table sizes. The CPU limit equals the v1.0 budget at the 50k
+            # target; memory headroom covers larger LATKIT_TOP_QUERIES /
+            # LATKIT_MAX_CONNS. Past its CPU the agent drops-and-counts
+            # rather than degrading silently.
             requests:
               cpu: 100m
               memory: 64Mi
             limits:
-              cpu: 500m
+              cpu: "1"
               memory: 256Mi
       volumes:
         - name: cgroup

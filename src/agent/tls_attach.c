@@ -203,7 +203,8 @@ static int attach_file(struct lk_tls *t, const char *host_path)
 /* Read /proc/<pid>/comm into buf (newline stripped). Returns 0 on success. */
 static int read_comm(const char *pid, char *buf, size_t sz)
 {
-    char path[64];
+    char path[NAME_MAX + 16]; /* pid is a /proc d_name; size for the worst case
+                               * (gcc -Wformat-truncation counts it at -O2) */
     FILE *f;
     size_t n;
 
