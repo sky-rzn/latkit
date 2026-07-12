@@ -22,6 +22,11 @@ enum lk_decode_status lk_ev_decode(const void *buf, size_t size, struct lk_ev_vi
 
         if (size < sizeof(*d))
             return LK_DEC_SHORT;
+        /* dir indexes lk_conn.frame[2] downstream; the kernel only ever writes
+         * 0/1, so anything else is a corrupt record (a damaged --record file) —
+         * classify it as garbage here, before it can index out of bounds. */
+        if (hdr->dir > LK_DIR_RECV)
+            return LK_DEC_UNKNOWN;
         v->data = d;
         v->cap_len = d->cap_len;
         /* Trust the record boundary over the kernel-written length. */

@@ -1,51 +1,60 @@
-# PG parser fuzz harness (task 3.6, stage-8 groundwork). Built only when
-# LATKIT_FUZZ is ON so a normal build never pays for it. The harness is
-# libbpf-free — it shares the framer (reassembly + conn_table) and the protocol
-# layer, and runs with no privileges. Enable a sanitizer at configure time, e.g.
-#   cmake -B build -DLATKIT_FUZZ=ON \
-#         -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all"
+# Fuzzing profile (task 8.3, Р51). Three libFuzzer targets over the pure
+# pipeline code, clang-only, with fuzzer+ASAN+UBSAN baked into the profile:
 #
-# LATKIT_FUZZER additionally builds the real libFuzzer target (needs clang and
-# -fsanitize=fuzzer); the default build is the offline corpus runner CI uses.
-set(FUZZ_SRC
-    pg_fuzz.c
-    ${CMAKE_SOURCE_DIR}/src/agent/conn_table.c
-    ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
+#   cmake -B build-fuzz -DCMAKE_C_COMPILER=clang -DLATKIT_FUZZ=ON
+#
+#   fuzz_pg    bytes -> framer -> lk_msg -> PG parser (harness from task 3.6)
+#   fuzz_norm  bytes -> lk_norm_sql (harness from task 4.1)
+#   fuzz_pipe  event scenario -> decode + conn_table + framer + parser + norm
+#
+# The dependency sources are compiled INTO each target rather than linked from
+# latkit_proto/latkit_norm: the libraries are built without sanitizers, and an
+# uninstrumented dependency is exactly where a fuzzer goes blind.
+#
+# Corpus lives in tests/fuzz/corpus/{pg,norm,pipe} (committed; minimised with
+# -merge=1 by campaign.sh). The ctest entries below replay it with -runs=0 —
+# the corpus-regression mode CI runs on every PR; fuzzing time budgets live in
+# ci.yml, not here.
+
+if(NOT CMAKE_C_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "LATKIT_FUZZ needs clang for libFuzzer; "
+                        "configure with -DCMAKE_C_COMPILER=clang")
+endif()
+
+set(FUZZ_SAN -O2 -g -fno-omit-frame-pointer
+    -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all)
 set(FUZZ_INC
     ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/pg
-    ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf)
+    ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf
+    ${CMAKE_SOURCE_DIR}/src/norm)
+set(FUZZ_PROTO_SRC
+    ${CMAKE_SOURCE_DIR}/src/proto/pg/pg.c ${CMAKE_SOURCE_DIR}/src/proto/pg/pg_session.c
+    ${CMAKE_SOURCE_DIR}/src/proto/pg/pg_query.c ${CMAKE_SOURCE_DIR}/src/proto/pg/pg_prep.c)
+set(FUZZ_CORE_SRC
+    ${CMAKE_SOURCE_DIR}/src/agent/conn_table.c ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
+set(FUZZ_NORM_SRC ${CMAKE_SOURCE_DIR}/src/norm/norm_sql.c)
 
-add_executable(pg_fuzz ${FUZZ_SRC})
-target_include_directories(pg_fuzz PRIVATE ${FUZZ_INC})
-target_link_libraries(pg_fuzz latkit_proto)
+function(latkit_fuzzer name)
+    add_executable(${name} ${ARGN})
+    target_include_directories(${name} PRIVATE ${FUZZ_INC})
+    target_include_directories(${name} SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/third_party/xxhash)
+    target_compile_options(${name} PRIVATE ${FUZZ_SAN})
+    target_link_options(${name} PRIVATE ${FUZZ_SAN})
+endfunction()
 
-# The corpus is the committed fixtures: arbitrary bytes into bytes -> lk_msg ->
-# parser must never crash. Any sanitizer set in CMAKE_C_FLAGS applies here.
-file(GLOB FUZZ_CORPUS ${CMAKE_SOURCE_DIR}/tests/fixtures/*.lkt)
-add_test(NAME pg_fuzz COMMAND pg_fuzz ${FUZZ_CORPUS})
+latkit_fuzzer(fuzz_pg fuzz_pg.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC})
+latkit_fuzzer(fuzz_norm fuzz_norm.c ${FUZZ_NORM_SRC})
+latkit_fuzzer(fuzz_pipe fuzz_pipe.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC} ${FUZZ_NORM_SRC}
+              ${CMAKE_SOURCE_DIR}/src/agent/decode.c ${CMAKE_SOURCE_DIR}/src/agent/pipeline.c)
 
-if(LATKIT_FUZZER)
-    add_executable(pg_fuzz_libfuzzer pg_fuzz.c
-                   ${CMAKE_SOURCE_DIR}/src/agent/conn_table.c
-                   ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
-    target_include_directories(pg_fuzz_libfuzzer PRIVATE ${FUZZ_INC})
-    target_link_libraries(pg_fuzz_libfuzzer latkit_proto)
-    target_compile_definitions(pg_fuzz_libfuzzer PRIVATE LK_FUZZ_LIBFUZZER)
-    target_compile_options(pg_fuzz_libfuzzer PRIVATE -fsanitize=fuzzer)
-    target_link_options(pg_fuzz_libfuzzer PRIVATE -fsanitize=fuzzer)
-endif()
+# Seed writer (campaign.sh regenerates seeds with it): plain host tool, no
+# fuzzer runtime, so it builds and runs anywhere the profile configures.
+add_executable(gen_seeds gen_seeds.c)
 
-# --- SQL normaliser fuzz harness (task 4.1, stage-8 groundwork) -------------
-# lk_norm_fuzz_one lives in latkit_norm; norm_fuzz.c is just the corpus/libFuzzer
-# driver, mirroring pg_fuzz. Arbitrary bytes into lk_norm_sql must never crash.
-add_executable(norm_fuzz norm_fuzz.c)
-target_link_libraries(norm_fuzz latkit_norm)
-add_test(NAME norm_fuzz COMMAND norm_fuzz ${FUZZ_CORPUS})
-
-if(LATKIT_FUZZER)
-    add_executable(norm_fuzz_libfuzzer norm_fuzz.c)
-    target_link_libraries(norm_fuzz_libfuzzer latkit_norm)
-    target_compile_definitions(norm_fuzz_libfuzzer PRIVATE LK_FUZZ_LIBFUZZER)
-    target_compile_options(norm_fuzz_libfuzzer PRIVATE -fsanitize=fuzzer)
-    target_link_options(norm_fuzz_libfuzzer PRIVATE -fsanitize=fuzzer)
-endif()
+# Corpus regression: every committed input replayed once, no fuzzing. The .lkt
+# fixtures double as extra pg inputs — raw traces through the same entry point.
+set(FUZZ_CORPUS ${CMAKE_SOURCE_DIR}/tests/fuzz/corpus)
+add_test(NAME fuzz_pg_corpus
+         COMMAND fuzz_pg -runs=0 ${FUZZ_CORPUS}/pg ${CMAKE_SOURCE_DIR}/tests/fixtures)
+add_test(NAME fuzz_norm_corpus COMMAND fuzz_norm -runs=0 ${FUZZ_CORPUS}/norm)
+add_test(NAME fuzz_pipe_corpus COMMAND fuzz_pipe -runs=0 ${FUZZ_CORPUS}/pipe)

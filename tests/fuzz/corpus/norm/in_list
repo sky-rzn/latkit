@@ -1,0 +1,1 @@
+select id from t where id in (1, 2, 3, 4, 5) limit 10

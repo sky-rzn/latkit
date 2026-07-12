@@ -3,9 +3,13 @@ name: CI
 on:
   push:
   pull_request:
+  schedule:
+    # Nightly fuzzing (Р51): 15 min per target, crash artifacts uploaded.
+    - cron: "17 2 * * *"
 
 jobs:
   build:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +29,7 @@ jobs:
   # stage, scratch image) on every push so a broken static link surfaces long
   # before a release tag. Uploads the binary as an artifact; publishes nothing.
   release-binary:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -50,6 +55,7 @@ jobs:
           path: latkit
 
   lint:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -67,6 +73,7 @@ jobs:
   # jq: no build, no BPF. Catches a metric rename in src/ (dashboards go stale)
   # and share-export drift (__inputs, hardcoded datasource, literal rate windows).
   dashboards-lint:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -78,6 +85,7 @@ jobs:
         run: ./dashboards/lint.sh
 
   unit:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -96,3 +104,48 @@ jobs:
         run: cmake --build build -j"$(nproc)"
       - name: Run tests
         run: ctest --test-dir build --output-on-failure
+
+  # Fuzzing (task 8.3, Р51). On PR/push: replay the committed corpus (a plain
+  # regression test, seconds) plus 60 s of budgeted fuzzing per target. The
+  # deep campaign is not CI's job — tests/fuzz/campaign.sh runs it on a stand;
+  # nightly (schedule) gets 15 min per target instead, artifacts on failure.
+  fuzz:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [pg, norm, pipe]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libelf-dev zlib1g-dev \
+              linux-tools-common linux-tools-generic
+      - name: Configure (fuzz profile)
+        run: cmake -B build-fuzz -DCMAKE_C_COMPILER=clang -DLATKIT_FUZZ=ON
+      - name: Build target
+        run: cmake --build build-fuzz --target fuzz_${{ matrix.target }} -j"$(nproc)"
+      - name: Corpus regression
+        run: ctest --test-dir build-fuzz -R "^fuzz_${{ matrix.target }}_corpus$" --output-on-failure
+      - name: Fuzz
+        run: |
+          budget=60
+          [ "${{ github.event_name }}" = schedule ] && budget=900
+          mkdir -p work findings
+          cp tests/fuzz/corpus/${{ matrix.target }}/* work/
+          ./build-fuzz/tests/fuzz/fuzz_${{ matrix.target }} work \
+              -max_total_time="$budget" -max_len=4096 -timeout=10 \
+              -dict=tests/fuzz/dict/pg.dict -print_final_stats=1 \
+              -artifact_prefix=findings/
+      - name: Upload findings
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            findings/
+            crash-*
+          if-no-files-found: ignore

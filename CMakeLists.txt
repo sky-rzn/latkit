@@ -257,10 +257,10 @@ add_subdirectory(tests/replay)
 add_executable(logjoin tests/bench/accuracy/logjoin.c)
 target_link_libraries(logjoin latkit_metrics)
 
-# Fuzz harness (task 3.6, stage-8 groundwork): off by default, built behind a
-# flag. See tests/fuzz/CMakeLists.txt for the sanitizer invocation CI uses.
-option(LATKIT_FUZZ "Build the PostgreSQL parser fuzz harness (stage-8 groundwork)" OFF)
-option(LATKIT_FUZZER "Also build the libFuzzer target (implies LATKIT_FUZZ; needs clang)" OFF)
-if(LATKIT_FUZZ OR LATKIT_FUZZER)
+# Fuzzing profile (task 8.3, Р51): three libFuzzer targets (fuzz_pg, fuzz_norm,
+# fuzz_pipe) with fuzzer+ASAN+UBSAN baked in, clang only. Off by default — a
+# normal build never pays for it. See tests/fuzz/CMakeLists.txt.
+option(LATKIT_FUZZ "Build the libFuzzer targets (clang; fuzzer,address,undefined)" OFF)
+if(LATKIT_FUZZ)
     add_subdirectory(tests/fuzz)
 endif()

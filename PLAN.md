@@ -164,7 +164,7 @@ latkit/
 ### Этап 8 — hardening и производительность (~1–2 недели)
 - [ ] Нагрузочное тестирование: pgbench (TPC-B и select-only, 100+ соединений), измерить overhead на TPS/латентность БД с агентом и без. Бюджет: <3% TPS, <1 CPU core на ~50k qps.
 - [ ] Валидация точности: сравнить p50/p95 агента с `pg_stat_statements.mean_exec_time` и `log_min_duration_statement` на контролируемой нагрузке; расхождение задокументировать (агент видит время «сеть-до-сети», PG — только execute).
-- [ ] Fuzzing парсера (libFuzzer на `src/proto/pg/` + `normalize.c`) — вход недоверенный; харнесс и корпус заложены в этапе 3 (`tests/fuzz`, `lk_pg_fuzz_one`).
+- [x] Fuzzing парсера (libFuzzer на `src/proto/pg/` + `normalize.c`) — вход недоверенный; харнесс и корпус заложены в этапе 3 (`tests/fuzz`, `lk_pg_fuzz_one`). → закрыт (Р51, задача 8.3): три таргета — fuzz_pg, fuzz_norm и структурный fuzz_pipe (сценарий событий через decode+conn_table+framer+парсер+нормализатор); инварианты Р51 assert'ами (включая сквозной Р19: после потери первое сообщение — только AFTER_RESYNC); кампания 32 CPU-часа чисто на финальной ревизии; минимизированный корпус и pg.dict в репо; CI — corpus-регрессия + 60 с/таргет на PR, nightly 15 мин/таргет. Находка в продукте одна: decode не валидировал `dir` битой записи (OOB `frame[dir]` с повреждённой `--record`-трассы) — исправлено.
 - [ ] Матрица ядер: проверка на 5.15 / 6.1 / 6.8+ (vmtest или qemu в CI); graceful degradation без BTF.
 - [ ] Утечки: valgrind/ASAN в CI; long-run тест 24h с чурном соединений.
 

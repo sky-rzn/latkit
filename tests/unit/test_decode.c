@@ -120,6 +120,18 @@ int main(void)
         CHECK(v.cap_len == LK_CHUNK_FULL);
     }
 
+    /* A data record whose dir byte is garbage is corrupt, not routable: dir
+     * indexes lk_conn.frame[2] downstream (found by fuzz_pipe, task 8.3 —
+     * reachable from a damaged --record file, never from the kernel). */
+    {
+        struct lk_ev_data *d = mk_data(64, 64, 0);
+
+        d->hdr.dir = 2;
+        CHECK(lk_ev_decode(d, sizeof(*d) + LK_CHUNK_SMALL, &v) == LK_DEC_UNKNOWN);
+        d->hdr.dir = 0xee;
+        CHECK(lk_ev_decode(d, sizeof(*d) + LK_CHUNK_SMALL, &v) == LK_DEC_UNKNOWN);
+    }
+
     /* A data record with no room for even the fixed part is short. */
     {
         struct lk_ev_data *d = mk_data(10, 10, 0);

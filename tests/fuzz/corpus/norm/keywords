@@ -1,0 +1,1 @@
+with q as (select a, count(*) from t group by a having count(*) > 2 order by a desc) update u set b = null where exists (select 1 from q)

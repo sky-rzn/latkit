@@ -138,10 +138,13 @@ comes up short:
 An unknown message *type* is likewise not an error (`unknown_msgs++`, skip by
 `len`): a future PostgreSQL type must not desynchronise the parser.
 
-The fuzz harness (`tests/fuzz/pg_fuzz.c`, built with `-DLATKIT_FUZZ=ON`) drives
-this whole path — `bytes → framer → lk_msg → parser` — from a single
-`lk_pg_fuzz_one(data, n)`, run over the fixture corpus under ASAN/UBSAN in CI and
-as a libFuzzer target (`-DLATKIT_FUZZER=ON`) for stage 8.
+The libFuzzer target (`tests/fuzz/fuzz_pg.c`, built with `-DLATKIT_FUZZ=ON` —
+clang, `fuzzer,address,undefined`) drives this whole path — `bytes → framer →
+lk_msg → parser` — from a single `lk_pg_fuzz_one(data, n)`, with the Р51
+invariants asserted on every emitted message/observation (task 8.3). CI replays
+the committed corpus (`tests/fuzz/corpus/pg/` + the `.lkt` fixtures) with
+`-runs=0` on every PR and fuzzes 60 s per target; nightly gets 15 min; the deep
+campaign is `tests/fuzz/campaign.sh`.
 
 ## Losses and honesty (Р19): an observation never spans a gap
 

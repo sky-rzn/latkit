@@ -1,0 +1,1 @@
+select E'a\'b', B'1010', X'deadbeef', U&'d!0061t' uescape '!'
