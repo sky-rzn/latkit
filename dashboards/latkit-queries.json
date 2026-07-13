@@ -181,7 +181,8 @@
           "expr": "topk($topk, histogram_quantile(0.99, sum by (le, query) (rate(latkit_query_duration_seconds_bucket[$__rate_interval]))))",
           "refId": "A",
           "range": false,
-          "instant": true
+          "instant": true,
+          "format": "table"
         }
       ],
       "transformations": [
@@ -276,7 +277,8 @@
           "expr": "topk($topk, sum by (query) (rate(latkit_query_duration_seconds_sum[$__rate_interval])))",
           "refId": "A",
           "range": false,
-          "instant": true
+          "instant": true,
+          "format": "table"
         }
       ],
       "transformations": [
@@ -371,7 +373,8 @@
           "expr": "topk($topk, sum by (query) (rate(latkit_query_duration_seconds_count[$__rate_interval])))",
           "refId": "A",
           "range": false,
-          "instant": true
+          "instant": true,
+          "format": "table"
         }
       ],
       "transformations": [
@@ -466,7 +469,8 @@
           "expr": "topk($topk, sum by (query) (rate(latkit_query_duration_seconds_count{code=\"error\"}[$__rate_interval])))",
           "refId": "A",
           "range": false,
-          "instant": true
+          "instant": true,
+          "format": "table"
         }
       ],
       "transformations": [
