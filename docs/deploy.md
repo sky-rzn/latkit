@@ -123,9 +123,21 @@ Notes:
   written as just `SYS_PTRACE + SYS_ADMIN`. The explicit four-cap list is
   kept in the documentation because it states intent and survives a future
   kernel relaxing the uprobe rule.
-- **AppArmor** (`docker-default`, Ubuntu): no interference observed — the
-  uprobe `-EACCES` above is the kernel capability check, not AppArmor
-  (verified identical with `--security-opt apparmor=unconfined`).
+- **AppArmor** (`docker-default`, Ubuntu): no interference with *plaintext*
+  capture, and the uprobe `-EACCES` above is the kernel capability check, not
+  AppArmor (verified identical with `--security-opt apparmor=unconfined`).
+  **But `docker-default` DOES break the `LATKIT_TLS=auto` libssl scan in a
+  container**: the scan reads `/proc/<host-pid>/root/.../libssl.so` of the
+  postgres backends, and the profile mediates that cross-process `/proc`
+  access — the scan comes back empty and the agent logs `TLS uprobes: no
+  libssl found for comm 'postgres'` *even with `CAP_SYS_PTRACE` granted*
+  (isolated on a VPS: `--privileged` worked, the four-cap set did not,
+  `cap_add:[…] + --security-opt apparmor=unconfined` with the same caps
+  fixed it — so AppArmor, not a missing cap). For containerised TLS capture
+  add `apparmor=unconfined` (keeps seccomp + the minimal caps) or ship a
+  custom profile that permits the `/proc/<pid>/root` traversal. The host
+  **systemd** unit is not under `docker-default` and needs none of this — the
+  scan resolves natively; prefer it for TLS installs.
 - **seccomp**: Docker's default profile gates `bpf(2)`/`perf_event_open(2)`
   on the corresponding capabilities (Docker ≥ 20.10.10) — no custom profile
   needed. Much older Docker requires `--security-opt seccomp=unconfined` or

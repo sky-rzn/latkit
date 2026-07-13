@@ -29,6 +29,15 @@ services:
     # last two (and set LATKIT_TLS=off below) if the DB connection is plaintext.
     # On kernels < 5.11 add SYS_RESOURCE. `privileged: true` is the fallback.
     cap_add: [BPF, PERFMON, SYS_PTRACE, SYS_ADMIN]
+    # TLS auto-scan reads /proc/<host-pid>/root/.../libssl.so of the postgres
+    # backends to attach the SSL_* uprobes. The docker-default AppArmor profile
+    # mediates that cross-process /proc access and makes the scan come back empty
+    # ("TLS uprobes: no libssl found for comm 'postgres'") EVEN WITH CAP_SYS_PTRACE
+    # — verified on this VPS (privileged worked, the 4-cap set did not; unconfining
+    # AppArmor with the same caps fixed it). seccomp + caps stay in force. Needed
+    # ONLY for TLS capture in a container; for plaintext (LATKIT_TLS=off) drop it.
+    security_opt:
+      - apparmor=unconfined
     environment:
       LATKIT_PORT: "5432"                 # your postgres server port
       LATKIT_PROM_LISTEN: "0.0.0.0:9752"  # a container must listen off-loopback
