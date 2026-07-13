@@ -105,6 +105,43 @@ jobs:
       - name: Run tests
         run: ctest --test-dir build --output-on-failure
 
+  # Valgrind memcheck on the replay harness (task 8.5, Р53). Nightly only —
+  # memcheck is ~20-50x slower than native, too slow for the PR path, and ASAN
+  # (which the `unit` job already runs) is the fast first echelon. This second
+  # echelon adds memcheck's uninitialised-value analysis (MSAN territory)
+  # without rebuilding every dependency instrumented. A failure here is a
+  # release blocker: test_replay drives the whole libbpf-free pipeline the agent
+  # runs 24/7, and it must stay leak- and error-clean. Suppressions (with the
+  # justification policy) live in tests/valgrind.supp — empty today by design.
+  # Built WITHOUT sanitizers on purpose: ASAN and valgrind do not co-exist.
+  valgrind:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libelf-dev zlib1g-dev valgrind \
+              linux-tools-common linux-tools-generic
+      - name: Configure
+        run: cmake -B build
+      # Only the replay target: it links no libbpf, so this pulls in none of the
+      # BPF skeleton machinery and builds anywhere with a plain toolchain.
+      - name: Build replay harness
+        run: cmake --build build --target test_replay -j"$(nproc)"
+      - name: Memcheck replay
+        run: |
+          valgrind --version
+          valgrind \
+            --leak-check=full --show-leak-kinds=all --track-origins=yes \
+            --errors-for-leak-kinds=definite,indirect,possible \
+            --suppressions=tests/valgrind.supp \
+            --error-exitcode=1 \
+            ./build/tests/replay/test_replay
+
   # Fuzzing (task 8.3, Р51). On PR/push: replay the committed corpus (a plain
   # regression test, seconds) plus 60 s of budgeted fuzzing per target. The
   # deep campaign is not CI's job — tests/fuzz/campaign.sh runs it on a stand;

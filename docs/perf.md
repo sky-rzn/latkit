@@ -193,5 +193,78 @@ RSS ~25 MiB steady under load (64k-conn table and top-500 query registry
 at defaults). `deploy/k8s/latkit-daemonset.yaml` now requests
 `100m/64Mi` and limits `1 CPU/256Mi` — the limit equals the v1.0 CPU
 budget at the 50k target; memory headroom covers bigger
-`--top-queries`/`--max-conns` settings. The 24 h leak/limits validation
-is stage 8.5.
+`--top-queries`/`--max-conns` settings.
+
+## Long-run soak — leaks and stability (stage 8.5, Р53)
+
+`tests/longrun/run.sh` runs the agent for 24 h under continuous disturbance
+and asserts that nothing drifts. The point is not throughput — it is that
+the agent that survives a night of churn, induced loss and restarts looks
+exactly like the one that started it.
+
+**Load** (all pgbench, each wrapped in a restart-on-exit loop so a postgres
+bounce never kills the generator): a persistent-connection baseline
+(`-S -M prepared` + TPC-B writes) plus two reconnect-per-transaction
+generators (`pgbench -C`) — one plaintext, one `sslmode=require`. The `-C`
+generators are the churn: every transaction is a fresh connection (and, for
+the TLS one, a fresh SSL handshake on a forked backend), which keeps the
+conn-table LRU + idle sweep (Р12) and the libssl uprobe attach/detach + the
+fd→sock→cookie bridge (Р37) under constant pressure.
+
+**Disturbances on a schedule:** hourly induced loss — `kill -STOP latkit;
+sleep; kill -CONT` — overflows the ringbuf while the agent is frozen, so the
+`gap → resync → recovery` path (Р10/Р19) is exercised dozens of times, not
+once (real overload can't be provoked deterministically; the bench peak
+configs cover that side). And a periodic TLS-postgres restart — synthetic
+OPEN, libssl rescan (Р39), cgroup re-resolve (Р48) in one shot.
+
+The agent runs **detached via `setsid`** (reparented to init), not as a
+`sudo` child: otherwise `sudo` mirrors the induced `SIGSTOP` onto itself and,
+stopped, never reaps the agent — deadlocking shutdown. Under systemd in
+production there is no such parent; the harness reproduces that.
+
+**Witness:** every 15 s a row lands in `samples.tsv` — RSS, `metric_series`,
+active conns, the process fd count (from `/proc/<pid>/fd`), and the
+dropped/resync/TLS counters, each tagged with the phase (`steady` /
+`recovery` / `restart`). `bpftool map show` for the agent's maps is captured
+before and after; a map that grew or appeared is a leak. `plot.py` renders
+the three-panel RSS/fd/series PNG for this doc.
+
+**Acceptance** (checked by the script, `VERDICT: PASS/FAIL`):
+
+- RSS reaches a plateau — 2nd-half spread < 5 % of the median;
+- fd count does not grow — 2nd-half max within 20 % of the first sample;
+- `latkit_metric_series` stays under the ceiling (top-K is bounded, Р23);
+- `dropped`/`resync` grow **only** inside induced/recovery/restart windows —
+  zero unexpected loss in any pure-`steady` sample;
+- kernel maps identical before/after.
+
+Reproduce (dev stand; needs docker, passwordless sudo, an optimised
+`build-rel`):
+
+```
+tests/longrun/run.sh up            # start + init the two postgres containers
+tests/longrun/run.sh run           # 24 h soak, DURATION_H=24 default
+SMOKE=1 tests/longrun/run.sh run   # 5-min harness self-check, same PASS/FAIL
+tests/longrun/plot.py tests/longrun/out/<ts>/samples.tsv   # RSS PNG
+```
+
+**Results.** The harness is validated end-to-end (the `SMOKE=1` self-check
+passes: RSS spread 0.16 %, fds flat, series bounded, zero steady-phase loss,
+maps unchanged, and every induced window recovers to zero resync). The full
+24 h stand run and its RSS graph land here once complete — this is the one
+calendar-bound step of the stage.
+
+## Nightly memory checking (stage 8.5, Р53)
+
+ASAN/UBSAN on the unit + replay suites already run on every PR (stages 2–4).
+The nightly `valgrind` CI job adds a second echelon: memcheck on the replay
+harness (`tests/replay/test_replay`), which drives the whole libbpf-free
+pipeline — decode → conn_table → reassembly → PG parser → norm →
+metrics/export — over the committed fixtures. It runs with
+`--leak-check=full --track-origins=yes --error-exitcode=1`; a failure is a
+release blocker. Suppressions live in `tests/valgrind.supp` with a
+justification policy — empty today by design: the harness is memcheck-clean
+(0 errors, all heap freed), and a leak there is a leak in code the agent runs
+24/7. memcheck is nightly-only (~20–50× slowdown); ASAN stays the fast PR
+echelon. Built without sanitizers on purpose — ASAN and valgrind don't mix.

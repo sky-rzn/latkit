@@ -1,0 +1,30 @@
+# Valgrind memcheck suppressions for the nightly replay job (STAGE8.md 8.5, Р53).
+#
+# Policy: this file is a liability, not a convenience. The replay harness
+# (tests/replay/test_replay) drives the whole libbpf-free userspace pipeline —
+# decode -> conn_table -> reassembly -> pg parser -> norm -> metrics/export —
+# over the committed fixtures, and it must run *clean* under memcheck: at the
+# time this file was written it reports 0 errors and "All heap blocks were
+# freed -- no leaks are possible". So there is nothing to suppress from our own
+# code, and there must never be: a leak in test_replay is a leak in the code
+# the agent runs 24/7, and the nightly job failing on it is the point.
+#
+# Every entry below must therefore
+#   (a) belong to libc / the dynamic loader / the toolchain, never to latkit,
+#   (b) carry a comment saying which platform surfaced it and why it is benign,
+#   (c) be as narrow as possible (name the frame, do not blanket a whole lib).
+# An entry that would hide a defect in src/ is a bug in this file.
+#
+# There are no active suppressions today — the harness is clean on the dev
+# stand (glibc 2.39, valgrind 3.26) and on the ubuntu-24.04 CI runner. The
+# template below documents the required shape for the first justified addition;
+# it is commented out and suppresses nothing.
+#
+# {
+#     <short-slug-why-benign>
+#     Memcheck:Leak
+#     match-leak-kinds: reachable
+#     ...
+#     fun:__libc_<the-exact-libc-frame>
+#     # seen on <distro/libc version>: <one line on why this is not our leak>
+# }

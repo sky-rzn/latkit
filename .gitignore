@@ -6,3 +6,4 @@ build*/
 *.kdev4
 /tests/bench/out/
 /tests/bench/accuracy/out/
+/tests/longrun/out/
