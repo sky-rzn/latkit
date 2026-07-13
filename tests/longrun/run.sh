@@ -57,6 +57,7 @@
 #   INDUCE_HOLD=5, RECOVER_SECS=90, RESTART_EVERY=14400, RESTART_SETTLE=90,
 #   RATE_STEADY=5000, RATE_TPCB=800, RATE_CHURN=400, RATE_CHURN_TLS=80,
 #   IDLE_TIMEOUT=45, K_CEIL=2000, RSS_PLATEAU_PCT=5, FD_GROWTH_PCT=20,
+#   SCALE=50, PG_SHARED_BUFFERS=1GB (lower both together on a small host),
 #   AGENT_BIN=build-rel/latkit, PROM_PORT=9753, OUT=tests/longrun/out/<utc-ts>,
 #   FORCE=1 (skip the idle-host check).
 #
@@ -114,7 +115,13 @@ DB_USER=latkit DB_NAME=latkit
 export PGPASSWORD=latkit
 PROM="http://127.0.0.1:$PROM_PORT/metrics"
 
-PG_TUNING=(-c shared_buffers=1GB -c max_connections=400
+# shared_buffers is a knob so the stand fits small hosts: two postgres run at
+# once, so 1GB each needs a >2GB box. On a small VPS set e.g.
+# PG_SHARED_BUFFERS=256MB with a smaller SCALE so the dataset still fits in it
+# (CPU-bound, not IO-bound). fsync/synchronous_commit/full_page_writes off keeps
+# TPC-B measuring CPU, not the disk.
+PG_SHARED_BUFFERS=${PG_SHARED_BUFFERS:-1GB}
+PG_TUNING=(-c shared_buffers=$PG_SHARED_BUFFERS -c max_connections=400
            -c fsync=off -c synchronous_commit=off -c full_page_writes=off)
 
 # The agent's BPF maps (src/bpf/latkit.bpf.c) — the set whose growth we watch.
