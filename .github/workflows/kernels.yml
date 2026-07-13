@@ -66,9 +66,11 @@ jobs:
             echo "pull attempt $attempt failed, retrying in $((attempt * 10))s"
             sleep $((attempt * 10))
           done
-          docker create --name k "$img" true
-          docker cp k:/boot/vmlinuz vmlinuz
-          docker rm k
+          # Container name needs >= 2 chars ([a-zA-Z0-9][a-zA-Z0-9_.-]+);
+          # the old single-char "k" is rejected by current docker.
+          docker create --name vmlinuz-src "$img" true
+          docker cp vmlinuz-src:/boot/vmlinuz vmlinuz
+          docker rm vmlinuz-src
       - name: Smoke in VM
         run: |
           # KVM keeps the four boots inside the job timeout; vmtest shares the
