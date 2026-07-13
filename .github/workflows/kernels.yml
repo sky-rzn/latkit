@@ -71,6 +71,16 @@ jobs:
           docker create --name vmlinuz-src "$img" true
           docker cp vmlinuz-src:/boot/vmlinuz vmlinuz
           docker rm vmlinuz-src
+      - name: Enable KVM access
+        run: |
+          # The ubuntu-24.04 runner ships /dev/kvm as root:kvm 0660, but the
+          # `runner` user is no longer in the kvm group (it used to be), so QEMU
+          # gets EACCES on the module before QMP even comes up. A udev rule that
+          # widens the node to 0666 restores access without a re-login.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
       - name: Smoke in VM
         run: |
           # KVM keeps the four boots inside the job timeout; vmtest shares the
