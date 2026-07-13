@@ -56,8 +56,17 @@ jobs:
       - name: Fetch kernel ${{ matrix.kernel }}
         run: |
           # Extract vmlinuz from the ci-kernels OCI image (docker is on the
-          # runner). The image tag is the version line of the matrix.
-          docker create --name k "ghcr.io/cilium/ci-kernels:${{ matrix.kernel }}" true
+          # runner). The image tag is the version line of the matrix. The pull
+          # from ghcr is retried: anonymous ghcr pulls off shared runner IPs
+          # occasionally rate-limit or drop, and all four jobs racing the same
+          # registry makes that likelier.
+          img="ghcr.io/cilium/ci-kernels:${{ matrix.kernel }}"
+          for attempt in 1 2 3 4 5; do
+            docker pull "$img" && break
+            echo "pull attempt $attempt failed, retrying in $((attempt * 10))s"
+            sleep $((attempt * 10))
+          done
+          docker create --name k "$img" true
           docker cp k:/boot/vmlinuz vmlinuz
           docker rm k
       - name: Smoke in VM

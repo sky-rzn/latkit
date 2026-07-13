@@ -33,7 +33,11 @@ struct pg_wire {
 static inline void pg_wire_init(struct pg_wire *w, const __u8 *body, __u32 body_cap)
 {
     w->p = body;
-    w->end = body + body_cap;
+    /* body may be NULL for a zero-length message; pointer arithmetic on NULL
+     * is UB (UBSAN "applying zero offset to null pointer" under clang-18), so
+     * only offset a real pointer. A NULL body leaves end == NULL and the
+     * first read trips overrun, as intended. */
+    w->end = body ? body + body_cap : body;
     w->overrun = false;
 }
 

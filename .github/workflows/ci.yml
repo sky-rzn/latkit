@@ -159,10 +159,14 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang libelf-dev zlib1g-dev \
+          # Pin the fuzz compiler to clang-18. Its UBSAN still flags NULL
+          # pointer arithmetic ("applying zero offset to null pointer"), which
+          # clang >= 19 dropped after the C23 clarification — leaving the pin
+          # unpinned would let that class of UB slip through CI silently.
+          sudo apt-get install -y clang-18 libelf-dev zlib1g-dev \
               linux-tools-common linux-tools-generic
       - name: Configure (fuzz profile)
-        run: cmake -B build-fuzz -DCMAKE_C_COMPILER=clang -DLATKIT_FUZZ=ON
+        run: cmake -B build-fuzz -DCMAKE_C_COMPILER=clang-18 -DLATKIT_FUZZ=ON
       - name: Build target
         run: cmake --build build-fuzz --target fuzz_${{ matrix.target }} -j"$(nproc)"
       - name: Corpus regression
