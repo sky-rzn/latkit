@@ -249,11 +249,49 @@ SMOKE=1 tests/longrun/run.sh run   # 5-min harness self-check, same PASS/FAIL
 tests/longrun/plot.py tests/longrun/out/<ts>/samples.tsv   # RSS PNG
 ```
 
-**Results.** The harness is validated end-to-end (the `SMOKE=1` self-check
-passes: RSS spread 0.16 %, fds flat, series bounded, zero steady-phase loss,
-maps unchanged, and every induced window recovers to zero resync). The full
-24 h stand run and its RSS graph land here once complete — this is the one
-calendar-bound step of the stage.
+**Results (2026-07-13, commit d70305f, 10 h run).** The soak ran 10 h
+(`DURATION_H=10`) on the dev stand (Core Ultra 7 155H, kernel 7.0), 2400
+witness samples, and passed every criterion:
+
+| Criterion | Result | Limit |
+|---|---|---|
+| RSS plateau (2nd half) | 21.9 MiB, spread **0.07 %** | < 5 % |
+| fd count | 163 → 163 (transient 165), **0 %** growth | < 20 % |
+| `metric_series` max | 16 | ≤ 2000 |
+| loss outside induced windows | **0** steady-phase events | 0 |
+| kernel maps before/after | byte-identical (`maps.diff` empty) | unchanged |
+
+RSS starts at 20.4 MiB and reaches its plateau within the first samples,
+flat for the rest of the run (last hundreds of samples identical at
+21.90 MiB):
+
+```
+RSS over time (20.4..21.9 MiB, 2400 samples):
+_=====================================================######
+```
+
+All disturbance accounting landed where it should: the 10 induced-loss
+windows produced **532 resync / 1.08 M dropped events, every one in a
+`recovery`-phase sample** — the 2342 `steady` samples and the `restart`
+window showed zero counter growth. That is the Р53 property proven, not
+assumed: the agent loses events only when deliberately frozen, and each
+window recovers (resync stops growing once the recovery window closes).
+The agent stayed up the whole 10 h and exited cleanly; kernel maps did not
+grow (no map leak), fds did not grow (no descriptor leak), RSS did not
+creep (no allocation leak).
+
+**Finding — unbounded stderr under TLS connection churn.** The TLS churn
+generator (`pgbench -C`, ~80 reconnects/s) exposed a per-connection log
+line — `conn=… TLS detected, switching to decrypted channel` — that grew to
+**2.9 M lines / 191 MB of agent stderr in 10 h**. Harmless to RSS/fds (it
+goes to a file, so the PASS verdict stands), but it would fill a disk in a
+long-lived deployment under TLS churn. Fixed to log the channel switch
+**once** (`latkit: TLS capture active …`); per-connection counts already
+live in `latkit_tls_connections_total`. Verified: a smoke run with 6 TLS
+connections now logs exactly one such line and 243 total (16 KB) instead of
+millions. This is the kind of thing the soak exists to catch. (The 10 h
+`samples.tsv` was not retained, so the PNG above is the report's ASCII
+sparkline; a confirmation re-run on the fixed build reproduces the plot.)
 
 ## Nightly memory checking (stage 8.5, Р53)
 

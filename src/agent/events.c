@@ -54,6 +54,7 @@ struct lk_events {
     struct lk_selfstats *selfstats; /* process_* provider (task 4.4) */
     struct lk_prom *prom;           /* Prometheus /metrics server (task 5.1), NULL if off */
     struct lk_otlp *otlp;           /* OTLP/HTTP push exporter (task 5.2), NULL if off */
+    bool tls_logged;                /* one-shot: "TLS capture active" logged once (see below) */
     __u64 proc_ns;                  /* cumulative time spent draining/processing the ringbuf,
                                        nanoseconds; the self-overhead counter's source (Р27). */
 };
@@ -588,13 +589,19 @@ static int handle_event(void *ctx, void *data, size_t size)
     case LK_DEC_DATA:
         if (e->cfg.events)
             print_data_event(ev.view.data, ev.view.cap_len, e->cfg.hexdump);
-        if (ev.tls_now)
-            /* One-time log; the HEADERS flip itself is apply_cap_policy's job
-             * (LK_CONN_TLS is set by now). Ciphertext socket events are dropped
-             * from here on and the framer has been reset to startup — the
-             * plaintext source is now the stage-6 uprobe channel (Р38). */
-            fprintf(stderr, "latkit: conn=%llx TLS detected, switching to decrypted channel\n",
-                    (unsigned long long)ev.view.hdr->conn_id);
+        if (ev.tls_now && !e->tls_logged) {
+            /* Log the channel switch ONCE globally, not once per connection: the
+             * operator only needs to know TLS capture is live; per-connection
+             * counts live in latkit_tls_connections_total. A per-conn line here
+             * grows unbounded under connection churn — the 10 h soak (task 8.5)
+             * produced ~2.9 M lines / 191 MB from a TLS reconnect workload. The
+             * HEADERS flip itself is apply_cap_policy's job (LK_CONN_TLS is set
+             * by now); ciphertext socket events are dropped from here on and the
+             * framer has been reset to startup — the plaintext source is now the
+             * stage-6 uprobe channel (Р38). */
+            e->tls_logged = true;
+            fprintf(stderr, "latkit: TLS capture active (decrypted channel via libssl uprobes)\n");
+        }
         if (ev.decrypted_early)
             /* Р38 says 'S' precedes any decrypted byte; if this fires the
              * correlation or ordering assumption broke — frame it best-effort. */
