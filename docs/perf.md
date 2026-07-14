@@ -150,6 +150,82 @@ Conclusions for the Р54 go/no-go (final decisions belong to task 8.6):
 - Uprobe channel: the D−C delta lives in postgres-side uprobe cost (Р40
   row gets a real, quantified trigger: ~25 µs/query).
 
+## Р54 optimisation decisions (stage 8.6)
+
+The stage-8 rule (Р54): a prepared optimisation is taken **only** if a Р49
+gate fails or a profile shows a coherent ≥ 10 % CPU concentration. Neither
+happened — gates passed with ~2× margin (§ Results), the largest profile
+cluster is ~8–12 % and every isolated site is ≤ 5 % (§ Profiles), and the
+soak saw zero steady-state loss (§ Long-run). So the expected outcome holds
+(STAGE8 §Р54, "не дойдёт"): **no go-rows for v1.0.** Each prep gets an
+explicit ruling below — `go` (do it in 8.6), `v1.1` (real signal, does not
+block v1.0), or `drop` (data showed it unneeded) — with the datum it rests on.
+
+| Prep | Origin | Verdict | Data it rests on |
+|---|---|---|---|
+| Second thread / lock-free aggregation | Р8 | **v1.1** | Single-thread pipeline ceiling ≈ 150–200k qps/core (saturation probe); the v1 target (50k) uses under half a core and passes the gate 2×. The "pipeline thread is the budget bottleneck" trigger does not fire at target — only past 150k qps/core, where the agent already drops-and-counts honestly. Revisit if a deployment sustains that rate; it is an architecture decision (own Р-number), not a tweak. |
+| Seq-loss attribution to one direction | Р9 | **drop** | Long-run: **0 resync in 2342 steady samples**; all 532 resyncs landed inside induced-loss windows. The "resync notable on clean load" trigger never fired — the cost of dirtying both directions is paid only on real loss, which on clean load is zero. Nothing to optimise. |
+| Dynamic capture_mode flip FULL↔HEADERS | Р21 | **drop** | B (probes, no pipeline) is free — 0.000 agent cores, ΔTPS −0.01 %. The measurable step is B→C, i.e. the whole pipeline, not isolated body copying; capture already byte-budgets bodies (headers + prefixes only). No "body-copy cost dominates the B→C delta" signal to act on. |
+| fp cache by raw text pointer/length | stage 4 | **v1.1** | The one borderline signal. The normalisation cluster (`lk_norm_sql` + `out_token` + XXH3) is ~8 % at 50k select, ~12 % on TPC-B — it grazes the ≥ 10 % trigger on write-heavy SQL only, and fails no gate. Kept as **watch**: a pointer/length fp cache is the first lever if a real norm-bound deployment appears. `bench_reasm`/`bench_spans` (see below) make the adjacent alloc cost visible for that future work. |
+| Pin hot fp against counter reset | stage 4 | **drop** | No signal (no reset complaint in practice), and the scenario is already handled downstream: Prometheus detects counter resets via `rate()`, and a top-K LRU eviction is a normal series end-of-life, not corruption. Speculative; reopen only on a concrete report. |
+| Registry sharding / RCU | Р26 | **drop** | Registry + dump are ≤ 3 % in every profile; the soak saw no dump/aggregation contention and no scrape-induced loss. `metric_series` peaked at 16 (ceiling 2000), so the registry is tiny. No signal. |
+| Incremental metric dump (`lk_metrics_iter`) | stage 5 | **drop** | Dump ≤ 3 % of profile; the soak's 15 s Prometheus witness scraped throughout and produced **0 steady-state loss** — the single-threaded full dump never blocked the pipeline into a drop. With `metric_series` ≈ 16 the dump is trivially small. No signal. |
+| SSL_read-only + timing reconstruction | Р40 | **v1.1** | The best-quantified trigger: the TLS uprobe channel costs the *observed postgres* +1.19 cores (select) / +1.38 (TPC-B) at 50k qps — ~24–28 µs/query — for four SSL_* uprobe+uretprobe hits (§ pgSCPU). But (a) it is **postgres-side** CPU; the agent's own gate passes, and (b) dropping `SSL_write`/uretprobes loses the send-side timestamp the Q→Z model (Р16/Р25) depends on, so reconstructing timings from read boundaries is a design change, not a tweak. Real, deferred, needs design. |
+
+**Alloc micro-benches (not a Р54 table row).** `tests/bench/micro/`
+(`bench_reasm`, `bench_spans`) count allocs/op on the two hottest allocating
+sites — the reassembly body-prefix buffer (Р11) and the span `db.query.text`
+copy (Р32) — both ~1.0 alloc/op today. They exist so a future init-time arena
+move is visible without a profiler. Neither is on a hot loop the profile flags
+(the reassembly malloc fires only for messages torn across event boundaries;
+the span copy only with sampling on, and is drained), and the static-inlining
+alternative for the reassembly buffer was already rejected (2 GiB at
+`max_conns=65536`). Verdict: **v1.1 nicety**, no budget signal — the malloc
+stays for v1.0.
+
+**Net: 0 go, 3 v1.1 (second thread, fp cache, SSL_read-only), 5 drop.** No
+deferred optimisation is left without a ruling; v1.0 ships single-threaded,
+malloc-per-op where it already is, with no capture-mode flip — every one of
+those choices now backed by a datum rather than left hanging.
+
+## Control benchmark after stage-8 fixes (stage 8.6)
+
+Between the 8.1 campaign and the v1.0 tag the hot path took only three
+fixes, all of which the fuzz/soak work surfaced:
+
+- **decode `dir` bounds check** (8.3): one `dir < LK_DIR_N` guard before
+  `frame[dir]` — a single predictable branch on a byte already in a register.
+- **`pg_wire_init` NULL-guard** (8.3): `body ? body + cap : body` replacing
+  `body + cap` — a branch that only differs for a zero-length body, off the
+  bulk path.
+- **TLS log-once** (8.5): *removes* a per-connection `fprintf` from the TLS
+  attach path — strictly less work under TLS churn, zero effect plaintext.
+
+None restructures the framer, parser or normaliser loops the profile
+measures. The confirmation ABAB campaign on the fixed build (2026-07-14,
+`v0.9.0-rc2-17-g7e8c246`, same stand) reproduces the 8.1 result — **GATE
+PASS**, ΔTPS noise-level, agent CPU at or slightly below 8.1:
+
+```
+workload cfg runs    dTPS%   agent cores/50k   pgSCPU   vs 8.1 (agent)
+select   B   5+5    -0.02%       0.000          +0.02   0.000  (=)
+select   C   5+5    +0.05%       0.239          +0.22   0.310  (-0.07)
+select   D   5+2    +0.07%       0.366          +1.15   0.447  (-0.08)
+select   E   5+5    +0.05%       0.246          +0.27   0.241  (=)
+tpcb     B   5+5    -0.25%       0.000          -0.03   0.000  (=)
+tpcb     C   5+5    +0.08%       0.228          +0.28   0.292  (-0.06)
+tpcb     D   5+3    +0.27%       0.349          +1.34   0.430  (-0.08)
+tpcb     E   5+5    +0.06%       0.229          +0.34   0.231  (=)
+```
+
+Every ΔTPS is ≤ 0.27 % (gate < 3 %); agent CPU is ≤ 0.37 cores/50k on the
+worst config (TLS), well under the 1-core gate — the C/D figures land a
+hair below 8.1 (run-to-run variance, plus the TLS log-once trimming the D
+attach path), so the budget is confirmed, not merely unregressed. Same
+validity discipline: 5 of the D pairs were discarded for residual resyncs,
+none of the counted runs lost an event. The full unit + replay suite (23
+tests) is green on the fixed build. These are the final v1.0 numbers.
+
 ## Fixes that landed during 8.1
 
 The benchmark's validity rule caught three real capture-quality bugs on
