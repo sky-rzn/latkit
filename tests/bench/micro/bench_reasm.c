@@ -21,7 +21,7 @@
 
 /* Body size of the framed message. <= LK_MSG_BODY_MAX so body_target == BODY
  * and the two events complete the message exactly (one malloc, no SKIP tail). */
-#define BODY 512
+#define BODY  512
 #define SPLIT 256 /* body bytes carried by the first event */
 
 static volatile uint64_t g_sink; /* keep emit observable */
