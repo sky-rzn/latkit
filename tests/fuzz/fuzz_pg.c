@@ -153,6 +153,7 @@ int lk_pg_fuzz_one(const uint8_t *data, size_t n)
     lk_conn_table_close(tbl, 0x1234, 1, 4000, &lost);
 
     lk_conn_table_free(tbl);
+    lk_reasm_free(&reasm); /* drain the recycled body-prefix slab pool (Р11) */
     lk_proto_free(proto);
     return 0;
 }
