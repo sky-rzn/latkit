@@ -1,14 +1,14 @@
 {
   "uid": "latkit-health",
   "title": "latkit — Agent health",
-  "description": "All self-metrics: losses, cardinality, OTLP, TLS, cgroup, process.",
+  "description": "All self-metrics: losses, cardinality, OTLP, TLS, cgroup, process, pipeline overhead.",
   "tags": [
     "latkit",
     "postgres"
   ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "editable": true,
   "graphTooltip": 1,
   "refresh": "10s",
@@ -778,6 +778,126 @@
         }
       ],
       "description": "cgroup paths = 0 while --cgroup is set means a misconfigured glob (Р48)."
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Agent CPU: pipeline vs total",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 28
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_process_seconds_total[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "pipeline cores"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(process_cpu_seconds_total[$__rate_interval]))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "process cores (total)"
+        }
+      ],
+      "description": "Cores-worth of CPU spent draining and parsing the ringbuf vs the whole process. The gap is ringbuf syscalls, epoll and HTTP scrapes — this isolates the parse/reassembly/correlation cost (Р27)."
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Mean per-event overhead",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_process_seconds_total[$__rate_interval])) / sum(rate(latkit_events_total[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "s/event"
+        }
+      ],
+      "description": "Wall time the agent spends processing one ringbuf record: process_seconds / events. Climbs when the parser or reassembly hits pathological input."
     }
   ],
   "__generated_by": "dashboards/README.md gen (Р42) — export from Grafana on edit"

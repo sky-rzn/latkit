@@ -8,7 +8,7 @@ provisioning depend on them, so don't change them:
 | `latkit-overview.json` | `latkit-overview` | QPS, p50/p95/p99, error rate, connections, transaction duration, capture honesty |
 | `latkit-queries.json` | `latkit-queries` | top-N normalised queries by p99 / total time / frequency / errors (data link → drilldown) |
 | `latkit-drilldown.json` | `latkit-drilldown` | one `$db`/`$user`/`$query` selection: latency, first-row, rows, SQLSTATE |
-| `latkit-health.json` | `latkit-health` | every agent self-metric: losses, cardinality, OTLP, TLS, cgroup, `process_*` |
+| `latkit-health.json` | `latkit-health` | every agent self-metric: losses, cardinality, OTLP, TLS, cgroup, `process_*`, pipeline overhead |
 
 ## Design rules (enforced by `lint.sh`)
 

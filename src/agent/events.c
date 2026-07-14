@@ -54,7 +54,20 @@ struct lk_events {
     struct lk_selfstats *selfstats; /* process_* provider (task 4.4) */
     struct lk_prom *prom;           /* Prometheus /metrics server (task 5.1), NULL if off */
     struct lk_otlp *otlp;           /* OTLP/HTTP push exporter (task 5.2), NULL if off */
+    __u64 proc_ns;                  /* cumulative time spent draining/processing the ringbuf,
+                                       nanoseconds; the self-overhead counter's source (Р27). */
 };
+
+/* Monotonic clock for the self-overhead timer. CLOCK_MONOTONIC is a vDSO read
+ * (~20 ns, no syscall), so wrapping a whole ringbuf drain in it is essentially
+ * free — the cost amortises across every record the drain processes. */
+static __u64 now_ns(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (__u64)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
 
 /* --- --queries logger (stage 3): the standard consumer of the parser -------
  * Prints one line per session (AuthenticationOk) and per observation. Stage 4
@@ -285,6 +298,15 @@ static void ev_provide_stats(void *ctx, struct lk_metrics *m)
         lk_metrics_set_counter(m, "latkit_events_total", "Records submitted to the ringbuf.",
                                (double)sum[LK_ST_EVENTS]);
     }
+
+    /* Self-overhead (Р27): cumulative wall time the agent spent draining and
+     * processing the ringbuf. rate() of this is the CPU-cores-worth burned in
+     * the pipeline; divided by rate(latkit_events_total) it is the mean
+     * per-event processing cost. Isolates the parse/reassembly/correlation path
+     * from process_cpu_seconds_total, which bills the whole process. */
+    lk_metrics_set_counter(m, "latkit_process_seconds_total",
+                           "Cumulative time spent draining and processing the ringbuf, seconds.",
+                           (double)e->proc_ns / 1e9);
 
     const struct lk_reasm_stats *rs = &e->pipe.reasm.st;
 
@@ -603,8 +625,15 @@ static int handle_event(void *ctx, void *data, size_t size)
 static int on_ringbuf_ready(void *ctx)
 {
     struct lk_events *e = ctx;
+    __u64 t0 = now_ns();
     int n = ring_buffer__consume(e->rb);
 
+    /* The whole drain — decode -> conn table -> framer -> PG parser -> sinks for
+     * every record consumed — is the agent's own processing overhead (Р27).
+     * Paired with latkit_events_total in PromQL, rate() gives cores burned in
+     * the pipeline and the mean per-event cost. Accrued even on the n<0 path so
+     * a partial drain still bills its work. */
+    e->proc_ns += now_ns() - t0;
     if (n < 0) {
         fprintf(stderr, "ring_buffer__consume: %d\n", n);
         return n;
