@@ -47,7 +47,8 @@ struct lk_spans_cfg {
 /* One collected span, drained by the OTLP traces encoder. Timings are still
  * CLOCK_MONOTONIC — the encoder converts them to Unix-epoch ns via the timebase
  * at export (Р33). text is a bounded copy of the raw (or, when masked, the
- * normalised) SQL, freed by the drain; NULL on a NO_TEXT observation. */
+ * normalised) SQL, pointing into the collector's text arena (not owned by the
+ * span, not freed per-drain); NULL on a NO_TEXT observation. */
 struct lk_span {
     uint8_t trace_id[16];
     uint8_t span_id[8];

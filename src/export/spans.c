@@ -23,6 +23,10 @@ struct lk_spans {
     uint64_t seed;     /* mixed into the sampling hash */
     uint64_t id_state; /* splitmix64 stream for trace/span ids */
 
+    /* One contiguous text-store slab: slot i owns [i*text_max, (i+1)*text_max).
+     * Allocated once, so the hot path never touches the allocator; RSS stays
+     * lazy — only pages actually written by a span become resident. */
+    char *text_arena;
     struct lk_span ring[LK_SPAN_BUF];
     unsigned head, count; /* FIFO: pop at head, push at (head + count) % BUF */
     bool wm_fired;        /* 3/4 watermark fired since the last drain */
@@ -110,11 +114,11 @@ static void fill_text_and_name(struct lk_spans *s, struct lk_span *sp, const str
         uint32_t n = slen > s->text_max ? s->text_max : slen;
 
         if (n) {
-            sp->text = malloc(n);
-            if (sp->text) {
-                memcpy(sp->text, src, n);
-                sp->text_len = n;
-            }
+            char *dst = s->text_arena + (size_t)(sp - s->ring) * s->text_max;
+
+            memcpy(dst, src, n);
+            sp->text = dst; /* NULL stays NULL on n==0: the encoder gates on it */
+            sp->text_len = n;
         }
     }
 }
@@ -172,6 +176,15 @@ struct lk_spans *lk_spans_new(const struct lk_spans_cfg *cfg)
     s->cfg = *cfg;
     s->text_max = cfg->text_max ? cfg->text_max : LK_SPAN_TEXT_MAX_DEF;
 
+    /* One slab for all slots. Virtual size is LK_SPAN_BUF * text_max, but the
+     * kernel backs only the pages a span actually writes, so RSS tracks real
+     * query sizes, not the cap (Р11 spirit: small steady-state memory). */
+    s->text_arena = malloc((size_t)LK_SPAN_BUF * s->text_max);
+    if (!s->text_arena) {
+        free(s);
+        return NULL;
+    }
+
     if (cfg->sample_ratio >= 1.0) {
         s->ratio_always = true;
     } else if (cfg->sample_ratio > 0.0) {
@@ -200,8 +213,7 @@ void lk_spans_free(struct lk_spans *s)
 {
     if (!s)
         return;
-    for (unsigned i = 0; i < s->count; i++)
-        free(s->ring[(s->head + i) % LK_SPAN_BUF].text);
+    free(s->text_arena);
     free(s);
 }
 
@@ -218,8 +230,7 @@ void lk_spans_drain(struct lk_spans *s, void (*emit)(void *ctx, const struct lk_
 
         if (emit)
             emit(ctx, sp);
-        free(sp->text);
-        sp->text = NULL;
+        sp->text = NULL; /* text lives in the arena; refill memsets the slot */
         s->head = (s->head + 1) % LK_SPAN_BUF;
         s->count--;
     }

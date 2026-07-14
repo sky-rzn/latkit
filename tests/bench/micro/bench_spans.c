@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Hot-path micro-bench: the span collector's per-query text allocation (Р32).
  *
- * spans.c mallocs a fresh db.query.text buffer for every sampled span
- * (fill_text_and_name -> malloc(n)) and frees it on drain. With sampling on,
- * that is one malloc + one free on the *hottest* path there is — every
- * completed query. This bench drives lk_query_sink at sample_ratio=1.0 so each
- * op allocates, draining whenever the fixed ring (LK_SPAN_BUF) fills so the
- * next op keeps allocating instead of being dropped. Baseline reads
- * allocs/op ~= 1.0; an init-time text arena should drive it to ~0. */
+ * spans.c copies db.query.text for every sampled span (fill_text_and_name).
+ * With sampling on, that is on the *hottest* path there is — every completed
+ * query. This bench drives lk_query_sink at sample_ratio=1.0 so each op fills
+ * a span, draining whenever the fixed ring (LK_SPAN_BUF) fills so the next op
+ * keeps filling instead of being dropped. The text now lives in an init-time
+ * arena (one slab, slot i owns [i*text_max, ...)), so the measured loop does
+ * zero allocations — this bench guards that invariant. */
 #include <string.h>
 
 #include "bench_util.h"
@@ -69,8 +69,11 @@ int main(int argc, char **argv)
     t1 = bench_now_ns();
 
     bench_report("spans/text", t1 - t0, n);
-    if (g_alloc.calls == 0)
-        fprintf(stderr, "warning: no allocations counted (wrap not linked?)\n");
     lk_spans_free(s);
+    if (g_alloc.calls != 0) {
+        fprintf(stderr, "FAIL: hot path allocated %llu times (arena regressed)\n",
+                (unsigned long long)g_alloc.calls);
+        return 1;
+    }
     return 0;
 }
