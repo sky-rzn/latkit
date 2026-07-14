@@ -10,9 +10,37 @@
 
 void lk_reasm_init(struct lk_reasm *r, const struct lk_msg_sink *sink)
 {
-    memset(r, 0, sizeof(*r));
+    memset(r, 0, sizeof(*r)); /* pool_n = 0: empty freelist */
     if (sink)
         r->sink = *sink;
+}
+
+void lk_reasm_free(struct lk_reasm *r)
+{
+    while (r->pool_n)
+        free(r->pool[--r->pool_n]);
+}
+
+/* Freelist for the body-prefix slabs (Р11): every slab is LK_MSG_BODY_MAX, so
+ * any prefix fits and slabs are interchangeable. buf_get pops the pool or
+ * mallocs (NULL on OOM — the caller degrades, it does not abort); buf_put
+ * recycles it or, past the cap, hands it back to the allocator. The loop is
+ * single-threaded, so no lock. */
+static __u8 *buf_get(struct lk_reasm *r)
+{
+    if (r->pool_n)
+        return r->pool[--r->pool_n];
+    return malloc(LK_MSG_BODY_MAX);
+}
+
+static void buf_put(struct lk_reasm *r, __u8 *buf)
+{
+    if (!buf)
+        return;
+    if (r->pool_n < LK_REASM_POOL_MAX)
+        r->pool[r->pool_n++] = buf;
+    else
+        free(buf);
 }
 
 static __u32 be32(const __u8 *p)
@@ -27,11 +55,11 @@ static bool in_startup(const struct lk_frame *f, enum lk_dir dir)
     return dir == LK_DIR_RECV && !f->startup_done;
 }
 
-/* Back to HEADER at a message boundary; the body-prefix buffer is freed here,
- * not reused, so steady-state memory is ~0 (Р11). */
-static void msg_reset(struct lk_frame *f)
+/* Back to HEADER at a message boundary; the body-prefix slab is recycled to
+ * the freelist here (Р11), so steady-state heap churn is ~0. */
+static void msg_reset(struct lk_reasm *r, struct lk_frame *f)
 {
-    free(f->buf);
+    buf_put(r, f->buf);
     f->buf = NULL;
     f->buf_len = 0;
     f->hdr_len = 0;
@@ -40,10 +68,10 @@ static void msg_reset(struct lk_frame *f)
 
 /* Sync lost on this direction: drop the partial message and wait for a
  * resync anchor. Each cause has its own counter. */
-static void go_dirty(struct lk_frame *f, __u64 *counter)
+static void go_dirty(struct lk_reasm *r, struct lk_frame *f, __u64 *counter)
 {
     (*counter)++;
-    msg_reset(f);
+    msg_reset(r, f);
     f->skip_left = 0;
     f->resync_matched = 0;
     f->st = LK_FR_DIRTY;
@@ -55,7 +83,7 @@ static void go_dirty(struct lk_frame *f, __u64 *counter)
  * emitted message tells the consumer the context before it is lost. */
 static void do_resync(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, struct lk_frame *f)
 {
-    msg_reset(f); /* conn-table dirtying leaves partial-message state behind */
+    msg_reset(r, f); /* conn-table dirtying leaves partial-message state behind */
     f->skip_left = 0;
     f->resync_matched = 0;
     f->after_resync = 1;
@@ -134,14 +162,14 @@ static bool parse_header(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir,
     /* len includes itself; a startup message must at least carry the 4-byte
      * code. Anything shorter, or absurdly long, is corruption (Р10). */
     if (len < (startup ? 8u : 4u) || len > LK_MSG_LEN_MAX) {
-        go_dirty(f, &r->st.bad_len);
+        go_dirty(r, f, &r->st.bad_len);
         return false;
     }
     f->msg_type = startup ? 0 : f->hdr[0];
     f->msg_len = len;
     if (len == 4) { /* empty body: whole message was the header */
         emit(r, c, dir, f, NULL, 0);
-        msg_reset(f);
+        msg_reset(r, f);
     } else {
         f->st = LK_FR_BODY;
     }
@@ -214,11 +242,12 @@ void lk_frame_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, cons
             __u32 rem = target - f->buf_len;
 
             if (n < rem) {
-                /* Prefix incomplete: spill into the lazy buffer. On OOM
+                /* Prefix incomplete: spill into the lazy slab (recycled from
+                 * the freelist, LK_MSG_BODY_MAX so any target fits). On OOM
                  * degrade to emitting what this chunk holds and skipping the
                  * rest — capture quality drops, framing stays in sync. */
                 if (!f->buf)
-                    f->buf = malloc(target);
+                    f->buf = buf_get(r);
                 if (f->buf) {
                     memcpy(f->buf + f->buf_len, p, n);
                     f->buf_len += n;
@@ -235,7 +264,7 @@ void lk_frame_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, cons
             emit(r, c, dir, f, body, target);
             p += rem;
             n -= rem;
-            msg_reset(f);
+            msg_reset(r, f);
             if (skip) {
                 f->st = LK_FR_SKIP;
                 f->skip_left = skip;
@@ -297,7 +326,7 @@ void lk_frame_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64
          * let the resync sort it out — scanning ciphertext may cost a false
          * anchor or two (see the STAGE2.md risk table), never silence. */
         c->flags &= ~LK_CONN_SSL_REPLY;
-        go_dirty(f, &r->st.hdr_holes);
+        go_dirty(r, f, &r->st.hdr_holes);
         return;
     }
     if (f->st == LK_FR_DIRTY) {
@@ -312,7 +341,7 @@ void lk_frame_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64
         case LK_FR_HEADER:
             /* The next header is somewhere inside the hole — nothing to
              * learn its position from (Р9). */
-            go_dirty(f, &r->st.hdr_holes);
+            go_dirty(r, f, &r->st.hdr_holes);
             return;
         case LK_FR_BODY: {
             /* The header is known: emit the captured prefix now and advance
@@ -322,7 +351,7 @@ void lk_frame_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64
 
             emit(r, c, dir, f, f->buf, f->buf_len);
             n -= take;
-            msg_reset(f);
+            msg_reset(r, f);
             if (take < rem) {
                 f->st = LK_FR_SKIP;
                 f->skip_left = rem - take;
@@ -390,7 +419,7 @@ void lk_reasm_data(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir,
          * one it is expected post-loss debris. Either way re-adopt so the
          * call position stays coherent for the resync. */
         if (f->st != LK_FR_DIRTY)
-            go_dirty(f, &r->st.off_anomalies);
+            go_dirty(r, f, &r->st.off_anomalies);
         f->call_total = total;
         f->call_pos = off;
     } else if (off > f->call_pos) {

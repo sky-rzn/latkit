@@ -38,9 +38,19 @@
  * then everything is discarded until CLOSE. Message semantics are stage 3.
  *
  * Memory is bounded by construction (Р11): at most the body prefix of one
- * unfinished message is buffered per direction (<= LK_MSG_BODY_MAX,
- * allocated lazily when a message spans chunks, freed at the message
- * boundary); the body tail beyond the prefix is skipped by len.
+ * unfinished message is buffered per direction (<= LK_MSG_BODY_MAX, filled
+ * lazily when a message spans chunks, released at the message boundary); the
+ * body tail beyond the prefix is skipped by len. The buffer is a fixed
+ * LK_MSG_BODY_MAX slab drawn from a small agent-wide freelist (not per-conn),
+ * so the message boundary recycles it instead of malloc/free churning the
+ * allocator on every torn message — the hot path (large Query/Bind, COPY, or
+ * any body straddling a capture chunk) does zero heap ops in steady state.
+ * The freelist is capped at LK_REASM_POOL_MAX slabs, so the recycled pool
+ * ceiling is LK_REASM_POOL_MAX * LK_MSG_BODY_MAX regardless of connection
+ * count; churn above the cap falls back to real free. RSS stays lazy: the
+ * kernel backs only the pages a prefix actually writes, so a small torn
+ * message costs a page, not 16 KiB (keeps Р11's small steady-state memory).
+ * Single-threaded loop, so the freelist needs no lock.
  *
  * Pure state manipulation, no I/O: unit tests feed synthetic events, the
  * agent feeds decoded ringbuf records (events.c). */
@@ -53,8 +63,14 @@
 #include "latkit.h"
 
 /* Body prefix kept per message (Р11): larger than the stage-4 fingerprint
- * needs and than the default per-call capture budget. */
+ * needs and than the default per-call capture budget. Also the fixed size of
+ * every freelist slab — any prefix fits, so slabs are interchangeable. */
 #define LK_MSG_BODY_MAX (16 * 1024)
+
+/* Body-slab freelist cap (Р11): the recycled pool holds at most this many
+ * LK_MSG_BODY_MAX slabs, an agent-wide ceiling of 1 MiB independent of the
+ * connection count. Frees past the cap go to the real allocator. */
+#define LK_REASM_POOL_MAX 64
 
 /* Startup-message codes the framer distinguishes (Р10) — the first 4 body
  * bytes of a startup-framed message. Everything else about them is stage 3. */
@@ -107,9 +123,19 @@ struct lk_reasm_stats {
 struct lk_reasm {
     struct lk_msg_sink sink;
     struct lk_reasm_stats st;
+    /* Recycled body-prefix slabs (Р11): a fixed-size freelist shared across
+     * all connections. buf_get pops one or mallocs; the message boundary
+     * pushes it back (or really frees past LK_REASM_POOL_MAX). */
+    __u8 *pool[LK_REASM_POOL_MAX];
+    unsigned pool_n;
 };
 
 void lk_reasm_init(struct lk_reasm *r, const struct lk_msg_sink *sink);
+
+/* Release the recycled slab pool (the in-flight buffers are the conn table's;
+ * it frees them on entry teardown). Call once when the framer is done — the
+ * agent does it from lk_pipeline_fini. */
+void lk_reasm_free(struct lk_reasm *r);
 
 /* Chunk layer: derive bytes()/hole() from one decoded data event and feed
  * the framer. cap_len must be the decode-clamped value (lk_ev_view.cap_len),

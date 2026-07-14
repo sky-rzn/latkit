@@ -33,8 +33,9 @@ void lk_pipeline_fini(struct lk_pipeline *p)
 {
     if (!p)
         return;
-    lk_conn_table_free(p->conns);
+    lk_conn_table_free(p->conns); /* frees in-flight body buffers on teardown */
     p->conns = NULL;
+    lk_reasm_free(&p->reasm); /* drain the recycled body-slab pool */
 }
 
 void lk_pipeline_feed(struct lk_pipeline *p, const void *data, size_t size,

@@ -76,6 +76,7 @@ static void reset(void)
 
     free(conn.frame[0].buf);
     free(conn.frame[1].buf);
+    lk_reasm_free(&reasm); /* drain the recycled slab pool before re-init */
     memset(&conn, 0, sizeof(conn));
     lk_reasm_init(&reasm, &sink);
     nrecs = 0;
@@ -636,6 +637,9 @@ int main(void)
         test_cancel() || test_resync_backend() || test_resync_frontend() ||
         test_false_z_in_body() || test_synthetic_midsession())
         return 1;
+    free(conn.frame[0].buf);
+    free(conn.frame[1].buf);
+    lk_reasm_free(&reasm); /* drain the last test's recycled slabs */
     printf("ok\n");
     return 0;
 }

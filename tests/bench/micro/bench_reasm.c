@@ -9,10 +9,16 @@
  *
  * Each op frames a single backend 'D' message whose BODY bytes are delivered in
  * two events (header + first half, then the rest): the first event leaves an
- * incomplete prefix -> malloc(body); the second completes it -> emit + free.
- * Baseline reads allocs/op ~= 1.0. Note the static-inlining fix rejected for
- * this site (2 GiB at max_conns=65536) — the bench is here to justify keeping
- * the malloc, or to measure a grow-only variant if one is ever tried. */
+ * incomplete prefix -> a body slab; the second completes it -> emit + recycle.
+ *
+ * Before the Р11 freelist this was one malloc + one free per op (allocs/op
+ * ~= 1.0). The slab is now drawn from a fixed agent-wide freelist and returned
+ * at the message boundary, so steady state is zero heap ops: only the very
+ * first op mallocs, every op after it reuses the recycled slab -> allocs/op
+ * -> 0. The wrap-liveness warning below is now a regression guard: the hot
+ * path must not allocate per message. (Static-inlining the buffer into the
+ * frame was rejected — 2 GiB at max_conns=65536; the freelist keeps churn out
+ * without paying that.) */
 #include <linux/types.h>
 #include <string.h>
 
@@ -88,9 +94,14 @@ int main(int argc, char **argv)
     if (reasm.st.msgs != n)
         fprintf(stderr, "warning: framed %llu msgs, expected %llu (framing off)\n",
                 (unsigned long long)reasm.st.msgs, (unsigned long long)n);
-    if (g_alloc.calls == 0)
-        fprintf(stderr, "warning: no allocations counted (wrap not linked?)\n");
+    /* Regression guard (Р11 freelist): the hot path recycles, so only the
+     * warm-up op may malloc. More than a couple of allocs over millions of ops
+     * means the per-message churn is back. */
+    if (n > 1000 && g_alloc.calls > 4)
+        fprintf(stderr, "warning: %llu allocs over %llu ops — freelist not recycling?\n",
+                (unsigned long long)g_alloc.calls, (unsigned long long)n);
     free(conn.frame[0].buf);
     free(conn.frame[1].buf);
+    lk_reasm_free(&reasm); /* drain the recycled slab pool */
     return 0;
 }
