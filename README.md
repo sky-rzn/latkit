@@ -1,19 +1,19 @@
 # latkit
 
-**Per-query PostgreSQL latency, straight from the kernel — no extension, no
-config change, no database restart.**
+**Per-query PostgreSQL latency without extension, config change, and database restart.**
 
-latkit is an eBPF agent that watches the PostgreSQL wire protocol at the
+Latkit is an eBPF agent that watches the PostgreSQL wire protocol at the
 socket layer and turns it into per-query latency histograms: normalised query
 text, database/user labels, row counts, SQLSTATE errors, transaction timings.
 It exports to Prometheus and OpenTelemetry, ships with four ready-made Grafana
 dashboards, runs beside the database, and the database never knows it's there.
 
+
 ![latkit Overview dashboard](docs/img/latkit-overview.png)
 
 ## Try the demo (≈2 minutes)
 
-One command brings up the whole stack — PostgreSQL + a load generator + latkit
+One command brings up the whole stack: PostgreSQL + a load generator + latkit
 + Prometheus + Grafana with every dashboard provisioned. All you need is a
 Linux host with Docker and a BTF-enabled kernel ≥ 5.15 (any mainstream distro
 of the last few years):
@@ -24,40 +24,37 @@ cd latkit/deploy/demo
 docker compose up --build -d
 ```
 
-Open <http://localhost:3000/dashboards> (anonymous — no login) and start with
-**latkit — Overview**; live query latency shows up within a minute. TLS
-profile and troubleshooting: [deploy/demo/README.md](deploy/demo/README.md).
+Open <http://localhost:3000/dashboards> and start with **latkit - Overview**;
+live query latency shows up within a minute. TLS profile and troubleshooting:
+[deploy/demo/README.md](deploy/demo/README.md).
 
 ## Why latkit
 
-- **Zero-touch.** No PostgreSQL extension, no `shared_preload_libraries`, no
-  restart — point the agent at a running database and metrics start flowing.
-  Nothing runs inside PostgreSQL; the database doesn't know the agent exists.
+- **Zero-touch.** You don't need PostgreSQL extension, `shared_preload_libraries`
+  or restart. Point the agent at a running database and metrics start flowing.
+  Nothing runs inside PostgreSQL. The database doesn't know the agent exists.
 - **Server-side truth.** Latency is measured network-to-network on the DB
-  host — what the server actually took, per query, including everything
+  host. It's what the server actually took, per query, including everything
   `pg_stat_statements` never sees (parse, protocol round-trips, result
   streaming). See [the measurement model](#what-the-numbers-mean).
 - **Bounded cardinality by construction.** SQL is normalised to a fingerprint
   (literals → `?`), a top-K LRU caps the distinct `query` labels, and the rest
   folds into `query="other"`.
 - **Honest under loss.** Ringbuf drops and parser resyncs are counted and
-  dashboarded; an observation that spans a loss is discarded, never guessed.
+  dashboarded.
 - **TLS without decryption keys.** Encrypted sessions ride the same pipeline
-  via `libssl` uprobes — plaintext latency, no MITM, no private keys.
-- **Drops in anywhere.** One static binary (musl, ~4 MB), `FROM scratch`
-  Docker image, systemd unit, k8s DaemonSet.
+  via `libssl` uprobes. You don't need to pass private keys.
+- **Drops in anywhere.** One static binary (musl, ~4 MB), Docker image,
+  systemd unit or k8s DaemonSet.
 
 ## Installation
 
-Pick one; they are all the same binary configured through the same
-`LATKIT_*` environment layer (or flags). Operator-depth notes — the measured
-capability set, LSM caveats, k8s specifics — live in
-[docs/deploy.md](docs/deploy.md).
+You can install latkit using one of the following methods.
 
 ### Release binary
 
 Grab the tarball from the GitHub Releases page (statically linked, x86_64;
-runs on any distro — the only dependency is the kernel, see
+runs on any distro - the only dependency is the kernel, see
 [Requirements](#requirements)):
 
 ```sh
@@ -85,7 +82,7 @@ docker run -d --pid=host \
 For TLS capture add `-e LATKIT_TLS=auto --cap-add SYS_PTRACE --cap-add
 SYS_ADMIN` (see [Requirements](#requirements) for why). `--privileged` is
 the documented fallback when a runtime or LSM cannot express the
-fine-grained set — diagnosis recipes in [docs/deploy.md](docs/deploy.md).
+fine-grained set - diagnosis recipes in [docs/deploy.md](docs/deploy.md).
 
 ### systemd
 
@@ -100,12 +97,12 @@ sudo systemctl daemon-reload && sudo systemctl enable --now latkit
 
 The unit runs sandboxed (`ProtectSystem=strict`, `NoNewPrivileges`, a
 capability bounding set instead of full root); `/etc/latkit/latkit.env` is
-the only configuration surface — every `LATKIT_*` variable is documented in
+the only configuration surface - every `LATKIT_*` variable is documented in
 [the example file](deploy/systemd/latkit.env.example).
 
 ### Kubernetes
 
-A single-file DaemonSet, no Helm (v1 scope):
+A single-file DaemonSet:
 
 ```sh
 kubectl apply -f deploy/k8s/latkit-daemonset.yaml
@@ -113,7 +110,7 @@ kubectl apply -f deploy/k8s/latkit-daemonset.yaml
 
 `hostPID: true` + the capability set, `/healthz` probes, Prometheus scrape
 annotations, and a `LATKIT_CGROUP` glob to tell apart several postgres pods
-sharing port 5432 on one node — kubepods glob patterns per cgroup driver are
+sharing port 5432 on one node. Kubepods glob patterns per cgroup driver are
 tabulated in [docs/deploy.md](docs/deploy.md).
 
 ### From source
@@ -136,20 +133,18 @@ binary is built differently (fully static musl, in a container):
 - **Linux kernel 5.15+ with BTF** (`/sys/kernel/btf/vmlinux`). The hard
   floors underneath: BPF ringbuf (5.8), `bpf_get_socket_cookie` in tracing
   programs and BPF atomics (5.12), fentry/`tp_btf` trampolines. **5.15+ is
-  the supported floor — it is what the CI kernel matrix boots and asserts
+  the supported floor - it is what the CI kernel matrix boots and asserts
   (5.15, 6.1, 6.8, current stable; plaintext + TLS), so anything below is
   neither tested nor promised.** Without BTF the agent refuses at startup
-  with a message naming the missing piece — it never runs blind. Full
-  version-by-version support: [docs/deploy.md](docs/deploy.md#kernel-support).
-- **x86_64** release artifacts (arm64 is a v1.1 target — CO-RE does not
-  stand in the way, it is untested hardware).
-- **cgroup v2** (unified hierarchy) if you use `--cgroup`; a pure-v1 host
-  with the flag set is a fatal startup error, not a silent no-match.
+  with a message naming the missing piece. Full version-by-version support:
+  [docs/deploy.md](docs/deploy.md#kernel-support).
+- **x86_64** arm64 is untested.
+- **cgroup v2** if you use `--cgroup`.
 - **Dynamically linked OpenSSL** in the postgres processes for TLS capture
-  (`--tls auto`); everything else is detected and counted, not decrypted —
-  see [Known limitations](#known-limitations-v1).
-- **Privileges** — root, or the capability set below (measured; kernel/LSM
-  caveats and failure signatures in [docs/deploy.md](docs/deploy.md)):
+  (`--tls auto`). Everything else is detected and counted without decryption.
+  See [Known limitations](#known-limitations-v1).
+- **Privileges** - root, or the capability set below (kernel/LSM caveats and
+  failure signatures in [docs/deploy.md](docs/deploy.md)):
 
 | Capture | Capabilities | Why |
 |---|---|---|
@@ -162,15 +157,13 @@ never needed: fentry capture sees every netns of the host by construction.
 
 ## Configuration
 
-Flags and environment only — no config file in v1. Every flag has a
-`LATKIT_<UPPER_SNAKE>` equivalent; precedence is **flag > `LATKIT_*` env >
+Flags and environment only. Every flag has a `LATKIT_<UPPER_SNAKE>`
+equivalent; precedence is **flag > `LATKIT_*` env >
 standard `OTEL_*` env (OTLP group only) > default**. Booleans take
-`1`/`true`/`yes`/`on`; repeatable flags map to one comma-separated variable
+`1`/`true`/`yes`/`on`. Repeatable flags map to one comma-separated variable
 (`LATKIT_PORT=5432,5433`, `LATKIT_OTLP_HEADERS="k1=v1,k2=v2"`).
-`latkit --print-config` prints the resolved result without touching BPF —
-use it to verify a deployment's env layer. This table is checked against
-`latkit --help` by a CI test (`tests/unit/readme_flags.sh`), so it cannot
-drift from the binary.
+`latkit --print-config` prints the resolved result without touching BPF.
+Use it to verify a deployment's env layer.
 
 **Capture filters** (all active filters combine with AND):
 
@@ -193,7 +186,7 @@ drift from the binary.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--top-queries N` | `LATKIT_TOP_QUERIES` | `500` | distinct normalised queries tracked before the rest fold into `query="other"` — the main cardinality knob |
+| `--top-queries N` | `LATKIT_TOP_QUERIES` | `500` | distinct normalised queries tracked before the rest fold into `query="other"` - the main cardinality knob |
 | `--query-label-len N` | `LATKIT_QUERY_LABEL_LEN` | `256` | max chars of the normalised text kept as the `query` label |
 | `--first-row-hist` | `LATKIT_FIRST_ROW_HIST` | off | also record `latkit_query_first_row_seconds` (doubles the query-labelled series) |
 
@@ -203,13 +196,13 @@ inherits the ambient config):
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--prom-listen ADDR:PORT\|none` | `LATKIT_PROM_LISTEN` | `127.0.0.1:9752` | serve `/metrics` + `/healthz`; `none` disables. Loopback by default — bind `0.0.0.0` to scrape from outside the host |
+| `--prom-listen ADDR:PORT\|none` | `LATKIT_PROM_LISTEN` | `127.0.0.1:9752` | serve `/metrics` + `/healthz`; `none` disables. Loopback by default - bind `0.0.0.0` to scrape from outside the host |
 | `--otlp-endpoint URL` | `LATKIT_OTLP_ENDPOINT` | off | push OTLP/HTTP metrics to this Collector base URL (`http://` only); setting it **enables** the exporter. Falls back to `$OTEL_EXPORTER_OTLP_ENDPOINT` |
 | `--otlp-interval SEC` | `LATKIT_OTLP_INTERVAL` | `15` | OTLP export period |
-| `--otlp-header K=V` | `LATKIT_OTLP_HEADERS` | — | repeatable OTLP request header (auth for managed backends); falls back to `$OTEL_EXPORTER_OTLP_HEADERS` |
-| `--otlp-resource K=V` | `LATKIT_OTLP_RESOURCE` | — | repeatable OTLP resource attribute; falls back to `$OTEL_RESOURCE_ATTRIBUTES` |
-| — | `LATKIT_OTLP_SERVICE_NAME` | `latkit` | `service.name` in the OTLP resource; falls back to `$OTEL_SERVICE_NAME` |
-| `--otlp-spans RATIO` | `LATKIT_OTLP_SPANS` | off | sample this fraction `[0,1]` of queries as spans (**raw SQL leaves the host** — see [Security](#security)); needs `--otlp-endpoint` |
+| `--otlp-header K=V` | `LATKIT_OTLP_HEADERS` | - | repeatable OTLP request header (auth for managed backends); falls back to `$OTEL_EXPORTER_OTLP_HEADERS` |
+| `--otlp-resource K=V` | `LATKIT_OTLP_RESOURCE` | - | repeatable OTLP resource attribute; falls back to `$OTEL_RESOURCE_ATTRIBUTES` |
+| - | `LATKIT_OTLP_SERVICE_NAME` | `latkit` | `service.name` in the OTLP resource; falls back to `$OTEL_SERVICE_NAME` |
+| `--otlp-spans RATIO` | `LATKIT_OTLP_SPANS` | off | sample this fraction `[0,1]` of queries as spans (**raw SQL leaves the host** - see [Security](#security)); needs `--otlp-endpoint` |
 | `--otlp-spans-slow-ms N` | `LATKIT_OTLP_SPANS_SLOW_MS` | off | also sample every query at least N ms long |
 | `--otlp-span-text-max N` | `LATKIT_OTLP_SPAN_TEXT_MAX` | `4096` | cap `db.query.text` at N bytes |
 | `--otlp-span-masked` | `LATKIT_OTLP_SPAN_MASKED` | off | send the normalised (literal-free) SQL as `db.query.text` instead of the raw text |
@@ -222,7 +215,7 @@ inherits the ambient config):
 | `--libssl PATH` | `LATKIT_LIBSSL` | off | attach the `SSL_*` uprobes to this exact libssl, skipping the scan (e.g. a container's copy); a missing file is fatal |
 | `--tls-comm NAME` | `LATKIT_TLS_COMM` | `postgres` | with `--tls auto`, scan only processes with this exact comm |
 
-**Debug / diagnostics** (off by default; noisy — not for production):
+**Debug / diagnostics** (off by default; noisy, not for production):
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
@@ -233,17 +226,17 @@ inherits the ambient config):
 | `-x, --hexdump` | `LATKIT_HEXDUMP` | off | dump event payload (`--events`) and the captured body prefix (`--messages`) |
 | `--dump-metrics[=FILE]` | `LATKIT_DUMP_METRICS` | off | write the Prometheus exposition on `SIGUSR1` and at exit, to FILE (default: stderr) |
 | `--cap-headers` | `LATKIT_CAP_HEADERS` | off | test hook: switch every connection to HEADERS capture mode (64 B/call) at OPEN |
-| `--print-config` | — | — | resolve config (flag > env > default) to stdout and exit; no BPF |
-| `--version` | — | — | print the agent version and exit |
-| `-h, --help` | — | — | print the flag reference and exit |
+| `--print-config` | - | - | resolve config (flag > env > default) to stdout and exit; no BPF |
+| `--version` | - | - | print the agent version and exit |
+| `-h, --help` | - | - | print the flag reference and exit |
 
 ## What the numbers mean
 
 latkit measures **server-side, network-to-network** time: from the query's
-arrival at the server's TCP socket to the completion of the reply — at
+arrival at the server's TCP socket to the completion of the reply - at
 syscall granularity (`bpf_ktime_get_ns` per `send`/`recv` call; messages
 packed into one syscall share a timestamp). For a simple query that is
-`Query` → `CommandComplete`; for the extended protocol, `Bind`/`Execute` →
+`Query` → `CommandComplete`. For the extended protocol, `Bind`/`Execute` →
 its completion, with pipelined batches attributed per execution unit rather
 than per shared `ReadyForQuery`. Time to first row
 (`latkit_query_first_row_seconds`, opt-in) and transaction spans
@@ -252,28 +245,11 @@ than per shared `ReadyForQuery`. Time to first row
 This is deliberately **not** the same number as `pg_stat_statements.
 mean_exec_time`, which times only the executor: latkit's span additionally
 contains parse/plan protocol handling, result serialisation and streaming,
-and the kernel socket path on the server side — i.e. what the *client*
+and the kernel socket path on the server side - i.e. what the *client*
 experiences minus the network RTT and the client itself.
 
-The difference is **measured**, not assumed
-([docs/accuracy.md](docs/accuracy.md), reproducible via
-`tests/bench/accuracy/run.sh`): joined against PostgreSQL's own csvlog
-through latkit's normaliser, statement counts match **exactly** on a
-lossless run, per-SQLSTATE errors and row counts match injected ground
-truth, p50/p95 agree within the histogram-bucket arithmetic for queries
-≥ 1 ms, and the systematic offset (agent ≥ log, by the model above) is
-**+6…+10 µs per query on loopback** (simple protocol; +13…+25 µs
-extended, whose parse/bind/execute gaps land in latkit's span only —
-rising to tens of µs on multi-ms, row-heavy statements). For sub-100 µs
-queries that offset is a real fraction of the number: at that scale
-latkit and the executor timer measure genuinely different spans. Full
-rationale and the parser's blind spots:
-[docs/notes-pgproto.md](docs/notes-pgproto.md),
-[docs/notes-metrics.md](docs/notes-metrics.md).
-
-Honesty guarantees, since an observer that silently degrades is worse than
-none: every ringbuf drop is counted twice (globally and per-connection), a
-query observation that spans a loss is discarded and counted
+Honesty guarantees, every ringbuf drop is counted twice (globally and
+per-connection), a query observation that spans a loss is discarded and counted
 (`latkit_queries_dropped_total{reason}`), parser resyncs are metrics, and
 the Overview dashboard pins a "capture degraded" annotation to any window
 with non-zero drops.
@@ -283,16 +259,14 @@ with non-zero drops.
 Measured with paired ABAB runs against a no-agent baseline at ~50k
 queries/s (pgbench select-only `-c 128` and TPC-B `-c 100`), counting only
 runs with **zero** capture loss ([docs/perf.md](docs/perf.md) has the full
-method, tables and reproduction script — `tests/bench/run.sh`):
+method, tables and reproduction script - `tests/bench/run.sh`):
 
 - **Workload impact: none measurable.** ΔTPS vs baseline is within ±0.2%
-  (v1.0 gate: < 3%) for plaintext, TLS and OTLP-export configurations.
-- **Agent CPU**: 0.31 cores per 50k queries/s plaintext, 0.45 with TLS
-  (v1.0 gate: < 1 core). RSS ~25 MiB under load.
+  for plaintext, TLS and OTLP-export configurations.
+- **Agent CPU**: 0.31 cores per 50k queries/s plaintext, 0.45 with TLS.
+  RSS ~25 MiB under load.
 - **TLS uprobe tax**: with `--tls`, the *observed postgres* pays
-  ~25 µs CPU per query for the `SSL_*` uprobes — that is the price of the
-  decryption-free plaintext channel, and it lands on the database, not
-  the agent.
+  ~25 µs CPU per query for the `SSL_*` uprobes.
 - Past the budget (this stand saturates the single pipeline thread at
   ~150–200k queries/s per core) the agent **drops and counts** rather
   than degrading silently.
@@ -301,68 +275,65 @@ method, tables and reproduction script — `tests/bench/run.sh`):
 
 - **The agent sees SQL text; masking is on by default and by construction.**
   Normalisation turns every literal into `?` before text can reach a metric
-  label; raw SQL never enters the metrics registry. This holds for TLS
-  sessions identically — with `--tls`, latkit reads decrypted buffers from
+  label. Raw SQL never enters the metrics registry. This holds for TLS
+  sessions identically - with `--tls`, latkit reads decrypted buffers from
   `libssl`, so wire encryption is not a privacy boundary against an agent
   on the DB host.
 - **Raw SQL leaves the agent only in OTel spans, which are off by default**
-  (`--otlp-spans`). Enable them deliberately; `--otlp-span-masked`
+  (`--otlp-spans`). Enable them deliberately. `--otlp-span-masked`
   substitutes the normalised text where literals must not leave the host.
 - **Own endpoints bind loopback by default** (`--prom-listen
-  127.0.0.1:9752`) and speak plain HTTP with no auth in v1 — exposing them
-  (`0.0.0.0`) is an explicit choice; front with a reverse proxy outside a
-  trusted scrape network. `--otlp-endpoint` is `http://` only — put TLS in
+  127.0.0.1:9752`) and speak plain HTTP with no auth. Exposing them
+  (`0.0.0.0`) is an explicit choice. Front with a reverse proxy outside a
+  trusted scrape network. `--otlp-endpoint` is `http://` only - put TLS in
   front of a remote Collector.
 - **`CAP_SYS_PTRACE` + `hostPID`** (TLS capture only) grant the agent read
-  access to other processes' `/proc/<pid>` — that is precisely what the
+  access to other processes' `/proc/<pid>` - that is precisely what the
   libssl autodetect needs and the reason the plaintext-only deployment can
-  drop both (see the unit/DaemonSet comments).
+  drop both.
 
-## Known limitations (v1)
+## Known limitations
 
 - **TLS: dynamically linked OpenSSL only.** Everything else is *detected*
-  and its ciphertext dropped-and-counted (`latkit_tls_*` metrics), never
-  silently mis-parsed: statically linked OpenSSL, GnuTLS/NSS, and GSSENC
-  (Kerberos encryption) are out of scope; BoringSSL may work through the
-  offset-independent bridge but is untested.
+  and its ciphertext dropped-and-counted (`latkit_tls_*` metrics).
+  Statically linked OpenSSL, GnuTLS/NSS, and GSSENC (Kerberos encryption)
+  are out of scope. BoringSSL may work through the offset-independent
+  bridge but is untested.
   [docs/notes-tls.md](docs/notes-tls.md) §6.
 - **Unix-domain sockets are invisible** (`tcp_*` hooks are not on that
-  path) — planned v1.1 (`unix_stream_sendmsg/recvmsg` hooks).
+  path). Planned v1.1 (`unix_stream_sendmsg/recvmsg` hooks).
 - **`splice()`-relayed traffic** (e.g. docker-proxy on published ports)
-  bypasses the capture point: sends degrade to honest zero-payload events,
+  bypasses the capture point. Sends degrade to honest zero-payload events,
   receives are missed entirely. Irrelevant for the intended
-  agent-on-the-DB-host deployment; details in
+  agent-on-the-DB-host deployment. Look for details in
   [docs/notes-iov.md](docs/notes-iov.md).
 - **No TLS/auth on the agent's own endpoints** (`/metrics`, `/healthz`,
-  OTLP client) — loopback default plus a reverse proxy is the v1 answer.
+  OTLP client).
 - **Prometheus exposition is classic `le`-buckets only.** For native
-  histograms, don't scrape — point the OTLP exporter at Prometheus's
-  `otlp-write-receiver` (or a Collector); the agent's
+  histograms point the OTLP exporter at Prometheus's
+  `otlp-write-receiver` (or a Collector). The agent's
   `ExponentialHistogram` lands as a native histogram losslessly.
 - **cgroup filter requires cgroup v2**, and a pod recreated between
   re-resolve ticks loses its first ≤ 30 s of capture (glob re-resolve
-  period) — structural globs instead of pod-uid globs keep the window that
-  small; see [docs/deploy.md](docs/deploy.md).
-- **x86_64 release artifacts only**; arm64 is v1.1.
-- **No YAML config** — flags + env are the v1 surface (a config file is
-  deferred until real demand).
+  period). See [docs/deploy.md](docs/deploy.md).
+- **x86_64 release artifacts only**.
 
 ## How it works
 
 ```
-        kernel                                userspace (one process, one epoll loop)
-┌───────────────────────────┐  ringbuf   ┌────────────────────────────────────────┐
-│ fentry tcp_sendmsg        │ ─────────▶ │ conn table → framer → PG v3 parser     │
-│ fentry/fexit tcp_recvmsg  │  events    │  → SQL normaliser → top-K registry     │
-│ tp_btf inet_sock_set_state│            │  → /metrics (pull) + OTLP push + spans │
+        kernel                             userspace (one process, one epoll loop)
+┌───────────────────────────┐            ┌────────────────────────────────────────┐
+│ fentry tcp_sendmsg        │  ringbuf   │ conn table → framer → PG v3 parser     │
+│ fentry/fexit tcp_recvmsg  │ ─────────▶ │  → SQL normaliser → top-K registry     │
+│ tp_btf inet_sock_set_state│  events    │  → /metrics (pull) + OTLP push + spans │
 │ uprobes SSL_read/SSL_write│            │                                        │
 └───────────────────────────┘            └────────────────────────────────────────┘
 ```
 
 The kernel side does the minimum: filter (port AND comm AND cgroup), stamp,
-and ship raw payload chunks with per-connection sequencing; all protocol
+and ship raw payload chunks with per-connection sequencing. All protocol
 intelligence lives in userspace, where a lost event is a countable gap
-instead of a corrupted parse. TLS sessions ride the same pipeline — the
+instead of a corrupted parse. TLS sessions ride the same pipeline - the
 uprobes substitute plaintext for the socket ciphertext under the same
 connection identity, and the socket-layer copy is dropped and counted. The
 layer-by-layer write-ups: [docs/notes-iov.md](docs/notes-iov.md) (payload
@@ -372,19 +343,18 @@ capture), [docs/notes-reassembly.md](docs/notes-reassembly.md) (framing),
 cardinality), [docs/notes-export.md](docs/notes-export.md) (exporters),
 [docs/notes-tls.md](docs/notes-tls.md) (TLS).
 
-The metric nomenclature is a public API (fixed since M2):
+The metric nomenclature is a public API:
 `latkit_query_duration_seconds{query,db,user,code}` histograms,
 `latkit_queries_total`, `latkit_query_errors_total{sqlstate}`,
 `latkit_query_rows_total`, connection/transaction series, and the agent
 self-metrics (`latkit_ringbuf_dropped_total`, `latkit_resync_total`,
 `latkit_metric_series`, …) that feed the **Agent health** dashboard.
-A valid exposition is one signal away with no exporter configured:
-`latkit --dump-metrics` + `kill -USR1`.
+For a valid exposition use `latkit --dump-metrics` + `kill -USR1`.
 
 ## Development
 
-Dev builds stay dynamic glibc (sanitizers don't mix with musl `-static`);
-the dev stand is PostgreSQL 16 in Docker plus pgbench:
+Dev builds stay dynamic glibc (sanitizers don't mix with musl `-static`).
+The dev stand is PostgreSQL 16 in Docker plus pgbench:
 
 ```sh
 docker compose -f deploy/dev/docker-compose.yml up -d
@@ -393,15 +363,13 @@ sudo ./build/latkit --queries &
 ```
 
 `--events` / `--messages` / `--queries` print the pipeline's intermediate
-streams one line at a time (`-x` adds hexdumps); `--record file.lkt` dumps
-the raw event stream for offline replay through the same pipeline — that is
+streams one line at a time (`-x` adds hexdumps). `--record file.lkt` dumps
+the raw event stream for offline replay through the same pipeline - that is
 how the deterministic test fixtures work (`tests/replay/`,
-`tests/e2e/verify.sh`, `verify-tls.sh`). The stage-by-stage design history
-with numbered decisions (Р1–Р48) is in [PLAN.md](PLAN.md) and
-`STAGE0.md`–`STAGE8.md` (Russian).
+`tests/e2e/verify.sh`, `verify-tls.sh`).
 
 ## License
 
 GPL-2.0 (see [LICENSE](LICENSE)). The BPF programs are GPL-licensed as the
 kernel requires; vendored dependencies keep their own licenses
-(`third_party/libbpf` — LGPL-2.1 OR BSD-2-Clause).
+(`third_party/libbpf` - LGPL-2.1 OR BSD-2-Clause).
