@@ -7,3 +7,4 @@ build*/
 /tests/bench/out/
 /tests/bench/accuracy/out/
 /tests/longrun/out/
+/internal/
