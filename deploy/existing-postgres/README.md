@@ -1,4 +1,4 @@
-# latkit on a VPS with an existing PostgreSQL
+# latkit with an existing PostgreSQL
 
 Monitoring-only stack — **latkit + Prometheus + Grafana**, pointed at a
 PostgreSQL you already run on the host (a website's database, say). Unlike
@@ -26,7 +26,7 @@ provisioning and the four dashboards from [`../../dashboards`](../../dashboards)
 ## Run
 
 ```sh
-cd deploy/vps
+cd deploy/existing-postgres
 GF_ADMIN_PASSWORD='choose-one' docker compose up --build -d
 ```
 

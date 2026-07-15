@@ -4,7 +4,7 @@
 # kernel-wide fentry on tcp_sendmsg/tcp_recvmsg, so `pid: host` is all it needs
 # to see the host's postgres traffic (loopback included) — no link to the DB.
 #
-#   cd deploy/vps
+#   cd deploy/existing-postgres
 #   GF_ADMIN_PASSWORD=change-me docker compose up --build -d
 #
 # Prereqs: Linux kernel >= 5.15 with BTF (/sys/kernel/btf/vmlinux), Docker +
