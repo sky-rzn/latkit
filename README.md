@@ -1,36 +1,22 @@
 # latkit
 
-**Per-query PostgreSQL latency from the kernel — no extension, no config
-change, no restart of the database.**
+**Per-query PostgreSQL latency, straight from the kernel — no extension, no
+config change, no database restart.**
 
-latkit is an eBPF agent (C + libbpf, CO-RE) that sits on the database host,
-captures the PostgreSQL wire protocol at the TCP-socket layer (and, for TLS
-sessions, one layer up via OpenSSL uprobes), and turns it into per-query
-latency histograms: normalised query text, database/user labels, row counts,
-SQLSTATE error breakdown, transaction timings. Metrics are exposed for
-Prometheus and pushed as OpenTelemetry metrics/spans; four provisioned
-Grafana dashboards are part of the repository. No backend of its own, and
-nothing runs inside PostgreSQL — the database does not know the agent exists.
+latkit is an eBPF agent that watches the PostgreSQL wire protocol at the
+socket layer and turns it into per-query latency histograms: normalised query
+text, database/user labels, row counts, SQLSTATE errors, transaction timings.
+It exports to Prometheus and OpenTelemetry, ships with four ready-made Grafana
+dashboards, runs beside the database, and the database never knows it's there.
 
 ![latkit Overview dashboard](docs/img/latkit-overview.png)
 
-- **Server-side truth**: latency is measured network-to-network on the DB
-  host — what the server actually took, per query, including everything
-  `pg_stat_statements` does not see (parse, protocol round-trips, result
-  streaming). See [the measurement model](#what-the-numbers-mean).
-- **Bounded cardinality by construction**: SQL is normalised to a
-  fingerprint (literals → `?`), a top-K LRU caps the distinct `query`
-  labels, the rest folds into `query="other"`.
-- **Honest under loss**: ringbuf drops and parser resyncs are counted and
-  dashboarded; an observation that spans a loss is discarded, never guessed.
-- **One static binary** (musl, ~4 MB), scratch Docker image, systemd unit,
-  k8s DaemonSet.
+## Try the demo (≈2 minutes)
 
-## Quickstart
-
-The demo stack (PostgreSQL + load generator + latkit + Prometheus + Grafana
-with all dashboards provisioned) needs a Linux host with Docker and a
-BTF-enabled kernel ≥ 5.15 — any mainstream distro of the last few years:
+One command brings up the whole stack — PostgreSQL + a load generator + latkit
++ Prometheus + Grafana with every dashboard provisioned. All you need is a
+Linux host with Docker and a BTF-enabled kernel ≥ 5.15 (any mainstream distro
+of the last few years):
 
 ```sh
 git clone --recurse-submodules https://github.com/sky-rzn/latkit.git
@@ -38,9 +24,28 @@ cd latkit/deploy/demo
 docker compose up --build -d
 ```
 
-Grafana is at <http://localhost:3000/dashboards> (anonymous) a few minutes
-later — start with **latkit — Overview**. Details, the TLS profile and
-troubleshooting: [deploy/demo/README.md](deploy/demo/README.md).
+Open <http://localhost:3000/dashboards> (anonymous — no login) and start with
+**latkit — Overview**; live query latency shows up within a minute. TLS
+profile and troubleshooting: [deploy/demo/README.md](deploy/demo/README.md).
+
+## Why latkit
+
+- **Zero-touch.** No PostgreSQL extension, no `shared_preload_libraries`, no
+  restart — point the agent at a running database and metrics start flowing.
+  Nothing runs inside PostgreSQL; the database doesn't know the agent exists.
+- **Server-side truth.** Latency is measured network-to-network on the DB
+  host — what the server actually took, per query, including everything
+  `pg_stat_statements` never sees (parse, protocol round-trips, result
+  streaming). See [the measurement model](#what-the-numbers-mean).
+- **Bounded cardinality by construction.** SQL is normalised to a fingerprint
+  (literals → `?`), a top-K LRU caps the distinct `query` labels, and the rest
+  folds into `query="other"`.
+- **Honest under loss.** Ringbuf drops and parser resyncs are counted and
+  dashboarded; an observation that spans a loss is discarded, never guessed.
+- **TLS without decryption keys.** Encrypted sessions ride the same pipeline
+  via `libssl` uprobes — plaintext latency, no MITM, no private keys.
+- **Drops in anywhere.** One static binary (musl, ~4 MB), `FROM scratch`
+  Docker image, systemd unit, k8s DaemonSet.
 
 ## Installation
 
@@ -149,7 +154,6 @@ binary is built differently (fully static musl, in a container):
 | Capture | Capabilities | Why |
 |---|---|---|
 | plaintext | `CAP_BPF` + `CAP_PERFMON` | BPF programs/maps; loading tracing programs |
-| … on kernels < 5.11 | + `CAP_SYS_RESOURCE` | memlock rlimit (newer kernels account BPF memory via memcg) |
 | TLS (`--tls auto`) | + `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` | reading `/proc/<pid>/(maps\|root)` of postgres processes to find libssl; the kernel demands full `CAP_SYS_ADMIN` to create **u**probes |
 
 TLS capture in a container additionally needs **`hostPID`** (the libssl

@@ -104,7 +104,6 @@ below are `--cap-add` on top of Docker's default cap set.
 | Feature | Capabilities | Why |
 |---|---|---|
 | Plaintext capture (fentry `tcp_*`, ringbuf) | `CAP_BPF` + `CAP_PERFMON` | `CAP_BPF` — bpf() (programs, maps); `CAP_PERFMON` — tracing program load |
-| … on kernels < 5.11 | + `CAP_SYS_RESOURCE` | memlock rlimit for BPF memory (≥ 5.11 accounts via memcg; without it the agent logs a harmless `setrlimit(MEMLOCK)` warning) |
 | TLS capture (libssl uprobes, Р39) | + `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` | `CAP_SYS_PTRACE` — `PTRACE_MODE_READ` for `/proc/<pid>/maps` and opening `/proc/<pid>/root/...` of foreign processes; `CAP_SYS_ADMIN` — the kernel's `perf_uprobe_init()` demands full `capable(CAP_SYS_ADMIN)` for **u**probes (`CAP_PERFMON` is enough for fentry/kprobes but *not* for uprobes — this is a kernel rule, not a Docker one) |
 
 Failure signatures when a capability is missing — useful for triage:

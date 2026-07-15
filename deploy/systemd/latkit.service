@@ -33,14 +33,13 @@ RestartSec=5
 # (measured set — docs/deploy.md "Minimal capabilities"):
 #   CAP_BPF          bpf(): programs, maps
 #   CAP_PERFMON      loading tracing programs (fentry)
-#   CAP_SYS_RESOURCE memlock rlimit on kernels < 5.11 (no-op cost on newer)
 #   CAP_SYS_PTRACE   /proc/<pid>/maps + /proc/<pid>/root of postgres processes
 #                    (libssl autodetect, LATKIT_TLS=auto)
 #   CAP_SYS_ADMIN    creating *u*probes: the kernel demands full CAP_SYS_ADMIN
 #                    for perf_uprobe_init() (CAP_PERFMON covers fentry only).
 #                    Running plaintext-only (LATKIT_TLS unset)? Delete
 #                    CAP_SYS_PTRACE and CAP_SYS_ADMIN from this line.
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_RESOURCE CAP_SYS_PTRACE CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_SYS_ADMIN
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
