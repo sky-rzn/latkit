@@ -1,0 +1,103 @@
+# latkit demo-olap stack: the same postgres + load + latkit + prometheus + grafana
+# wiring as ../demo, but the load runs a *complex analytical* workload instead of
+# pgbench — recursive CTEs, window functions, GROUPING SETS / CUBE, LATERAL and
+# percentiles over a ~900k-row order_items table (see load/queries.sql). It shows
+# latkit under heavyweight OLAP traffic: fat p99 tail, large multi-row results,
+# and a handful of distinct normalized query shapes on "Top queries".
+#
+#   docker compose up --build -d
+#   docker compose down -v          # tear down (containers, volume, network)
+#
+# TLS decryption is orthogonal and already demonstrated by ../demo (--profile
+# tls); this stack keeps ssl=off to stay focused on the query workload.
+#
+# Capture hygiene: postgres publishes NO port — the load reaches it by service
+# name over the compose network, so nothing crosses docker-proxy on localhost.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: latkit
+      POSTGRES_PASSWORD: latkit
+      POSTGRES_DB: latkit
+    # A little more memory than the defaults so the analytical queries hash/sort
+    # in RAM instead of thrashing to disk — keeps the demo latencies honest.
+    command:
+      - postgres
+      - -c
+      - ssl=off
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=64MB
+      - -c
+      - max_parallel_workers_per_gather=2
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U latkit -d latkit"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Builds the e-commerce dataset (load/schema.sql), then runs the analytical
+  # query set (load/queries.sql) in a few parallel sessions forever, plus a
+  # slow/error spice loop. See load/load.sh.
+  load:
+    image: postgres:17-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPASSWORD: latkit
+      WORKERS: "3"
+    volumes:
+      - ./load:/load:ro
+    command: ["bash", "/load/load.sh"]
+    restart: unless-stopped
+
+  # The agent — release scratch image (musl static), built from the repo root so
+  # the version stamp sees .git. Configured only through the LATKIT_* env layer.
+  latkit:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Demo simplicity. Minimal capability set instead (docs/deploy.md):
+    #   cap_add: [BPF, PERFMON, SYS_PTRACE, SYS_ADMIN]
+    privileged: true
+    pid: host               # uprobes / /proc access need the host PID namespace
+    environment:
+      LATKIT_PORT: "5432"
+      LATKIT_PROM_LISTEN: "0.0.0.0:9752"  # default is loopback; a container must listen out
+      LATKIT_TLS: auto
+      LATKIT_FIRST_ROW_HIST: "1"          # feeds the drilldown "time to first row" panel
+    ports: ["9752:9752"]    # convenience: curl http://localhost:9752/metrics
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on:
+      - latkit
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=2h"
+    ports: ["19091:9090"]   # 19091 to avoid clashing with a host Prometheus or the base demo
+
+  grafana:
+    image: grafana/grafana:11.4.0    # pinned major 11.x
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: "dark"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # The dashboards repo dir is the single source — mounted read-only.
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3001:3000"]    # 3001 so it can run alongside the base demo on 3000

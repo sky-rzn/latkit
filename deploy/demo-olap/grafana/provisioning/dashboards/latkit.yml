@@ -1,0 +1,15 @@
+# Provision the dashboards straight from the repo's dashboards/ directory, mounted
+# read-only at /var/lib/grafana/dashboards (that dir is the single source — no
+# copies). Non-JSON files there (lint.sh, README.md) are ignored.
+apiVersion: 1
+providers:
+  - name: latkit
+    orgId: 1
+    folder: latkit
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
