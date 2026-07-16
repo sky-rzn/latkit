@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: GPL-2.0
+/* SPDX-License-Identifier: GPL-2.0 */
 /* Shared harness for the hot-path micro-benchmarks (tests/bench/micro).
  *
  * The whole point of these benches is the per-op heap churn the two hottest
