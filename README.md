@@ -13,8 +13,8 @@ dashboards, runs beside the database, and the database never knows it's there.
 
 ## Try the demo (≈2 minutes)
 
-One command brings up the whole stack: PostgreSQL + a load generator + latkit
-+ Prometheus + Grafana with every dashboard provisioned. All you need is a
+One command brings up the whole stack: PostgreSQL + a load generator + latkit +
+Prometheus + Grafana with every dashboard provisioned. All you need is a
 Linux host with Docker and a BTF-enabled kernel ≥ 5.15 (any mainstream distro
 of the last few years):
 
