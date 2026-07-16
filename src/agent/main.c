@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0
 /* latkit agent entry point: parse CLI, configure filters (ports map,
  * .rodata), load and attach the skeleton, then hand control to the epoll
- * loop (loop.c); event decoding, printing and stats live in events.c
- * (task 2.1). */
+ * loop (loop.c); event decoding, printing and stats live in events.c */
+
 #include <errno.h>
 #include <getopt.h>
 #include <linux/types.h>
@@ -11,7 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/resource.h>
 #include <unistd.h>
 
 #include <bpf/btf.h>
@@ -29,7 +28,15 @@
 #include "tls_attach.h"
 #include "version.h"
 
-#define LK_OTLP_MAX_KV 32 /* --otlp-header / --otlp-resource entries accepted */
+#define LK_OTLP_MAX_KV            32 /* --otlp-header / --otlp-resource entries accepted */
+#define LK_CGROUP_RESCAN_SEC      30 /* re-resolve cgroup globs every N s */
+#define LK_TLS_RESCAN_SEC         30 /* --tls auto: rescan /proc for new libssl paths every N s*/
+#define LK_MAX_CONN_IDLE_TIMEOUT  (86400 * 365) /* 1 year in seconds */
+#define LK_MAX_OTLP_INTERVAL      86400         /* 1 day in seconds */
+#define LK_MAX_CONNS              (1 << 24)
+#define LK_MAX_TOP_QUERIES        (1 << 20)
+#define LK_MAX_OTLP_SPANS_SLOW_MS 3600000 /* 1 hour in ms */
+#define LK_MAX_OTLP_SPAN_TEXT_MAX (1 << 20)
 
 static bool opt_hexdump;
 static bool opt_cap_headers;
@@ -46,7 +53,6 @@ static const char *opt_record;
 static char opt_comm[16];
 static const char *opt_cgroup[LK_MAX_CGROUPS]; /* --cgroup glob patterns */
 static int opt_ncgroup;
-#define LK_CGROUP_RESCAN_SEC 30   /* re-resolve cgroup globs every N s (Р48; same ritm as TLS) */
 static __u32 opt_top_queries;     /* 0 = metrics default (K = 500) */
 static __u32 opt_query_label_len; /* 0 = metrics default (256) */
 static bool opt_first_row_hist;
@@ -67,14 +73,13 @@ static bool opt_otlp_span_masked;
 static enum lk_tls_mode opt_tls_mode = LK_TLS_OFF; /* --tls; default off */
 static const char *opt_libssl;                     /* --libssl PATH: explicit uprobe target */
 static char opt_tls_comm[16]; /* --tls-comm: comm to scan for (default postgres) */
-#define LK_TLS_RESCAN_SEC 30  /* --tls auto: rescan /proc for new libssl paths every N s (Р39) */
 /* Env-derived header/resource arrays (freed at exit for ASAN cleanliness). */
 static char **env_headers, **env_resource;
 static int env_nheaders, env_nresource;
 static bool opt_print_config; /* --print-config: resolve config, print it, exit 0 */
 static bool opt_version;      /* --version: print the version string, exit 0 */
 /* Which options were given on the CLI, indexed by getopt id (< 512: ASCII ids
- * plus the OPT_* enum below). The env layer (Р34) fills only the unseen ones,
+ * plus the OPT_* enum below). The env layer fills only the unseen ones,
  * so a flag always wins over its LATKIT_* environment equivalent. */
 static bool opt_seen[512];
 
@@ -250,8 +255,7 @@ static int set_option(int c, char *optarg)
         break;
     case OPT_CAPTURE_LIMIT:
         /* The BPF data path emits at most LK_MAX_CHUNKS chunks per call
-         * (a verifier loop bound), so a larger limit could not be
-         * honored anyway. */
+         * (a verifier loop bound), so a larger limit could not be honored anyway. */
         if (parse_num(optarg, 1, LK_MAX_CHUNKS * LK_CHUNK_FULL, &v)) {
             fprintf(stderr, "--capture-limit: expected 1..%d, got '%s'\n",
                     LK_MAX_CHUNKS * LK_CHUNK_FULL, optarg);
@@ -277,9 +281,7 @@ static int set_option(int c, char *optarg)
             fprintf(stderr, "--cgroup: empty pattern\n");
             return -1;
         }
-        /* Own the string: an env pattern (LATKIT_CGROUP=a,b) is a token into a
-         * temporary buffer the env layer frees; a CLI optarg is stable but
-         * strdup'd too so cleanup is uniform. Freed at exit for ASAN. */
+
         dup = strdup(optarg);
         if (!dup)
             return -1;
@@ -290,17 +292,17 @@ static int set_option(int c, char *optarg)
         opt_cap_headers = true;
         break;
     case OPT_MAX_CONNS:
-        if (parse_num(optarg, 1, 1 << 24, &v)) {
-            fprintf(stderr, "--max-conns: expected 1..%d, got '%s'\n", 1 << 24, optarg);
+        if (parse_num(optarg, 1, LK_MAX_CONNS, &v)) {
+            fprintf(stderr, "--max-conns: expected 1..%d, got '%s'\n", LK_MAX_CONNS, optarg);
             return -1;
         }
         opt_max_conns = v;
         break;
     case OPT_CONN_IDLE_TIMEOUT:
         /* Upper bound keeps sec -> ns conversions far from overflow. */
-        if (parse_num(optarg, 1, 86400 * 365, &v)) {
-            fprintf(stderr, "--conn-idle-timeout: expected seconds 1..%d, got '%s'\n", 86400 * 365,
-                    optarg);
+        if (parse_num(optarg, 1, LK_MAX_CONN_IDLE_TIMEOUT, &v)) {
+            fprintf(stderr, "--conn-idle-timeout: expected seconds 1..%d, got '%s'\n",
+                    LK_MAX_CONN_IDLE_TIMEOUT, optarg);
             return -1;
         }
         opt_conn_idle_timeout = v;
@@ -318,8 +320,9 @@ static int set_option(int c, char *optarg)
         opt_queries = true;
         break;
     case OPT_TOP_QUERIES:
-        if (parse_num(optarg, 1, 1 << 20, &v)) {
-            fprintf(stderr, "--top-queries: expected 1..%d, got '%s'\n", 1 << 20, optarg);
+        if (parse_num(optarg, 1, LK_MAX_TOP_QUERIES, &v)) {
+            fprintf(stderr, "--top-queries: expected 1..%d, got '%s'\n", LK_MAX_TOP_QUERIES,
+                    optarg);
             return -1;
         }
         opt_top_queries = v;
@@ -346,8 +349,9 @@ static int set_option(int c, char *optarg)
         opt_otlp_endpoint = optarg;
         break;
     case OPT_OTLP_INTERVAL:
-        if (parse_num(optarg, 1, 86400, &v)) {
-            fprintf(stderr, "--otlp-interval: expected seconds 1..86400, got '%s'\n", optarg);
+        if (parse_num(optarg, 1, LK_MAX_OTLP_INTERVAL, &v)) {
+            fprintf(stderr, "--otlp-interval: expected seconds 1..%d, got '%s'\n",
+                    LK_MAX_OTLP_INTERVAL, optarg);
             return -1;
         }
         opt_otlp_interval = v;
@@ -379,15 +383,17 @@ static int set_option(int c, char *optarg)
         break;
     }
     case OPT_OTLP_SPANS_SLOW_MS:
-        if (parse_num(optarg, 1, 3600000, &v)) {
-            fprintf(stderr, "--otlp-spans-slow-ms: expected 1..3600000, got '%s'\n", optarg);
+        if (parse_num(optarg, 1, LK_MAX_OTLP_SPANS_SLOW_MS, &v)) {
+            fprintf(stderr, "--otlp-spans-slow-ms: expected 1..%d, got '%s'\n",
+                    LK_MAX_OTLP_SPANS_SLOW_MS, optarg);
             return -1;
         }
         opt_otlp_span_slow_ms = v;
         break;
     case OPT_OTLP_SPAN_TEXT_MAX:
-        if (parse_num(optarg, 1, 1 << 20, &v)) {
-            fprintf(stderr, "--otlp-span-text-max: expected 1..%d, got '%s'\n", 1 << 20, optarg);
+        if (parse_num(optarg, 1, LK_MAX_OTLP_SPAN_TEXT_MAX, &v)) {
+            fprintf(stderr, "--otlp-span-text-max: expected 1..%d, got '%s'\n",
+                    LK_MAX_OTLP_SPAN_TEXT_MAX, optarg);
             return -1;
         }
         opt_otlp_span_text_max = v;
@@ -445,10 +451,10 @@ static bool env_bool_word(const char *v)
            !strcasecmp(v, "on");
 }
 
-/* One LATKIT_* env variable ↔ its flag (Р34). Repeatable flags read a
- * comma-separated list from the single env variable. The OTEL-standard vars
- * (endpoint/interval/headers/resource/service) are handled by
- * apply_otlp_env_defaults, which also honours their OTEL_* spellings. */
+/* One LATKIT_* env variable ↔ its flag. Repeatable flags read a comma-separated
+ * list from the single env variable. The OTEL-standard vars (endpoint/interval/
+ * headers/resource/service) are handled by apply_otlp_env_defaults, which also
+ * honours their OTEL_* spellings. */
 struct env_opt {
     const char *name;
     int val;
@@ -605,7 +611,7 @@ static const char *env_or(const char *a, const char *b)
     return (v && v[0]) ? v : NULL;
 }
 
-/* Fill the OTLP config from the environment where a flag was not given (Р34):
+/* Fill the OTLP config from the environment where a flag was not given:
  * flag > LATKIT_* > OTEL_* > default. Standard OTel variables are honoured so an
  * agent deployed beside other OTel tooling inherits the ambient config. */
 static void apply_otlp_env_defaults(void)
@@ -616,7 +622,7 @@ static void apply_otlp_env_defaults(void)
         const char *s = env_or("LATKIT_OTLP_INTERVAL", NULL);
         __u64 v;
 
-        if (s && !parse_num(s, 1, 86400, &v))
+        if (s && !parse_num(s, 1, LK_MAX_OTLP_INTERVAL, &v))
             opt_otlp_interval = v;
     }
     if (!opt_otlp_service_name)
@@ -630,7 +636,7 @@ static void apply_otlp_env_defaults(void)
                                       &env_nresource);
 }
 
-/* Print the effective configuration after CLI + env resolution and exit (Р34):
+/* Print the effective configuration after CLI + env resolution and exit:
  * a no-BPF way to confirm flag > LATKIT_* > OTEL_* > default without a running
  * agent. The `0 = default` sentinels are resolved to their concrete values so
  * the output reads as what the agent will actually use. Drives the priority
@@ -678,11 +684,10 @@ static void print_config(void)
 /* Argument count of this kernel's tcp_recvmsg, from its BTF; -1 when the
  * probe fails. The arity has changed twice (6 args before 5.19, 5 until ~7.0,
  * 4 after), each change moving the fexit return-value slot, which CO-RE
- * cannot relocate — the BPF object carries one lk_tcp_recvmsg_exit* variant
- * per shape and main() autoloads exactly one (task 8.4, Р52). On a probe
- * failure or an arity without a variant the 5-arg default is loaded and, if
- * wrong for the kernel, fails loudly at load rather than capturing half a
- * stream. */
+ * cannot relocate - the BPF object carries one lk_tcp_recvmsg_exit* variant
+ * per shape and main() autoloads exactly one. On a probe failure or an arity
+ * without a variant the 5-arg default is loaded and, if wrong for the kernel,
+ * fails loudly at load rather than capturing half a stream. */
 static int recvmsg_arity(void)
 {
     struct btf *btf = btf__load_vmlinux_btf();
@@ -721,7 +726,6 @@ static int fill_ports(struct latkit_bpf *skel)
 
 int main(int argc, char **argv)
 {
-    struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
     struct lk_events *events = NULL;
     struct lk_loop *loop = NULL;
     struct latkit_bpf *skel;
@@ -741,11 +745,11 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    /* Hard floor (Р52, task 8.4): every program here is CO-RE and relocates
-     * against the running kernel's BTF, so a kernel without
-     * CONFIG_DEBUG_INFO_BTF cannot work — fail with one clear line instead of
-     * a wall of libbpf relocation errors. The no-BTF negative test of the
-     * kernel matrix (kernels.yml) asserts this exact behaviour. */
+    /* Hard floor: every program here is CO-RE and relocates against the running
+     * kernel's BTF, so a kernel without CONFIG_DEBUG_INFO_BTF cannot work - fail
+     * with one clear line instead of a wall of libbpf relocation errors. The
+     * no-BTF negative test of the kernel matrix (kernels.yml) asserts this exact
+     * behaviour. */
     if (access("/sys/kernel/btf/vmlinux", R_OK)) {
         fprintf(stderr, "latkit: kernel 5.15+ with BTF is required "
                         "(/sys/kernel/btf/vmlinux is missing; CONFIG_DEBUG_INFO_BTF=y)\n");
@@ -754,20 +758,16 @@ int main(int argc, char **argv)
 
     libbpf_set_print(libbpf_print);
 
-    /* Needed on pre-5.11 kernels; harmless on newer ones. */
-    if (setrlimit(RLIMIT_MEMLOCK, &rlim))
-        fprintf(stderr, "warn: setrlimit(MEMLOCK): %s\n", strerror(errno));
-
     skel = latkit_bpf__open();
     if (!skel) {
         fprintf(stderr, "failed to open BPF skeleton\n");
         return 1;
     }
 
-    /* The effective comm to gate the TLS uprobes on (Р39): --tls-comm, else the
-     * general --comm, else the postgres default. Attaching on pid=-1 hooks every
-     * process mapping a shared libssl — including a psql client that maps the same
-     * file — so the in-program comm filter is what keeps foreign SSL traffic out.
+    /* The effective comm to gate the TLS uprobes: --tls-comm, else the general
+     * --comm, else the postgres default. Attaching on pid=-1 hooks every process
+     * mapping a shared libssl — including a psql client that maps the same file -
+     * so the in-program comm filter is what keeps foreign SSL traffic out.
      * When --comm was not set, adopt this comm for the whole BPF filter; the
      * socket path is port-filtered to the server side anyway, so narrowing it to
      * the postgres comm changes nothing there. */
@@ -789,7 +789,7 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    /* Decide autoload of the SSL_* uprobe programs before load (Р39): with no
+    /* Decide autoload of the SSL_* uprobe programs before load: with no
      * libssl to attach, they are dropped from the load entirely. */
     struct lk_tls_cfg tlscfg = {
         .mode = opt_tls_mode,
@@ -823,8 +823,8 @@ int main(int argc, char **argv)
     if (err)
         goto cleanup;
 
-    /* cgroup filter (Р48): resolve the globs and fill the maps before attach,
-     * like fill_ports, so the filter is live before the first event. A v1 host
+    /* cgroup filter: resolve the globs and fill the maps before attach, like
+     * fill_ports, so the filter is live before the first event. A v1 host
      * with --cgroup fails here. */
     struct lk_cgroup_cfg cgcfg = {
         .patterns = opt_cgroup,
@@ -848,7 +848,7 @@ int main(int argc, char **argv)
     }
 
     /* Attach the TLS uprobes after the core programs; a missing libssl is a
-     * soft none, not a startup failure (Р39). */
+     * soft none, not a startup failure. */
     err = lk_tls_attach(tls);
     if (err)
         goto cleanup;
@@ -908,7 +908,7 @@ int main(int argc, char **argv)
         goto cleanup;
 
     /* Re-resolve the cgroup globs periodically so a recreated pod (new cgroup
-     * id under the same glob) is re-picked up without a restart (Р48). */
+     * id under the same glob) is re-picked up without a restart. */
     err = lk_cgroup_register(cgroup, loop);
     if (err)
         goto cleanup;
@@ -929,11 +929,9 @@ int main(int argc, char **argv)
     }
 
 cleanup:
-    /* Free events before the loop: the HTTP server (task 5.1) deregisters its
-     * listen and client fds from the loop as it tears down. */
     lk_events_free(events);
     lk_loop_free(loop);
-    lk_tls_free(tls); /* detach uprobe links before the skeleton owning them */
+    lk_tls_free(tls);
     lk_cgroup_free(cgroup);
     latkit_bpf__destroy(skel);
     for (int i = 0; i < opt_ncgroup; i++)
