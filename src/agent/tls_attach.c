@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0
-/* TLS uprobe attach lifecycle (stage 6, Р39). Attaches the SSL_read/SSL_write(_ex)
- * data probes (6.1) and the SSL_set_fd/rfd/wfd + SSL_free bridge probes (6.2) to
- * libssl, pid=-1 so every process mapping that file — present and future postgres
- * backends — is covered. The libssl is either an explicit --libssl path or, under
- * --tls auto, discovered by scanning /proc (6.3): the maps of every comm-matching
- * process are searched for a libssl.so mapping, each in-container path is resolved
- * through /proc/<pid>/root, and distinct files (by device+inode) are attached
- * once. A periodic rescan picks up libssl paths that appear later (a cluster
- * restart or a second install); forked backends need no rescan thanks to pid=-1. */
+/* TLS uprobe attach lifecycle. Attaches the SSL_read/SSL_write(_ex) data probes
+ * and the SSL_set_fd/rfd/wfd + SSL_free bridge probes to libssl with pid=-1 so
+ * every process mapping that file (present and future postgres backends) is
+ * covered. The libssl is either an explicit --libssl path or, under --tls auto,
+ * discovered by scanning /proc: the maps of every comm-matching process are
+ * searched for a libssl.so mapping, each in-container path is resolved through
+ * /proc/<pid>/root, and distinct files (by device+inode) are attached once. A
+ * periodic rescan picks up libssl paths that appear later (a cluster restart or
+ * a second install). Forked backends need no rescan thanks to pid=-1. */
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
@@ -64,9 +64,9 @@ static const struct lk_tls_probe tls_probes[] = {
     {tls_prog_lk_ssl_read_ret, "SSL_read", true, false},
     {tls_prog_lk_ssl_read_ex, "SSL_read_ex", false, true},
     {tls_prog_lk_ssl_read_ex_ret, "SSL_read_ex", true, true},
-    /* Bridge probes (stage 6.2): SSL_set_fd is the primary SSL*->cookie link,
-     * SSL_free the cleanup — both present in every OpenSSL. The rfd/wfd variants
-     * are rarely used (separate read/write fds) and tolerated absent. */
+    /* Bridge probes: SSL_set_fd is the primary SSL*->cookie link, SSL_free the
+     * cleanup - both present in every OpenSSL. The rfd/wfd variants are rarely
+     * used (separate read/write fds) and tolerated absent. */
     {tls_prog_lk_ssl_set_fd, "SSL_set_fd", false, false},
     {tls_prog_lk_ssl_set_rfd, "SSL_set_rfd", false, true},
     {tls_prog_lk_ssl_set_wfd, "SSL_set_wfd", false, true},
@@ -74,7 +74,7 @@ static const struct lk_tls_probe tls_probes[] = {
 };
 #define TLS_NPROBES (sizeof(tls_probes) / sizeof(tls_probes[0]))
 
-/* Ceiling on distinct libssl files attached — several postgres installs on one
+/* Ceiling on distinct libssl files attached - several postgres installs on one
  * host is unusual; more than this is almost certainly a scan gone wrong. */
 #define TLS_MAX_PATHS    32
 #define TLS_DEFAULT_COMM "postgres"
@@ -129,8 +129,8 @@ static bool file_known(const struct lk_tls *t, dev_t dev, ino_t ino)
 }
 
 /* Attach the whole probe set to one libssl binary at `path`. Returns the number
- * of probes attached (0 if none — e.g. not actually a libssl); sets *full when
- * every probe attached. Absent optional symbols are skipped silently; a mandatory
+ * of probes attached (0 if none - e.g. not actually a libssl); sets *full when
+ * every probe attached. Absent optional symbols are skipped silently. A mandatory
  * symbol that fails to attach warns and drops the file to partial. */
 static unsigned attach_path(struct lk_tls *t, const char *path, bool *full)
 {
@@ -145,7 +145,7 @@ static unsigned attach_path(struct lk_tls *t, const char *path, bool *full)
             mandatory++;
 
         /* pid = -1: attach to every process mapping this libssl, including
-         * backends forked after us — no rescan needed for fork coverage. */
+         * backends forked after us - no rescan needed for fork coverage. */
         link = bpf_program__attach_uprobe_opts(pr->prog(t->skel), -1, path, 0, &opts);
         if (!link) {
             if (!pr->optional)
@@ -224,7 +224,7 @@ static int read_comm(const char *pid, char *buf, size_t sz)
 
 /* Scan one process's maps for a libssl.so mapping and attach it (via its
  * /proc/<pid>/root view, so a container's copy is reachable from the host). A
- * process may map libssl in several segments; attach_file's inode dedup collapses
+ * process may map libssl in several segments, attach_file's inode dedup collapses
  * them. Returns the number of newly attached files. */
 static int scan_pid_maps(struct lk_tls *t, const char *pid)
 {
@@ -248,7 +248,7 @@ static int scan_pid_maps(struct lk_tls *t, const char *pid)
         if (len && p[len - 1] == '\n')
             p[--len] = '\0';
 
-        /* The path is in the target's mount namespace; reach it from the host
+        /* The path is in the target's mount namespace. Reach it from the host
          * through /proc/<pid>/root (identity on a host process). */
         if ((size_t)snprintf(host, sizeof(host), "/proc/%s/root%s", pid, p) >= sizeof(host))
             continue;
@@ -312,7 +312,7 @@ struct lk_tls *lk_tls_new(struct latkit_bpf *skel, const struct lk_tls_cfg *cfg)
     t->enabled = cfg->libssl_override || cfg->mode == LK_TLS_AUTO;
 
     /* libbpf never auto-attaches a bare SEC("uprobe") (no target in the section
-     * name), but be explicit; we attach these by hand. When disabled, drop them
+     * name), but be explicit, we attach these by hand. When disabled, drop them
      * from the load entirely. */
     for (size_t i = 0; i < TLS_NPROBES; i++) {
         struct bpf_program *p = tls_probes[i].prog(skel);
@@ -327,11 +327,11 @@ struct lk_tls *lk_tls_new(struct latkit_bpf *skel, const struct lk_tls_cfg *cfg)
 int lk_tls_attach(struct lk_tls *t)
 {
     if (!t || !t->enabled)
-        return 0; /* OFF: soft none, not an error (Р39) */
+        return 0; /* OFF: soft none, not an error */
 
     if (t->explicit_path) {
         /* An explicit --libssl must resolve: a bad path is fatal on start, like a
-         * failed port bind (Р39/Р29). */
+         * failed port bind. */
         struct stat st;
 
         if (stat(t->explicit_path, &st)) {
@@ -346,7 +346,7 @@ int lk_tls_attach(struct lk_tls *t)
         return 0;
     }
 
-    /* AUTO: scanning is best effort — no libssl found is a soft none (the agent
+    /* AUTO: scanning is best effort - no libssl found is a soft none (the agent
      * still serves plaintext), logged so the operator can tell why TLS is dark. */
     scan_proc(t);
     update_state(t);

@@ -1,9 +1,9 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* TLS uprobe attach lifecycle (stage 6, Р39): the libssl-facing half of the
- * decrypted channel — everything about which binary to hook and when — kept out
- * of the BPF programs (latkit.bpf.c) and out of main/loader. The BPF side emits
- * plaintext with LK_F_DECRYPTED; this module decides where the SSL_* uprobes
- * land and owns their bpf_link lifetime.
+/* TLS uprobe attach lifecycle: the libssl-facing half of the decrypted channel -
+ * everything about which binary to hook and when - kept out of the BPF programs
+ * (latkit.bpf.c) and out of main/loader. The BPF side emits plaintext with
+ * LK_F_DECRYPTED; this module decides where the SSL_* uprobes land and owns
+ * their bpf_link lifetime.
  *
  * Two ways to pick the libssl: --libssl PATH attaches to one given binary (no
  * scanning); --tls auto scans /proc for the libssl mapped by the postgres
@@ -14,6 +14,7 @@
  *
  * No I/O beyond libbpf attach and reading /proc; the caller (main.c) drives load
  * order and registers the rescan timer. */
+
 #ifndef LATKIT_TLS_ATTACH_H
 #define LATKIT_TLS_ATTACH_H
 
@@ -38,14 +39,14 @@ struct lk_tls_cfg {
  * after latkit_bpf__open() and BEFORE latkit_bpf__load(): when no uprobes will
  * be attached (mode OFF and no --libssl) the SSL_* programs are marked
  * autoload=off so they are not even verified. In every case they are marked
- * autoattach=off — libbpf never auto-attaches a bare SEC("uprobe"); this module
+ * autoattach=off - libbpf never auto-attaches a bare SEC("uprobe"); this module
  * attaches them explicitly in lk_tls_attach(). Returns NULL only on OOM. */
 struct lk_tls *lk_tls_new(struct latkit_bpf *skel, const struct lk_tls_cfg *cfg);
 
 /* Attach the SSL_* uprobe/uretprobe pairs to the configured libssl. Call after
  * latkit_bpf__attach(). Absent symbols (old OpenSSL without _ex) are skipped
  * without error; the resulting coverage is reflected by lk_tls_status. Returns
- * 0 (a soft miss — no libssl, nothing attached — is not an error, Р39), <0 only
+ * 0 (a soft miss - no libssl, nothing attached - is not an error), <0 only
  * on a hard failure. */
 int lk_tls_attach(struct lk_tls *t);
 
