@@ -5,3 +5,7 @@ build/
 build-*/
 demo/
 dump.txt
+# ...except the host-built dev binary the e2e stand copies into its image
+# (tests/e2e/Dockerfile.latkit); the release Dockerfile builds from source
+# and never references it.
+!build/latkit
