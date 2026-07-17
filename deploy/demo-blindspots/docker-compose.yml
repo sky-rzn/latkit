@@ -1,0 +1,114 @@
+# latkit demo-blindspots stack: postgres (with pg_stat_statements ON) + a load
+# generator that drives four problematic query patterns + latkit + prometheus +
+# grafana. The theme is the *contrast*: pg_stat_statements is preloaded here so
+# you can query it side by side with latkit's dashboards and see, for each
+# pattern, what the in-database tool misses and latkit does not. See README.md.
+#
+#   docker compose up --build -d
+#   docker compose down -v            # tear down (containers, volume, network)
+#
+# Ports are shifted (Grafana 3002, Prometheus 19092) so this can sit next to the
+# ../demo (3000/19090) and ../demo-olap (3001/19091) stacks. The agent's metrics
+# port is 9752 in all three, and latkit's port filter matches server port 5432
+# kernel-wide (pid: host) — so run only ONE of the three stacks at a time, or
+# the agents will double-count each other's postgres. See README "How it is wired".
+#
+# Capture hygiene (same as the other demos): postgres publishes NO port; the load
+# reaches it by service name over the compose network, so nothing crosses
+# docker-proxy on localhost. The contrast psql commands in the README run via
+# `docker compose exec postgres` over the unix socket — latkit watches TCP 5432,
+# so those admin queries never pollute the dashboards.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: latkit
+      POSTGRES_PASSWORD: latkit
+      POSTGRES_DB: latkit
+    # pg_stat_statements preloaded so the README's side-by-side comparison works.
+    # max=100 is deliberately small: the varying-length IN/VALUES statements from
+    # the cardinality loop churn the table and evict real queries — the very
+    # failure mode latkit's bounded normalisation avoids. track=all catches
+    # nested statements too (it still never records the ones that error out).
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=all
+      - -c
+      - pg_stat_statements.max=100
+      - -c
+      - ssl=off
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - work_mem=64MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U latkit -d latkit"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # The load: builds schema.sql once, then runs the four blind-spot loops forever.
+  load:
+    image: postgres:17-alpine
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPASSWORD: latkit
+    volumes:
+      - ./load:/load:ro
+    command: ["bash", "/load/load.sh"]
+    restart: unless-stopped
+
+  # The agent — the release scratch image (musl static), built from the repo root
+  # so the version stamp sees .git. Same config as the base demo: capture port
+  # 5432, /metrics on 0.0.0.0:9752, --tls auto, first-row histogram on (feeds the
+  # "time to first row" panel the bigresult loop exercises).
+  latkit:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Demo simplicity. The measured minimal set instead (docs/deploy.md):
+    #   cap_add: [BPF, PERFMON, SYS_PTRACE, SYS_ADMIN]
+    privileged: true
+    pid: host               # uprobes / /proc access need the host PID namespace
+    environment:
+      LATKIT_PORT: "5432"
+      LATKIT_PROM_LISTEN: "0.0.0.0:9752"  # default is loopback; a container must listen out
+      LATKIT_TLS: auto
+      LATKIT_FIRST_ROW_HIST: "1"          # feeds the drilldown "time to first row" panel
+    ports: ["9752:9752"]    # convenience: curl http://localhost:9752/metrics
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on:
+      - latkit
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=2h"
+    ports: ["19092:9090"]   # shifted so it can run beside ../demo and ../demo-olap
+
+  grafana:
+    image: grafana/grafana:11.4.0    # pinned major 11.x
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: "dark"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      # The dashboards repo dir is the single source — mounted read-only.
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3002:3000"]   # shifted so it can run beside ../demo and ../demo-olap
