@@ -7,7 +7,7 @@
  * export against a listener that replies 503 bumps result="error". Covers the
  * client the encoder tests cannot reach. Cooperative loop via lk_loop_poll. */
 #ifndef _GNU_SOURCE
-#define _GNU_SOURCE /* strcasestr, open_memstream, accept4 */
+#define _GNU_SOURCE /* strcasestr, memmem, open_memstream, accept4 */
 #endif
 #include "loop.h"
 #include "metrics.h"
@@ -252,12 +252,17 @@ int main(void)
         if (traces) {
             char *body = strstr(traces, "\r\n\r\n");
 
-            /* Body's first byte is ExportTraceServiceRequest.resource_spans
+            /* The body is protobuf and carries embedded NULs (fixed64 timestamps,
+             * random id bytes), so it must be searched by length, not as a
+             * C-string: strstr would stop at the first NUL and miss attributes
+             * that sit past it — a per-run flake as wall-clock bytes shift.
+             * Body's first byte is ExportTraceServiceRequest.resource_spans
              * (field 1, wire 2 = 0x0a); the span carries db.system.name. */
             EXPECT(body && (unsigned char)body[4] == 0x0a,
                    "traces body starts with resource_spans");
-            EXPECT(strstr(traces, "postgresql") != NULL, "span carries db.system.name=postgresql");
-            EXPECT(strstr(traces, "select 1") != NULL, "span carries db.query.text");
+            EXPECT(memmem(traces, tlen, "postgresql", 10) != NULL,
+                   "span carries db.system.name=postgresql");
+            EXPECT(memmem(traces, tlen, "select 1", 8) != NULL, "span carries db.query.text");
             free(traces);
         }
         EXPECT(dump_export_count(m2, "ok") >= 1, "an OTLP export succeeded with spans on");
