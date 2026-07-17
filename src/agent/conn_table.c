@@ -15,8 +15,27 @@ struct lk_conn_table {
      * protocol handler frees lk_conn.proto_state here on all paths. */
     void (*on_destroy)(void *ctx, struct lk_conn *c);
     void *on_destroy_ctx;
+    /* port→protocol map (РМ2): borrowed pointers, set once before events flow.
+     * Entries created with a tuple resolve by the local port; lazy tupleless
+     * ones get proto_dflt. Both NULL when never configured (offline harnesses):
+     * lk_conn.ops stays NULL and the framer falls back to PG. */
+    const struct lk_port_proto *protos;
+    unsigned nprotos;
+    const struct lk_proto_ops *proto_dflt;
     struct lk_conn_table_stats st;
 };
+
+/* Protocol of a new entry (РМ2): the capture is server-side (Р7), so the
+ * local port (tuple.sport) is the filtered one and picks the protocol. */
+static const struct lk_proto_ops *resolve_proto(const struct lk_conn_table *t,
+                                                const struct lk_tuple *tuple)
+{
+    if (tuple)
+        for (unsigned i = 0; i < t->nprotos; i++)
+            if (t->protos[i].port == tuple->sport)
+                return t->protos[i].ops;
+    return t->proto_dflt;
+}
 
 static struct lk_conn **hash_bucket(struct lk_conn_table *t, __u64 cookie)
 {
@@ -147,6 +166,7 @@ struct lk_conn *lk_conn_table_open(struct lk_conn_table *t, __u64 cookie, __u32 
     if (!c)
         return NULL;
     c->tuple = *tuple;
+    c->ops = resolve_proto(t, tuple);
     if (synthetic) {
         c->flags |= LK_CONN_SYNTHETIC;
         /* Startup was not seen: framing can only enter via resync (Р10). */
@@ -167,10 +187,12 @@ struct lk_conn *lk_conn_table_data(struct lk_conn_table *t, __u64 cookie, __u32 
     }
     /* Unknown cookie: the entry was evicted here (or its OPEN lost) and the
      * kernel will not resend a synthetic OPEN — re-create as dirty, no
-     * tuple. No baseline for the seq check, so no loss reported. */
+     * tuple. No baseline for the seq check, so no loss reported. No tuple
+     * also means no port to pick a protocol by — the default it is (РМ2). */
     c = create(t, cookie, seq, ts_ns);
     if (!c)
         return NULL;
+    c->ops = t->proto_dflt;
     mark_dirty(c);
     return c;
 }
@@ -221,6 +243,7 @@ struct lk_conn *lk_conn_table_data_decrypted(struct lk_conn_table *t, __u64 cook
     c = create(t, cookie, seq, ts_ns);
     if (!c)
         return NULL;
+    c->ops = t->proto_dflt; /* no tuple, no port: the default protocol (РМ2) */
     c->tls_seq_seen = 1;
     c->tls_last_seq = seq;
     mark_dirty(c);
@@ -312,6 +335,14 @@ void lk_conn_table_on_destroy(struct lk_conn_table *t, void (*fn)(void *ctx, str
 {
     t->on_destroy = fn;
     t->on_destroy_ctx = ctx;
+}
+
+void lk_conn_table_set_protos(struct lk_conn_table *t, const struct lk_port_proto *map, unsigned n,
+                              const struct lk_proto_ops *dflt)
+{
+    t->protos = map;
+    t->nprotos = n;
+    t->proto_dflt = dflt;
 }
 
 void lk_conn_table_free(struct lk_conn_table *t)

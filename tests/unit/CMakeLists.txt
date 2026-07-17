@@ -12,9 +12,12 @@ target_include_directories(test_conn_table PRIVATE
     ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
 add_test(NAME conn_table COMMAND test_conn_table)
 
+# The framer's protocol knowledge lives behind the lk_proto_ops vtable (РМ1),
+# so reassembly.c pulls in the proto lib for the PG entry (pg_frame.c).
 add_executable(test_reassembly test_reassembly.c ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
 target_include_directories(test_reassembly PRIVATE
     ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
+target_link_libraries(test_reassembly latkit_proto)
 add_test(NAME reassembly COMMAND test_reassembly)
 
 # TLS decrypted-channel routing (task 6.4): the shared pipeline over synthetic
@@ -27,6 +30,7 @@ add_executable(test_tls_route test_tls_route.c
     ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
 target_include_directories(test_tls_route PRIVATE
     ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
+target_link_libraries(test_tls_route latkit_proto)
 add_test(NAME tls_route COMMAND test_tls_route)
 
 # cgroup filter core (task 7.1, Р48): glob matcher, id-set diff and the cgroupfs

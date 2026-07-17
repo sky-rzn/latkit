@@ -19,11 +19,13 @@
  * path (CONN_CLOSE, LRU eviction, idle sweep, table teardown) — see
  * lk_conn_table_on_destroy — so proto_state never leaks.
  *
- * Deliberate seam (Р15): the framer itself (reassembly.c) stays PG-aware —
- * type+len frames, startup framing and the 'Z' resync anchor are baked in.
- * Generalising the framer into per-protocol framer-ops waits for a second real
- * protocol; abstracting from a single instance is guessing. When that day
- * comes, the registry below grows a second entry and this file grows a vtable.
+ * The seam Р15 deliberately deferred is now real (РМ1, MYSQL.md М1): the
+ * framer mechanics (bytes/hole, the body-prefix slab pool, off-anomalies,
+ * counters) stay in reassembly.c, while everything protocol-shaped — header
+ * size and parse, startup framing, SSL/Cancel transitions, resync anchors —
+ * lives behind the lk_proto_ops vtable below. The PG entry is
+ * src/proto/pg/pg_frame.c; a connection picks its ops from the port→protocol
+ * map at creation (РМ2), NULL falling back to PG — the CLI default.
  *
  * Everything under src/proto/ is pure (no I/O, no libbpf), like decode /
  * conn_table / reassembly: unit tests feed synthetic lk_msg, replay tests feed
@@ -33,6 +35,7 @@
 
 #include <linux/types.h>
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "conn_table.h" /* struct lk_conn, enum lk_dir */
 #include "reassembly.h" /* struct lk_msg, struct lk_msg_sink (down contract) */
@@ -113,13 +116,18 @@ struct lk_proto_stats {
     __u64 by_type[2][256];        /* [enum lk_dir][type byte]; startup at [.][0] */
 };
 
-/* --- registry (Р15): one handler today, a vtable when a second arrives ---- */
+/* --- protocol handler (down: lk_msg_sink, up: lk_query_sink) -------------- */
 
-/* Opaque protocol handler. Owns its per-connection state through
+/* Protocol handler object. Owns its per-connection state through
  * lk_conn.proto_state; is an lk_msg_sink downward and drives an lk_query_sink
  * upward. Assembled in exactly one place: events.c (live) / the replay harness
- * (offline). */
-struct lk_proto;
+ * (offline). The base is protocol-independent — a handler's own state lives
+ * entirely in proto_state — so the accessors below are shared (registry.c). */
+struct lk_proto {
+    struct lk_msg_sink msink; /* down: installed as the framer's sink */
+    struct lk_query_sink out; /* up: borrowed from the assembler */
+    struct lk_proto_stats st;
+};
 
 /* PostgreSQL v3 handler. `out` (may have NULL callbacks) receives the
  * observations; it is borrowed, not copied deeply — keep it alive for the
@@ -133,5 +141,69 @@ const struct lk_msg_sink *lk_proto_sink(struct lk_proto *p);
 const struct lk_proto_stats *lk_proto_stats(const struct lk_proto *p);
 
 void lk_proto_free(struct lk_proto *p);
+
+/* --- protocol vtable + registry (РМ1) ------------------------------------- */
+
+struct lk_reasm; /* reassembly.h (included above); for the hook signatures */
+struct lk_ev_data;
+
+/* One wire protocol: its name (the `--port N=<name>` selector), its handler
+ * constructor, and the framer knowledge reassembly.c calls out for. The framer
+ * hooks are pure state manipulation over lk_frame / lk_conn flags — no I/O, no
+ * allocation. All hooks except the two intercept_* are mandatory.
+ *
+ * Contract notes:
+ *  - hdr_size returns how many header bytes to accumulate in f->hdr before
+ *    parse_hdr can run (<= sizeof f->hdr); it may depend on the direction's
+ *    framing state (PG: 4 in startup framing, 5 normal).
+ *  - parse_hdr reads f->hdr and fills f->msg_type, f->msg_len (the lk_msg.len
+ *    value, protocol semantics) and f->body_len (wire bytes following the
+ *    header). false = corrupt header: the framer dirties the direction and
+ *    bumps bad_len.
+ *  - pre_emit runs on every assembled message right before the sink: set
+ *    protocol flags on *m (LK_MSG_STARTUP) and drive framing-state transitions
+ *    that depend on the body (PG: startup code -> startup_done /
+ *    LK_CONN_SSL_REPLY / LK_CONN_CANCEL).
+ *  - intercept_bytes consumes cross-direction special bytes before framing
+ *    (PG: the one-byte SSL/GSSENC reply); it advances *p and *n, returning false
+ *    discards the rest of the chunk (the connection went encrypted).
+ *    intercept_hole is its hole twin: true = the pending special reply fell
+ *    into the hole, and the framer dirties the direction (hdr_holes).
+ *  - resync_scan runs in LK_FR_DIRTY over captured bytes: return how many were
+ *    consumed and set *found when framing may resume at the next byte
+ *    (f->resync_matched is the protocol's scratch, zeroed on holes).
+ *  - resync_boundary is the call-boundary anchor, checked by lk_reasm_data on
+ *    a dirty direction before the bytes are fed (PG: frontend off==0 + valid
+ *    type + plausible len). */
+struct lk_proto_ops {
+    const char *name;
+
+    struct lk_proto *(*proto_new)(const struct lk_query_sink *out);
+
+    __u32 (*hdr_size)(const struct lk_conn *c, enum lk_dir dir, const struct lk_frame *f);
+    bool (*parse_hdr)(struct lk_conn *c, enum lk_dir dir, struct lk_frame *f);
+    void (*pre_emit)(struct lk_conn *c, enum lk_dir dir, struct lk_frame *f, struct lk_msg *m);
+    bool (*intercept_bytes)(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, const __u8 **p,
+                            __u32 *n, __u64 ts_ns);
+    bool (*intercept_hole)(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir);
+    __u32 (*resync_scan)(struct lk_conn *c, enum lk_dir dir, struct lk_frame *f, const __u8 *p,
+                         __u32 n, bool *found);
+    bool (*resync_boundary)(const struct lk_conn *c, enum lk_dir dir, const struct lk_ev_data *ev,
+                            __u32 cap_len);
+};
+
+/* PG v3 framing behind the vtable (src/proto/pg/pg_frame.c). Also the
+ * default: a bare `--port N` and a connection without an assigned protocol
+ * (lazily created entry, bare unit-test lk_conn) frame as PG (РМ2). */
+extern const struct lk_proto_ops lk_proto_pg_ops;
+
+/* The registry: one entry per supported protocol, PG first (the default).
+ * LK_PROTO_MAX caps it so consumers can size parallel arrays statically. */
+#define LK_PROTO_MAX 4
+extern const struct lk_proto_ops *const lk_proto_registry[];
+extern const unsigned lk_proto_nregistry;
+
+/* Name lookup for the CLI (`--port 3306=mysql`); NULL when unknown. */
+const struct lk_proto_ops *lk_proto_find(const char *name, size_t name_len);
 
 #endif /* LATKIT_PROTO_H */

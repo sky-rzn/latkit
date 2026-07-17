@@ -24,6 +24,7 @@
 #include "loop.h"
 #include "metrics.h"
 #include "otel_env.h"
+#include "proto.h"
 #include "spans.h"
 #include "tls_attach.h"
 #include "version.h"
@@ -44,6 +45,10 @@ static bool opt_events;
 static bool opt_messages;
 static bool opt_queries;
 static __u16 opt_ports[LK_MAX_PORTS];
+/* Protocol per port (РМ2): parallel to opt_ports, from `--port N[=pg|mysql]`;
+ * a bare number is the default protocol (pg, the registry head). */
+static const struct lk_proto_ops *opt_port_ops[LK_MAX_PORTS];
+static struct lk_port_proto opt_port_protos[LK_MAX_PORTS];
 static int opt_nports;
 static __u64 opt_ringbuf_bytes = LK_RINGBUF_SZ;
 static __u32 opt_capture_limit = LK_CAPTURE_LIMIT;
@@ -95,8 +100,9 @@ static void usage(FILE *out, const char *argv0)
     fprintf(out,
             "latkit %s\n"
             "usage: %s [options]\n"
-            "  -p, --port PORT       local (server) port to capture; repeatable,\n"
-            "                        up to %d ports (default: %d)\n"
+            "  -p, --port PORT[=pg]  local (server) port to capture, optionally\n"
+            "                        with its wire protocol (default: pg);\n"
+            "                        repeatable, up to %d ports (default: %d)\n"
             "      --ringbuf-bytes N ringbuf size, power-of-two bytes (default: %d)\n"
             "      --capture-limit N capture budget per send/recv call, bytes\n"
             "                        (default: %d, max: %d; total_len stays honest)\n"
@@ -234,17 +240,41 @@ static int set_option(int c, char *optarg)
     __u64 v;
 
     switch (c) {
-    case 'p':
+    case 'p': {
+        /* PORT[=proto] (РМ2): a bare number keeps the pg default. */
+        const char *eq = strchr(optarg, '=');
+        const struct lk_proto_ops *ops = lk_proto_registry[0];
+        char port_str[8];
+
         if (opt_nports == LK_MAX_PORTS) {
             fprintf(stderr, "--port: at most %d ports\n", LK_MAX_PORTS);
             return -1;
+        }
+        if (eq) {
+            ops = lk_proto_find(eq + 1, strlen(eq + 1));
+            if (!ops) {
+                fprintf(stderr, "--port: unknown protocol '%s' (supported:", eq + 1);
+                for (unsigned i = 0; i < lk_proto_nregistry; i++)
+                    fprintf(stderr, " %s", lk_proto_registry[i]->name);
+                fprintf(stderr, ")\n");
+                return -1;
+            }
+            if ((size_t)(eq - optarg) >= sizeof(port_str)) {
+                fprintf(stderr, "--port: bad port '%s'\n", optarg);
+                return -1;
+            }
+            memcpy(port_str, optarg, eq - optarg);
+            port_str[eq - optarg] = '\0';
+            optarg = port_str;
         }
         if (parse_num(optarg, 1, 65535, &v)) {
             fprintf(stderr, "--port: bad port '%s'\n", optarg);
             return -1;
         }
+        opt_port_ops[opt_nports] = ops;
         opt_ports[opt_nports++] = v;
         break;
+    }
     case OPT_RINGBUF_BYTES:
         /* Kernel-side constraint: power of two and page-aligned. */
         if (parse_num(optarg, 4096, 1ULL << 30, &v) || (v & (v - 1))) {
@@ -595,8 +625,13 @@ static int parse_args(int argc, char **argv)
 
     if (apply_env_defaults())
         return -1;
-    if (opt_nports == 0)
+    if (opt_nports == 0) {
+        opt_port_ops[opt_nports] = lk_proto_registry[0]; /* pg (РМ2) */
         opt_ports[opt_nports++] = LK_DEFAULT_PORT;
+    }
+    /* The port→protocol map handed to the conn table (РМ2). */
+    for (int i = 0; i < opt_nports; i++)
+        opt_port_protos[i] = (struct lk_port_proto){.port = opt_ports[i], .ops = opt_port_ops[i]};
     return 0;
 }
 
@@ -643,8 +678,14 @@ static void apply_otlp_env_defaults(void)
  * test (tests/unit/config_priority.sh). */
 static void print_config(void)
 {
-    for (int i = 0; i < opt_nports; i++)
-        printf("port=%u\n", opt_ports[i]);
+    for (int i = 0; i < opt_nports; i++) {
+        /* The pg default prints bare — the pre-РМ2 format, pinned by
+         * config_priority.sh; an explicit protocol prints as given. */
+        if (opt_port_ops[i] == lk_proto_registry[0])
+            printf("port=%u\n", opt_ports[i]);
+        else
+            printf("port=%u=%s\n", opt_ports[i], opt_port_ops[i]->name);
+    }
     printf("ringbuf_bytes=%llu\n", (unsigned long long)opt_ringbuf_bytes);
     printf("capture_limit=%u\n", opt_capture_limit);
     printf("comm=%s\n", opt_comm);
@@ -857,6 +898,8 @@ int main(int argc, char **argv)
         .ringbuf = skel->maps.events,
         .stats = skel->maps.stats,
         .capmode = skel->maps.capmode,
+        .port_protos = opt_port_protos, /* port→protocol map (РМ2) */
+        .n_port_protos = (unsigned)opt_nports,
         .tls = tls,       /* attach-state gauge source (latkit_tls_attached) */
         .cgroup = cgroup, /* latkit_cgroup_filter_paths gauge source */
         .max_conns = opt_max_conns,
@@ -914,8 +957,12 @@ int main(int argc, char **argv)
         goto cleanup;
 
     fprintf(stderr, "latkit %s: attached, capturing local port(s)", LK_VERSION);
-    for (int i = 0; i < opt_nports; i++)
-        fprintf(stderr, " %u", opt_ports[i]);
+    for (int i = 0; i < opt_nports; i++) {
+        if (opt_port_ops[i] == lk_proto_registry[0])
+            fprintf(stderr, " %u", opt_ports[i]);
+        else
+            fprintf(stderr, " %u=%s", opt_ports[i], opt_port_ops[i]->name);
+    }
     if (opt_comm[0])
         fprintf(stderr, ", comm=%s", opt_comm);
     if (opt_ncgroup)

@@ -28,7 +28,9 @@ set(FUZZ_INC
     ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf
     ${CMAKE_SOURCE_DIR}/src/norm)
 set(FUZZ_PROTO_SRC
-    ${CMAKE_SOURCE_DIR}/src/proto/pg/pg.c ${CMAKE_SOURCE_DIR}/src/proto/pg/pg_session.c
+    ${CMAKE_SOURCE_DIR}/src/proto/registry.c
+    ${CMAKE_SOURCE_DIR}/src/proto/pg/pg.c ${CMAKE_SOURCE_DIR}/src/proto/pg/pg_frame.c
+    ${CMAKE_SOURCE_DIR}/src/proto/pg/pg_session.c
     ${CMAKE_SOURCE_DIR}/src/proto/pg/pg_query.c ${CMAKE_SOURCE_DIR}/src/proto/pg/pg_prep.c)
 set(FUZZ_CORE_SRC
     ${CMAKE_SOURCE_DIR}/src/agent/conn_table.c ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)

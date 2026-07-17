@@ -24,6 +24,14 @@
 
 #include "latkit.h"
 
+struct lk_proto_ops; /* proto.h; the table only stores the pointers */
+
+/* One port→protocol mapping (РМ2): `--port 3306=mysql`. */
+struct lk_port_proto {
+    __u16 port;
+    const struct lk_proto_ops *ops;
+};
+
 /* Userspace defaults for the CLI knobs. max_conns matches the kernel `conns`
  * map capacity; the idle timeout is deliberately conservative (a pooled
  * connection idling minutes between transactions must survive). */
@@ -41,9 +49,14 @@ struct lk_frame {
     __u64 skip_left;            /* SKIP: wire bytes of the body left to discard */
     __u32 call_pos, call_total; /* chunk off-arithmetic within one call;
                                    call_total == 0: no call in progress */
-    /* Message being assembled (valid in BODY/SKIP, hdr[] while in HEADER). */
+    /* Message being assembled (valid in BODY/SKIP, hdr[] while in HEADER).
+     * msg_type/msg_len/body_len are filled by the protocol's parse_hdr hook
+     * (lk_proto_ops, РМ1): msg_len keeps the protocol's own len semantics for
+     * lk_msg.len, body_len is the wire bytes following the header — what the
+     * generic framer actually counts. */
     __u64 msg_ts;        /* ts of the event with the first header byte (Р13) */
     __u32 msg_len;       /* protocol len field of the current message */
+    __u32 body_len;      /* wire bytes of body after the header */
     __u8 msg_type;       /* 0 while in startup framing */
     __u8 startup_done;   /* frontend: StartupMessage seen, normal framing on */
     __u8 after_resync;   /* next emitted message gets LK_MSG_AFTER_RESYNC */
@@ -86,7 +99,13 @@ struct lk_conn {
     struct lk_conn *lru_prev, *lru_next;
     __u64 cookie;
     struct lk_tuple tuple; /* zeroed for lazily created entries */
-    __u16 flags;           /* LK_CONN_* */
+    /* Wire protocol of this connection (РМ1/РМ2): assigned from the
+     * port→protocol map (lk_conn_table_set_protos) when the entry is created —
+     * by the local port (tuple.sport; the capture is server-side, Р7). NULL —
+     * no map configured, or a lazily created entry without a tuple — means the
+     * default: the framer falls back to PG (lk_proto_pg_ops). */
+    const struct lk_proto_ops *ops;
+    __u16 flags; /* LK_CONN_* */
     __u32 last_seq;
     __u32 dropped; /* events lost on this connection (userspace-detected) */
     /* Decrypted-channel seq space (Р38, stage 6.4): the plaintext uprobe events
@@ -127,6 +146,14 @@ struct lk_conn_table;
 
 struct lk_conn_table *lk_conn_table_new(__u32 max_conns, __u64 idle_timeout_ns);
 void lk_conn_table_free(struct lk_conn_table *t);
+
+/* Install the port→protocol map (РМ2), borrowed for the table's lifetime:
+ * entries created from an OPEN resolve ops by the tuple's local port, lazily
+ * created (tupleless) ones get `dflt`. Call once after lk_conn_table_new,
+ * before any event is fed; never calling it leaves lk_conn.ops NULL, which the
+ * framer treats as the PG default — the offline harnesses rely on that. */
+void lk_conn_table_set_protos(struct lk_conn_table *t, const struct lk_port_proto *map, unsigned n,
+                              const struct lk_proto_ops *dflt);
 
 /* Register a hook fired for every entry removal — CONN_CLOSE, LRU eviction,
  * idle sweep, and lk_conn_table_free teardown — while the entry is still fully

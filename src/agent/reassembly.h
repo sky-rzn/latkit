@@ -24,18 +24,14 @@
  * directions on a seq gap before events reach this module; synthetic
  * connections start dirty and enter the stream through the same resync.
  *
- * Framing knowledge is deliberately minimal (Р10): normal messages are
- * type(1) + len(4, BE, includes itself, excludes the type) + body(len-4);
- * the frontend direction starts in startup framing — len(4) + body, no type
- * byte — and switches to normal framing once a StartupMessage
- * (code 0x00030000) is seen. SSLRequest/GSSENCRequest arm the cross-direction
- * "next backend byte is the one-byte reply" flag (LK_CONN_SSL_REPLY): the
- * reply is emitted as an lk_msg with len == 0 (the only untyped backend
- * message — no length field on the wire), 'S'/'G' marks the connection
- * LK_CONN_TLS (framing off, socket events silently discarded — the
- * plaintext source becomes the stage-6 uprobe channel), 'N' continues in
- * plaintext. CancelRequest marks the connection LK_CONN_CANCEL: emitted,
- * then everything is discarded until CLOSE. Message semantics are stage 3.
+ * Framing knowledge is deliberately minimal (Р10) and, since РМ1 (MYSQL.md
+ * М1), protocol-owned: header size/parse, startup framing, the SSL/Cancel
+ * transitions and both resync anchors come from the connection's
+ * lk_proto_ops vtable (proto.h) — PG's entry is src/proto/pg/pg_frame.c, and
+ * a connection without assigned ops frames as PG (the default, РМ2). This
+ * module keeps only the generic mechanics: chunk arithmetic, holes, the
+ * header/body/skip/dirty state machine, the slab pool and the counters.
+ * Message semantics are stage 3.
  *
  * Memory is bounded by construction (Р11): at most the body prefix of one
  * unfinished message is buffered per direction (<= LK_MSG_BODY_MAX, filled
@@ -72,8 +68,10 @@
  * connection count. Frees past the cap go to the real allocator. */
 #define LK_REASM_POOL_MAX 64
 
-/* Startup-message codes the framer distinguishes (Р10) — the first 4 body
- * bytes of a startup-framed message. Everything else about them is stage 3. */
+/* PG startup-message codes (Р10) — the first 4 body bytes of a startup-framed
+ * message. The framer logic that reads them moved to src/proto/pg/pg_frame.c
+ * (РМ1); the codes stay here because pg_session.c and a raft of test builders
+ * include this header for them. */
 #define LK_PG_PROTO_V3       0x00030000u /* StartupMessage */
 #define LK_PG_CANCEL_REQUEST 80877102u   /* CancelRequest */
 #define LK_PG_SSL_REQUEST    80877103u   /* SSLRequest */

@@ -40,13 +40,15 @@
 struct lk_events {
     struct lk_events_cfg cfg;
     struct ring_buffer *rb;
-    struct lk_pipeline pipe;              /* decode -> conn table -> framer (Р14) */
-    struct lk_proto *proto;               /* PG handler: the standard framer sink */
-    const struct lk_msg_sink *proto_sink; /* = lk_proto_sink(proto) */
-    struct lk_recorder *rec;              /* --record trace writer, NULL when off */
-    struct lk_metrics *metrics;           /* aggregator: the parser's standard consumer */
-    const struct lk_query_sink *msink;    /* = lk_metrics_query_sink(metrics) */
-    struct lk_query_sink qsink;           /* tee installed into the parser (below) */
+    struct lk_pipeline pipe; /* decode -> conn table -> framer (Р14) */
+    /* Protocol handlers (РМ1): one instance per registry entry, parallel to
+     * lk_proto_registry[]; messages route by lk_conn.ops (proto_of below).
+     * protos[0] is the PG default. */
+    struct lk_proto *protos[LK_PROTO_MAX];
+    struct lk_recorder *rec;           /* --record trace writer, NULL when off */
+    struct lk_metrics *metrics;        /* aggregator: the parser's standard consumer */
+    const struct lk_query_sink *msink; /* = lk_metrics_query_sink(metrics) */
+    struct lk_query_sink qsink;        /* tee installed into the parser (below) */
     /* Fan-out list the tee drives (Р32): the aggregator always, plus the span
      * collector when spans are enabled. --queries is a separate debug mirror. */
     const struct lk_query_sink *qsinks[2];
@@ -164,10 +166,21 @@ static void ev_on_txn(void *ctx, const struct lk_conn *c, __u64 start_ns, __u64 
             e->qsinks[i]->on_txn(e->qsinks[i]->ctx, c, start_ns, end_ns, final_status);
 }
 
-/* PG parser counters (stage 3). The skeleton (task 3.1) only tallies messages,
- * so print the totals plus the per-type breakdown its stubs produce — the
- * proof that live traffic is reaching the handler. Printable types show as the
- * PG letter, others as 0xNN; startup-framed messages have type 0. */
+/* Route a connection to its protocol handler instance (РМ1): c->ops is set by
+ * the conn table (port map) or the framer (PG fallback); a conn that never saw
+ * data has NULL ops and lands on the PG default — its proto_state is NULL, so
+ * the close hook is a no-op there. */
+static struct lk_proto *proto_of(struct lk_events *e, const struct lk_conn *c)
+{
+    for (unsigned i = 1; i < lk_proto_nregistry; i++)
+        if (lk_proto_registry[i] == c->ops)
+            return e->protos[i];
+    return e->protos[0]; /* PG: the registry head and the default (РМ2) */
+}
+
+/* Parser counters (stage 3), one block per protocol handler. Printable types
+ * show as the protocol letter, others as 0xNN; startup-framed messages have
+ * type 0. */
 static void append_type_counts(char *buf, size_t n, const __u64 *by_type)
 {
     size_t off = 0;
@@ -184,27 +197,27 @@ static void append_type_counts(char *buf, size_t n, const __u64 *by_type)
     }
 }
 
-static void print_proto_stats(const struct lk_proto_stats *ps)
+static void print_proto_stats(const char *name, const struct lk_proto_stats *ps)
 {
     char fe[256] = {0}, be[256] = {0};
 
-    fprintf(stderr, "latkit: pg msgs=%llu startup=%llu resyncs=%llu conns=%llu\n",
+    fprintf(stderr, "latkit: %s msgs=%llu startup=%llu resyncs=%llu conns=%llu\n", name,
             (unsigned long long)ps->msgs, (unsigned long long)ps->startup_msgs,
             (unsigned long long)ps->resyncs, (unsigned long long)ps->conns);
     fprintf(stderr,
-            "latkit: pg sessions=%llu queries=%llu errors_sql=%llu "
+            "latkit: %s sessions=%llu queries=%llu errors_sql=%llu "
             "parse_errors=%llu unknown=%llu replication=%llu\n",
-            (unsigned long long)ps->sessions, (unsigned long long)ps->queries,
+            name, (unsigned long long)ps->sessions, (unsigned long long)ps->queries,
             (unsigned long long)ps->errors_sql, (unsigned long long)ps->parse_errors,
             (unsigned long long)ps->unknown_msgs, (unsigned long long)ps->replication_conns);
     fprintf(stderr,
-            "latkit: pg units_dropped resync=%llu close=%llu overflow=%llu prep_evictions=%llu\n",
-            (unsigned long long)ps->units_dropped_resync,
+            "latkit: %s units_dropped resync=%llu close=%llu overflow=%llu prep_evictions=%llu\n",
+            name, (unsigned long long)ps->units_dropped_resync,
             (unsigned long long)ps->units_dropped_close,
             (unsigned long long)ps->units_dropped_overflow, (unsigned long long)ps->prep_evictions);
     append_type_counts(fe, sizeof(fe), ps->by_type[LK_DIR_RECV]);
     append_type_counts(be, sizeof(be), ps->by_type[LK_DIR_SEND]);
-    fprintf(stderr, "latkit: pg types fe:%s | be:%s\n", fe, be);
+    fprintf(stderr, "latkit: %s types fe:%s | be:%s\n", name, fe, be);
 }
 
 /* Sum the per-CPU kernel `stats` counters into sum[]. Both the human stats line
@@ -314,22 +327,33 @@ static void ev_provide_stats(void *ctx, struct lk_metrics *m)
     lk_metrics_set_counter(m, "latkit_resync_total",
                            "Stream directions resynchronised after a loss.", (double)rs->resyncs);
 
-    const struct lk_proto_stats *ps = lk_proto_stats(e->proto);
+    /* Parser counters, summed over the per-protocol handler instances (РМ1) —
+     * the series stay protocol-wide; the per-protocol split is М6 (РМ6). */
+    __u64 parse_errors = 0, unknown_msgs = 0;
+    __u64 drop_resync = 0, drop_close = 0, drop_overflow = 0;
 
+    for (unsigned i = 0; i < lk_proto_nregistry; i++) {
+        const struct lk_proto_stats *ps = lk_proto_stats(e->protos[i]);
+
+        parse_errors += ps->parse_errors;
+        unknown_msgs += ps->unknown_msgs;
+        drop_resync += ps->units_dropped_resync;
+        drop_close += ps->units_dropped_close;
+        drop_overflow += ps->units_dropped_overflow;
+    }
     lk_metrics_set_counter(m, "latkit_parse_errors_total",
-                           "Protocol fields the parser rejected as corrupt.",
-                           (double)ps->parse_errors);
+                           "Protocol fields the parser rejected as corrupt.", (double)parse_errors);
     lk_metrics_set_counter(m, "latkit_unknown_msgs_total",
-                           "Unknown message types skipped by length.", (double)ps->unknown_msgs);
+                           "Unknown message types skipped by length.", (double)unknown_msgs);
     /* Р19 blind spot ("query cut off mid-flight") now has a counter, split by
      * why the in-flight unit was dropped. */
     lk_metrics_set_counter_l(m, "latkit_queries_dropped_total",
                              "In-flight query units dropped before completion.", "reason", "resync",
-                             (double)ps->units_dropped_resync);
+                             (double)drop_resync);
     lk_metrics_set_counter_l(m, "latkit_queries_dropped_total", NULL, "reason", "disconnect",
-                             (double)ps->units_dropped_close);
+                             (double)drop_close);
     lk_metrics_set_counter_l(m, "latkit_queries_dropped_total", NULL, "reason", "overflow",
-                             (double)ps->units_dropped_overflow);
+                             (double)drop_overflow);
 
     const struct lk_conn_table_stats *cs = lk_conn_table_stats(e->pipe.conns);
 
@@ -417,7 +441,8 @@ void lk_events_print_stats(struct lk_events *e)
             (unsigned long long)rs->off_anomalies, (unsigned long long)rs->resyncs,
             (unsigned long long)rs->tls_conns);
 
-    print_proto_stats(lk_proto_stats(e->proto));
+    for (unsigned i = 0; i < lk_proto_nregistry; i++)
+        print_proto_stats(lk_proto_registry[i]->name, lk_proto_stats(e->protos[i]));
 }
 
 /* xxd-style: offset, 16 hex bytes, ASCII column. */
@@ -479,18 +504,20 @@ static void print_data_event(const struct lk_ev_data *ev, __u32 cap, bool dump)
         hexdump(ev->payload, cap);
 }
 
-/* Framer sink installed by events.c: it tees every message into the PG parser
- * (the standard consumer since stage 3) and, when --messages is on, also logs
- * it. The stage-2 logger thus survives as a debug mirror alongside the parser
- * (STAGE3.md task 3.1). --hexdump adds the captured body prefix. fe> is the
- * frontend->backend stream (RECV on the server socket), <be the reverse. */
+/* Framer sink installed by events.c: it tees every message into the parser of
+ * the connection's protocol (the standard consumer since stage 3) and, when
+ * --messages is on, also logs it. The stage-2 logger thus survives as a debug
+ * mirror alongside the parser (STAGE3.md task 3.1). --hexdump adds the
+ * captured body prefix. fe> is the frontend->backend stream (RECV on the
+ * server socket), <be the reverse. */
 static void on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struct lk_msg *m)
 {
     struct lk_events *e = ctx;
+    const struct lk_msg_sink *ps = lk_proto_sink(proto_of(e, c));
     char type[8];
 
-    if (e->proto_sink->on_msg)
-        e->proto_sink->on_msg(e->proto_sink->ctx, c, dir, m);
+    if (ps->on_msg)
+        ps->on_msg(ps->ctx, c, dir, m);
 
     if (!e->cfg.messages)
         return;
@@ -513,22 +540,24 @@ static void on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struct l
 static void on_resync(void *ctx, struct lk_conn *c, enum lk_dir dir)
 {
     struct lk_events *e = ctx;
+    const struct lk_msg_sink *ps = lk_proto_sink(proto_of(e, c));
 
     fprintf(stderr, "latkit: conn=%llx resync (%s)\n", (unsigned long long)c->cookie,
             dir == LK_DIR_RECV ? "fe>" : "<be");
-    if (e->proto_sink->on_resync)
-        e->proto_sink->on_resync(e->proto_sink->ctx, c, dir);
+    if (ps->on_resync)
+        ps->on_resync(ps->ctx, c, dir);
 }
 
-/* Connection removed from the table (any path): let the parser free its
- * per-connection state (Р15). The pipeline routes the conn-table destroy hook
- * here through the framer sink. */
+/* Connection removed from the table (any path): let its protocol's parser
+ * free the per-connection state (Р15). The pipeline routes the conn-table
+ * destroy hook here through the framer sink. */
 static void on_conn_close(void *ctx, struct lk_conn *c)
 {
     struct lk_events *e = ctx;
+    const struct lk_msg_sink *ps = lk_proto_sink(proto_of(e, c));
 
-    if (e->proto_sink->on_conn_close)
-        e->proto_sink->on_conn_close(e->proto_sink->ctx, c);
+    if (ps->on_conn_close)
+        ps->on_conn_close(ps->ctx, c);
 }
 
 /* Flip a connection into HEADERS capture (Р21) by writing its cookie into the
@@ -706,35 +735,45 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
     if (e->selfstats)
         lk_metrics_add_provider(e->metrics, lk_selfstats_provide, e->selfstats);
 
-    /* Install a tee (ev_*) as the parser's upward sink: it fans every
+    /* Install a tee (ev_*) as the parsers' upward sink: it fans every
      * observation into the aggregator and, with --queries, the stage-3 logger
      * (Р15). events.c's own message sink (above) similarly tees messages into
-     * the parser and mirrors them to the --messages logger. */
+     * the parser and mirrors them to the --messages logger. One handler
+     * instance per registry protocol (РМ1); all share the tee. */
     e->qsink = (struct lk_query_sink){
         .ctx = e, .on_session = ev_on_session, .on_query = ev_on_query, .on_txn = ev_on_txn};
-    e->proto = lk_proto_pg_new(&e->qsink);
-    if (!e->proto) {
-        lk_selfstats_free(e->selfstats);
-        lk_metrics_free(e->metrics);
-        free(e);
-        return NULL;
+    for (unsigned i = 0; i < lk_proto_nregistry; i++) {
+        e->protos[i] = lk_proto_registry[i]->proto_new(&e->qsink);
+        if (!e->protos[i]) {
+            while (i)
+                lk_proto_free(e->protos[--i]);
+            lk_selfstats_free(e->selfstats);
+            lk_metrics_free(e->metrics);
+            free(e);
+            return NULL;
+        }
     }
-    e->proto_sink = lk_proto_sink(e->proto);
     if (lk_pipeline_init(&e->pipe, cfg->max_conns, cfg->conn_idle_timeout_sec * 1000000000ULL,
                          &sink)) {
-        lk_proto_free(e->proto);
+        for (unsigned i = 0; i < lk_proto_nregistry; i++)
+            lk_proto_free(e->protos[i]);
         lk_selfstats_free(e->selfstats);
         lk_metrics_free(e->metrics);
         free(e);
         return NULL;
     }
+    /* Port→protocol assignment happens at entry creation (РМ2); the default is
+     * the registry head (PG), matching the framer's NULL-ops fallback. */
+    lk_conn_table_set_protos(e->pipe.conns, cfg->port_protos, cfg->n_port_protos,
+                             lk_proto_registry[0]);
     if (cfg->record_path) {
         e->rec = lk_recorder_open(cfg->record_path);
         if (!e->rec) {
             fprintf(stderr, "failed to open --record file '%s': %s\n", cfg->record_path,
                     strerror(errno));
             lk_pipeline_fini(&e->pipe);
-            lk_proto_free(e->proto);
+            for (unsigned i = 0; i < lk_proto_nregistry; i++)
+                lk_proto_free(e->protos[i]);
             lk_metrics_free(e->metrics);
             free(e);
             return NULL;
@@ -745,7 +784,8 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
         fprintf(stderr, "failed to create ring buffer\n");
         lk_recorder_close(e->rec);
         lk_pipeline_fini(&e->pipe);
-        lk_proto_free(e->proto);
+        for (unsigned i = 0; i < lk_proto_nregistry; i++)
+            lk_proto_free(e->protos[i]);
         lk_selfstats_free(e->selfstats);
         lk_metrics_free(e->metrics);
         free(e);
@@ -791,9 +831,10 @@ void lk_events_free(struct lk_events *e)
     if (lk_recorder_close(e->rec))
         fprintf(stderr, "warn: --record file may be incomplete (write error)\n");
     /* Tear the table down first: its destroy hooks free every connection's
-     * proto_state through the parser, which must still be alive here. */
+     * proto_state through the parsers, which must still be alive here. */
     lk_pipeline_fini(&e->pipe);
-    lk_proto_free(e->proto);
+    for (unsigned i = 0; i < lk_proto_nregistry; i++)
+        lk_proto_free(e->protos[i]);
     lk_selfstats_free(e->selfstats);
     lk_metrics_free(e->metrics);
     free(e);

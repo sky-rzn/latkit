@@ -124,13 +124,9 @@ struct pg_conn {
     __u64 txn_start_ns; /* Z timestamp of the I->T that opened the current txn */
 };
 
-/* The handler object, shared with the pg_*.c helpers so they can reach the
- * upward query sink and the counters. Assembled by lk_proto_pg_new (pg.c). */
-struct lk_proto {
-    struct lk_msg_sink msink; /* down: installed as the framer's sink */
-    struct lk_query_sink out; /* up: borrowed from the assembler */
-    struct lk_proto_stats st;
-};
+/* The handler object (struct lk_proto) is the protocol-independent base from
+ * proto.h — the pg_*.c helpers reach the upward query sink and the counters
+ * through it. Assembled by lk_proto_pg_new (pg.c). */
 
 /* --- pg_session.c (task 3.2): startup, auth, session labels --------------- */
 

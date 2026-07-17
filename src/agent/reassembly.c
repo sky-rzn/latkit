@@ -1,12 +1,26 @@
 // SPDX-License-Identifier: GPL-2.0
+/* Generic framer mechanics (Р9-Р11); the protocol-shaped parts — header
+ * size/parse, startup framing, special transitions, resync anchors — come
+ * from the connection's lk_proto_ops (РМ1, proto.h). A connection without
+ * assigned ops frames as PG: the default protocol (РМ2), and what keeps the
+ * pre-vtable unit tests and fixtures running unchanged. */
 #include "reassembly.h"
 
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Message length sanity ceiling (Р10): larger values are corruption. */
-#define LK_MSG_LEN_MAX (1u << 30)
+#include "proto.h"
+
+/* Resolve (and pin) the connection's protocol. The live path assigns ops at
+ * entry creation (conn_table, РМ2); the fallback covers lazily created
+ * entries with no tuple and bare unit-test connections. */
+static const struct lk_proto_ops *conn_ops(struct lk_conn *c)
+{
+    if (!c->ops)
+        c->ops = &lk_proto_pg_ops;
+    return c->ops;
+}
 
 void lk_reasm_init(struct lk_reasm *r, const struct lk_msg_sink *sink)
 {
@@ -43,18 +57,6 @@ static void buf_put(struct lk_reasm *r, __u8 *buf)
         free(buf);
 }
 
-static __u32 be32(const __u8 *p)
-{
-    return (__u32)p[0] << 24 | (__u32)p[1] << 16 | (__u32)p[2] << 8 | p[3];
-}
-
-/* The port filter captures the server side, so RECV is the frontend->backend
- * stream: only it starts in startup framing (no type byte, Р10). */
-static bool in_startup(const struct lk_frame *f, enum lk_dir dir)
-{
-    return dir == LK_DIR_RECV && !f->startup_done;
-}
-
 /* Back to HEADER at a message boundary; the body-prefix slab is recycled to
  * the freelist here (Р11), so steady-state heap churn is ~0. */
 static void msg_reset(struct lk_reasm *r, struct lk_frame *f)
@@ -63,6 +65,7 @@ static void msg_reset(struct lk_reasm *r, struct lk_frame *f)
     f->buf = NULL;
     f->buf_len = 0;
     f->hdr_len = 0;
+    f->body_len = 0;
     f->st = LK_FR_HEADER;
 }
 
@@ -93,8 +96,8 @@ static void do_resync(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, st
         r->sink.on_resync(r->sink.ctx, c, dir);
 }
 
-static void emit(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, struct lk_frame *f,
-                 const __u8 *body, __u32 body_cap)
+static void emit(struct lk_reasm *r, const struct lk_proto_ops *ops, struct lk_conn *c,
+                 enum lk_dir dir, struct lk_frame *f, const __u8 *body, __u32 body_cap)
 {
     struct lk_msg m = {
         .ts_ns = f->msg_ts,
@@ -104,38 +107,14 @@ static void emit(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, struct 
         .body = body,
     };
 
-    if (in_startup(f, dir)) {
-        m.flags |= LK_MSG_STARTUP;
-        /* The code is all the semantics the framer needs (Р10). An
-         * unreadable code (body cut before byte 4) leaves startup framing
-         * on; if it actually was a StartupMessage the next header fails the
-         * len sanity check and the direction goes dirty — no silent
-         * corruption. */
-        if (body_cap >= 4) {
-            switch (be32(body)) {
-            case LK_PG_PROTO_V3:
-                f->startup_done = 1; /* normal framing from the next byte */
-                break;
-            case LK_PG_SSL_REQUEST:
-            case LK_PG_GSSENC_REQUEST:
-                /* The next backend byte is the one-byte reply; the request
-                 * direction stays in startup framing (a StartupMessage
-                 * follows after 'N'). */
-                c->flags |= LK_CONN_SSL_REPLY;
-                break;
-            case LK_PG_CANCEL_REQUEST:
-                /* Nothing else ever travels on a cancel connection: emit
-                 * this message, then discard until CLOSE. */
-                c->flags |= LK_CONN_CANCEL;
-                break;
-            }
-        }
-    }
+    /* Protocol flags and body-dependent framing transitions (startup code,
+     * SSL/Cancel) live in the vtable (РМ1). */
+    ops->pre_emit(c, dir, f, &m);
     if (f->after_resync) {
         m.flags |= LK_MSG_AFTER_RESYNC;
         f->after_resync = 0;
     }
-    if (body_cap < f->msg_len - 4) {
+    if (body_cap < f->body_len) {
         m.flags |= LK_MSG_BODY_TRUNC;
         r->st.msgs_trunc++;
     }
@@ -147,80 +126,24 @@ static void emit(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, struct 
 /* Body prefix actually captured per message (Р11). */
 static __u32 body_target(const struct lk_frame *f)
 {
-    __u32 body_len = f->msg_len - 4;
-
-    return body_len < LK_MSG_BODY_MAX ? body_len : LK_MSG_BODY_MAX;
+    return f->body_len < LK_MSG_BODY_MAX ? f->body_len : LK_MSG_BODY_MAX;
 }
-
-/* Header complete: sanity-check len and move on. Returns false when the
- * direction went dirty. */
-static bool parse_header(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, struct lk_frame *f)
-{
-    bool startup = in_startup(f, dir);
-    __u32 len = be32(f->hdr + (startup ? 0 : 1));
-
-    /* len includes itself; a startup message must at least carry the 4-byte
-     * code. Anything shorter, or absurdly long, is corruption (Р10). */
-    if (len < (startup ? 8u : 4u) || len > LK_MSG_LEN_MAX) {
-        go_dirty(r, f, &r->st.bad_len);
-        return false;
-    }
-    f->msg_type = startup ? 0 : f->hdr[0];
-    f->msg_len = len;
-    if (len == 4) { /* empty body: whole message was the header */
-        emit(r, c, dir, f, NULL, 0);
-        msg_reset(r, f);
-    } else {
-        f->st = LK_FR_BODY;
-    }
-    return true;
-}
-
-/* The one-byte backend reply to SSLRequest/GSSENCRequest — the only untyped
- * backend message (Р10). Emitted as an lk_msg with len == 0 (there is no
- * length field on the wire). Returns false when the connection went
- * encrypted and the rest of the stream must be dropped. An unexpected byte
- * (an ancient server answering with ErrorResponse) is treated as consumed
- * plaintext: framing derails on the next header and recovers via resync. */
-static bool ssl_reply(struct lk_reasm *r, struct lk_conn *c, __u8 b, __u64 ts_ns)
-{
-    struct lk_msg m = {.ts_ns = ts_ns, .type = (char)b};
-
-    c->flags &= ~LK_CONN_SSL_REPLY;
-    r->st.msgs++;
-    if (r->sink.on_msg)
-        r->sink.on_msg(r->sink.ctx, c, LK_DIR_SEND, &m);
-    if (b == 'S' || b == 'G') {
-        /* TLS (or GSSAPI encryption) accepted: framing off, socket events
-         * of this connection are discarded from now on — the plaintext
-         * source becomes the stage-6 uprobe channel. */
-        c->flags |= LK_CONN_TLS;
-        r->st.tls_conns++;
-        return false;
-    }
-    return true; /* 'N': plaintext continues */
-}
-
-/* Backend resync anchor: ReadyForQuery on the wire (Р10). Positions 0-4 are
- * fixed bytes, position 5 accepts the three status values. */
-static const __u8 resync_pat[5] = {'Z', 0, 0, 0, 5};
 
 void lk_frame_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, const __u8 *p, __u32 n,
                     __u64 ts_ns)
 {
+    const struct lk_proto_ops *ops = conn_ops(c);
     struct lk_frame *f = &c->frame[dir];
 
-    if (dir == LK_DIR_SEND && (c->flags & LK_CONN_SSL_REPLY) && n > 0) {
-        if (!ssl_reply(r, c, p[0], ts_ns))
-            return;
-        p++;
-        n--;
-    }
+    /* Cross-direction special bytes before framing (PG: the one-byte SSL
+     * reply). false = the rest of the chunk is ciphertext, drop it. */
+    if (ops->intercept_bytes && n > 0 && !ops->intercept_bytes(r, c, dir, &p, &n, ts_ns))
+        return;
 
     while (n > 0) {
         switch (f->st) {
         case LK_FR_HEADER: {
-            __u32 hdr_size = in_startup(f, dir) ? 4 : 5;
+            __u32 hdr_size = ops->hdr_size(c, dir, f);
             __u32 take = hdr_size - f->hdr_len;
 
             if (f->hdr_len == 0)
@@ -233,8 +156,16 @@ void lk_frame_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, cons
             n -= take;
             if (f->hdr_len < hdr_size)
                 return;
-            if (!parse_header(r, c, dir, f))
+            if (!ops->parse_hdr(c, dir, f)) {
+                go_dirty(r, f, &r->st.bad_len);
                 return;
+            }
+            if (f->body_len == 0) { /* empty body: whole message was the header */
+                emit(r, ops, c, dir, f, NULL, 0);
+                msg_reset(r, f);
+            } else {
+                f->st = LK_FR_BODY;
+            }
             break;
         }
         case LK_FR_BODY: {
@@ -257,11 +188,11 @@ void lk_frame_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, cons
                 target = f->buf_len + n; /* buf_len == 0 when buf is NULL */
             }
             const __u8 *body = f->buf ? f->buf : p;
-            __u64 skip = (__u64)(f->msg_len - 4) - target;
+            __u64 skip = (__u64)f->body_len - target;
 
             if (f->buf)
                 memcpy(f->buf + f->buf_len, p, rem);
-            emit(r, c, dir, f, body, target);
+            emit(r, ops, c, dir, f, body, target);
             p += rem;
             n -= rem;
             msg_reset(r, f);
@@ -281,51 +212,37 @@ void lk_frame_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, cons
                 f->st = LK_FR_HEADER;
             break;
         }
-        case LK_FR_DIRTY:
-            /* Backend resync scan (Р10): find 'Z' 00 00 00 05 [ITE] in the
-             * captured bytes; resync_matched carries the partial match
-             * across event boundaries. The pattern restarts only on 'Z' —
-             * no other pattern byte equals 'Z', so this shortcut is exact.
-             * The frontend anchor is a call boundary, checked in
-             * lk_reasm_data; frontend bytes are discarded here. */
-            if (dir != LK_DIR_SEND)
-                return;
-            while (n > 0) {
-                __u8 b = *p++;
+        case LK_FR_DIRTY: {
+            /* Anchor scan in the captured bytes (Р10) — the pattern and the
+             * direction policy are the protocol's (PG: backend 'Z' scan,
+             * frontend bytes discarded; its anchor is a call boundary,
+             * checked in lk_reasm_data). Framing resumes at the byte after
+             * the anchor. */
+            bool found = false;
+            __u32 used = ops->resync_scan(c, dir, f, p, n, &found);
 
-                n--;
-                if (f->resync_matched < 5) {
-                    f->resync_matched =
-                        b == resync_pat[f->resync_matched] ? f->resync_matched + 1 : b == 'Z';
-                } else if (b == 'I' || b == 'T' || b == 'E') {
-                    /* Framing resumes at the byte after the anchor; the
-                     * ReadyForQuery itself is not emitted — it is only a
-                     * boundary marker (Р10). */
-                    do_resync(r, c, dir, f);
-                    break;
-                } else {
-                    f->resync_matched = b == 'Z';
-                }
-            }
-            if (f->st == LK_FR_DIRTY)
+            p += used;
+            n -= used;
+            if (!found)
                 return; /* no anchor in this chunk */
+            do_resync(r, c, dir, f);
             break;
+        }
         }
     }
 }
 
 void lk_frame_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64 n)
 {
+    const struct lk_proto_ops *ops = conn_ops(c);
     struct lk_frame *f = &c->frame[dir];
 
     if (n == 0)
         return;
-    if (dir == LK_DIR_SEND && (c->flags & LK_CONN_SSL_REPLY)) {
-        /* The one-byte reply fell into the hole: 'S' or 'N' is unknown, so
-         * whether the stream is now ciphertext is unknown too. Dirty and
-         * let the resync sort it out — scanning ciphertext may cost a false
-         * anchor or two (see the STAGE2.md risk table), never silence. */
-        c->flags &= ~LK_CONN_SSL_REPLY;
+    if (ops->intercept_hole && ops->intercept_hole(r, c, dir)) {
+        /* A pending special reply fell into the hole (PG: the SSL byte —
+         * whether the stream is now ciphertext is unknown): dirty and let
+         * the resync sort it out. */
         go_dirty(r, f, &r->st.hdr_holes);
         return;
     }
@@ -346,10 +263,10 @@ void lk_frame_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64
         case LK_FR_BODY: {
             /* The header is known: emit the captured prefix now and advance
              * over the rest of the body arithmetically. */
-            __u64 rem = (__u64)(f->msg_len - 4) - f->buf_len;
+            __u64 rem = (__u64)f->body_len - f->buf_len;
             __u64 take = rem < n ? rem : n;
 
-            emit(r, c, dir, f, f->buf, f->buf_len);
+            emit(r, ops, c, dir, f, f->buf, f->buf_len);
             n -= take;
             msg_reset(r, f);
             if (take < rem) {
@@ -373,15 +290,10 @@ void lk_frame_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64
     }
 }
 
-/* Frontend message types acceptable as a resync anchor (Р10). */
-static bool fe_type_ok(__u8 b)
-{
-    return b && strchr("QPBESXCDFHdcfp", b);
-}
-
 void lk_reasm_data(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir,
                    const struct lk_ev_data *ev, __u32 cap_len)
 {
+    const struct lk_proto_ops *ops = conn_ops(c);
     struct lk_frame *f = &c->frame[dir];
     __u32 total = ev->total_len, off = ev->off;
     bool decrypted = ev->hdr.flags & LK_F_DECRYPTED;
@@ -428,18 +340,12 @@ void lk_reasm_data(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir,
         f->call_pos = off;
     }
 
-    /* Frontend resync anchor (Р10): a call boundary whose first captured
-     * byte is a valid frontend type with a plausible len. Messages start at
-     * call boundaries on the frontend (libpq flushes whole messages), so
-     * this is where framing may safely re-enter; checked after the hole/
-     * anomaly bookkeeping, right before the bytes are fed. */
-    if (f->st == LK_FR_DIRTY && dir == LK_DIR_RECV && off == 0 && cap_len >= 5 &&
-        fe_type_ok(ev->payload[0])) {
-        __u32 len = be32(ev->payload + 1);
-
-        if (len >= 4 && len <= LK_MSG_LEN_MAX)
-            do_resync(r, c, dir, f);
-    }
+    /* Call-boundary resync anchor (Р10): where messages start at call
+     * boundaries, a dirty direction may safely re-enter framing (PG:
+     * frontend, valid type + plausible len). Checked after the hole/anomaly
+     * bookkeeping, right before the bytes are fed. */
+    if (f->st == LK_FR_DIRTY && ops->resync_boundary(c, dir, ev, cap_len))
+        do_resync(r, c, dir, f);
 
     if (cap_len)
         lk_frame_bytes(r, c, dir, ev->payload, cap_len, ev->hdr.ts_ns);

@@ -19,11 +19,16 @@ struct bpf_map;
 struct lk_loop;
 struct lk_tls;
 struct lk_cgroup;
+struct lk_port_proto;
 
 struct lk_events_cfg {
-    struct bpf_map *ringbuf;     /* `events` map */
-    struct bpf_map *stats;       /* `stats` per-CPU counters */
-    struct bpf_map *capmode;     /* per-conn capture-budget override (Р21) */
+    struct bpf_map *ringbuf; /* `events` map */
+    struct bpf_map *stats;   /* `stats` per-CPU counters */
+    struct bpf_map *capmode; /* per-conn capture-budget override (Р21) */
+    /* port→protocol map (РМ2): borrowed, alive for the agent's lifetime; the
+     * conn table assigns lk_conn.ops from it at entry creation. */
+    const struct lk_port_proto *port_protos;
+    unsigned n_port_protos;
     struct lk_tls *tls;          /* TLS uprobe manager: source of the attach-state
                                     gauge (latkit_tls_attached), NULL when off */
     struct lk_cgroup *cgroup;    /* cgroup filter: source of latkit_cgroup_filter_paths,

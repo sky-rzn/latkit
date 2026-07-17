@@ -14,7 +14,8 @@
 
 #include "pg_wire.h"
 
-/* struct lk_proto lives in pg.h so the pg_*.c helpers reach the sink/counters. */
+/* struct lk_proto is the shared handler base (proto.h); its accessors live in
+ * registry.c, the framing knowledge in pg_frame.c. */
 
 /* Lazily attach per-connection state on the first message (Р15). Returns NULL
  * only on allocation failure — the caller degrades to counting, never crashes. */
@@ -256,19 +257,4 @@ struct lk_proto *lk_proto_pg_new(const struct lk_query_sink *out)
     /* on_conn_open unused: proto_state is allocated lazily on the first
      * message, so there is nothing to do at open time (Р15). */
     return p;
-}
-
-const struct lk_msg_sink *lk_proto_sink(struct lk_proto *p)
-{
-    return &p->msink;
-}
-
-const struct lk_proto_stats *lk_proto_stats(const struct lk_proto *p)
-{
-    return &p->st;
-}
-
-void lk_proto_free(struct lk_proto *p)
-{
-    free(p);
 }

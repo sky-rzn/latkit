@@ -169,7 +169,7 @@ Use it to verify a deployment's env layer.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `-p, --port PORT` | `LATKIT_PORT` | `5432` | local (server) port to capture; repeatable, up to 16 |
+| `-p, --port PORT[=pg]` | `LATKIT_PORT` | `5432` | local (server) port to capture, optionally with its wire protocol (default: `pg`); repeatable, up to 16 |
 | `--comm NAME` | `LATKIT_COMM` | off | only capture send/recv of processes with this exact comm |
 | `--cgroup PATTERN` | `LATKIT_CGROUP` | off | only capture cgroups whose path under `/sys/fs/cgroup` matches this glob (`*` stays within a path segment, `**` spans); repeatable, re-resolved every 30 s; requires cgroup v2 |
 
