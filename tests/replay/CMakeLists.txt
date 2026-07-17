@@ -26,3 +26,10 @@ add_test(NAME replay COMMAND test_replay)
 add_executable(gen_fixtures gen_fixtures.c ${REPLAY_SRC})
 target_include_directories(gen_fixtures PRIVATE ${REPLAY_INC})
 target_link_libraries(gen_fixtures latkit_proto)
+
+# Dev tool: validate + summarise LKT1 traces (MySQL М0 trace-corpus check,
+# tests/traces/mysql/README.md).
+add_executable(lkt_info lkt_info.c
+    ${CMAKE_SOURCE_DIR}/src/agent/decode.c
+    ${CMAKE_SOURCE_DIR}/src/agent/record.c)
+target_include_directories(lkt_info PRIVATE ${REPLAY_INC})
