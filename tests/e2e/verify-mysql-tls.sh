@@ -1,31 +1,32 @@
 #!/usr/bin/env bash
 #
-# TLS e2e check (STAGE6.md task 6.5): the plaintext M3 stand with ssl=on and
-# pgbench on sslmode=require, plus latkit --tls auto. It asserts that a fully
-# encrypted workload produces the *same* query observability as plaintext —
-# because latkit reads the decrypted plaintext from the libssl SSL_* uprobes —
-# and that the TLS path is provably the data source:
+# MySQL TLS e2e check (MYSQL.md этап М5, РМ10): mysqld with
+# require_secure_transport=ON, a mysql-CLI load loop on --ssl-mode=REQUIRED,
+# and latkit with `-p 3306=mysql --tls auto` — no --tls-comm, so the stand
+# exercises the М5 default scan set {postgres, mysqld, mariadbd} and the
+# thread-comm kernel filter (MySQL 8.x session threads are named `connection`;
+# the pre-М5 filter dropped every event of an 8.x server, находка М0).
 #
-#   - the stage-4 series are present and grow under load (queries_total, a
-#     plausible duration p95) — identical to the plaintext verify.sh;
-#   - latkit_tls_connections > 0 and latkit_tls_connections_total > 0 (the
-#     backends went TLS);
-#   - latkit_tls_attached{state="ok"} == 1 (uprobes attached to libssl);
-#   - latkit_tls_uprobe_events_total > 0 (decrypted events actually flowed);
-#   - latkit_tls_correlation_misses_total stays ~0 on a clean session (Р37);
+# Asserts, mirroring the postgres verify-tls.sh:
+#   - the query series are present and grow under load (queries_total, a
+#     plausible duration p95) — a TLS-only workload feeds the parser;
+#   - the db/user labels come from the HandshakeResponse repeated inside TLS;
+#   - latkit_tls_connections > 0 and latkit_tls_connections_total > 0;
+#   - latkit_tls_attached{state="ok"} == 1 (uprobes found mysqld's libssl);
+#   - latkit_tls_uprobe_events_total > 0, correlation misses negligible;
 #   - the same latkit_queries_total lands at the OTel Collector over OTLP.
 #
-# Needs Docker and BPF privileges on the host, plus /proc access to the
-# postgres backends (pid:host) for the uprobes. Where the runner lacks these,
-# this is a manual check — CI marks it optional, like verify.sh.
+# Needs Docker and BPF privileges on the host, plus /proc access to the mysqld
+# container (pid:host) for the uprobes. Where the runner lacks these, this is a
+# manual check — CI marks it optional, like verify.sh.
 #
-#   ./verify-tls.sh          # build agent, up, assert, down
-#   KEEP=1 ./verify-tls.sh   # leave the stand running afterwards
+#   ./verify-mysql-tls.sh          # build agent, up, assert, down
+#   KEEP=1 ./verify-mysql-tls.sh   # leave the stand running afterwards
 set -euo pipefail
 
 cd "$(dirname "$0")"
 REPO_ROOT=$(cd ../.. && pwd)
-COMPOSE="docker compose -f docker-compose.yml -f docker-compose.tls.yml"
+COMPOSE="docker compose -f docker-compose.mysql-tls.yml"
 PROM=http://localhost:19090
 fails=0
 
@@ -65,7 +66,7 @@ cmake --build "$REPO_ROOT/build" --target latkit -j"$(nproc)" >/dev/null
 note "built $REPO_ROOT/build/latkit"
 
 # --- 1. bring the stand up ---------------------------------------------------
-log "bringing the TLS stand up (ssl=on, sslmode=require, --tls auto)"
+log "bringing the MySQL TLS stand up (require_secure_transport=ON, --tls auto)"
 $COMPOSE up -d --build
 note "waiting for the agent to attach libssl and Prometheus to scrape"
 sleep 35
@@ -79,8 +80,8 @@ fi
 # The agent logs the libssl it attached; surface it for debugging.
 $COMPOSE logs latkit 2>/dev/null | grep -iE 'tls|libssl|uprobe' | tail -5 || true
 
-# --- 2. the query pipeline works over TLS (same series as plaintext) --------
-log "query pipeline over TLS"
+# --- 2. the query pipeline works over TLS ------------------------------------
+log "query pipeline over TLS (mysql classic protocol)"
 if [ "$(scalar_of 'up{job="latkit"}')" = "1" ]; then
     pass "target up{job=latkit} == 1"
 else
@@ -104,6 +105,13 @@ else
     fail "queries_total did not grow (uprobe channel stalled?)"
 fi
 
+# The db/user labels can only come from the HandshakeResponse the client
+# repeats INSIDE the TLS channel (М3 session parsing over the decrypted path).
+qlab=$(scalar_of 'sum(latkit_queries_total{db="latkit",user="latkit"})')
+note "sum(latkit_queries_total{db=latkit,user=latkit}) = ${qlab:-<none>}"
+gt "$qlab" && pass "db/user labels parsed from the in-TLS handshake" \
+    || fail "no queries labelled db=latkit/user=latkit — session parse failed"
+
 # job="latkit" only: the collector re-exports the same histogram on a different
 # le grid, and summing the two by (le) yields a broken cumulative histogram
 # (histogram_quantile then reports the top bucket bound, e.g. a flat "32").
@@ -116,11 +124,11 @@ else
 fi
 
 # --- 3. the TLS path is provably the data source ----------------------------
-log "TLS observability metrics (Р41)"
+log "TLS observability metrics (Р41 / РМ10)"
 tconn=$(scalar_of 'latkit_tls_connections')
 note "latkit_tls_connections = ${tconn:-<none>}"
 if gt "$tconn"; then
-    pass "latkit_tls_connections > 0 (backends went TLS)"
+    pass "latkit_tls_connections > 0 (sessions negotiated CLIENT_SSL)"
 else
     fail "latkit_tls_connections is zero — no connection flipped to TLS"
 fi
@@ -132,20 +140,20 @@ gt "$ttot" && pass "latkit_tls_connections_total > 0" || fail "latkit_tls_connec
 attached=$(scalar_of 'latkit_tls_attached{state="ok"}')
 note "latkit_tls_attached{state=ok} = ${attached:-<none>}"
 if [ "$attached" = "1" ]; then
-    pass "latkit_tls_attached{state=ok} == 1 (uprobes on libssl)"
+    pass "latkit_tls_attached{state=ok} == 1 (uprobes on mysqld's libssl)"
 else
     part=$(scalar_of 'latkit_tls_attached{state="partial"}')
     if [ "$part" = "1" ]; then
         pass "latkit_tls_attached{state=partial} == 1 (some symbols attached)"
     else
-        fail "libssl uprobes not attached (state is none)"
+        fail "libssl uprobes not attached (state is none — default scan set missed mysqld?)"
     fi
 fi
 
 uevents=$(scalar_of 'latkit_tls_uprobe_events_total')
 note "latkit_tls_uprobe_events_total = ${uevents:-<none>}"
 gt "$uevents" && pass "decrypted uprobe events flowed (> 0)" \
-    || fail "no uprobe events — SSL_read/SSL_write not captured"
+    || fail "no uprobe events — SSL_read/SSL_write not captured (comm filter dropping the 'connection' threads?)"
 
 miss=$(scalar_of 'latkit_tls_correlation_misses_total')
 note "latkit_tls_correlation_misses_total = ${miss:-0}"
@@ -169,8 +177,8 @@ gt "$mpush" && pass "collector received the TLS-sourced metrics over OTLP" \
 # --- verdict -----------------------------------------------------------------
 log "verdict"
 if [ "$fails" -eq 0 ]; then
-    echo "  TLS e2e: all checks passed"
+    echo "  MySQL TLS e2e: all checks passed"
     exit 0
 fi
-echo "  TLS e2e: $fails check(s) failed"
+echo "  MySQL TLS e2e: $fails check(s) failed"
 exit 1

@@ -9,6 +9,13 @@
 #define LK_MAX_PORTS    16   /* capacity of the `ports` filter map */
 #define LK_DEFAULT_PORT 5432 /* used when no --port is given */
 
+/* Capacity and entry size of the comm filter (РМ10). The filter matches the
+ * *thread* comm (bpf_get_current_comm), so the list must fit the default
+ * DB-server set {postgres, mysqld, mariadbd} plus `connection` — MySQL 8.x
+ * renames its per-session threads. LK_COMM_LEN mirrors TASK_COMM_LEN. */
+#define LK_COMM_FILTER_MAX 4
+#define LK_COMM_LEN        16
+
 /* Capacity of the `cgroups` filter map (task 7.1, Р48): a handful of postgres
  * pods per node; the userspace resolver caps matched paths at this too. */
 #define LK_MAX_CGROUPS 64

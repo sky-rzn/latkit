@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: GPL-2.0
 /* TLS uprobe attach lifecycle. Attaches the SSL_read/SSL_write(_ex) data probes
  * and the SSL_set_fd/rfd/wfd + SSL_free bridge probes to libssl with pid=-1 so
- * every process mapping that file (present and future postgres backends) is
- * covered. The libssl is either an explicit --libssl path or, under --tls auto,
- * discovered by scanning /proc: the maps of every comm-matching process are
- * searched for a libssl.so mapping, each in-container path is resolved through
- * /proc/<pid>/root, and distinct files (by device+inode) are attached once. A
- * periodic rescan picks up libssl paths that appear later (a cluster restart or
- * a second install). Forked backends need no rescan thanks to pid=-1. */
+ * every process mapping that file (present and future postgres backends, every
+ * mysqld session thread) is covered. The libssl is either an explicit --libssl
+ * path or, under --tls auto, discovered by scanning /proc: the maps of every
+ * comm-matching process (default: the DB-server set {postgres, mysqld,
+ * mariadbd}, РМ10; --tls-comm narrows to one name) are searched for a libssl.so
+ * mapping, each in-container path is resolved through /proc/<pid>/root, and
+ * distinct files (by device+inode) are attached once. A periodic rescan picks
+ * up libssl paths that appear later (a cluster restart or a second install).
+ * Forked backends need no rescan thanks to pid=-1.
+ *
+ * The scan matches the /proc/<pid>/comm of the top-level pid dirs, i.e. the
+ * *process* (main-thread) comm — deliberately not the per-thread comm the BPF
+ * filter sees: MySQL 8.x renames session threads to `connection` while the
+ * process stays `mysqld` (main.c widens the kernel filter accordingly). */
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
@@ -74,10 +81,15 @@ static const struct lk_tls_probe tls_probes[] = {
 };
 #define TLS_NPROBES (sizeof(tls_probes) / sizeof(tls_probes[0]))
 
-/* Ceiling on distinct libssl files attached - several postgres installs on one
+/* Ceiling on distinct libssl files attached - several DB installs on one
  * host is unusual; more than this is almost certainly a scan gone wrong. */
-#define TLS_MAX_PATHS    32
-#define TLS_DEFAULT_COMM "postgres"
+#define TLS_MAX_PATHS 32
+
+/* Default comms the AUTO scan looks for (РМ10): every server latkit speaks the
+ * protocol of. NULL-terminated; --tls-comm replaces the whole list with one
+ * name. Exposed for main.c, which derives the kernel-side thread-comm filter
+ * from the same set. */
+const char *const lk_tls_default_comms[] = {"postgres", "mysqld", "mariadbd", NULL};
 
 /* An attached libssl, identified by its file so a rescan never double-attaches
  * the same binary (many backends map it; its /proc/<pid>/root path differs per
@@ -90,10 +102,11 @@ struct lk_tls_file {
 struct lk_tls {
     struct latkit_bpf *skel;
     struct lk_tls_cfg cfg;
-    bool enabled;              /* AUTO, or an explicit --libssl: SSL_* programs loaded */
-    const char *explicit_path; /* --libssl PATH, or NULL for the /proc scan */
-    const char *comm;          /* comm to scan for (never empty; defaults to postgres) */
-    struct bpf_link **links;   /* grown as paths are attached */
+    bool enabled;               /* AUTO, or an explicit --libssl: SSL_* programs loaded */
+    const char *explicit_path;  /* --libssl PATH, or NULL for the /proc scan */
+    const char *single_comm[2]; /* backing store when --tls-comm narrows the scan */
+    const char *const *comms;   /* NULL-terminated comm list to scan for (never empty) */
+    struct bpf_link **links;    /* grown as paths are attached */
     int nlinks, links_cap;
     struct lk_tls_file files[TLS_MAX_PATHS];
     int nfiles;
@@ -259,6 +272,14 @@ static int scan_pid_maps(struct lk_tls *t, const char *pid)
     return newly;
 }
 
+static bool comm_in_scan_set(const struct lk_tls *t, const char *comm)
+{
+    for (const char *const *c = t->comms; *c; c++)
+        if (!strcmp(comm, *c))
+            return true;
+    return false;
+}
+
 /* Walk /proc, attach the libssl of every comm-matching process not yet attached.
  * Returns the number of newly attached files. */
 static int scan_proc(struct lk_tls *t)
@@ -277,7 +298,7 @@ static int scan_proc(struct lk_tls *t)
 
         if (de->d_name[0] < '0' || de->d_name[0] > '9') /* pid dirs only */
             continue;
-        if (read_comm(de->d_name, comm, sizeof(comm)) || strcmp(comm, t->comm))
+        if (read_comm(de->d_name, comm, sizeof(comm)) || !comm_in_scan_set(t, comm))
             continue;
         newly += scan_pid_maps(t, de->d_name);
     }
@@ -305,7 +326,12 @@ struct lk_tls *lk_tls_new(struct latkit_bpf *skel, const struct lk_tls_cfg *cfg)
     t->cfg = *cfg;
     t->state = LK_TLS_STATE_NONE;
     t->explicit_path = cfg->libssl_override;
-    t->comm = (cfg->comm_filter && cfg->comm_filter[0]) ? cfg->comm_filter : TLS_DEFAULT_COMM;
+    if (cfg->comm_filter && cfg->comm_filter[0]) {
+        t->single_comm[0] = cfg->comm_filter;
+        t->comms = t->single_comm;
+    } else {
+        t->comms = lk_tls_default_comms;
+    }
     /* Enabled when there is anything to attach to: an explicit path always, or
      * AUTO which will scan. OFF with no --libssl loads none of the SSL_* programs
      * so the verifier never sees them. */
@@ -350,11 +376,12 @@ int lk_tls_attach(struct lk_tls *t)
      * still serves plaintext), logged so the operator can tell why TLS is dark. */
     scan_proc(t);
     update_state(t);
-    if (t->nfiles == 0)
-        fprintf(stderr,
-                "latkit: TLS uprobes: no libssl found for comm '%s', "
-                "TLS connections will be dropped\n",
-                t->comm);
+    if (t->nfiles == 0) {
+        fprintf(stderr, "latkit: TLS uprobes: no libssl found for comm");
+        for (const char *const *c = t->comms; *c; c++)
+            fprintf(stderr, "%s '%s'", c == t->comms ? "" : " /", *c);
+        fprintf(stderr, ", TLS connections will be dropped\n");
+    }
     return 0;
 }
 

@@ -96,7 +96,10 @@ else
     fail "queries_total did not grow (pipeline stalled?)"
 fi
 
-p95=$(scalar_of 'histogram_quantile(0.95, sum(rate(latkit_query_duration_seconds_bucket[2m])) by (le))')
+# job="latkit" only: the collector re-exports the same histogram on a different
+# le grid, and summing the two by (le) yields a broken cumulative histogram
+# (histogram_quantile then reports the top bucket bound, e.g. a flat "32").
+p95=$(scalar_of 'histogram_quantile(0.95, sum(rate(latkit_query_duration_seconds_bucket{job="latkit"}[2m])) by (le))')
 note "p95 latency = ${p95:-<none>} s"
 if [ -n "$p95" ] && python3 -c "import sys; v=float('$p95'); sys.exit(0 if 0<=v<60 else 1)" 2>/dev/null; then
     pass "histogram_quantile(0.95) is a plausible latency (0..60 s)"

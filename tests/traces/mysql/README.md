@@ -69,12 +69,15 @@ build/tests/replay/lkt_info tests/traces/mysql/*/*.lkt
 ## Findings recorded while capturing (feed into М2/М5)
 
 - **MySQL 8.x names session OS threads `connection`** (5.7 and MariaDB keep
-  `mysqld`/`mariadbd`). With `--tls`, the agent adopts the TLS comm as the
-  global kernel comm filter, so `--tls-comm mysqld` silently drops *all* 8.x
-  events — socket and uprobe alike (per-thread comm). The `tls-decrypted`
-  traces for 8.4 were recorded with `--libssl <container path> --tls-comm
-  connection`; the М5 default-scan design must handle process-comm ≠
-  thread-comm.
+  `mysqld`/`mariadbd`). With the pre-М5 agent, `--tls` adopted the TLS comm as
+  the global kernel comm filter, so `--tls-comm mysqld` silently dropped *all*
+  8.x events — socket and uprobe alike (per-thread comm). The `tls-decrypted`
+  traces for 8.4 were recorded with the workaround `--libssl <container path>
+  --tls-comm connection`. **Fixed in М5** (РМ10): the /proc scan matches the
+  process comm (default set `{postgres, mysqld, mariadbd}`) while the kernel
+  filter is that set widened by the `connection` thread name — plain
+  `--tls auto` now covers 8.x; record.sh keeps the explicit flags only for
+  reproducibility against older agents (see docs/notes-tls.md §4a).
 - mysql:8.4 / mysql:5.7 containers link OpenSSL (`libssl.so.3` / `1.0.2k` —
   the latter attaches partial, no `_ex` symbols); mariadb:10.11 (Ubuntu) links
   `libssl.so.3`. All three decrypt fine via uprobes.

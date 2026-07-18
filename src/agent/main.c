@@ -77,7 +77,8 @@ static __u64 opt_otlp_span_text_max; /* --otlp-span-text-max; 0 = default */
 static bool opt_otlp_span_masked;
 static enum lk_tls_mode opt_tls_mode = LK_TLS_OFF; /* --tls; default off */
 static const char *opt_libssl;                     /* --libssl PATH: explicit uprobe target */
-static char opt_tls_comm[16]; /* --tls-comm: comm to scan for (default postgres) */
+static char opt_tls_comm[16];                      /* --tls-comm: the one comm to scan for (default:
+                                                    * the lk_tls_default_comms DB-server set) */
 /* Env-derived header/resource arrays (freed at exit for ASAN cleanliness). */
 static char **env_headers, **env_resource;
 static int env_nheaders, env_nresource;
@@ -170,7 +171,8 @@ static void usage(FILE *out, const char *argv0)
             "      --libssl PATH     attach the SSL_* uprobes to this libssl,\n"
             "                        skipping the scan (e.g. a container's copy)\n"
             "      --tls-comm NAME   with --tls auto, scan only processes with\n"
-            "                        this comm (default: postgres)\n"
+            "                        this comm (default: postgres, mysqld,\n"
+            "                        mariadbd)\n"
             "      --print-config    resolve config (flag > LATKIT_* env > default)\n"
             "                        to stdout and exit; every flag has a LATKIT_*\n"
             "                        env equivalent (see README)\n"
@@ -765,6 +767,26 @@ static int fill_ports(struct latkit_bpf *skel)
     return 0;
 }
 
+/* Append one name to the kernel comm-filter list in .rodata (frozen at load;
+ * called before latkit_bpf__load only). Entries are packed from 0, duplicates
+ * skipped; .rodata starts zeroed, so a bounded memcpy stays NUL-terminated
+ * (strncpy of exactly size-1 trips gcc -Wstringop-truncation at -O2). */
+static void comm_filter_add(struct latkit_bpf *skel, const char *name)
+{
+    char (*flt)[LK_COMM_LEN] = (char (*)[LK_COMM_LEN])skel->rodata->cfg_comm_filter;
+    int i;
+
+    for (i = 0; i < LK_COMM_FILTER_MAX && flt[i][0]; i++)
+        if (!strncmp(flt[i], name, LK_COMM_LEN))
+            return;
+    if (i == LK_COMM_FILTER_MAX) {
+        fprintf(stderr, "warn: comm filter full (%d entries), ignoring '%s'\n", LK_COMM_FILTER_MAX,
+                name);
+        return;
+    }
+    memcpy(flt[i], name, strnlen(name, LK_COMM_LEN - 1));
+}
+
 int main(int argc, char **argv)
 {
     struct lk_events *events = NULL;
@@ -805,25 +827,35 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* The effective comm to gate the TLS uprobes: --tls-comm, else the general
-     * --comm, else the postgres default. Attaching on pid=-1 hooks every process
-     * mapping a shared libssl — including a psql client that maps the same file -
-     * so the in-program comm filter is what keeps foreign SSL traffic out.
-     * When --comm was not set, adopt this comm for the whole BPF filter; the
-     * socket path is port-filtered to the server side anyway, so narrowing it to
-     * the postgres comm changes nothing there. */
+    /* The process comm(s) the TLS /proc scan looks for: --tls-comm, else the
+     * general --comm, else NULL = the built-in DB-server set (РМ10,
+     * lk_tls_default_comms in tls_attach). */
     bool tls_enabled = opt_tls_mode == LK_TLS_AUTO || opt_libssl;
-    const char *tls_comm = opt_tls_comm[0] ? opt_tls_comm : (opt_comm[0] ? opt_comm : "postgres");
+    const char *tls_scan_comm = opt_tls_comm[0] ? opt_tls_comm : (opt_comm[0] ? opt_comm : NULL);
 
     /* .rodata and map sizes are frozen at load time. */
     skel->rodata->cfg_capture_limit = opt_capture_limit;
-    if (opt_comm[0])
-        memcpy((char *)skel->rodata->cfg_comm_filter, opt_comm, sizeof(opt_comm));
-    else if (tls_enabled)
-        /* .rodata starts zeroed, so a bounded memcpy stays NUL-terminated
-         * (strncpy of exactly size-1 trips gcc -Wstringop-truncation at -O2). */
-        memcpy((char *)skel->rodata->cfg_comm_filter, tls_comm,
-               strnlen(tls_comm, sizeof(skel->rodata->cfg_comm_filter) - 1));
+    if (opt_comm[0]) {
+        /* --comm: the user's exact kernel filter, with or without TLS. */
+        comm_filter_add(skel, opt_comm);
+    } else if (tls_enabled) {
+        /* Attaching on pid=-1 hooks every process mapping a shared libssl —
+         * including a psql/mysql client that maps the same file — so the
+         * in-program comm filter is what keeps foreign SSL traffic out. It
+         * matches the *thread* comm while the scan matches the *process* comm,
+         * and the two differ (находка М0): MySQL 8.x renames its session
+         * threads to `connection` while the process stays `mysqld` — a filter
+         * of just the scanned comm would silently drop every event of an 8.x
+         * server. So the kernel gate is the scan set widened by `connection`.
+         * The socket path is port-filtered to the server side anyway, so the
+         * wider set changes nothing there. */
+        if (tls_scan_comm)
+            comm_filter_add(skel, tls_scan_comm);
+        else
+            for (const char *const *c = lk_tls_default_comms; *c; c++)
+                comm_filter_add(skel, *c);
+        comm_filter_add(skel, "connection");
+    }
     err = bpf_map__set_max_entries(skel->maps.events, opt_ringbuf_bytes);
     if (err) {
         fprintf(stderr, "failed to size ringbuf: %d\n", err);
@@ -835,7 +867,7 @@ int main(int argc, char **argv)
     struct lk_tls_cfg tlscfg = {
         .mode = opt_tls_mode,
         .libssl_override = opt_libssl,
-        .comm_filter = tls_comm,
+        .comm_filter = tls_scan_comm,
         .rescan_sec = tls_enabled && !opt_libssl ? LK_TLS_RESCAN_SEC : 0,
     };
 

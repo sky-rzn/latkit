@@ -43,11 +43,14 @@ char LICENSE[] SEC("license") = "GPL";
  * capture_mode in `conns` can tighten it further (LK_CAP_HEADERS). */
 const volatile __u32 cfg_capture_limit = LK_CAPTURE_LIMIT;
 
-/* Optional comm filter (task 1.3), off when the first byte is 0. Checked on
- * the send/recv path only: fentry/fexit of tcp_sendmsg/tcp_recvmsg run in the
- * calling task's context, while the lifecycle tracepoint may fire in softirq
- * where comm is garbage. */
-const volatile char cfg_comm_filter[16];
+/* Optional comm filter (task 1.3), off when the first entry is empty; entries
+ * are packed from index 0. A short list, not a single name (РМ10): the match is
+ * against the *thread* comm, and one server may need several — MySQL 8.x names
+ * its per-session threads `connection` while the process stays `mysqld`.
+ * Checked on the send/recv path only: fentry/fexit of tcp_sendmsg/tcp_recvmsg
+ * run in the calling task's context, while the lifecycle tracepoint may fire in
+ * softirq where comm is garbage. */
+const volatile char cfg_comm_filter[LK_COMM_FILTER_MAX][LK_COMM_LEN];
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -248,23 +251,32 @@ static __always_inline int cgroup_allowed(void)
     return bpf_map_lookup_elem(&cgroups, &id) != NULL;
 }
 
-/* Exact-match comm filter; a no-op unless cfg_comm_filter is set. Send/recv
- * path only, see cfg_comm_filter above. */
+/* Exact-match comm filter: the current thread's comm must equal one of the
+ * configured entries; a no-op unless cfg_comm_filter is set. Send/recv path
+ * only, see cfg_comm_filter above. */
 static __always_inline int comm_allowed(void)
 {
-    char comm[sizeof(cfg_comm_filter)];
+    char comm[LK_COMM_LEN];
 
-    if (!cfg_comm_filter[0])
+    if (!cfg_comm_filter[0][0])
         return 1;
     if (bpf_get_current_comm(comm, sizeof(comm)))
         return 0;
-    for (unsigned i = 0; i < sizeof(comm); i++) {
-        if (comm[i] != cfg_comm_filter[i])
-            return 0;
-        if (!comm[i])
-            break;
+    for (unsigned f = 0; f < LK_COMM_FILTER_MAX; f++) {
+        unsigned i;
+
+        if (!cfg_comm_filter[f][0])
+            break; /* packed from 0: first empty entry ends the list */
+        for (i = 0; i < LK_COMM_LEN; i++) {
+            if (comm[i] != cfg_comm_filter[f][i])
+                break;
+            if (!comm[i])
+                return 1; /* equal up to and including the NUL */
+        }
+        if (i == LK_COMM_LEN)
+            return 1; /* both unterminated at 16 bytes: full-buffer match */
     }
-    return 1;
+    return 0;
 }
 
 /* Fill *t (must be zeroed by the caller) from the socket. tcp_sendmsg and
@@ -725,6 +737,9 @@ struct {
  * cross-session query attribution) while the other conn saw no decrypted data
  * at all. The tgid disambiguates; every prober runs in the owning task's
  * context, so bpf_get_current_pid_tgid() is the right scope at all five sites.
+ * A thread-per-connection server (mysqld/mariadbd: one process, one thread per
+ * session) needs no disambiguation — every SSL* is unique within its single
+ * tgid — so the composite key is merely redundant there, never wrong.
  * value = the socket cookie the decrypted events must carry, plus the tuple
  * (snapshotted for parity with the socket path / future synthetic use).
  * LRU_HASH with its own ceiling so a missed SSL_free ages out. */
@@ -921,9 +936,12 @@ int BPF_PROG(lk_tcp_recvmsg_exit_a4, struct sock *sk, struct msghdr *msg, size_t
  *
  * Entry saves {ssl, buf, written_ptr} keyed by pid_tgid; the return probe reads
  * the real byte count (ret for the classic calls, *written for _ex) and, on a
- * positive length, copies the buffer out. postgres backends are single-threaded
- * per connection and never nest SSL_read/SSL_write, so pid_tgid uniquely keys
- * the in-flight call.
+ * positive length, copies the buffer out. pid_tgid keys the in-flight call per
+ * *thread*, which is correct for both server models we observe: a postgres
+ * backend is a single-threaded process per connection, and a mysqld/mariadbd
+ * session is one thread inside the server process (its VIO layer issues one
+ * blocking SSL_read/SSL_write at a time). Neither nests the calls on a thread;
+ * one read and one write may be in flight concurrently, hence the wr/rd split.
  *
  * SSL* is correlated to the socket cookie by the bridge above (ssl_to_conn); the
  * return probe stamps each decrypted event with that cookie, so it lands in the

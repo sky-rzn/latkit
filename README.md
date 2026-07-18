@@ -149,7 +149,7 @@ binary is built differently (fully static musl, in a container):
 | Capture | Capabilities | Why |
 |---|---|---|
 | plaintext | `CAP_BPF` + `CAP_PERFMON` | BPF programs/maps; loading tracing programs |
-| TLS (`--tls auto`) | + `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` | reading `/proc/<pid>/(maps\|root)` of postgres processes to find libssl; the kernel demands full `CAP_SYS_ADMIN` to create **u**probes |
+| TLS (`--tls auto`) | + `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` | reading `/proc/<pid>/(maps\|root)` of the DB server processes to find libssl; the kernel demands full `CAP_SYS_ADMIN` to create **u**probes |
 
 TLS capture in a container additionally needs **`hostPID`** (the libssl
 autodetect walks `/proc/<pid>` of the postgres processes). `hostNetwork` is
@@ -213,7 +213,7 @@ inherits the ambient config):
 |---|---|---|---|
 | `--tls auto\|off` | `LATKIT_TLS` | `off` | capture TLS plaintext via `libssl` uprobes; `auto` scans `/proc` for the matching processes' libssl and rescans every 30 s for new ones |
 | `--libssl PATH` | `LATKIT_LIBSSL` | off | attach the `SSL_*` uprobes to this exact libssl, skipping the scan (e.g. a container's copy); a missing file is fatal |
-| `--tls-comm NAME` | `LATKIT_TLS_COMM` | `postgres` | with `--tls auto`, scan only processes with this exact comm |
+| `--tls-comm NAME` | `LATKIT_TLS_COMM` | `postgres`, `mysqld`, `mariadbd` | with `--tls auto`, scan only processes with this exact comm |
 
 **Debug / diagnostics** (off by default; noisy, not for production):
 
@@ -366,7 +366,7 @@ sudo ./build/latkit --queries &
 streams one line at a time (`-x` adds hexdumps). `--record file.lkt` dumps
 the raw event stream for offline replay through the same pipeline - that is
 how the deterministic test fixtures work (`tests/replay/`,
-`tests/e2e/verify.sh`, `verify-tls.sh`).
+`tests/e2e/verify.sh`, `verify-tls.sh`, `verify-mysql-tls.sh`).
 
 ## License
 

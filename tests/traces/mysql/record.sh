@@ -163,13 +163,15 @@ py()   { "$WORK/venv/bin/python" clients/scenarios.py "$@"; }
 jdbc() { java -cp "$WORK/mysql-connector-j.jar:$WORK/jclasses" Scenarios "$@"; }
 
 # Agent flags for the decrypted-channel (uprobe) TLS trace. Trap found while
-# recording М0: with --tls, the agent adopts the TLS comm as the *global* BPF
-# comm filter — harmless for postgres, but MySQL 8.x names its per-session OS
-# threads `connection`, so filtering on `mysqld` silently drops every socket
-# AND uprobe event (comm is per-thread). For 8.x we therefore skip the
+# recording М0: the pre-М5 agent adopted the TLS comm as the *global* BPF comm
+# filter — harmless for postgres, but MySQL 8.x names its per-session OS
+# threads `connection`, so filtering on `mysqld` silently dropped every socket
+# AND uprobe event (comm is per-thread). For 8.x we therefore skipped the
 # comm-based /proc scan (--libssl straight at the container's file) and set
 # --tls-comm to the *thread* name. 5.7 and MariaDB do not rename threads.
-# The М5 default-scan design must account for this.
+# Fixed in М5 (РМ10: scan by process comm, kernel filter widened by
+# `connection`) — a plain `--tls auto` works on any current agent; the explicit
+# flags stay so the corpus can be re-recorded with pre-М5 binaries too.
 tls_agent_flags() {
     local srv=$1 pid libssl
     case $srv in

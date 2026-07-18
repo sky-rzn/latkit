@@ -1,10 +1,13 @@
 # TLS capture notes (stage 6)
 
-How latkit observes **TLS-encrypted** PostgreSQL sessions. At the socket level
-the bytes are ciphertext — useless to the parser — so the plaintext is read one
-layer up, at the `libssl` API boundary, via uprobes. The design decisions are
-Р35–Р41 in [STAGE6.md](../STAGE6.md); this note is the operator- and
-reader-facing summary of the mechanism and its limits.
+How latkit observes **TLS-encrypted** PostgreSQL and MySQL/MariaDB sessions. At
+the socket level the bytes are ciphertext — useless to the parser — so the
+plaintext is read one layer up, at the `libssl` API boundary, via uprobes. The
+design decisions are Р35–Р41 in [STAGE6.md](../STAGE6.md) plus РМ10 in
+[MYSQL.md](../MYSQL.md) (этап М5); this note is the operator- and reader-facing
+summary of the mechanism and its limits. The prose below narrates the postgres
+process-per-connection model; §4a is the delta for the thread-per-connection
+MySQL/MariaDB servers.
 
 The guiding constraint: a TLS session must yield the **same** query
 observations, metrics and spans as its plaintext twin, with **no change** to
@@ -46,8 +49,8 @@ from the client = **frontend** messages (`Q`, `P`, `B`, …) → `LK_DIR_RECV`;
 `LK_DIR_SEND`. This is exactly the socket path's convention (`tcp_recvmsg` =
 recv = frontend), so the stage-3 parser cannot tell the two channels apart.
 
-A comm filter inside the uprobe (default `postgres`) drops traps from unrelated
-processes that happen to map the same `libssl` — see §4.
+A comm filter inside the uprobe (default: the DB-server set, §4a) drops traps
+from unrelated processes that happen to map the same `libssl` — see §4.
 
 ## 2. Bridging `SSL*` to a connection (Р36, Р37)
 
@@ -131,10 +134,12 @@ A TLS connection has two physical event sources under one cookie: ciphertext
 
 `tls_attach.c` owns all the process/path handling, outside the BPF logic:
 
-- **Scan.** For each `/proc/<pid>` whose `comm` matches the filter (default
-  `postgres`, override with `--tls-comm`), parse `/proc/<pid>/maps` for
-  `…/libssl.so[.N]` lines; deduplicate by device+inode (many backends → one
-  `libssl`).
+- **Scan.** For each `/proc/<pid>` whose `comm` matches the scan set (default
+  `{postgres, mysqld, mariadbd}` — РМ10; `--tls-comm` narrows it to one name),
+  parse `/proc/<pid>/maps` for `…/libssl.so[.N]` lines; deduplicate by
+  device+inode (many backends → one `libssl`). This is the **process** comm
+  (the top-level `/proc/<pid>` entries), distinct from the per-thread comm the
+  BPF filter matches — see §4a.
 - **Containers.** The path in `maps` is in the target's mount namespace; latkit
   opens it as `/proc/<pid>/root/<path>` so libbpf's uprobe attach can resolve
   the symbol offset from that ELF on the host.
@@ -150,8 +155,8 @@ A TLS connection has two physical event sources under one cookie: ciphertext
   `pid=-1` already covers them.
 - **Flags.** `--tls auto|off` (default `off`; `auto` scans and attaches),
   `--libssl PATH` (explicit target, skips the scan — for a container copy or a
-  non-standard build), `--tls-comm NAME` (override the comm filter). Every flag
-  has a `LATKIT_*` env equivalent.
+  non-standard build), `--tls-comm NAME` (narrow the scan set to one comm).
+  Every flag has a `LATKIT_*` env equivalent.
 - **Degradation.** Under `--tls auto`, no libssl found is **not** an error: it
   logs and reports `latkit_tls_attached{state="none"}`, and the agent keeps
   working on plaintext. An explicit `--libssl` pointing at a missing file is
@@ -162,8 +167,42 @@ A TLS connection has two physical event sources under one cookie: ciphertext
 uprobes need `CAP_BPF` + `CAP_PERFMON` (as fentry does) **plus** read access to
 the targets' `/proc/<pid>/maps` and `/proc/<pid>/root`. In a container that
 means **`hostPID: true`** and a readable `/proc` (see the deploy notes, stage
-7). Without host PID visibility the scan finds no postgres backend and TLS
+7). Without host PID visibility the scan finds no DB server process and TLS
 degrades to `state=none`.
+
+## 4a. MySQL/MariaDB delta (РМ10, MYSQL.md этап М5)
+
+The mechanism above transfers to mysqld/mariadbd unchanged — the differences
+are in the process model and in naming, not in the probes:
+
+- **Thread-per-connection is already covered.** postgres forks a process per
+  connection; mysqld runs one process with a thread per session. Every per-call
+  key in the BPF program is per-*thread* (`pid_tgid` for the in-flight
+  SSL_read/SSL_write, `{SSL*, tgid}` for the SSL*→cookie bridge), so both
+  models key correctly; for a single-process server the `tgid` in the bridge
+  key is merely redundant. Neither server nests SSL_read/SSL_write on one
+  thread.
+- **Process comm ≠ thread comm.** MySQL 8.x names its session OS threads
+  `connection` while the process stays `mysqld` (5.7 and MariaDB do not rename
+  threads). The /proc **scan** matches the process comm; the kernel comm filter
+  matches the **thread** comm (`bpf_get_current_comm`). A single shared name —
+  the pre-М5 behaviour of adopting `--tls-comm` as the kernel filter — silently
+  dropped *every* socket and uprobe event of an 8.x server (находка М0). Since
+  М5 the two diverge: with `--tls` and no explicit `--comm`, the kernel filter
+  is the scan set widened by `connection`; an explicit `--comm` still overrides
+  the kernel filter exactly.
+- **MariaDB bundled TLS is a blind spot.** MariaDB builds linked against
+  bundled wolfSSL (the upstream default in some packagings) or GnuTLS map no
+  `libssl.so`, so there is nothing to hook: the scan finds the process but no
+  target, TLS sessions stay ciphertext and are dropped-and-counted.
+  `latkit_tls_attached{state="none"}` (with mariadbd running and `--tls auto`)
+  is the diagnostic; the fix is a server build linked against OpenSSL — the
+  official MariaDB docker images and most distro packages qualify.
+- **e2e.** `tests/e2e/verify-mysql-tls.sh` is the MySQL twin of
+  `verify-tls.sh`: mysqld with `require_secure_transport=ON`, a CLI load loop
+  on `--ssl-mode=REQUIRED`, latkit with `-p 3306=mysql --tls auto` and **no**
+  `--tls-comm` — proving the default scan set and the widened kernel filter on
+  a live 8.x server.
 
 ## 5. Self-metrics (Р41)
 

@@ -1,0 +1,166 @@
+# MySQL TLS e2e stand (MYSQL.md этап М5, РМ10): mysqld with
+# require_secure_transport=ON + a mysql-CLI load loop + latkit + prometheus +
+# otel-collector. A standalone stand, not an override of the postgres base
+# docker-compose.yml — the two share nothing but the exporter sidecars. Drive
+# it with ./verify-mysql-tls.sh (build + up + assert + down).
+#
+#   docker compose -f docker-compose.mysql-tls.yml up -d
+#
+# What it proves: a fully TLS-encrypted MySQL workload yields the same query
+# observability as plaintext, because latkit reads the decrypted plaintext from
+# the mysqld libssl uprobes. Specifically the М5 mechanics:
+#   - `--tls auto` with NO --tls-comm: the default /proc scan set
+#     {postgres, mysqld, mariadbd} finds the container's mysqld and its libssl;
+#   - the kernel comm filter admits `connection` — MySQL 8.x renames its
+#     session threads, and with the pre-М5 single-comm filter (`mysqld`) every
+#     socket and uprobe event of an 8.x server was silently dropped (находка М0);
+#   - the handshake requires TLS (CLIENT_SSL short HandshakeResponse, М2), the
+#     session is parsed from the HandshakeResponse repeated inside TLS (М3).
+#
+# Capture note (see the project memory): the load client talks to mysqld over
+# the compose network by service name, NOT via a published localhost port — a
+# localhost hop would go through docker-proxy, which splice()s the payload and
+# defeats the socket capture. mysqld publishes nothing; latkit filters the
+# server port 3306 it sees on the bridge.
+
+name: latkit-mysql-tls
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: latkit
+      MYSQL_DATABASE: latkit
+      MYSQL_USER: latkit
+      MYSQL_PASSWORD: latkit
+    # The entrypoint auto-generates a self-signed CA/server cert pair into the
+    # datadir on first init (auto_generate_certs, on by default) — no cert-init
+    # sidecar needed, unlike the postgres TLS stand. require_secure_transport
+    # rejects any non-TLS TCP client, so every captured session is ciphertext
+    # at the socket and the uprobe channel is provably the data source.
+    command:
+      - mysqld
+      - --require_secure_transport=ON
+    healthcheck:
+      # TCP + TLS + the app user: passes only on the final server. A socket
+      # `mysqladmin ping` would already succeed against the socket-only
+      # temporary server the entrypoint runs during first-boot initialisation,
+      # letting mysql-init race the user creation and fail.
+      test: ["CMD-SHELL",
+             "mysql --ssl-mode=REQUIRED -h 127.0.0.1 -ulatkit -platkit latkit -e 'SELECT 1'"]
+      interval: 2s
+      timeout: 4s
+      retries: 60
+
+  # One-shot: create and seed the dataset, then exit. --ssl-mode=REQUIRED makes
+  # the TLS requirement explicit (the 8.x CLI would negotiate TLS anyway).
+  mysql-init:
+    image: mysql:8.4
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_PWD: latkit
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        mysql --ssl-mode=REQUIRED -h mysql -ulatkit latkit <<'SQL'
+        CREATE TABLE IF NOT EXISTS accounts (
+            id INT PRIMARY KEY, abalance INT NOT NULL, filler CHAR(84)
+        );
+        SET SESSION cte_max_recursion_depth = 10001;
+        INSERT INTO accounts (id, abalance, filler)
+            SELECT n, 0, 'x' FROM (
+                WITH RECURSIVE seq(n) AS (
+                    SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 10000
+                ) SELECT n FROM seq
+            ) s
+        ON DUPLICATE KEY UPDATE abalance = accounts.abalance;
+        SQL
+    restart: "no"
+
+  # Steady load: a fresh TLS session per iteration (greeting → CLIENT_SSL →
+  # handshake inside TLS), then a small statement mix — point reads, an
+  # aggregate, a write, a transaction — so several query fingerprints and the
+  # duration histogram are non-trivial while verify-mysql-tls.sh samples them.
+  # A background *persistent* session (one statement per second down a pipe)
+  # keeps the latkit_tls_connections gauge deterministically non-zero: the
+  # per-iteration sessions live ~100 ms, so a 5 s Prometheus scrape would
+  # usually catch the gauge between connections.
+  mysql-load:
+    image: mysql:8.4
+    depends_on:
+      mysql-init:
+        condition: service_completed_successfully
+    environment:
+      MYSQL_PWD: latkit
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        ( while :; do echo "SELECT max(id) FROM accounts;"; sleep 1; done ) \
+            | mysql --ssl-mode=REQUIRED -h mysql -ulatkit latkit >/dev/null &
+        while :; do
+          id=$$((RANDOM % 10000 + 1))
+          mysql --ssl-mode=REQUIRED -h mysql -ulatkit latkit >/dev/null <<SQL
+        SELECT abalance FROM accounts WHERE id = $$id;
+        SELECT count(*), avg(abalance) FROM accounts WHERE id < 100;
+        UPDATE accounts SET abalance = abalance + 1 WHERE id = $$id;
+        BEGIN;
+        SELECT abalance FROM accounts WHERE id = $$((id + 1)) FOR UPDATE;
+        COMMIT;
+        SQL
+          sleep 0.1
+        done
+    restart: "no"
+
+  # The agent: privileged for BPF load/attach, pid:host so the /proc scan can
+  # see the mysqld container process. No --tls-comm: this stand exercises the
+  # М5 default scan set. Both exporters on, as in the postgres stands.
+  latkit:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.latkit
+    depends_on:
+      mysql:
+        condition: service_healthy
+    privileged: true
+    pid: host
+    volumes:
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+    command:
+      - "-p"
+      - "3306=mysql"
+      - "--tls"
+      - "auto"
+      - "--prom-listen"
+      - "0.0.0.0:9752"
+      - "--otlp-endpoint"
+      - "http://otel-collector:4318"
+      - "--otlp-interval"
+      - "5"
+      - "--otlp-spans"
+      - "0.1"
+      - "--otlp-spans-slow-ms"
+      - "100"
+    ports: ["9752:9752"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      - latkit
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=1h"
+    # Host port 19090, like the postgres stands (they never run concurrently).
+    ports: ["19090:9090"]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "4318:4318" # OTLP/HTTP
+      - "8889:8889" # collector's own Prometheus exporter (metrics readout)

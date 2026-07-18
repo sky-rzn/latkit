@@ -6,11 +6,13 @@
  * their bpf_link lifetime.
  *
  * Two ways to pick the libssl: --libssl PATH attaches to one given binary (no
- * scanning); --tls auto scans /proc for the libssl mapped by the postgres
- * processes (comm-filtered), resolving each container path through
+ * scanning); --tls auto scans /proc for the libssl mapped by the DB-server
+ * processes — process comm in {postgres, mysqld, mariadbd} by default (РМ10),
+ * one --tls-comm name when narrowed — resolving each container path through
  * /proc/<pid>/root and deduping by inode, then rescans on a timer to pick up
  * newly started clusters. pid=-1 on every attach covers forked backends without
- * a rescan.
+ * a rescan. MariaDB builds linked against bundled wolfSSL/GnuTLS map no libssl
+ * and stay dark; latkit_tls_attached{state="none"} is the diagnostic.
  *
  * No I/O beyond libbpf attach and reading /proc; the caller (main.c) drives load
  * order and registers the rescan timer. */
@@ -31,9 +33,15 @@ enum lk_tls_state { LK_TLS_STATE_NONE = 0, LK_TLS_STATE_PARTIAL, LK_TLS_STATE_OK
 struct lk_tls_cfg {
     enum lk_tls_mode mode;       /* --tls: OFF (default) or AUTO (scan /proc) */
     const char *libssl_override; /* --libssl PATH: attach here, skip the scan */
-    const char *comm_filter;     /* --tls-comm: which comm to scan for; NULL => postgres */
+    const char *comm_filter;     /* --tls-comm: the one process comm to scan for;
+                                  * NULL => the lk_tls_default_comms set */
     unsigned rescan_sec;         /* AUTO rescan period for new libssl paths (0 => no rescan) */
 };
+
+/* The default AUTO-scan process-comm set, NULL-terminated: every server latkit
+ * speaks the protocol of. main.c derives the kernel-side thread-comm filter
+ * from the same list (plus `connection`, the MySQL 8.x session-thread name). */
+extern const char *const lk_tls_default_comms[];
 
 /* Create the handle and decide autoload of the SSL_* programs. MUST be called
  * after latkit_bpf__open() and BEFORE latkit_bpf__load(): when no uprobes will

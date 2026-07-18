@@ -19,6 +19,10 @@ pgbench ──sql──▶ postgres          (compose bridge; NO localhost/docke
 ```sh
 ./verify.sh          # build the agent, bring the stand up, assert M3, tear down
 KEEP=1 ./verify.sh   # same, but leave the stand running to poke at it
+
+./verify-tls.sh        # TLS variant: ssl=on + sslmode=require + --tls auto (stage 6)
+./verify-mysql-tls.sh  # MySQL TLS stand: mysqld require_secure_transport=ON,
+                       #   -p 3306=mysql --tls auto (MYSQL.md этап М5)
 ```
 
 `verify.sh` builds `build/latkit` on the host first (the image just wraps that
@@ -68,3 +72,7 @@ Prometheus on 9090), <http://localhost:9752/metrics> (the agent),
 | `prometheus.yml` | scrape config (agent + collector re-export) |
 | `otel-collector-config.yaml` | OTLP receiver → debug + prometheus exporters |
 | `verify.sh` | build + up + assert + down |
+| `docker-compose.tls.yml` | TLS overlay for the base stand (postgres ssl=on, stage 6) |
+| `verify-tls.sh` | the TLS assert set: same series + `latkit_tls_*` provenance |
+| `docker-compose.mysql-tls.yml` | standalone MySQL TLS stand (MYSQL.md этап М5) |
+| `verify-mysql-tls.sh` | MySQL twin of `verify-tls.sh` |
