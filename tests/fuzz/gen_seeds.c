@@ -204,6 +204,14 @@ static void write_text(const char *root, const char *name, const char *sql)
     write_seed(root, "norm", name);
 }
 
+/* Same, behind fuzz_norm's dialect switch: a leading 0xFF selects LK_SQL_MYSQL. */
+static void write_text_my(const char *root, const char *name, const char *sql)
+{
+    put_u8(0xFF);
+    put(sql, strlen(sql));
+    write_seed(root, "norm", name);
+}
+
 /* --- pg seeds: whole sessions, frontend and backend bytes concatenated ------ */
 
 static void pg_seeds(const char *root)
@@ -323,6 +331,18 @@ static void norm_seeds(const char *root)
     write_text(root, "keywords",
                "with q as (select a, count(*) from t group by a having count(*) > 2 "
                "order by a desc) update u set b = null where exists (select 1 from q)");
+
+    /* MySQL dialect (РМ9): every rule the MySQL lexer branch adds */
+    write_text_my(root, "my_comments",
+                  "select 1 # line\n-- spaced\n--glued\n/* flat /* not nested */ + 2");
+    write_text_my(root, "my_versioned",
+                  "insert /*! ignore */ into t values (1), (2) "
+                  "/*!80013 on duplicate key update a = 3 */");
+    write_text_my(root, "my_strings",
+                  "select 'a\\'b', \"double\\\"quoted\", N'nat', _utf8mb4'intro', "
+                  "_binary\"raw\", X'ff', B'1010', 0xFF, 0b01");
+    write_text_my(root, "my_backtick", "select `From`, `a``b` from `T` where id in (1,2,3)");
+    write_text_my(root, "my_unterminated", "select /*!50000 `oo");
 }
 
 /* --- pipe seeds: scenarios over the ops format ------------------------------ */

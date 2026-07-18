@@ -120,7 +120,7 @@ static void pipe_on_query(void *ctx, const struct lk_conn *c, const struct lk_se
     /* The aggregator's next step over live traffic: normalise the text. The
      * stability check makes the fingerprint contract part of this target. */
     if (o->text)
-        fz_check_norm_stable(o->text, o->text_len);
+        fz_check_norm_stable(o->text, o->text_len, LK_SQL_PG); /* PG pipeline */
     if (s)
         fz_read_bytes(s->user, strnlen(s->user, sizeof(s->user)));
 }

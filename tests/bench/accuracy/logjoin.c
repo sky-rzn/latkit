@@ -261,7 +261,7 @@ static struct logq *logq_for_text(const char *sql)
     struct lk_norm_out norm;
     char label[LK_QUERY_LABEL_MAX];
 
-    lk_norm_sql(sql, strlen(sql), &norm);
+    lk_norm_sql(sql, strlen(sql), LK_SQL_PG, &norm);
     utf8_trunc(norm.text, label, label_len);
     return logq_get(norm.fp, label);
 }

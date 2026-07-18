@@ -175,7 +175,9 @@ static void mx_on_query(void *ctx, const struct lk_conn *c, const struct lk_sess
     if ((fl & LK_QO_NO_TEXT) || o->kind == LK_Q_CANCEL || !o->text) {
         ro.force_other = true;
     } else {
-        lk_norm_sql(o->text, o->text_len, &norm);
+        /* Dialect stays pinned to PG until М6 threads the protocol through
+         * the observation path (conn->ops), together with the proto label. */
+        lk_norm_sql(o->text, o->text_len, LK_SQL_PG, &norm);
         ro.fp = norm.fp;
         ro.label = norm.text;
         ro.truncated = norm.trunc || (fl & LK_QO_TEXT_TRUNC);

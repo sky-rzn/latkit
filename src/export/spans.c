@@ -100,7 +100,9 @@ static void fill_text_and_name(struct lk_spans *s, struct lk_span *sp, const str
     if (!o->text || (o->flags & LK_QO_NO_TEXT) || o->text_len == 0)
         return;
 
-    lk_norm_sql(o->text, o->text_len, &norm);
+    /* Dialect stays pinned to PG until М6 threads the protocol through the
+     * observation path (conn->ops), together with the proto span attribute. */
+    lk_norm_sql(o->text, o->text_len, LK_SQL_PG, &norm);
     {
         uint32_t nn = norm.text_len < sizeof(sp->name) - 1 ? norm.text_len : sizeof(sp->name) - 1;
 

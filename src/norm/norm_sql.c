@@ -310,7 +310,33 @@ static bool is_op_char(unsigned char c)
 
 /* --- the lexer ------------------------------------------------------------ */
 
-void lk_norm_sql(const char *sql, size_t len, struct lk_norm_out *out)
+/* Scan past a quoted body (opening quote already consumed): a doubled quote
+ * char is an escape; backslash escapes too when `backslash`. Returns the new
+ * cursor. The caller treats cursor == end as "may be truncated" — even a body
+ * that CLOSES on the last byte, because that closing quote could equally be
+ * the first half of a doubling cut off by the capture budget. */
+static const unsigned char *skip_quoted(const unsigned char *p, const unsigned char *const end,
+                                        unsigned char q, bool backslash)
+{
+    while (p < end) {
+        if (backslash && *p == '\\') {
+            p += (p + 1 < end) ? 2 : 1; /* escape: skip next byte */
+            continue;
+        }
+        if (*p == q) {
+            if (p + 1 < end && p[1] == q) { /* doubled -> literal quote */
+                p += 2;
+                continue;
+            }
+            p++; /* closing quote */
+            break;
+        }
+        p++;
+    }
+    return p;
+}
+
+void lk_norm_sql(const char *sql, size_t len, enum lk_sql_dialect dialect, struct lk_norm_out *out)
 {
     XXH3_state_t xh; /* ~576 B, 64-byte aligned by its own type — stack is fine */
     struct norm_ctx nx = {
@@ -322,6 +348,11 @@ void lk_norm_sql(const char *sql, size_t len, struct lk_norm_out *out)
     };
     const unsigned char *p = (const unsigned char *)sql;
     const unsigned char *const end = p + len;
+    const bool my = (dialect == LK_SQL_MYSQL);
+    /* Open versioned comments (MySQL, "slash * !"): their content is lexed as
+     * ordinary tokens, so all this tracks is how many closing star-slashes to
+     * swallow. */
+    uint32_t ver_depth = 0;
 
     out->text_len = 0;
     out->trunc = false;
@@ -337,7 +368,15 @@ void lk_norm_sql(const char *sql, size_t len, struct lk_norm_out *out)
             continue;
         }
 
-        /* line comment -- ... \n */
+        /* closing star-slash of an open versioned comment: acts as whitespace */
+        if (ver_depth > 0 && c == '*' && p + 1 < end && p[1] == '/') {
+            ver_depth--;
+            p += 2;
+            continue;
+        }
+
+        /* line comment -- ... \n (MySQL wants whitespace after the dashes; we
+         * accept both spellings in both dialects) */
         if (c == '-' && p + 1 < end && p[1] == '-') {
             p += 2;
             while (p < end && *p != '\n')
@@ -345,52 +384,62 @@ void lk_norm_sql(const char *sql, size_t len, struct lk_norm_out *out)
             continue;
         }
 
-        /* block comment, nested (PG nests them) */
-        if (c == '/' && p + 1 < end && p[1] == '*') {
-            int depth = 1;
+        /* line comment # ... \n (MySQL only; # is an operator char in PG) */
+        if (my && c == '#') {
+            p++;
+            while (p < end && *p != '\n')
+                p++;
+            continue;
+        }
 
-            p += 2;
-            while (p < end && depth > 0) {
-                if (p + 1 < end && p[0] == '/' && p[1] == '*') {
-                    depth++;
-                    p += 2;
-                } else if (p + 1 < end && p[0] == '*' && p[1] == '/') {
-                    depth--;
-                    p += 2;
-                } else {
+        /* block comment: nested in PG, flat in MySQL; a MySQL versioned
+         * comment (! after the opener) is executed by the server, so we skip
+         * the opener + version gate digits and lex its content as tokens */
+        if (c == '/' && p + 1 < end && p[1] == '*') {
+            if (my && p + 2 < end && p[2] == '!') {
+                p += 3;
+                while (p < end && is_digit(*p))
                     p++;
-                }
+                ver_depth++;
+                continue;
             }
-            if (depth > 0)
-                out->trunc = true; /* unterminated: ran off the captured prefix */
+            {
+                int depth = 1;
+
+                p += 2;
+                while (p < end && depth > 0) {
+                    if (!my && p + 1 < end && p[0] == '/' && p[1] == '*') {
+                        depth++;
+                        p += 2;
+                    } else if (p + 1 < end && p[0] == '*' && p[1] == '/') {
+                        depth--;
+                        p += 2;
+                    } else {
+                        p++;
+                    }
+                }
+                if (depth > 0)
+                    out->trunc = true; /* unterminated: ran off the captured prefix */
+            }
             continue;
         }
 
         /* string literals -> ? */
         {
-            bool is_estr = (c == 'e' || c == 'E') && p + 1 < end && p[1] == '\'';
-            bool is_pref =
-                (c == 'b' || c == 'B' || c == 'x' || c == 'X') && p + 1 < end && p[1] == '\'';
+            bool is_estr = !my && (c == 'e' || c == 'E') && p + 1 < end && p[1] == '\'';
+            bool is_pref = ((c == 'b' || c == 'B' || c == 'x' || c == 'X') ||
+                            (my && (c == 'n' || c == 'N'))) &&
+                           p + 1 < end && p[1] == '\'';
+            bool my_dq = my && c == '"'; /* ANSI_QUOTES undetectable: always a string */
 
-            if (c == '\'' || is_estr || is_pref) {
-                bool backslash = is_estr; /* only E'' honours backslash escapes */
+            if (c == '\'' || is_estr || is_pref || my_dq) {
+                /* MySQL strings honour backslash escapes (NO_BACKSLASH_ESCAPES
+                 * is undetectable on the wire — accepted); in PG only E'' does */
+                bool backslash = my || is_estr;
+                unsigned char q = my_dq ? '"' : '\'';
 
-                p += (c == '\'') ? 1 : 2; /* skip opening quote (and prefix) */
-                while (p < end) {
-                    if (backslash && *p == '\\') {
-                        p += (p + 1 < end) ? 2 : 1; /* escape: skip next byte */
-                        continue;
-                    }
-                    if (*p == '\'') {
-                        if (p + 1 < end && p[1] == '\'') { /* '' -> literal quote */
-                            p += 2;
-                            continue;
-                        }
-                        p++; /* closing quote */
-                        break;
-                    }
-                    p++;
-                }
+                p += (c == q) ? 1 : 2; /* skip opening quote (and prefix) */
+                p = skip_quoted(p, end, q, backslash);
                 if (p >= end)
                     out->trunc = true; /* unterminated literal */
                 emit(&nx, K_PH, false, "?", 1);
@@ -398,30 +447,31 @@ void lk_norm_sql(const char *sql, size_t len, struct lk_norm_out *out)
             }
         }
 
-        /* quoted identifier "..." -> verbatim (case significant) */
-        if (c == '"') {
+        /* backtick-quoted identifier `...` -> verbatim (MySQL only) */
+        if (my && c == '`') {
             const char *start = (const char *)p;
 
-            p++;
-            while (p < end) {
-                if (*p == '"') {
-                    if (p + 1 < end && p[1] == '"') { /* "" -> literal quote */
-                        p += 2;
-                        continue;
-                    }
-                    p++; /* closing quote */
-                    break;
-                }
-                p++;
-            }
+            p = skip_quoted(p + 1, end, '`', false);
             if (p >= end)
                 out->trunc = true;
             emit(&nx, K_OTHER, false, start, (uint32_t)((const char *)p - start));
             continue;
         }
 
-        /* dollar: parameter $N, or dollar-quoted string $tag$...$tag$ */
-        if (c == '$') {
+        /* quoted identifier "..." -> verbatim (case significant; PG only) */
+        if (!my && c == '"') {
+            const char *start = (const char *)p;
+
+            p = skip_quoted(p + 1, end, '"', false);
+            if (p >= end)
+                out->trunc = true;
+            emit(&nx, K_OTHER, false, start, (uint32_t)((const char *)p - start));
+            continue;
+        }
+
+        /* dollar: parameter $N, or dollar-quoted string $tag$...$tag$ (PG only:
+         * in MySQL $ is plain identifier material, handled below) */
+        if (!my && c == '$') {
             unsigned char nxt = (p + 1 < end) ? p[1] : 0;
 
             if (is_digit(nxt)) { /* $1, $2, ... -> ? */
@@ -497,13 +547,24 @@ void lk_norm_sql(const char *sql, size_t len, struct lk_norm_out *out)
             continue;
         }
 
-        /* unquoted identifier / keyword -> lower-cased */
-        if (is_ident_start(c)) {
+        /* unquoted identifier / keyword -> lower-cased (MySQL: may start with $) */
+        if (is_ident_start(c) || (my && c == '$')) {
             const char *start = (const char *)p;
 
             p++;
             while (p < end && is_ident_cont(*p))
                 p++;
+            /* charset introducer _utf8mb4'...' (quote glued to a _-leading
+             * identifier): the whole thing is one string literal -> ? */
+            if (my && c == '_' && p < end && (*p == '\'' || *p == '"')) {
+                unsigned char q = *p;
+
+                p = skip_quoted(p + 1, end, q, true);
+                if (p >= end)
+                    out->trunc = true;
+                emit(&nx, K_PH, false, "?", 1);
+                continue;
+            }
             emit(&nx, K_OTHER, true, start, (uint32_t)((const char *)p - start));
             continue;
         }
@@ -535,7 +596,10 @@ void lk_norm_sql(const char *sql, size_t len, struct lk_norm_out *out)
             continue;
         }
 
-        /* operator run (stops before a comment opener) */
+        /* operator run (stops before a comment opener; in MySQL also before a
+         * # comment, a backtick identifier, and the star-slash closing an open
+         * versioned comment — each is its own token upstream, never part of an
+         * operator) */
         if (is_op_char(c)) {
             const char *start = (const char *)p;
 
@@ -544,6 +608,10 @@ void lk_norm_sql(const char *sql, size_t len, struct lk_norm_out *out)
                 if (*p == '-' && p + 1 < end && p[1] == '-')
                     break;
                 if (*p == '/' && p + 1 < end && p[1] == '*')
+                    break;
+                if (my && (*p == '#' || *p == '`'))
+                    break;
+                if (ver_depth > 0 && *p == '*' && p + 1 < end && p[1] == '/')
                     break;
                 p++;
             }
@@ -562,6 +630,8 @@ void lk_norm_sql(const char *sql, size_t len, struct lk_norm_out *out)
 
     /* drain the pipeline: held comma -> f2, buffered match -> sink, trailing ;
      * dropped, then finalise text + fingerprint. */
+    if (ver_depth > 0)
+        out->trunc = true; /* versioned comment never closed: truncated input */
     f1_finish(&nx);
     f2_finish(&nx);
 
@@ -571,13 +641,13 @@ void lk_norm_sql(const char *sql, size_t len, struct lk_norm_out *out)
 
 /* --- fuzz entry ----------------------------------------------------------- */
 
-int lk_norm_fuzz_one(const uint8_t *data, size_t n)
+int lk_norm_fuzz_one(const uint8_t *data, size_t n, enum lk_sql_dialect dialect)
 {
     static volatile uint64_t sink;
     struct lk_norm_out out;
     uint64_t acc;
 
-    lk_norm_sql((const char *)data, n, &out);
+    lk_norm_sql((const char *)data, n, dialect, &out);
 
     /* Touch every field so a sanitizer flags an OOB write into text[] or a
      * missing NUL terminator; the compiler cannot elide the volatile store. */

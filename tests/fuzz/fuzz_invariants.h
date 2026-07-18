@@ -93,12 +93,12 @@ static inline void fz_check_obs(const struct lk_query_obs *o)
  * and the fingerprint is a pure function of the input — two runs over the same
  * bytes agree bit-for-bit (a hash reading uninitialised or out-of-bounds memory
  * fails this before ASAN ever notices). */
-static inline void fz_check_norm_stable(const char *sql, size_t len)
+static inline void fz_check_norm_stable(const char *sql, size_t len, enum lk_sql_dialect dialect)
 {
     struct lk_norm_out a, b;
 
-    lk_norm_sql(sql, len, &a);
-    lk_norm_sql(sql, len, &b);
+    lk_norm_sql(sql, len, dialect, &a);
+    lk_norm_sql(sql, len, dialect, &b);
     FZ_ASSERT(a.text_len < LK_NORM_TEXT_MAX);
     FZ_ASSERT(a.text[a.text_len] == '\0');
     FZ_ASSERT(a.fp == b.fp && a.text_len == b.text_len && a.trunc == b.trunc);

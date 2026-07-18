@@ -10,6 +10,11 @@
  * runs agree bit-for-bit — a hash reading uninitialised memory fails this
  * before ASAN ever notices).
  *
+ * Dialects (РМ9): a leading 0xFF byte selects LK_SQL_MYSQL for the rest of the
+ * input; anything else is LK_SQL_PG over the input untouched. 0xFF cannot start
+ * meaningful SQL in either dialect, so the whole pre-М4 corpus keeps exercising
+ * the PG branch unshifted, and the fuzzer flips dialects by mutating one byte.
+ *
  * Built only in the -DLATKIT_FUZZ=ON profile, like fuzz_pg. The committed
  * corpus (plain SQL bytes) lives in tests/fuzz/corpus/norm/. */
 #include <stddef.h>
@@ -20,7 +25,14 @@
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
-    lk_norm_fuzz_one(data, size);
-    fz_check_norm_stable((const char *)data, size);
+    enum lk_sql_dialect dialect = LK_SQL_PG;
+
+    if (size > 0 && data[0] == 0xFF) {
+        dialect = LK_SQL_MYSQL;
+        data++;
+        size--;
+    }
+    lk_norm_fuzz_one(data, size, dialect);
+    fz_check_norm_stable((const char *)data, size, dialect);
     return 0;
 }
