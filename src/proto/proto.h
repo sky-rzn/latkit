@@ -157,9 +157,16 @@ struct lk_ev_data;
  *    parse_hdr can run (<= sizeof f->hdr); it may depend on the direction's
  *    framing state (PG: 4 in startup framing, 5 normal).
  *  - parse_hdr reads f->hdr and fills f->msg_type, f->msg_len (the lk_msg.len
- *    value, protocol semantics) and f->body_len (wire bytes following the
- *    header). false = corrupt header: the framer dirties the direction and
- *    bumps bad_len.
+ *    value, protocol semantics), f->body_len (wire bytes following the
+ *    header) and f->body_total (logical body size, what BODY_TRUNC is judged
+ *    against — equal to body_len unless the message glues wire fragments).
+ *    false = corrupt header: the framer dirties the direction and bumps
+ *    bad_len. A protocol whose logical message spans several wire fragments
+ *    (MySQL 16MB continuations, РМ3) sets f->msg_cont: the fragment's body
+ *    then ends in reading the next header instead of emitting, the prefix in
+ *    f->buf is pinned across fragments (prefix_closed), and parse_hdr sees
+ *    the continuation header with msg_cont still set. Clearing msg_cont on
+ *    the last fragment releases the single glued emit.
  *  - pre_emit runs on every assembled message right before the sink: set
  *    protocol flags on *m (LK_MSG_STARTUP) and drive framing-state transitions
  *    that depend on the body (PG: startup code -> startup_done /
@@ -196,6 +203,12 @@ struct lk_proto_ops {
  * default: a bare `--port N` and a connection without an assigned protocol
  * (lazily created entry, bare unit-test lk_conn) frame as PG (РМ2). */
 extern const struct lk_proto_ops lk_proto_pg_ops;
+
+/* MySQL classic-protocol framing (src/proto/my/my_frame.c, РМ3/РМ4):
+ * `--port 3306=mysql`. lk_proto_my_new is the М2 counting-only handler stub —
+ * messages tallied, no observations yet; М3 grows it into the real parser. */
+extern const struct lk_proto_ops lk_proto_my_ops;
+struct lk_proto *lk_proto_my_new(const struct lk_query_sink *out);
 
 /* The registry: one entry per supported protocol, PG first (the default).
  * LK_PROTO_MAX caps it so consumers can size parallel arrays statically. */

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Protocol registry (РМ1) and the handler-base accessors shared by every
- * protocol. One entry today; MySQL (М2/М3) adds the second — nothing else in
- * the core changes when it does. */
+ * protocol. */
 #include "proto.h"
 
 #include <stdlib.h>
@@ -9,6 +8,7 @@
 
 const struct lk_proto_ops *const lk_proto_registry[] = {
     &lk_proto_pg_ops, /* index 0 is the default (РМ2: a bare --port N is pg) */
+    &lk_proto_my_ops, /* MySQL classic (М2): `--port 3306=mysql` */
 };
 const unsigned lk_proto_nregistry = sizeof(lk_proto_registry) / sizeof(lk_proto_registry[0]);
 

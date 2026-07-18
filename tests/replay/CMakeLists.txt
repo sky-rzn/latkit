@@ -33,3 +33,9 @@ add_executable(lkt_info lkt_info.c
     ${CMAKE_SOURCE_DIR}/src/agent/decode.c
     ${CMAKE_SOURCE_DIR}/src/agent/record.c)
 target_include_directories(lkt_info PRIVATE ${REPLAY_INC})
+
+# Dev tool: the --messages view over LKT1 traces through the offline pipeline
+# (МYSQL.md М2 acceptance — packet boundaries on the М0 corpus).
+add_executable(lkt_messages lkt_messages.c ${REPLAY_SRC})
+target_include_directories(lkt_messages PRIVATE ${REPLAY_INC})
+target_link_libraries(lkt_messages latkit_proto)

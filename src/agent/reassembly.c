@@ -66,6 +66,8 @@ static void msg_reset(struct lk_reasm *r, struct lk_frame *f)
     f->buf_len = 0;
     f->hdr_len = 0;
     f->body_len = 0;
+    f->msg_cont = 0;
+    f->prefix_closed = 0;
     f->st = LK_FR_HEADER;
 }
 
@@ -114,7 +116,7 @@ static void emit(struct lk_reasm *r, const struct lk_proto_ops *ops, struct lk_c
         m.flags |= LK_MSG_AFTER_RESYNC;
         f->after_resync = 0;
     }
-    if (body_cap < f->body_len) {
+    if (body_cap < f->body_total) {
         m.flags |= LK_MSG_BODY_TRUNC;
         r->st.msgs_trunc++;
     }
@@ -129,11 +131,29 @@ static __u32 body_target(const struct lk_frame *f)
     return f->body_len < LK_MSG_BODY_MAX ? f->body_len : LK_MSG_BODY_MAX;
 }
 
+/* A protocol transition flipped the connection out of plaintext framing
+ * mid-chunk (MySQL pre_emit: CLIENT_SSL -> LK_CONN_TLS, the compressed-framing
+ * flip -> LK_CONN_IGNORE): the rest of the chunk is ciphertext / compressed
+ * frames — drop it. PG never trips this: its TLS flip happens in
+ * intercept_bytes, which discards the tail itself. `entry_flags` is the
+ * connection's flags on chunk entry, so the decrypted uprobe stream of a
+ * connection that is *already* TLS keeps framing. */
+static bool went_blind(struct lk_reasm *r, const struct lk_conn *c, __u16 entry_flags)
+{
+    if ((entry_flags & (LK_CONN_TLS | LK_CONN_IGNORE)) ||
+        !(c->flags & (LK_CONN_TLS | LK_CONN_IGNORE)))
+        return false;
+    if (c->flags & LK_CONN_TLS)
+        r->st.tls_conns++;
+    return true;
+}
+
 void lk_frame_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, const __u8 *p, __u32 n,
                     __u64 ts_ns)
 {
     const struct lk_proto_ops *ops = conn_ops(c);
     struct lk_frame *f = &c->frame[dir];
+    __u16 entry_flags = c->flags;
 
     /* Cross-direction special bytes before framing (PG: the one-byte SSL
      * reply). false = the rest of the chunk is ciphertext, drop it. */
@@ -146,8 +166,8 @@ void lk_frame_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, cons
             __u32 hdr_size = ops->hdr_size(c, dir, f);
             __u32 take = hdr_size - f->hdr_len;
 
-            if (f->hdr_len == 0)
-                f->msg_ts = ts_ns; /* first byte of the header (Р13) */
+            if (f->hdr_len == 0 && !f->msg_cont)
+                f->msg_ts = ts_ns; /* first byte of the first header (Р13) */
             if (take > n)
                 take = n;
             memcpy(f->hdr + f->hdr_len, p, take);
@@ -160,16 +180,21 @@ void lk_frame_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, cons
                 go_dirty(r, f, &r->st.bad_len);
                 return;
             }
-            if (f->body_len == 0) { /* empty body: whole message was the header */
-                emit(r, ops, c, dir, f, NULL, 0);
+            if (f->body_len == 0) { /* empty body: the message ends with the
+                                       header (buf carries the glued prefix
+                                       when an empty fragment terminated an
+                                       exact-multiple continuation, РМ3) */
+                emit(r, ops, c, dir, f, f->buf, f->buf_len);
                 msg_reset(r, f);
+                if (went_blind(r, c, entry_flags))
+                    return;
             } else {
                 f->st = LK_FR_BODY;
             }
             break;
         }
         case LK_FR_BODY: {
-            __u32 target = body_target(f);
+            __u32 target = f->prefix_closed ? f->buf_len : body_target(f);
             __u32 rem = target - f->buf_len;
 
             if (n < rem) {
@@ -187,10 +212,35 @@ void lk_frame_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, cons
                 rem = n;
                 target = f->buf_len + n; /* buf_len == 0 when buf is NULL */
             }
-            const __u8 *body = f->buf ? f->buf : p;
-            __u64 skip = (__u64)f->body_len - target;
+            /* This fragment's body is accounted for: the prefix took
+             * target - prefix_base of it, the rest is an arithmetic skip. */
+            __u64 skip = (__u64)f->body_len - (f->prefix_closed ? 0 : target);
 
-            if (f->buf)
+            if (f->msg_cont) {
+                /* More fragments follow (РМ3): no emit yet. Pin the prefix
+                 * into the slab — it must outlive this chunk — and read the
+                 * continuation header after the skip. On OOM the prefix is
+                 * lost, not the message: the final emit degrades to cap 0. */
+                if (rem && !f->buf)
+                    f->buf = buf_get(r);
+                if (rem && f->buf) {
+                    memcpy(f->buf + f->buf_len, p, rem);
+                    f->buf_len += rem;
+                }
+                p += rem;
+                n -= rem;
+                f->prefix_closed = 1;
+                f->hdr_len = 0;
+                f->st = LK_FR_HEADER;
+                if (skip) {
+                    f->st = LK_FR_SKIP;
+                    f->skip_left = skip;
+                }
+                break;
+            }
+            const __u8 *body = f->buf ? f->buf : p;
+
+            if (f->buf && rem)
                 memcpy(f->buf + f->buf_len, p, rem);
             emit(r, ops, c, dir, f, body, target);
             p += rem;
@@ -200,6 +250,8 @@ void lk_frame_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, cons
                 f->st = LK_FR_SKIP;
                 f->skip_left = skip;
             }
+            if (went_blind(r, c, entry_flags))
+                return;
             break;
         }
         case LK_FR_SKIP: {
@@ -236,6 +288,7 @@ void lk_frame_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64
 {
     const struct lk_proto_ops *ops = conn_ops(c);
     struct lk_frame *f = &c->frame[dir];
+    __u16 entry_flags = c->flags;
 
     if (n == 0)
         return;
@@ -262,10 +315,24 @@ void lk_frame_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64
             return;
         case LK_FR_BODY: {
             /* The header is known: emit the captured prefix now and advance
-             * over the rest of the body arithmetically. */
-            __u64 rem = (__u64)f->body_len - f->buf_len;
+             * over the rest of the body arithmetically. Mid-glue (РМ3) there
+             * is no emit — the prefix stays pinned, the fragment tail is
+             * skipped and the continuation header is read after the hole
+             * (a hole over that header dirties as usual, dropping the glue). */
+            __u64 rem = (__u64)f->body_len - (f->prefix_closed ? 0 : f->buf_len);
             __u64 take = rem < n ? rem : n;
 
+            if (f->msg_cont) {
+                n -= take;
+                f->prefix_closed = 1;
+                f->hdr_len = 0;
+                f->st = LK_FR_HEADER;
+                if (take < rem) {
+                    f->st = LK_FR_SKIP;
+                    f->skip_left = rem - take;
+                }
+                break;
+            }
             emit(r, ops, c, dir, f, f->buf, f->buf_len);
             n -= take;
             msg_reset(r, f);
@@ -273,6 +340,8 @@ void lk_frame_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64
                 f->st = LK_FR_SKIP;
                 f->skip_left = rem - take;
             }
+            if (went_blind(r, c, entry_flags))
+                return;
             break;
         }
         case LK_FR_SKIP: {
@@ -298,8 +367,8 @@ void lk_reasm_data(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir,
     __u32 total = ev->total_len, off = ev->off;
     bool decrypted = ev->hdr.flags & LK_F_DECRYPTED;
 
-    if (c->flags & LK_CONN_CANCEL)
-        return; /* cancel: nothing else travels this connection, discard it all */
+    if (c->flags & (LK_CONN_CANCEL | LK_CONN_IGNORE))
+        return; /* cancel / deliberate blind zone (РМ7): discard it all */
     if ((c->flags & LK_CONN_TLS) && !decrypted)
         return; /* ciphertext on a TLS connection: dropped (Р38). The router
                    already drops it before the seq detector; this guards the

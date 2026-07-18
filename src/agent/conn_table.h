@@ -50,15 +50,30 @@ struct lk_frame {
     __u32 call_pos, call_total; /* chunk off-arithmetic within one call;
                                    call_total == 0: no call in progress */
     /* Message being assembled (valid in BODY/SKIP, hdr[] while in HEADER).
-     * msg_type/msg_len/body_len are filled by the protocol's parse_hdr hook
-     * (lk_proto_ops, РМ1): msg_len keeps the protocol's own len semantics for
-     * lk_msg.len, body_len is the wire bytes following the header — what the
-     * generic framer actually counts. */
+     * msg_type/msg_len/body_len/body_total are filled by the protocol's
+     * parse_hdr hook (lk_proto_ops, РМ1): msg_len keeps the protocol's own len
+     * semantics for lk_msg.len, body_len is the wire bytes following the
+     * header — what the generic framer actually counts — and body_total is the
+     * logical message's body size, what LK_MSG_BODY_TRUNC is judged against.
+     * For PG the two are equal; for MySQL a >16MB logical packet spans several
+     * wire fragments (РМ3) and body_total accumulates across them. */
     __u64 msg_ts;        /* ts of the event with the first header byte (Р13) */
     __u32 msg_len;       /* protocol len field of the current message */
-    __u32 body_len;      /* wire bytes of body after the header */
+    __u32 body_len;      /* wire bytes of body after the current header */
+    __u32 body_total;    /* logical body size (== body_len except mid-glue) */
     __u8 msg_type;       /* 0 while in startup framing */
-    __u8 startup_done;   /* frontend: StartupMessage seen, normal framing on */
+    __u8 msg_cont;       /* set by parse_hdr (РМ3): this fragment's body does
+                            not finish the logical message — no emit at its
+                            end, the next header continues it */
+    __u8 prefix_closed;  /* a fragment boundary passed: the body prefix in buf
+                            is final, later fragments are skip-only */
+    __u8 msg_seq;        /* protocol scratch (MySQL: expected seq of the next
+                            continuation fragment) */
+    __u8 msg_seq0;       /* protocol scratch (MySQL: logical message started
+                            at wire seq 0 — a frontend command marker) */
+    __u8 startup_done;   /* frontend: StartupMessage seen, normal framing on
+                            (MySQL: RECV — HandshakeResponse consumed, SEND —
+                            auth exchange over, command phase) */
     __u8 after_resync;   /* next emitted message gets LK_MSG_AFTER_RESYNC */
     __u8 resync_matched; /* DIRTY backend: bytes of the 'Z' anchor matched so
                             far — the sliding window surviving event borders */
@@ -93,6 +108,17 @@ struct lk_frame {
     (1 << 5) /* userspace already flipped this connection                                          \
                 to HEADERS capture: a one-shot guard so the                                        \
                 capmode map is written once, not per event */
+#define LK_CONN_IGNORE                                                                             \
+    (1 << 6) /* deliberate blind zone (РМ7: MySQL compressed                                     \
+                framing; М3 adds binlog streams): framing off,                                    \
+                events discarded until CLOSE, capture drops to                                     \
+                HEADERS — like replication, with its own flag                                    \
+                so the counters stay honest per reason */
+#define LK_CONN_COMPRESS_PENDING                                                                   \
+    (1 << 7) /* MySQL HandshakeResponse carried CLIENT_COMPRESS                                    \
+                or _ZSTD (РМ7): the stream flips to compressed                                   \
+                framing right after the auth exchange — the                                      \
+                final OK turns this into LK_CONN_IGNORE */
 
 struct lk_conn {
     struct lk_conn *hnext; /* hash chain */

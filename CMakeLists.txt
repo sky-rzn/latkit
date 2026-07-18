@@ -163,9 +163,11 @@ add_custom_target(latkit_skel DEPENDS ${SKEL_H})
 # unit/replay harnesses. It speaks to the core through the contract headers
 # only (proto.h re-exports conn_table.h / reassembly.h).
 set(PROTO_SRC src/proto/registry.c src/proto/pg/pg.c src/proto/pg/pg_frame.c
-              src/proto/pg/pg_session.c src/proto/pg/pg_query.c src/proto/pg/pg_prep.c)
+              src/proto/pg/pg_session.c src/proto/pg/pg_query.c src/proto/pg/pg_prep.c
+              src/proto/my/my_frame.c)
 set(PROTO_INC ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
               ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/pg
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/my
               ${CMAKE_CURRENT_SOURCE_DIR}/src/agent
               ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf)
 add_library(latkit_proto STATIC ${PROTO_SRC})

@@ -35,8 +35,9 @@
  *
  * Memory is bounded by construction (Р11): at most the body prefix of one
  * unfinished message is buffered per direction (<= LK_MSG_BODY_MAX, filled
- * lazily when a message spans chunks, released at the message boundary); the
- * body tail beyond the prefix is skipped by len. The buffer is a fixed
+ * lazily when a message spans chunks — or wire fragments, when the protocol
+ * glues a multi-fragment logical message via msg_cont (РМ3) — released at the
+ * message boundary); the body tail beyond the prefix is skipped by len. The buffer is a fixed
  * LK_MSG_BODY_MAX slab drawn from a small agent-wide freelist (not per-conn),
  * so the message boundary recycles it instead of malloc/free churning the
  * allocator on every torn message — the hot path (large Query/Bind, COPY, or

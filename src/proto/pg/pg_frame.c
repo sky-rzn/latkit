@@ -54,6 +54,7 @@ static bool pg_parse_hdr(struct lk_conn *c, enum lk_dir dir, struct lk_frame *f)
     f->msg_type = startup ? 0 : f->hdr[0];
     f->msg_len = len;
     f->body_len = len - 4;
+    f->body_total = f->body_len; /* PG never glues fragments (РМ3 is MySQL's) */
     return true;
 }
 

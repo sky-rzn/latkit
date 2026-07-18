@@ -45,6 +45,20 @@ add_executable(test_pg_wire test_pg_wire.c)
 target_include_directories(test_pg_wire PRIVATE ${CMAKE_SOURCE_DIR}/src/proto/pg)
 add_test(NAME pg_wire COMMAND test_pg_wire)
 
+# MySQL bounded cursor (МYSQL.md М2): little-endian + lenenc twin of pg_wire.
+add_executable(test_my_wire test_my_wire.c)
+target_include_directories(test_my_wire PRIVATE ${CMAKE_SOURCE_DIR}/src/proto/my)
+add_test(NAME my_wire COMMAND test_my_wire)
+
+# MySQL framer (МYSQL.md М2): the reassembly matrix over lk_proto_my_ops plus
+# continuation glue, connection phase, TLS/compress transitions and the РМ4
+# anchors. Same shape as test_reassembly: reassembly.c + the proto lib.
+add_executable(test_my_frame test_my_frame.c ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
+target_include_directories(test_my_frame PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
+target_link_libraries(test_my_frame latkit_proto)
+add_test(NAME my_frame COMMAND test_my_frame)
+
 # Startup/auth/session (task 3.2): white-box over the PG handler (links the
 # libbpf-free proto lib; includes the internal pg.h for state assertions).
 add_executable(test_pg_session test_pg_session.c)

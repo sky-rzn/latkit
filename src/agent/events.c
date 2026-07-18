@@ -584,7 +584,7 @@ static void apply_cap_policy(struct lk_events *e, struct lk_conn *c)
 {
     if (!c || (c->flags & LK_CONN_CAP_HEADERS))
         return;
-    if (!(c->flags & (LK_CONN_TLS | LK_CONN_CANCEL | LK_CONN_REPLICATION)))
+    if (!(c->flags & (LK_CONN_TLS | LK_CONN_CANCEL | LK_CONN_REPLICATION | LK_CONN_IGNORE)))
         return;
     set_cap_headers(e->cfg.capmode, c->cookie);
     c->flags |= LK_CONN_CAP_HEADERS;
