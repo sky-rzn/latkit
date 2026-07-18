@@ -39,3 +39,15 @@ target_include_directories(lkt_info PRIVATE ${REPLAY_INC})
 add_executable(lkt_messages lkt_messages.c ${REPLAY_SRC})
 target_include_directories(lkt_messages PRIVATE ${REPLAY_INC})
 target_link_libraries(lkt_messages latkit_proto)
+
+# Dev tool: the --queries view — the real protocol handler over LKT1 traces
+# (МYSQL.md М3 acceptance; the expectation table is queries_traces.sh).
+add_executable(lkt_queries lkt_queries.c ${REPLAY_SRC})
+target_include_directories(lkt_queries PRIVATE ${REPLAY_INC})
+target_link_libraries(lkt_queries latkit_proto)
+
+# М3 acceptance: expected observations per М0 trace scenario + parse_errors
+# == 0 on clean traces, asserted over the committed corpus.
+add_test(NAME my_queries_traces
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/queries_traces.sh
+                 $<TARGET_FILE:lkt_queries> ${CMAKE_SOURCE_DIR}/tests/traces/mysql)

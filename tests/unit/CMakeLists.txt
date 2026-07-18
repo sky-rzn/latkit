@@ -86,6 +86,33 @@ target_include_directories(test_pg_prep PRIVATE
 target_link_libraries(test_pg_prep latkit_proto)
 add_test(NAME pg_prep COMMAND test_pg_prep)
 
+# MySQL connection phase (МYSQL.md М3): greeting/response/auth cycle, labels,
+# promote/synthetic/compress paths. White-box over the my handler internals.
+add_executable(test_my_session test_my_session.c)
+target_include_directories(test_my_session PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/my
+    ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf)
+target_link_libraries(test_my_session latkit_proto)
+add_test(NAME my_session COMMAND test_my_session)
+
+# MySQL query phase machine (М3): resultset shapes, terminators, LOAD DATA,
+# transactions, query attributes, cursors, honesty drops.
+add_executable(test_my_query test_my_query.c)
+target_include_directories(test_my_query PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/my
+    ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf)
+target_link_libraries(test_my_query latkit_proto)
+add_test(NAME my_query COMMAND test_my_query)
+
+# MySQL prepared-statement cache (М3): stmt_id binding, metadata skip, CLOSE
+# without a reply, pipelined-close rescue, eviction, reset.
+add_executable(test_my_prep test_my_prep.c)
+target_include_directories(test_my_prep PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/my
+    ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf)
+target_link_libraries(test_my_prep latkit_proto)
+add_test(NAME my_prep COMMAND test_my_prep)
+
 # SQL normaliser + fingerprint (task 4.1): table-driven cases over the public
 # lk_norm_sql API. Links the pure normaliser lib (no libbpf, no privileges).
 add_executable(test_norm_sql test_norm_sql.c)

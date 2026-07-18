@@ -204,9 +204,9 @@ struct lk_proto_ops {
  * (lazily created entry, bare unit-test lk_conn) frame as PG (РМ2). */
 extern const struct lk_proto_ops lk_proto_pg_ops;
 
-/* MySQL classic-protocol framing (src/proto/my/my_frame.c, РМ3/РМ4):
- * `--port 3306=mysql`. lk_proto_my_new is the М2 counting-only handler stub —
- * messages tallied, no observations yet; М3 grows it into the real parser. */
+/* MySQL classic protocol: framing in src/proto/my/my_frame.c (РМ3/РМ4), the
+ * handler in src/proto/my/my.c + my_session/my_query/my_prep (М3, РМ8) —
+ * `--port 3306=mysql`. */
 extern const struct lk_proto_ops lk_proto_my_ops;
 struct lk_proto *lk_proto_my_new(const struct lk_query_sink *out);
 

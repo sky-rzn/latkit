@@ -42,7 +42,6 @@
  *     boundaries carry higher seqs and are rejected; the backend converges at
  *     the next request/response cycle, the accepted РМ4 cost. */
 #include <stdbool.h>
-#include <stdlib.h>
 
 #include "proto.h"
 
@@ -239,50 +238,9 @@ static bool my_resync_boundary(const struct lk_conn *c, enum lk_dir dir,
     return ev->payload[3] == 1 && len >= 1 && len < MY_PKT_MAX;
 }
 
-/* --- М2 handler stub ------------------------------------------------------ */
-
-/* Counting-only lk_msg_sink: the message tallies feed the stats line and the
- * М2 acceptance runs (--messages over the М0 corpus); no per-connection
- * state, no observations. М3 replaces this with the real parser
- * (src/proto/my/my.c) without touching the ops above. */
-static void my_on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struct lk_msg *m)
-{
-    struct lk_proto *p = ctx;
-
-    (void)c;
-    p->st.msgs++;
-    if (m->flags & LK_MSG_STARTUP)
-        p->st.startup_msgs++;
-    p->st.by_type[dir][(__u8)m->type]++;
-}
-
-static void my_on_resync(void *ctx, struct lk_conn *c, enum lk_dir dir)
-{
-    struct lk_proto *p = ctx;
-
-    (void)c;
-    (void)dir;
-    p->st.resyncs++;
-}
-
-struct lk_proto *lk_proto_my_new(const struct lk_query_sink *out)
-{
-    struct lk_proto *p = calloc(1, sizeof(*p));
-
-    if (!p)
-        return NULL;
-    if (out)
-        p->out = *out;
-    p->msink.ctx = p;
-    p->msink.on_msg = my_on_msg;
-    p->msink.on_resync = my_on_resync;
-    /* on_conn_open/on_conn_close unused: the stub allocates no proto_state. */
-    return p;
-}
-
 const struct lk_proto_ops lk_proto_my_ops = {
     .name = "mysql",
-    .proto_new = lk_proto_my_new,
+    .proto_new = lk_proto_my_new, /* the М3 handler, src/proto/my/my.c */
     .hdr_size = my_hdr_size,
     .parse_hdr = my_parse_hdr,
     .pre_emit = my_pre_emit,
