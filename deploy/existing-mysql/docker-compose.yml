@@ -1,0 +1,89 @@
+# latkit on a VPS with an EXISTING MySQL/MariaDB (native, TCP :3306) —
+# monitoring only. Unlike deploy/demo-mysql, this brings NO mysql and NO load
+# generator: the agent captures the real database already running on the host.
+# Capture is kernel-wide fentry on tcp_sendmsg/tcp_recvmsg, so `pid: host` is
+# all it needs to see the host's mysql traffic (loopback included) — no link to
+# the DB.
+#
+#   cd deploy/existing-mysql
+#   GF_ADMIN_PASSWORD=change-me docker compose up --build -d
+#
+# Prereqs: Linux kernel >= 5.15 with BTF (/sys/kernel/btf/vmlinux), Docker +
+# compose plugin. The app must reach mysql over TCP — unix-socket
+# (/var/run/mysqld/mysqld.sock) and docker-proxy'd localhost traffic are NOT
+# captured (README "Known limitations").
+#
+# Grafana + Prometheus bind to 127.0.0.1 only: /metrics and this Grafana have no
+# auth. Reach them via SSH tunnel (ssh -L 3000:127.0.0.1:3000 vps) or your own
+# TLS reverse proxy — do not publish these ports to the internet.
+
+services:
+  # The agent — release scratch image (musl static), built from the repo root so
+  # the version stamp sees .git. LATKIT_TLS=auto is safe on plaintext (it just
+  # sees no TLS) and decrypts sessions via libssl uprobes if the app uses SSL.
+  latkit:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    pid: host                 # uprobes / /proc scan need the host PID namespace
+    # Measured minimal set (docs/deploy.md). BPF+PERFMON = plaintext capture;
+    # SYS_PTRACE+SYS_ADMIN are only for the TLS=auto libssl uprobes. Drop the
+    # last two (and set LATKIT_TLS=off below) if the DB connection is plaintext.
+    # On kernels < 5.11 add SYS_RESOURCE. `privileged: true` is the fallback.
+    cap_add: [BPF, PERFMON, SYS_PTRACE, SYS_ADMIN]
+    # TLS auto-scan reads /proc/<host-pid>/root/.../libssl.so of the mysqld
+    # process to attach the SSL_* uprobes. The docker-default AppArmor profile
+    # mediates that cross-process /proc access and makes the scan come back empty
+    # EVEN WITH CAP_SYS_PTRACE — verified on postgres; the same applies here.
+    # seccomp + caps stay in force. Needed ONLY for TLS capture in a container;
+    # for plaintext (LATKIT_TLS=off) drop it.
+    security_opt:
+      - apparmor=unconfined
+    environment:
+      LATKIT_PORT: "3306=mysql"           # your mysql server port + wire protocol
+      LATKIT_PROM_LISTEN: "0.0.0.0:9752"  # a container must listen off-loopback
+      LATKIT_TLS: auto                    # -> off if you know it's plaintext
+      LATKIT_FIRST_ROW_HIST: "1"          # feeds the drilldown "time to first row"
+      # TLS /proc scan set — the default is {postgres, mysqld, mariadbd}; narrow
+      # it to your server if the host runs nothing else worth scanning. MariaDB:
+      # set "mariadbd" (or "mysqld" on older packaging).
+      # LATKIT_TLS_COMM: mysqld
+      # Do NOT set LATKIT_COMM=mysqld: that is the *kernel* capture filter on the
+      # per-THREAD comm, and MySQL 8.x names its session threads `connection`
+      # (not `mysqld`) — the filter would silently drop every event (MYSQL.md М5,
+      # находка М0). Leave it unset; the port filter already scopes the capture.
+    # No published port: Prometheus scrapes latkit:9752 over the compose network.
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on: [latkit]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+    ports: ["127.0.0.1:9090:9090"]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0     # pinned major 11.x (Р42)
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GF_ADMIN_PASSWORD:?set GF_ADMIN_PASSWORD}"
+      GF_USERS_DEFAULT_THEME: "dark"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      # Reuse the postgres demo provisioning (datasource -> http://prometheus:9090)
+      # and the four dashboards straight from the repo — single source, read-only.
+      # The dashboards' $proto variable selects mysql.
+      - ../demo/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["127.0.0.1:3000:3000"]
+    restart: unless-stopped
+
+volumes:
+  prom-data:
+  grafana-data:

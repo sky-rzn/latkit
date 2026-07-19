@@ -56,6 +56,11 @@ spec:
               value: "0.0.0.0:9752"
             - name: LATKIT_PORT
               value: "5432"
+            # MySQL/MariaDB instead of (or alongside) postgres: name the port's
+            # wire protocol, e.g. "3306=mysql" or "5432,3306=mysql". Do NOT add
+            # LATKIT_COMM=mysqld — that per-thread kernel filter drops every
+            # event on MySQL 8.x, whose session threads are named `connection`
+            # (MYSQL.md М5). The default TLS scan set already includes mysqld.
             # TLS capture of postgres running with ssl=on (stage 6). Needs the
             # SYS_PTRACE + SYS_ADMIN capabilities below.
             - name: LATKIT_TLS

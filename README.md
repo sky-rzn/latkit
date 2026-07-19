@@ -1,12 +1,16 @@
 # latkit
 
-**Per-query PostgreSQL latency without extension, config change, and database restart.**
+**Per-query PostgreSQL and MySQL latency without extension, config change, and database restart.**
 
-Latkit is an eBPF agent that watches the PostgreSQL wire protocol at the
-socket layer and turns it into per-query latency histograms: normalised query
-text, database/user labels, row counts, SQLSTATE errors, transaction timings.
-It exports to Prometheus and OpenTelemetry, ships with four ready-made Grafana
-dashboards, runs beside the database, and the database never knows it's there.
+Latkit is an eBPF agent that watches the PostgreSQL and MySQL/MariaDB wire
+protocols at the socket layer and turns them into per-query latency histograms:
+normalised query text, database/user labels, row counts, SQLSTATE errors,
+transaction timings. It exports to Prometheus and OpenTelemetry, ships with
+four ready-made Grafana dashboards, runs beside the database, and the database
+never knows it's there.
+
+Every query series carries a `proto="pg"|"mysql"` label; one agent can watch a
+5432 and a 3306 at once (`--port 5432,3306=mysql`).
 
 
 ![latkit Overview dashboard](docs/img/latkit-overview.png)
@@ -26,7 +30,9 @@ docker compose up --build -d
 
 Open <http://localhost:3000/dashboards> and start with **latkit - Overview**;
 live query latency shows up within a minute. TLS profile and troubleshooting:
-[deploy/demo/README.md](deploy/demo/README.md).
+[deploy/demo/README.md](deploy/demo/README.md). For MySQL, the same stack with
+`mysql:8.4` and `proto="mysql"` dashboards lives in
+[deploy/demo-mysql](deploy/demo-mysql/README.md).
 
 ## Why latkit
 
@@ -142,9 +148,11 @@ binary is built differently (fully static musl, in a container):
   [docs/deploy.md](docs/deploy.md#kernel-support).
 - **x86_64** arm64 is untested.
 - **cgroup v2** if you use `--cgroup`.
-- **Dynamically linked OpenSSL** in the postgres processes for TLS capture
-  (`--tls auto`). Everything else is detected and counted without decryption.
-  See [Known limitations](#known-limitations-v1).
+- **Dynamically linked OpenSSL** in the DB server processes for TLS capture
+  (`--tls auto`). MariaDB builds that link a bundled **wolfSSL/GnuTLS** instead
+  of OpenSSL have no `libssl.so` to attach to — their TLS is detected and
+  dropped-and-counted, not decrypted. Everything else is detected and counted
+  without decryption. See [Known limitations](#known-limitations-v1).
 - **Privileges** - root, or the capability set below (kernel/LSM caveats and
   failure signatures in [docs/deploy.md](docs/deploy.md)):
 
@@ -171,8 +179,8 @@ Use it to verify a deployment's env layer.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `-p, --port PORT[=pg]` | `LATKIT_PORT` | `5432` | local (server) port to capture, optionally with its wire protocol (default: `pg`); repeatable, up to 16 |
-| `--comm NAME` | `LATKIT_COMM` | off | only capture send/recv of processes with this exact comm |
+| `-p, --port PORT[=pg\|mysql]` | `LATKIT_PORT` | `5432` | local (server) port to capture, optionally with its wire protocol (default: `pg`); repeatable, up to 16 (e.g. `5432,3306=mysql`) |
+| `--comm NAME` | `LATKIT_COMM` | off | only capture send/recv of processes with this exact comm. **MySQL 8.x names its per-session threads `connection`, not `mysqld`** — don't filter on `mysqld` there; the port filter already scopes it |
 | `--cgroup PATTERN` | `LATKIT_CGROUP` | off | only capture cgroups whose path under `/sys/fs/cgroup` matches this glob (`*` stays within a path segment, `**` spans); repeatable, re-resolved every 30 s; requires cgroup v2 |
 
 **Capture tuning**:
@@ -302,6 +310,13 @@ method, tables and reproduction script - `tests/bench/run.sh`):
   are out of scope. BoringSSL may work through the offset-independent
   bridge but is untested.
   [docs/notes-tls.md](docs/notes-tls.md) §6.
+- **MySQL scope: classic protocol only.** The **X Protocol** (port 33060,
+  protobuf) is a different protocol, out of scope. The **compressed protocol**
+  (`CLIENT_COMPRESS`, zstd) and **replication** streams (`COM_BINLOG_DUMP`) are
+  recognised and honestly counted as blind — the connection goes to a
+  headers-only IGNORE with a reason, no partial parse. Query attributes,
+  prepared statements, multi-statements, `LOAD DATA LOCAL` and multi-resultsets
+  are parsed. [docs/notes-myproto.md](docs/notes-myproto.md).
 - **Unix-domain sockets are invisible** (`tcp_*` hooks are not on that
   path). Planned v1.1 (`unix_stream_sendmsg/recvmsg` hooks).
 - **`splice()`-relayed traffic** (e.g. docker-proxy on published ports)
@@ -325,7 +340,7 @@ method, tables and reproduction script - `tests/bench/run.sh`):
 ```
         kernel                             userspace (one process, one epoll loop)
 ┌───────────────────────────┐            ┌────────────────────────────────────────┐
-│ fentry tcp_sendmsg        │  ringbuf   │ conn table → framer → PG v3 parser     │
+│ fentry tcp_sendmsg        │  ringbuf   │ conn table → framer → PG/MySQL parser  │
 │ fentry/fexit tcp_recvmsg  │ ─────────▶ │  → SQL normaliser → top-K registry     │
 │ tp_btf inet_sock_set_state│  events    │  → /metrics (pull) + OTLP push + spans │
 │ uprobes SSL_read/SSL_write│            │                                        │
@@ -340,13 +355,14 @@ uprobes substitute plaintext for the socket ciphertext under the same
 connection identity, and the socket-layer copy is dropped and counted. The
 layer-by-layer write-ups: [docs/notes-iov.md](docs/notes-iov.md) (payload
 capture), [docs/notes-reassembly.md](docs/notes-reassembly.md) (framing),
-[docs/notes-pgproto.md](docs/notes-pgproto.md) (parser),
+[docs/notes-pgproto.md](docs/notes-pgproto.md) /
+[docs/notes-myproto.md](docs/notes-myproto.md) (parsers),
 [docs/notes-metrics.md](docs/notes-metrics.md) (normalisation, nomenclature,
 cardinality), [docs/notes-export.md](docs/notes-export.md) (exporters),
 [docs/notes-tls.md](docs/notes-tls.md) (TLS).
 
 The metric nomenclature is a public API:
-`latkit_query_duration_seconds{query,db,user,code}` histograms,
+`latkit_query_duration_seconds{proto,query,db,user,code}` histograms,
 `latkit_queries_total`, `latkit_query_errors_total{sqlstate}`,
 `latkit_query_rows_total`, connection/transaction series, and the agent
 self-metrics (`latkit_ringbuf_dropped_total`, `latkit_resync_total`,

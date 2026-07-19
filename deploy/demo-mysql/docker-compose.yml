@@ -1,0 +1,156 @@
+# latkit MySQL demo stack (MYSQL.md М8): mysql + load + latkit + prometheus +
+# grafana — the MySQL twin of ../demo, wired so `docker compose up` on a Linux
+# host gives live Grafana with the four dashboards (proto="mysql") in about a
+# minute after the images are there. See README.md for the requirements and a
+# tour.
+#
+#   docker compose up --build -d
+#   docker compose --profile tls up --build -d    # + a require_secure_transport mysqld
+#   docker compose --profile tls down -v          # tear down either variant
+#
+# Capture hygiene (README "Known limitations"): the load talks to mysqld over
+# the compose network by service name — mysqld publishes NO port, so nothing
+# crosses docker-proxy on localhost (which would splice() the payload and
+# defeat the socket capture). latkit filters the server port 3306 it sees
+# kernel-wide, which covers both mysqld containers of the tls profile.
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: latkit
+      MYSQL_DATABASE: latkit
+      MYSQL_USER: latkit
+      MYSQL_PASSWORD: latkit
+    command: ["mysqld"]
+    healthcheck:
+      # TCP + the app user over 127.0.0.1: passes only on the final server, not
+      # the socket-only temporary server the entrypoint runs during first-boot
+      # init (which would let the load race the user creation). MySQL 8.4 always
+      # offers TLS, so the plaintext clients opt out with --ssl-mode=DISABLED;
+      # --get-server-public-key lets caching_sha2_password (the 8.4 default)
+      # auth over the plaintext link via RSA, no TLS (plan risk 2).
+      test: ["CMD-SHELL",
+             "mysql --ssl-mode=DISABLED --get-server-public-key -h 127.0.0.1 -ulatkit -platkit latkit -e 'SELECT 1'"]
+      interval: 2s
+      timeout: 4s
+      retries: 60
+
+  # Steady, varied load so every panel is alive: several persistent sessions of
+  # point reads + writes for QPS/latency/top-N, plus a slow/error loop (SLEEP()
+  # for the p99 tail; a missing table, a duplicate key and a syntax error for
+  # the error-rate and SQLSTATE panels). The script seeds its dataset itself.
+  load:
+    image: mysql:8.4
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_PWD: latkit
+    volumes:
+      - ./load/load.sh:/load.sh:ro
+    command: ["bash", "/load.sh"]
+    restart: unless-stopped
+
+  # The agent — the release scratch image (musl static), built from the repo
+  # root so the version stamp sees .git. Configured through the LATKIT_* env
+  # layer, nothing else. The one MySQL-specific line is the port form
+  # `3306=mysql` (a bare number would default the connection to the pg parser).
+  # --tls auto is always on: with the plain profile it attaches the libssl
+  # uprobes and simply sees no TLS traffic; with --profile tls it decrypts the
+  # mysql-tls sessions (latkit_tls_connections > 0).
+  latkit:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    depends_on:
+      mysql:
+        condition: service_healthy
+    # Demo simplicity. The measured minimal set instead (docs/deploy.md):
+    #   cap_add: [BPF, PERFMON, SYS_PTRACE, SYS_ADMIN]
+    # (SYS_PTRACE + SYS_ADMIN only for TLS uprobes; + SYS_RESOURCE on < 5.11)
+    privileged: true
+    pid: host               # uprobes / /proc access need the host PID namespace
+    environment:
+      LATKIT_PORT: "3306=mysql"           # the wire protocol on this port
+      LATKIT_PROM_LISTEN: "0.0.0.0:9752"  # default is loopback (Р29); a container must listen out
+      LATKIT_TLS: auto
+      LATKIT_FIRST_ROW_HIST: "1"          # feeds the drilldown "time to first row" panel
+    ports: ["9752:9752"]    # convenience: curl http://localhost:9752/metrics
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on:
+      - latkit
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=2h"
+    ports: ["19090:9090"]   # 19090 to avoid clashing with a host Prometheus
+
+  grafana:
+    image: grafana/grafana:11.4.0    # pinned major 11.x (Р42)
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: "dark"
+    volumes:
+      # Reuse the postgres demo's provisioning (datasource -> prometheus:9090,
+      # dashboard provider) — same Prometheus service name, and the dashboards
+      # carry a $proto variable (М6) that selects mysql here.
+      - ../demo/grafana/provisioning:/etc/grafana/provisioning:ro
+      # The dashboards repo dir is the single source (Р43) — mounted read-only.
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+
+  # --- profile tls (additive): a second mysqld with require_secure_transport=ON
+  # --- and a client that forces TLS — the stage-6 demonstration. The plaintext
+  # --- pair keeps running, so the dashboards show both kinds of traffic side by
+  # --- side. No cert sidecar: the entrypoint auto-generates a self-signed cert
+  # --- pair into the datadir on first init (auto_generate_certs, on by default),
+  # --- unlike the postgres TLS profile.
+
+  mysql-tls:
+    image: mysql:8.4
+    profiles: ["tls"]
+    environment:
+      MYSQL_ROOT_PASSWORD: latkit
+      MYSQL_DATABASE: latkit
+      MYSQL_USER: latkit
+      MYSQL_PASSWORD: latkit
+    # require_secure_transport rejects any non-TLS TCP client, so every captured
+    # session is ciphertext at the socket and the uprobe channel is provably the
+    # data source. Same in-container port 3306 — latkit's port filter is
+    # per-connection, not per-container, so both servers fall under 3306=mysql.
+    command:
+      - mysqld
+      - --require_secure_transport=ON
+    healthcheck:
+      test: ["CMD-SHELL",
+             "mysql --ssl-mode=REQUIRED -h 127.0.0.1 -ulatkit -platkit latkit -e 'SELECT 1'"]
+      interval: 2s
+      timeout: 4s
+      retries: 60
+
+  # Same load script, MYSQL_HOST=mysql-tls and MYSQL_SSL=REQUIRED: every session
+  # is TLS, the socket bytes are ciphertext, and the plaintext on the dashboards
+  # comes from the libssl uprobe channel (stage 6). The SLEEP/error spice runs
+  # here too, so the SQLSTATE panels get contributions from both servers.
+  load-tls:
+    image: mysql:8.4
+    profiles: ["tls"]
+    depends_on:
+      mysql-tls:
+        condition: service_healthy
+    environment:
+      MYSQL_PWD: latkit
+      MYSQL_HOST: mysql-tls
+      MYSQL_SSL: REQUIRED
+    volumes:
+      - ./load/load.sh:/load.sh:ro
+    command: ["bash", "/load.sh"]
+    restart: unless-stopped

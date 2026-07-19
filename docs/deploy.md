@@ -35,6 +35,30 @@ CO-RE handles the version drift internally (`src/bpf/latkit.bpf.c`,
 resolved at load time — the event format never changes. **arm64** is a v1.1
 target (CO-RE does not stand in the way; it is untested hardware).
 
+## Wire protocols (PostgreSQL and MySQL)
+
+A capture port carries its wire protocol: `--port 5432` (or `5432=pg`) is
+PostgreSQL, `--port 3306=mysql` is MySQL/MariaDB, and one agent can watch both
+(`--port 5432,3306=mysql`, `LATKIT_PORT=5432,3306=mysql`). Every query-family
+metric is labelled `proto="pg"|"mysql"` so the two never collide. MySQL support
+covers the classic protocol (5.7 / 8.x, MariaDB 10.6+); the X Protocol, the
+compressed protocol and replication streams are recognised and counted as blind
+(README "Known limitations", [notes-myproto.md](notes-myproto.md)).
+
+Two MySQL-specific operator traps:
+
+- **Do not filter MySQL on comm `mysqld`.** `--comm`/`LATKIT_COMM` is the kernel
+  capture filter and matches the per-**thread** comm; MySQL 8.x renames its
+  per-session threads to `connection` (5.7 and MariaDB keep `mysqld`), so
+  `--comm mysqld` on an 8.x server drops every event. The port filter already
+  scopes the capture — leave comm unset. This is distinct from `--tls-comm`,
+  which matches the *process* comm for the libssl `/proc` scan and is fine as
+  `mysqld` (MYSQL.md М5).
+- **TLS scan set.** `--tls auto` scans `{postgres, mysqld, mariadbd}` by
+  default; `--tls-comm` narrows it. MariaDB linking bundled wolfSSL/GnuTLS has
+  no `libssl.so` to attach to — TLS is then detected and dropped-and-counted,
+  visible as `latkit_tls_attached{state!="ok"}`.
+
 ## The release binary
 
 The release artifact is a **fully static musl binary** (Р45), built in the
