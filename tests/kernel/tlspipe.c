@@ -314,7 +314,7 @@ int main(int argc, char **argv)
     }
     signal(SIGPIPE, SIG_IGN);
 
-    n = ks_extract_all(true, ss, KS_MAX_STREAMS);
+    n = ks_extract_all(true, NULL, ss, KS_MAX_STREAMS);
     if (!n) {
         fprintf(stderr, "tlspipe: no replayable fixtures\n");
         return 1;

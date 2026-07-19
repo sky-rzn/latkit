@@ -13,6 +13,7 @@
 #ifndef LATKIT_FUZZ_INVARIANTS_H
 #define LATKIT_FUZZ_INVARIANTS_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -44,25 +45,45 @@ static inline void fz_read_bytes(const void *p, size_t n)
     fz_byte_sink += acc;
 }
 
-/* Framer message contract (reassembly.h, Р10/Р11/Р19): len is sane, the body
- * prefix never exceeds the wire body or the Р11 cap, and "truncated" is exactly
- * "prefix shorter than the body" — trunc is not mutually exclusive with a valid
- * message. len == 0 is the lone untyped one-byte SSL/GSSENC reply. */
-static inline void fz_check_msg(const struct lk_msg *m)
+/* Framer message contract (reassembly.h, Р10/Р11/Р19). The two protocols
+ * differ in what lk_msg.len means, so the contract is parameterised:
+ *
+ *   PG    — len is the wire length field, which *includes* its own 4-byte
+ *           prefix, so the body is len-4; len == 0 is the lone untyped
+ *           one-byte SSL/GSSENC reply; a startup packet is >= 8 bytes.
+ *   MySQL — len is the logical payload length itself (no self-inclusion), so
+ *           the body is len; len == 0 is a legitimate empty packet (the LOAD
+ *           DATA end marker); a 1-byte command (COM_QUIT) has len == 1.
+ *
+ * Common to both: the captured body prefix never exceeds the payload or the
+ * Р11 cap, and "truncated" is exactly "prefix shorter than the payload" —
+ * trunc is not mutually exclusive with a valid message. A STARTUP packet is
+ * untyped (type == 0) in either protocol. */
+static inline void fz_check_msg(const struct lk_msg *m, bool mysql)
 {
-    if (m->len == 0) {
-        FZ_ASSERT(m->body_cap == 0);
-        FZ_ASSERT(!(m->flags & (LK_MSG_BODY_TRUNC | LK_MSG_STARTUP)));
-        return;
+    uint32_t body; /* the wire payload length the captured prefix belongs to */
+
+    if (mysql) {
+        FZ_ASSERT(m->body_cap <= LK_MSG_BODY_MAX);
+        if (m->flags & LK_MSG_STARTUP)
+            FZ_ASSERT(m->type == 0);
+        body = m->len;
+    } else {
+        if (m->len == 0) {
+            FZ_ASSERT(m->body_cap == 0);
+            FZ_ASSERT(!(m->flags & (LK_MSG_BODY_TRUNC | LK_MSG_STARTUP)));
+            return;
+        }
+        FZ_ASSERT(m->len >= 4 && m->len <= (1u << 30));
+        if (m->flags & LK_MSG_STARTUP) {
+            FZ_ASSERT(m->type == 0);
+            FZ_ASSERT(m->len >= 8);
+        }
+        FZ_ASSERT(m->body_cap <= LK_MSG_BODY_MAX);
+        body = m->len - 4;
     }
-    FZ_ASSERT(m->len >= 4 && m->len <= (1u << 30));
-    if (m->flags & LK_MSG_STARTUP) {
-        FZ_ASSERT(m->type == 0);
-        FZ_ASSERT(m->len >= 8);
-    }
-    FZ_ASSERT(m->body_cap <= m->len - 4);
-    FZ_ASSERT(m->body_cap <= LK_MSG_BODY_MAX);
-    FZ_ASSERT(((m->flags & LK_MSG_BODY_TRUNC) != 0) == (m->body_cap < m->len - 4));
+    FZ_ASSERT(m->body_cap <= body);
+    FZ_ASSERT(((m->flags & LK_MSG_BODY_TRUNC) != 0) == (m->body_cap < body));
     if (m->body_cap) {
         FZ_ASSERT(m->body != NULL);
         fz_read_bytes(m->body, m->body_cap);

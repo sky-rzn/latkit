@@ -15,6 +15,8 @@
 # runner lacks any of these it is a manual check; CI marks it optional.
 #
 #   ./smoke.sh            # build image, up kind, assert, tear the cluster down
+#   DB=mysql ./smoke.sh   # the same smoke against mysql:8.4 (LATKIT_PORT patched
+#                         # to 3306=mysql; client forced onto TCP) — MYSQL.md М7
 #   KEEP=1 ./smoke.sh     # leave the cluster up afterwards for inspection
 #   SKIP_BUILD=1 ./smoke.sh   # reuse an already-built/loaded latkit:latest
 #
@@ -42,6 +44,26 @@ PF_PORT=${PF_PORT:-19752}
 MANIFEST="$REPO_ROOT/deploy/k8s/latkit-daemonset.yaml"
 PF_PID=""
 fails=0
+
+# Database engine under test (MYSQL.md М7): postgres (the default) or mysql. It
+# selects the workload pod/client and the agent's LATKIT_PORT — a mysql run
+# patches the DaemonSet to `3306=mysql` before the rollout so the agent frames
+# and parses the classic protocol.
+DB=${DB:-postgres}
+case "$DB" in
+postgres)
+    DB_IMAGE=postgres:16
+    LATKIT_PORT_VAL=5432
+    ;;
+mysql)
+    DB_IMAGE=mysql:8.4
+    LATKIT_PORT_VAL="3306=mysql"
+    ;;
+*)
+    echo "smoke: unknown DB '$DB' (want postgres|mysql)" >&2
+    exit 2
+    ;;
+esac
 
 log()  { printf '\n=== %s ===\n' "$*"; }
 note() { printf '  %s\n' "$*"; }
@@ -74,8 +96,48 @@ msum() {
     metrics | awk -v m="$1" '$0 !~ /^#/ && $0 ~ "^"m"([{ ]|$)" { s += $NF } END { printf "%.0f", s+0 }'
 }
 
-# pgbench NAME EXTRA... — always over TCP (see the -h trap in the header).
+# Workload helpers, always over TCP (see the -h trap in the header): a unix
+# socket would never touch the fentry hooks and the test would pass vacuously.
 pgb() { kubectl -n "$NS" exec pg -- pgbench -h 127.0.0.1 -U postgres "$@" postgres; }
+
+# db_deploy — bring up the workload pod and wait for it to accept TCP.
+db_deploy() {
+    if [ "$DB" = mysql ]; then
+        kubectl -n "$NS" run db --image="$DB_IMAGE" \
+            --env=MYSQL_ROOT_PASSWORD=pw --env=MYSQL_DATABASE=bench \
+            --port=3306 -- mysqld --skip-ssl >/dev/null
+        kubectl -n "$NS" wait --for=condition=Ready pod/db --timeout=180s >/dev/null
+        for _ in $(seq 1 60); do
+            kubectl -n "$NS" exec db -- \
+                mysql --skip-ssl -h 127.0.0.1 -uroot -ppw -e 'SELECT 1' >/dev/null 2>&1 && break
+            sleep 2
+        done
+    else
+        kubectl -n "$NS" run pg --image="$DB_IMAGE" --env=POSTGRES_PASSWORD=pw \
+            --port=5432 >/dev/null
+        kubectl -n "$NS" wait --for=condition=Ready pod/pg --timeout=120s >/dev/null
+        for _ in $(seq 1 30); do
+            kubectl -n "$NS" exec pg -- pg_isready -q -U postgres >/dev/null 2>&1 && break
+            sleep 1
+        done
+    fi
+}
+
+# db_load DURATION — drive a burst of TCP queries for ~DURATION seconds.
+db_load() {
+    local secs="$1"
+    if [ "$DB" = mysql ]; then
+        kubectl -n "$NS" exec db -- bash -c '
+            end=$(( $(date +%s) + '"$secs"' ))
+            while [ "$(date +%s)" -lt "$end" ]; do
+                mysql --skip-ssl -h 127.0.0.1 -uroot -ppw bench \
+                    -e "SELECT 1; SELECT COUNT(*) FROM information_schema.tables;" \
+                    >/dev/null 2>&1
+            done' >/dev/null 2>&1
+    else
+        pgb -c 4 -T "$secs" >/dev/null 2>&1
+    fi
+}
 
 # --- 0. build + load the release image --------------------------------------
 if [ "${SKIP_BUILD:-0}" = "1" ]; then
@@ -97,6 +159,11 @@ kubectl create namespace "$NS" >/dev/null 2>&1 || true
 # hostPID + added capabilities need a privileged PSA level (docs/deploy.md).
 kubectl label ns "$NS" pod-security.kubernetes.io/enforce=privileged --overwrite >/dev/null
 kubectl -n "$NS" apply -f "$MANIFEST" >/dev/null
+# Point the agent at the engine under test before the pods settle (МYSQL.md М7).
+if [ "$LATKIT_PORT_VAL" != "5432" ]; then
+    note "patching the DaemonSet to LATKIT_PORT=$LATKIT_PORT_VAL ($DB)"
+    kubectl -n "$NS" set env ds/latkit LATKIT_PORT="$LATKIT_PORT_VAL" >/dev/null
+fi
 
 log "waiting for the DaemonSet to become Ready (green /healthz)"
 if kubectl -n "$NS" rollout status ds/latkit --timeout=120s; then
@@ -126,21 +193,17 @@ else
     exit 1
 fi
 
-# --- 4. postgres workload over TCP ------------------------------------------
-log "deploying postgres and driving load over TCP"
-kubectl -n "$NS" run pg --image=postgres:16 --env=POSTGRES_PASSWORD=pw --port=5432 >/dev/null
-kubectl -n "$NS" wait --for=condition=Ready pod/pg --timeout=120s >/dev/null
-# Ready != accepting connections; poll pg_isready before the first pgbench.
-for _ in $(seq 1 30); do
-    kubectl -n "$NS" exec pg -- pg_isready -q -U postgres >/dev/null 2>&1 && break
-    sleep 1
-done
+# --- 4. database workload over TCP ------------------------------------------
+log "deploying $DB and driving load over TCP"
+db_deploy
 
 ev0=$(msum latkit_events_total)
 note "events_total before load = $ev0"
-pgb -i -s 5 >/dev/null 2>&1
+if [ "$DB" = postgres ]; then
+    pgb -i -s 5 >/dev/null 2>&1
+fi
 note "first load burst"
-pgb -c 4 -T 8 2>&1 | grep -E 'tps|failed' | sed 's/^/  /'
+db_load 8
 
 # --- 5. assertions ----------------------------------------------------------
 log "capture assertions"
@@ -162,7 +225,7 @@ else
 fi
 
 note "second load burst — counter must grow"
-pgb -c 4 -T 8 >/dev/null 2>&1
+db_load 8
 q2=$(msum latkit_queries_total)
 note "sum(latkit_queries_total) after +burst = $q2"
 if [ "$q2" -gt "$q1" ]; then

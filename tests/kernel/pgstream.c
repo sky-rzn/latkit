@@ -114,9 +114,10 @@ int main(int argc, char **argv)
     struct ks_stream ss[KS_MAX_STREAMS];
     struct sockaddr_in addr = {.sin_family = AF_INET};
     int port = 5432, repeat = 1, opt, lfd, one = 1;
+    const char *proto = NULL; /* NULL = pg; "mysql" with -m (МYSQL.md М7) */
     size_t n, conns = 0;
 
-    while ((opt = getopt(argc, argv, "p:r:h")) != -1) {
+    while ((opt = getopt(argc, argv, "p:r:mh")) != -1) {
         switch (opt) {
         case 'p':
             port = atoi(optarg);
@@ -124,13 +125,16 @@ int main(int argc, char **argv)
         case 'r':
             repeat = atoi(optarg);
             break;
+        case 'm':
+            proto = "mysql"; /* stream the mysql fixtures (agent: -p PORT=mysql) */
+            break;
         default:
-            fprintf(stderr, "usage: %s [-p port] [-r repeat]\n", argv[0]);
+            fprintf(stderr, "usage: %s [-p port] [-r repeat] [-m]\n", argv[0]);
             return opt == 'h' ? 0 : 1;
         }
     }
 
-    n = ks_extract_all(false, ss, KS_MAX_STREAMS);
+    n = ks_extract_all(false, proto, ss, KS_MAX_STREAMS);
     if (!n) {
         fprintf(stderr, "pgstream: no replayable fixtures\n");
         return 1;

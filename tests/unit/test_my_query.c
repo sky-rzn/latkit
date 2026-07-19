@@ -671,6 +671,32 @@ static int test_blind_head(void)
     return 0;
 }
 
+/* A column-definition packet whose body fell entirely into a capture hole
+ * (body_cap == 0) in the MY_R_COLS state: the dispatcher lets a blind packet
+ * through here (a definition skip survives it), so reply_cols must not deref
+ * the NULL body — it counts the skip and the resultset still completes. This
+ * is the regression for the fuzz_my finding (MYSQL.md М7). */
+static int test_blind_coldef(void)
+{
+    SETUP(CAPS_NEW, 0);
+    struct lk_msg blind = {
+        .ts_ns = 1011, .flags = LK_MSG_BODY_TRUNC, .len = 30, .body_cap = 0, .body = NULL};
+
+    query(sink, &c, "SELECT 1", 1000);
+    be_count(sink, &c, 1, 1010); /* cols_left = 1 -> MY_R_COLS */
+    sink->on_msg(sink->ctx, &c, LK_DIR_SEND, &blind); /* blind coldef: no crash */
+    be_row(sink, &c, 1020);
+    be_ok_fe(sink, &c, 0, 0x0002, 1030);
+
+    CHECK(r.nqueries == 1); /* the skipped definition let the resultset finish */
+    CHECK(r.last.rows == 1);
+    CHECK(lk_proto_stats(p)->parse_errors == 0);
+
+    TEARDOWN();
+    printf("ok blind-coldef\n");
+    return 0;
+}
+
 /* Service commands consume their replies without observations; an unknown
  * command is counted and its stray reply ignored. */
 static int test_service_and_unknown(void)
@@ -743,7 +769,8 @@ int main(void)
         test_progress() || test_multi_resultset() || test_txn() || test_load_data() ||
         test_query_attributes() || test_synthetic_sniff() || test_cursor_fetch() ||
         test_anchor_discipline() || test_resync_drop() || test_close_drop() || test_text_trunc() ||
-        test_blind_head() || test_service_and_unknown() || test_binlog_ignore() ||
+        test_blind_head() || test_blind_coldef() || test_service_and_unknown() ||
+        test_binlog_ignore() ||
         test_corrupt_head())
         return 1;
     printf("ok\n");

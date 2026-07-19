@@ -267,6 +267,13 @@ add_subdirectory(tests/bench/micro)
 add_executable(logjoin tests/bench/accuracy/logjoin.c)
 target_link_libraries(logjoin latkit_metrics)
 
+# lknorm (MYSQL.md М7): a CLI over the same lk_norm_sql the agent links, so the
+# MySQL accuracy stand can normalise performance_schema DIGEST_TEXT through the
+# agent's exact lexer before the digest-vs-agent join. Built by
+# tests/bench/accuracy/run-mysql.sh; pure, builds anywhere.
+add_executable(lknorm tests/bench/accuracy/lknorm.c)
+target_link_libraries(lknorm latkit_norm)
+
 # Fuzzing profile (task 8.3, Р51): three libFuzzer targets (fuzz_pg, fuzz_norm,
 # fuzz_pipe) with fuzzer+ASAN+UBSAN baked in, clang only. Off by default — a
 # normal build never pays for it. See tests/fuzz/CMakeLists.txt.

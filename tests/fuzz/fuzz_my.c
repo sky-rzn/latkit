@@ -1,29 +1,28 @@
 // SPDX-License-Identifier: GPL-2.0
-/* PostgreSQL parser libFuzzer target (task 8.3, Р51; harness laid down in 3.6).
+/* MySQL classic-protocol parser libFuzzer target (MYSQL.md М7; the fuzz_pg
+ * harness transplanted to the second protocol). Same contract as fuzz_pg: the
+ * parser input is untrusted — packet bodies come off the wire and may be
+ * truncated (capture budget) or corrupt — so this target drives the exact
+ * production path an attacker-controlled byte stream takes: bytes -> framer
+ * (my_frame.c) -> lk_msg -> MySQL handler (src/proto/my), through one function,
+ * lk_my_fuzz_one(), so a single input covers both the framer's u24-length /
+ * seq / 16MB-continuation gating and every field read in the handler
+ * (my_wire.h bounds, lenenc parsing, the reply state machine).
  *
- * The whole point of Р18 is that the parser input is untrusted: bodies come
- * off the wire and may be truncated (capture budget) or outright corrupt. This
- * target drives the exact production path an attacker-controlled byte stream
- * would take — bytes -> framer -> lk_msg -> PG parser — through one function,
- * lk_pg_fuzz_one(), so a single input covers both the framer's length/type
- * gating and every field read in src/proto/pg.
+ * The connection is forced to the mysql vtable (lk_conn_table_set_protos):
+ * without it the framer would fall back to PG. The same input feeds both
+ * directions of one connection — the RECV pass drives frontend commands
+ * (COM_QUERY / STMT_* / the handshake response) that open units, the SEND pass
+ * drives the replies (OK / ERR / EOF / resultsets) that close them — then the
+ * connection closes so the destroy hook frees per-connection state on the live
+ * agent's path (Р15): a leak or use-after-free shows up under ASAN. Every
+ * emitted message and observation goes through the Р51 invariant asserts
+ * (fuzz_invariants.h), and every emitted field is read, so an out-of-bounds
+ * pointer is caught at emit time.
  *
- * The framer (reassembly.c) turns a per-direction byte stream into whole
- * messages; the PG handler (latkit_proto) consumes them. lk_pg_fuzz_one feeds
- * the same input to both directions of one connection, so frontend passes open
- * units (Q/Parse/Bind/...) and backend passes drive the replies that close them
- * (C/E/Z/COPY/...), then closes the connection so the destroy hook frees the
- * per-connection parser state on the same path the live agent uses (Р15) — a
- * leak or a use-after-free shows up under ASAN. On top of the memory checks,
- * every emitted message and observation goes through the Р51 invariant asserts
- * (fuzz_invariants.h): in-bounds body prefixes, trunc consistent with the
- * prefix, well-formed observations — and every emitted field is read, so an
- * out-of-bounds pointer is caught at emit time, not just at parse time.
- *
- * Built only in the -DLATKIT_FUZZ=ON profile (clang; fuzzer,address,undefined
- * baked in — see tests/fuzz/CMakeLists.txt). The committed corpus lives in
- * tests/fuzz/corpus/pg/; CI replays it (plus the .lkt fixtures) with -runs=0
- * as a regression test. */
+ * Built only in the -DLATKIT_FUZZ=ON profile (clang; fuzzer,address,undefined).
+ * The committed corpus lives in tests/fuzz/corpus/my/; CI replays it (plus the
+ * MySQL .lkt traces) with -runs=0 as a regression test. */
 #include <linux/types.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -68,10 +67,7 @@ static void fz_on_txn(void *ctx, const struct lk_conn *c, __u64 start_ns, __u64 
     fz_byte_sink += start_ns ^ end_ns ^ (unsigned char)final_status;
 }
 
-/* --- framer -> parser tee -------------------------------------------------
- * The framer's sink checks the Р51 message invariants, then tees every message
- * / resync into the PG handler, exactly as events.c and the replay harness
- * wire it. */
+/* --- framer -> parser tee (identical to fuzz_pg) -------------------------- */
 struct fz_tee {
     const struct lk_msg_sink *psink; /* = lk_proto_sink(proto) */
 };
@@ -80,7 +76,7 @@ static void tee_on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const stru
 {
     const struct lk_msg_sink *ps = ((struct fz_tee *)ctx)->psink;
 
-    fz_check_msg(m, false);
+    fz_check_msg(m, true);
     if (ps->on_msg)
         ps->on_msg(ps->ctx, c, dir, m);
 }
@@ -93,8 +89,6 @@ static void tee_on_resync(void *ctx, struct lk_conn *c, enum lk_dir dir)
         ps->on_resync(ps->ctx, c, dir);
 }
 
-/* The connection table fires this on every removal path; route it to the parser
- * so proto_state is freed (Р15). */
 static void fz_on_destroy(void *ctx, struct lk_conn *c)
 {
     const struct lk_msg_sink *ps = ((struct fz_tee *)ctx)->psink;
@@ -103,16 +97,16 @@ static void fz_on_destroy(void *ctx, struct lk_conn *c)
         ps->on_conn_close(ps->ctx, c);
 }
 
-/* One fuzz iteration: bytes -> lk_msg -> PG parser, set up and torn down from
- * scratch so state never leaks between inputs. Returns 0 always (a crash or an
- * invariant abort is the only failure a fuzzer cares about). */
-int lk_pg_fuzz_one(const uint8_t *data, size_t n)
+/* One fuzz iteration: bytes -> lk_msg -> MySQL parser, set up and torn down
+ * from scratch so state never leaks between inputs. */
+int lk_my_fuzz_one(const uint8_t *data, size_t n)
 {
     struct lk_query_sink qsink = {
         .on_query = fz_on_query,
         .on_session = fz_on_session,
         .on_txn = fz_on_txn,
     };
+    const struct lk_proto_ops *ops = lk_proto_find("mysql", 5);
     struct lk_proto *proto;
     struct fz_tee tee;
     struct lk_reasm reasm;
@@ -122,7 +116,9 @@ int lk_pg_fuzz_one(const uint8_t *data, size_t n)
     __u32 lost = 0;
     __u32 len = n > LK_FUZZ_MAX_INPUT ? LK_FUZZ_MAX_INPUT : (__u32)n;
 
-    proto = lk_proto_pg_new(&qsink);
+    if (!ops)
+        return 0;
+    proto = ops->proto_new(&qsink);
     if (!proto)
         return 0;
     tee.psink = lk_proto_sink(proto);
@@ -136,7 +132,8 @@ int lk_pg_fuzz_one(const uint8_t *data, size_t n)
         lk_proto_free(proto);
         return 0;
     }
-    /* The destroy hook (CONN_CLOSE / eviction / teardown) frees proto_state. */
+    /* Force the mysql framer/handler on every entry (else the PG default). */
+    lk_conn_table_set_protos(tbl, NULL, 0, ops);
     lk_conn_table_on_destroy(tbl, fz_on_destroy, &tee);
 
     c = lk_conn_table_open(tbl, 0x1234, 0, 1000, &tuple, false, &lost);
@@ -144,21 +141,20 @@ int lk_pg_fuzz_one(const uint8_t *data, size_t n)
         /* Frontend then backend over the same bytes: the request pass opens
          * units, the reply pass closes them. A header hole between the two
          * dirties the frontend so the parser's resync/degraded path is walked
-         * whenever the backend bytes carry a 'Z' anchor. */
+         * whenever the backend bytes carry a response-head anchor. */
         lk_frame_bytes(&reasm, c, LK_DIR_RECV, data, len, 2000);
         lk_frame_hole(&reasm, c, LK_DIR_RECV, 5);
         lk_frame_bytes(&reasm, c, LK_DIR_SEND, data, len, 3000);
     }
-    /* CLOSE fires the destroy hook -> parser frees proto_state (Р15). */
     lk_conn_table_close(tbl, 0x1234, 1, 4000, &lost);
 
     lk_conn_table_free(tbl);
-    lk_reasm_free(&reasm); /* drain the recycled body-prefix slab pool (Р11) */
+    lk_reasm_free(&reasm);
     lk_proto_free(proto);
     return 0;
 }
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 {
-    return lk_pg_fuzz_one(data, size);
+    return lk_my_fuzz_one(data, size);
 }

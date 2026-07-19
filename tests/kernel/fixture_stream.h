@@ -107,11 +107,25 @@ static int ks_on_record(void *ctx, const void *data, __u32 size)
     return 0;
 }
 
-/* Extract every replayable fixture into out[]; returns the count. With
- * `tls_mode` the SSLRequest-opening fixtures are also skipped: tlspipe issues
- * its own SSLRequest/'S' prelude before the handshake, so the replayed stream
- * must start at the (in-TLS) StartupMessage, like a real libpq session. */
-static size_t ks_extract_all(bool tls_mode, struct ks_stream *out, size_t max)
+/* True when a fixture's protocol matches the wanted one (NULL == the pg
+ * default on both sides). The replay tool and the agent must agree on the
+ * protocol: pgstream streams raw bytes, but the agent parses them per its
+ * -p PORT[=proto], so a mysql fixture fed to a pg-configured agent would
+ * misparse and blow the exact-count asserts (МYSQL.md М7). */
+static bool ks_proto_match(const char *fixture_proto, const char *want)
+{
+    if (!fixture_proto || !want)
+        return fixture_proto == want; /* both NULL = pg */
+    return strcmp(fixture_proto, want) == 0;
+}
+
+/* Extract every replayable fixture of protocol `want` (NULL = pg) into out[];
+ * returns the count. With `tls_mode` the SSLRequest-opening fixtures are also
+ * skipped: tlspipe issues its own SSLRequest/'S' prelude before the handshake,
+ * so the replayed stream must start at the (in-TLS) StartupMessage, like a
+ * real libpq session. */
+static size_t ks_extract_all(bool tls_mode, const char *want_proto, struct ks_stream *out,
+                             size_t max)
 {
     size_t n = 0;
 
@@ -119,6 +133,9 @@ static size_t ks_extract_all(bool tls_mode, struct ks_stream *out, size_t max)
         struct fx x = {0};
         struct ks_stream *s = &out[n];
         struct ks_extract e = {.s = s};
+
+        if (!ks_proto_match(lk_fixtures[i].proto, want_proto))
+            continue;
 
         memset(s, 0, sizeof(*s));
         s->name = lk_fixtures[i].name;

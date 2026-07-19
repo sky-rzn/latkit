@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "fixtures_gen.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1020,20 +1021,882 @@ static void build_cancel(struct fx *x)
     b.x->obs_text = NULL; /* CANCEL carries no text */
 }
 
+/* ===========================================================================
+ * MySQL classic-protocol fixtures (MYSQL.md М7) — the mirror of the PG set,
+ * built as LKT1 traces of synthetic mysqld sessions in the same record format
+ * `--record` produces. run_fixture routes a fixture whose .proto is "mysql"
+ * through the MySQL framer + handler; a real `--record` capture of mysqld
+ * drops in as another one of these without harness changes. Every builder
+ * ends with COM_QUIT + CLOSE so the connection table returns to empty.
+ * ===========================================================================
+ */
+
+/* --- little-endian + length-encoded wire writers --------------------------- */
+
+static __u8 *le16(__u8 *p, __u16 v)
+{
+    *p++ = (__u8)v;
+    *p++ = (__u8)(v >> 8);
+    return p;
+}
+
+static __u8 *le24(__u8 *p, __u32 v)
+{
+    *p++ = (__u8)v;
+    *p++ = (__u8)(v >> 8);
+    *p++ = (__u8)(v >> 16);
+    return p;
+}
+
+static __u8 *le32(__u8 *p, __u32 v)
+{
+    *p++ = (__u8)v;
+    *p++ = (__u8)(v >> 8);
+    *p++ = (__u8)(v >> 16);
+    *p++ = (__u8)(v >> 24);
+    return p;
+}
+
+/* Length-encoded integer (the fixtures only need the small forms). */
+static __u8 *lenenc(__u8 *p, __u64 v)
+{
+    if (v < 251) {
+        *p++ = (__u8)v;
+    } else if (v < 0x10000) {
+        *p++ = 0xfc;
+        p = le16(p, (__u16)v);
+    } else {
+        *p++ = 0xfd;
+        p = le24(p, (__u32)v);
+    }
+    return p;
+}
+
+/* Length-encoded string: lenenc length + the bytes. */
+static __u8 *lenstr(__u8 *p, const char *s, __u32 n)
+{
+    p = lenenc(p, n);
+    if (n)
+        memcpy(p, s, n);
+    return p + n;
+}
+
+static __u8 *lenstr0(__u8 *p, const char *s)
+{
+    return lenstr(p, s, (__u32)strlen(s));
+}
+
+/* One classic-protocol packet: len(u24, LE) + seq(u8) + body. Returns the
+ * total wire size; the framer reports m->len == blen (the logical payload). */
+static __u32 mypkt(__u8 *out, __u8 seq, const __u8 *body, __u32 blen)
+{
+    le24(out, blen);
+    out[3] = seq;
+    if (blen)
+        memcpy(out + 4, body, blen);
+    return blen + 4;
+}
+
+/* Client capability flags every plaintext fixture negotiates: mysql dialect
+ * (the filler u32 is not MariaDB extended caps), CONNECT_WITH_DB, PROTOCOL_41,
+ * TRANSACTIONS, MULTI_STATEMENTS, PLUGIN_AUTH, CONNECT_ATTRS (the app label),
+ * DEPRECATE_EOF (the modern resultset shape — an OK-with-0xFE terminator, no
+ * intermediate EOF). No CLIENT_SSL / _COMPRESS / PLUGIN_AUTH_LENENC. */
+#define MY_FX_CAPS      0x01192209u
+#define MY_FX_CAP_SSL   0x00000800u
+#define MY_FX_CAP_COMPR 0x00000020u
+
+/* Server status flags in OK / EOF terminators. */
+#define MY_FX_ST_INTRANS   0x0001
+#define MY_FX_ST_AUTOCOMMIT 0x0002
+#define MY_FX_ST_MORE      0x0008
+#define MY_FX_ST_CURSOR    0x0040
+#define MY_FX_ST_LASTROW   0x0080
+
+/* Initial Handshake (protocol 10). The session reads only the version; the
+ * rest is realistic filler the parser skips. */
+static __u32 my_greeting(__u8 *out)
+{
+    __u8 b[128], *p = b;
+
+    *p++ = 10;               /* protocol version */
+    memcpy(p, "8.4.0", 6);   /* server_version + NUL */
+    p += 6;
+    p = le32(p, 1);          /* thread id */
+    memset(p, 0, 8);         /* auth-plugin-data part 1 */
+    p += 8;
+    *p++ = 0;                /* filler */
+    p = le16(p, 0xffff);     /* capability flags (lower) — server offer only */
+    *p++ = 0xff;             /* charset (utf8mb4) */
+    p = le16(p, MY_FX_ST_AUTOCOMMIT);
+    p = le16(p, 0xffff);     /* capability flags (upper) */
+    *p++ = 21;               /* auth-plugin-data length */
+    memset(p, 0, 10);        /* reserved */
+    p += 10;
+    memset(p, 0, 13);        /* auth-plugin-data part 2 */
+    p += 13;
+    memcpy(p, "caching_sha2_password", 22); /* + NUL */
+    p += 22;
+    return mypkt(out, 0, b, (__u32)(p - b));
+}
+
+/* HandshakeResponse41: caps u32, max_packet u32, charset u8, 23-byte filler,
+ * user\0, u8-len auth response (empty — never read, Р16), database\0, auth
+ * plugin\0, connect-attrs (program_name=mysql -> the app label). */
+static __u32 my_handshake_response(__u8 *out, __u32 caps)
+{
+    __u8 b[256], *p = b;
+    __u8 kv[64], *k = kv;
+    __u32 klen;
+
+    p = le32(p, caps);
+    p = le32(p, 0x01000000); /* max_packet 16 MB */
+    *p++ = 0xff;             /* charset */
+    memset(p, 0, 23);        /* filler (mysql dialect: mcaps stays 0) */
+    p += 23;
+    memcpy(p, "root", 5);    /* user + NUL */
+    p += 5;
+    *p++ = 0;                /* auth response length 0 */
+    memcpy(p, "test", 5);    /* database + NUL */
+    p += 5;
+    memcpy(p, "caching_sha2_password", 22); /* plugin + NUL */
+    p += 22;
+    k = lenstr0(k, "program_name");
+    k = lenstr0(k, "mysql");
+    klen = (__u32)(k - kv);
+    p = lenenc(p, klen);     /* connect-attrs total length */
+    memcpy(p, kv, klen);
+    p += klen;
+    return mypkt(out, 1, b, (__u32)(p - b));
+}
+
+/* OK packet (0x00 header). */
+static __u32 my_ok(__u8 *out, __u8 seq, __u64 affected, __u16 status)
+{
+    __u8 b[16], *p = b;
+
+    *p++ = 0x00;
+    p = lenenc(p, affected);
+    p = lenenc(p, 0);        /* last_insert_id */
+    p = le16(p, status);
+    p = le16(p, 0);          /* warnings */
+    return mypkt(out, seq, b, (__u32)(p - b));
+}
+
+/* OK-with-0xFE terminator (CLIENT_DEPRECATE_EOF): closes a resultset. */
+static __u32 my_eof(__u8 *out, __u8 seq, __u16 status)
+{
+    __u8 b[16], *p = b;
+
+    *p++ = 0xfe;
+    p = lenenc(p, 0);        /* affected_rows */
+    p = lenenc(p, 0);        /* last_insert_id */
+    p = le16(p, status);
+    p = le16(p, 0);          /* warnings */
+    return mypkt(out, seq, b, (__u32)(p - b));
+}
+
+/* ERR packet: errno u16, '#' SQLSTATE(5), message. */
+static __u32 my_err(__u8 *out, __u8 seq, __u16 code, const char *sqlstate, const char *msg)
+{
+    __u8 b[128], *p = b;
+    __u32 ml = (__u32)strlen(msg);
+
+    *p++ = 0xff;
+    p = le16(p, code);
+    *p++ = '#';
+    memcpy(p, sqlstate, 5);
+    p += 5;
+    memcpy(p, msg, ml);
+    p += ml;
+    return mypkt(out, seq, b, (__u32)(p - b));
+}
+
+/* Result head: a lenenc column count. */
+static __u32 my_colcount(__u8 *out, __u8 seq, __u32 count)
+{
+    __u8 b[8];
+
+    return mypkt(out, seq, b, (__u32)(lenenc(b, count) - b));
+}
+
+/* A column definition (head byte is the lenenc "def" length, 0x03 — never
+ * 0xFE/0xFF, so the reply machine skips it as metadata). */
+static __u32 my_coldef(__u8 *out, __u8 seq, const char *name)
+{
+    __u8 b[128], *p = b;
+
+    p = lenstr0(p, "def");   /* catalog */
+    p = lenstr0(p, "test");  /* schema */
+    p = lenstr0(p, "t");     /* table */
+    p = lenstr0(p, "t");     /* org_table */
+    p = lenstr0(p, name);    /* name */
+    p = lenstr0(p, name);    /* org_name */
+    *p++ = 0x0c;             /* length of the fixed-length fields */
+    p = le16(p, 0x003f);     /* charset (binary) */
+    p = le32(p, 11);         /* column length */
+    *p++ = 0x03;             /* column type: LONG */
+    p = le16(p, 0x0000);     /* flags */
+    *p++ = 0x00;             /* decimals */
+    p = le16(p, 0);          /* filler */
+    return mypkt(out, seq, b, (__u32)(p - b));
+}
+
+/* A text-protocol row (one lenenc-string column). */
+static __u32 my_textrow(__u8 *out, __u8 seq, const char *val)
+{
+    __u8 b[64];
+
+    return mypkt(out, seq, b, (__u32)(lenstr0(b, val) - b));
+}
+
+/* A binary-protocol row (prepared resultset): 0x00 header + null bitmap +
+ * values. Only counted by the reply machine, never parsed. */
+static __u32 my_binrow(__u8 *out, __u8 seq)
+{
+    __u8 b[8], *p = b;
+
+    *p++ = 0x00;             /* binary row packet header */
+    *p++ = 0x00;             /* null bitmap */
+    p = le32(p, 1);          /* one 4-byte value */
+    return mypkt(out, seq, b, (__u32)(p - b));
+}
+
+/* COM_QUERY (command byte 0x03) with the SQL text. */
+static __u32 my_query_cmd(__u8 *out, const char *sql)
+{
+    __u8 b[512];
+    __u32 sl = (__u32)strlen(sql);
+
+    b[0] = 0x03;
+    memcpy(b + 1, sql, sl);
+    return mypkt(out, 0, b, 1 + sl);
+}
+
+/* COM_STMT_PREPARE (0x16) with the SQL text. */
+static __u32 my_prepare_cmd(__u8 *out, const char *sql)
+{
+    __u8 b[512];
+    __u32 sl = (__u32)strlen(sql);
+
+    b[0] = 0x16;
+    memcpy(b + 1, sql, sl);
+    return mypkt(out, 0, b, 1 + sl);
+}
+
+/* COM_STMT_PREPARE_OK: 0x00, stmt_id u32, num_columns u16, num_params u16,
+ * reserved u8, warnings u16. */
+static __u32 my_prepare_ok(__u8 *out, __u8 seq, __u32 stmt_id, __u16 ncols, __u16 nparams)
+{
+    __u8 b[16], *p = b;
+
+    *p++ = 0x00;
+    p = le32(p, stmt_id);
+    p = le16(p, ncols);
+    p = le16(p, nparams);
+    *p++ = 0x00;             /* reserved */
+    p = le16(p, 0);          /* warning count */
+    return mypkt(out, seq, b, (__u32)(p - b));
+}
+
+/* COM_STMT_EXECUTE (0x17): stmt_id u32, flags u8, iteration u32. The
+ * parameter tail is never parsed; `cursor` sets CURSOR_TYPE_READ_ONLY. */
+static __u32 my_execute_cmd(__u8 *out, __u32 stmt_id, bool cursor)
+{
+    __u8 b[16], *p = b;
+
+    *p++ = 0x17;
+    p = le32(p, stmt_id);
+    *p++ = cursor ? 0x01 : 0x00; /* CURSOR_TYPE_READ_ONLY */
+    p = le32(p, 1);              /* iteration count */
+    return mypkt(out, 0, b, (__u32)(p - b));
+}
+
+/* COM_STMT_FETCH (0x1c): stmt_id u32, rows-to-fetch u32. */
+static __u32 my_fetch_cmd(__u8 *out, __u32 stmt_id, __u32 nrows)
+{
+    __u8 b[16], *p = b;
+
+    *p++ = 0x1c;
+    p = le32(p, stmt_id);
+    p = le32(p, nrows);
+    return mypkt(out, 0, b, (__u32)(p - b));
+}
+
+/* COM_STMT_CLOSE (0x19): stmt_id u32; no server reply. */
+static __u32 my_close_cmd(__u8 *out, __u32 stmt_id)
+{
+    __u8 b[8], *p = b;
+
+    *p++ = 0x19;
+    p = le32(p, stmt_id);
+    return mypkt(out, 0, b, (__u32)(p - b));
+}
+
+/* COM_QUIT (0x01): no reply, socket closes. */
+static __u32 my_quit_cmd(__u8 *out)
+{
+    __u8 b = 0x01;
+
+    return mypkt(out, 0, &b, 1);
+}
+
+static void mybld_init(struct bld *b, struct fx *x)
+{
+    bld_init(b, x);
+    b->tuple.dport = 3306; /* the mysqld port (realism; run_fixture forces ops) */
+}
+
+/* Prelude: OPEN + greeting + HandshakeResponse41 + final OK — a complete
+ * connection phase. Emits one session (user=root db=test app=mysql). All
+ * three packets carry LK_MSG_STARTUP (the flag clears on the first command).
+ * `caps` selects the plaintext / SSL / compressed handshake shape. */
+static void my_prelude(struct bld *b, __u32 caps)
+{
+    __u8 w[512];
+    __u32 n;
+
+    ev_open(b, false);
+    n = my_greeting(w);
+    call(b, LK_DIR_SEND, w, n);
+    expect(b, LK_DIR_SEND, 0, n - 4, LK_MSG_STARTUP);
+    n = my_handshake_response(w, caps);
+    call(b, LK_DIR_RECV, w, n);
+    expect(b, LK_DIR_RECV, 0, n - 4, LK_MSG_STARTUP);
+    n = my_ok(w, 2, 0, MY_FX_ST_AUTOCOMMIT);
+    call(b, LK_DIR_SEND, w, n);
+    expect(b, LK_DIR_SEND, 0, n - 4, LK_MSG_STARTUP);
+
+    b->x->sessions = 1;
+    b->x->sess_user = "root";
+    b->x->sess_db = "test";
+}
+
+/* Append a full text-protocol SELECT resultset (colcount, one coldef, `nrows`
+ * text rows, OK-0xFE terminator) as one backend call, seqs starting at
+ * `seq0`. Its expect() lines are added in order. */
+static void my_resultset(struct bld *b, __u8 seq0, int nrows, __u16 end_status)
+{
+    __u8 w[512];
+    __u32 n = 0, t;
+    __u8 seq = seq0;
+
+    t = my_colcount(w + n, seq++, 1);
+    expect(b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    t = my_coldef(w + n, seq++, "c");
+    expect(b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    for (int i = 0; i < nrows; i++) {
+        char v[2] = {(char)('1' + i), '\0'};
+
+        t = my_textrow(w + n, seq++, v);
+        expect(b, LK_DIR_SEND, 0, t - 4, 0);
+        n += t;
+    }
+    t = my_eof(w + n, seq++, end_status);
+    expect(b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    call(b, LK_DIR_SEND, w, n);
+}
+
+/* --- MySQL fixtures -------------------------------------------------------- */
+
+/* mysql CLI simple query: handshake -> COM_QUERY "SELECT 1" -> 1-row resultset
+ * -> COM_QUIT. One SIMPLE unit, one row, text "SELECT 1" (-> "select ?"). */
+static void build_my_simple_query(struct fx *x)
+{
+    struct bld b;
+    __u8 w[512];
+    __u32 n;
+
+    mybld_init(&b, x);
+    my_prelude(&b, MY_FX_CAPS);
+
+    n = my_query_cmd(w, "SELECT 1");
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x03, n - 4, 0);
+
+    my_resultset(&b, 1, 1, MY_FX_ST_AUTOCOMMIT);
+
+    n = my_quit_cmd(w);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x01, 1, 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_kind = LK_Q_SIMPLE;
+    b.x->obs_rows = 1;
+    b.x->obs_flags = 0;
+    b.x->obs_text = "SELECT 1";
+}
+
+/* A failing query: COM_QUERY on a missing table -> ERR (errno 1146, SQLSTATE
+ * 42S02). One SIMPLE unit closed by the error; errors_sql ticks. */
+static void build_my_error(struct fx *x)
+{
+    struct bld b;
+    __u8 w[512];
+    __u32 n;
+
+    mybld_init(&b, x);
+    my_prelude(&b, MY_FX_CAPS);
+
+    n = my_query_cmd(w, "SELECT * FROM missing");
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x03, n - 4, 0);
+
+    n = my_err(w, 1, 1146, "42S02", "Table 'test.missing' doesn't exist");
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 0, n - 4, 0);
+
+    n = my_quit_cmd(w);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x01, 1, 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->errors_sql = 1;
+    b.x->obs_kind = LK_Q_SIMPLE;
+    b.x->obs_rows = 0;
+    b.x->obs_flags = LK_QO_ERROR;
+    b.x->obs_text = "SELECT * FROM missing";
+    b.x->obs_sqlstate = "42S02";
+}
+
+/* Multi-statement COM_QUERY "SELECT 1; SELECT 2": two resultsets, the first's
+ * OK carrying SERVER_MORE_RESULTS_EXISTS, chained into one MULTI_STMT unit
+ * with the row counts summed (1 + 1 = 2). */
+static void build_my_multi_statement(struct fx *x)
+{
+    struct bld b;
+    __u8 w[512];
+    __u32 n;
+
+    mybld_init(&b, x);
+    my_prelude(&b, MY_FX_CAPS);
+
+    n = my_query_cmd(w, "SELECT 1; SELECT 2");
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x03, n - 4, 0);
+
+    /* First resultset: OK-0xFE carries MORE_RESULTS; seqs 1..4. */
+    my_resultset(&b, 1, 1, MY_FX_ST_AUTOCOMMIT | MY_FX_ST_MORE);
+    /* Second resultset: plain terminator; seqs continue at 5. */
+    my_resultset(&b, 5, 1, MY_FX_ST_AUTOCOMMIT);
+
+    n = my_quit_cmd(w);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x01, 1, 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_kind = LK_Q_SIMPLE;
+    b.x->obs_rows = 2;
+    b.x->obs_flags = LK_QO_MULTI_STMT;
+    b.x->obs_text = "SELECT 1; SELECT 2";
+}
+
+/* Binary prepared statement: COM_STMT_PREPARE "SELECT ?" -> PREPARE_OK (id 1,
+ * 1 col + 1 param) -> 2 metadata defs -> two COM_STMT_EXECUTE round-trips, each
+ * a 1-row binary resultset -> COM_STMT_CLOSE. Two EXTENDED units, both with the
+ * cached text "SELECT ?" (placeholder intact). */
+static void build_my_prepared(struct fx *x)
+{
+    struct bld b;
+    __u8 w[512];
+    __u32 n, t;
+
+    mybld_init(&b, x);
+    my_prelude(&b, MY_FX_CAPS);
+
+    n = my_prepare_cmd(w, "SELECT ?");
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x16, n - 4, 0);
+
+    /* PREPARE_OK + the param def + the column def (DEPRECATE_EOF: no EOFs). */
+    n = 0;
+    t = my_prepare_ok(w + n, 1, 1, 1, 1);
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    t = my_coldef(w + n, 2, "?");
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    t = my_coldef(w + n, 3, "c");
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    call(&b, LK_DIR_SEND, w, n);
+
+    for (int i = 0; i < 2; i++) {
+        n = my_execute_cmd(w, 1, false);
+        call(&b, LK_DIR_RECV, w, n);
+        expect(&b, LK_DIR_RECV, 0x17, n - 4, 0);
+
+        /* Binary resultset: colcount, coldef, one binary row, OK-0xFE. */
+        n = 0;
+        t = my_colcount(w + n, 1, 1);
+        expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+        n += t;
+        t = my_coldef(w + n, 2, "c");
+        expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+        n += t;
+        t = my_binrow(w + n, 3);
+        expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+        n += t;
+        t = my_eof(w + n, 4, MY_FX_ST_AUTOCOMMIT);
+        expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+        n += t;
+        call(&b, LK_DIR_SEND, w, n);
+    }
+
+    n = my_close_cmd(w, 1); /* COM_STMT_CLOSE: no reply */
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x19, n - 4, 0);
+
+    n = my_quit_cmd(w);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x01, 1, 0);
+    ev_close(&b);
+
+    b.x->queries = 2;
+    b.x->obs_kind = LK_Q_EXTENDED;
+    b.x->obs_rows = 1;
+    b.x->obs_flags = 0;
+    b.x->obs_text = "SELECT ?";
+}
+
+/* LOAD DATA LOCAL INFILE: COM_QUERY -> 0xFB filename request -> client data
+ * packets -> empty packet -> final OK (affected_rows = 2). One COPY_IN unit;
+ * bytes = the summed data-packet payload, rows from the OK. */
+static void build_my_load_data(struct fx *x)
+{
+    struct bld b;
+    __u8 w[512];
+    __u32 n, t;
+    const char *rows[2] = {"1\tone\n", "2\ttwo\n"};
+    __u64 bytes = 0;
+    __u8 seq;
+
+    mybld_init(&b, x);
+    my_prelude(&b, MY_FX_CAPS);
+
+    n = my_query_cmd(w, "LOAD DATA LOCAL INFILE 'x' INTO TABLE t");
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x03, n - 4, 0);
+
+    /* 0xFB LOCAL INFILE request (the filename is not observable). */
+    {
+        __u8 body[64], *p = body;
+
+        *p++ = 0xfb;
+        memcpy(p, "x", 1);
+        p += 1;
+        n = mypkt(w, 1, body, (__u32)(p - body));
+    }
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 0, n - 4, 0);
+
+    /* Client data packets (seqs 2..) then the empty end-of-data packet. */
+    n = 0;
+    seq = 2;
+    for (int i = 0; i < 2; i++) {
+        __u32 rl = (__u32)strlen(rows[i]);
+
+        t = mypkt(w + n, seq++, (const __u8 *)rows[i], rl);
+        expect(&b, LK_DIR_RECV, 0, rl, 0);
+        n += t;
+        bytes += rl;
+    }
+    t = mypkt(w + n, seq++, NULL, 0); /* empty packet: end of data */
+    expect(&b, LK_DIR_RECV, 0, 0, 0);
+    n += t;
+    call(&b, LK_DIR_RECV, w, n);
+
+    n = my_ok(w, seq, 2, MY_FX_ST_AUTOCOMMIT); /* final OK: affected_rows = 2 */
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 0, n - 4, 0);
+
+    n = my_quit_cmd(w);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x01, 1, 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_kind = LK_Q_COPY_IN;
+    b.x->obs_rows = 2;
+    b.x->obs_bytes = bytes;
+    b.x->obs_flags = 0;
+    b.x->obs_text = "LOAD DATA LOCAL INFILE 'x' INTO TABLE t";
+}
+
+/* Server-side cursor: COM_STMT_EXECUTE with CURSOR_TYPE_READ_ONLY opens a
+ * cursor (metadata then an OK-0xFE carrying CURSOR_EXISTS — the SUSPENDED
+ * terminator, no rows), then two COM_STMT_FETCH batches: the first still
+ * SUSPENDED, the last draining (LAST_ROW_SENT, flags 0). Three EXTENDED units
+ * sharing the cached text; rows 0 + 2 + 1. */
+static void build_my_cursor_fetch(struct fx *x)
+{
+    struct bld b;
+    __u8 w[512];
+    __u32 n, t;
+
+    mybld_init(&b, x);
+    my_prelude(&b, MY_FX_CAPS);
+
+    n = my_prepare_cmd(w, "SELECT id FROM t");
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x16, n - 4, 0);
+
+    /* PREPARE_OK (id 7, 1 column, 0 params) + the column def. */
+    n = 0;
+    t = my_prepare_ok(w + n, 1, 7, 1, 0);
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    t = my_coldef(w + n, 2, "id");
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    call(&b, LK_DIR_SEND, w, n);
+
+    /* EXECUTE with a cursor: colcount, coldef, OK-0xFE with CURSOR_EXISTS —
+     * the terminator, no rows (the SUSPENDED execute unit). */
+    n = my_execute_cmd(w, 7, true);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x17, n - 4, 0);
+    n = 0;
+    t = my_colcount(w + n, 1, 1);
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    t = my_coldef(w + n, 2, "id");
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    t = my_eof(w + n, 3, MY_FX_ST_AUTOCOMMIT | MY_FX_ST_CURSOR);
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    call(&b, LK_DIR_SEND, w, n);
+
+    /* FETCH batch 1: two binary rows + OK-0xFE with CURSOR_EXISTS (SUSPENDED). */
+    n = my_fetch_cmd(w, 7, 2);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x1c, n - 4, 0);
+    n = 0;
+    t = my_binrow(w + n, 1);
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    t = my_binrow(w + n, 2);
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    t = my_eof(w + n, 3, MY_FX_ST_AUTOCOMMIT | MY_FX_ST_CURSOR);
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    call(&b, LK_DIR_SEND, w, n);
+
+    /* FETCH batch 2: one row + OK-0xFE with LAST_ROW_SENT (drained, flags 0). */
+    n = my_fetch_cmd(w, 7, 2);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x1c, n - 4, 0);
+    n = 0;
+    t = my_binrow(w + n, 1);
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    t = my_eof(w + n, 2, MY_FX_ST_AUTOCOMMIT | MY_FX_ST_LASTROW);
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    call(&b, LK_DIR_SEND, w, n);
+
+    n = my_close_cmd(w, 7);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x19, n - 4, 0);
+
+    n = my_quit_cmd(w);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x01, 1, 0);
+    ev_close(&b);
+
+    b.x->queries = 3;
+    b.x->obs_kind = LK_Q_EXTENDED;
+    b.x->obs_rows = 1;      /* the last (draining) batch */
+    b.x->obs_flags = 0;     /* LAST_ROW_SENT: no SUSPENDED */
+    b.x->obs_text = "SELECT id FROM t";
+}
+
+/* Compressed connection (РМ7 blind zone): the HandshakeResponse negotiates
+ * CLIENT_COMPRESS, so the final OK flips the connection to IGNORE. The session
+ * labels were on the wire in plaintext and are read; the compressed command
+ * phase is never observed (queries = 0). */
+static void build_my_compressed(struct fx *x)
+{
+    struct bld b;
+    __u8 w[512];
+
+    mybld_init(&b, x);
+    my_prelude(&b, MY_FX_CAPS | MY_FX_CAP_COMPR);
+
+    /* A compressed command packet: opaque to the framer once IGNORE is set —
+     * no message, no observation. */
+    memset(w, 0xa5, 32);
+    call(&b, LK_DIR_RECV, w, 32);
+    ev_close(&b);
+
+    /* Session parsed from the plaintext handshake; no queries. */
+    b.x->queries = 0;
+}
+
+/* TLS session: the socket path carries the greeting + the short SSLRequest
+ * (CLIENT_SSL flips the connection to TLS), then ciphertext — dropped. The
+ * real session travels the decrypted uprobe channel, where the full
+ * HandshakeResponse repeats and the query parses in plaintext, so the
+ * observation matches the cleartext twin. */
+static void build_my_ssl(struct fx *x)
+{
+    struct bld b;
+    __u8 w[512];
+    __u32 n;
+
+    mybld_init(&b, x);
+    ev_open(&b, false);
+
+    /* Socket: greeting, then the 32-byte SSLRequest (header only, CLIENT_SSL). */
+    n = my_greeting(w);
+    call(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 0, n - 4, LK_MSG_STARTUP);
+    {
+        __u8 b32[36], *p = b32;
+
+        p = le32(p, MY_FX_CAPS | MY_FX_CAP_SSL);
+        p = le32(p, 0x01000000); /* max_packet */
+        *p++ = 0xff;             /* charset */
+        memset(p, 0, 23);        /* filler — the packet ends here */
+        p += 23;
+        n = mypkt(w, 1, b32, (__u32)(p - b32));
+    }
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0, n - 4, LK_MSG_STARTUP);
+
+    /* Ciphertext on the socket: every raw event now dropped. */
+    memset(w, 0xa5, 64);
+    call(&b, LK_DIR_RECV, w, 64);
+    call(&b, LK_DIR_SEND, w, 64);
+
+    /* Decrypted channel: the full HandshakeResponse, the OK, then the query. */
+    n = my_handshake_response(w, MY_FX_CAPS | MY_FX_CAP_SSL);
+    call_dec(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0, n - 4, LK_MSG_STARTUP);
+    n = my_ok(w, 2, 0, MY_FX_ST_AUTOCOMMIT);
+    call_dec(&b, LK_DIR_SEND, w, n);
+    expect(&b, LK_DIR_SEND, 0, n - 4, LK_MSG_STARTUP);
+    b.x->sessions = 1;
+    b.x->sess_user = "root";
+    b.x->sess_db = "test";
+
+    n = my_query_cmd(w, "SELECT 1");
+    call_dec(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x03, n - 4, 0);
+    {
+        __u8 rw[256];
+        __u32 rn = 0, t;
+        __u8 seq = 1;
+
+        t = my_colcount(rw + rn, seq++, 1);
+        expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+        rn += t;
+        t = my_coldef(rw + rn, seq++, "c");
+        expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+        rn += t;
+        t = my_textrow(rw + rn, seq++, "1");
+        expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+        rn += t;
+        t = my_eof(rw + rn, seq++, MY_FX_ST_AUTOCOMMIT);
+        expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+        rn += t;
+        call_dec(&b, LK_DIR_SEND, rw, rn);
+    }
+
+    n = my_quit_cmd(w);
+    call_dec(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x01, 1, 0);
+
+    /* A trailing ciphertext close-notify on the socket — dropped — then CLOSE. */
+    memset(w, 0x5a, 32);
+    call(&b, LK_DIR_SEND, w, 32);
+    ev_close(&b);
+
+    b.x->tls_conns = 1;
+    b.x->queries = 1;
+    b.x->obs_kind = LK_Q_SIMPLE;
+    b.x->obs_rows = 1;
+    b.x->obs_flags = 0;
+    b.x->obs_text = "SELECT 1";
+}
+
+/* Agent attached mid-session (synthetic OPEN, handshake never seen): both
+ * directions start dirty. The frontend rejoins on its command anchor (a seq-0
+ * COM_QUERY), the backend on a response-head anchor (seq 1). The unit opened
+ * by the command is dropped by the backend resync (Р19) — no observation, but
+ * framing recovers cleanly. */
+static void build_my_synthetic_midsession(struct fx *x)
+{
+    struct bld b;
+    __u8 w[512];
+    __u32 n, t;
+    __u8 seq;
+
+    mybld_init(&b, x);
+    ev_open(&b, true); /* synthetic: both directions marked dirty */
+
+    /* Frontend anchor: a fresh COM_QUERY at a call boundary. */
+    n = my_query_cmd(w, "SELECT 1");
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x03, n - 4, LK_MSG_AFTER_RESYNC);
+
+    /* Backend anchor: the response head (seq 1) at a call boundary. */
+    n = 0;
+    seq = 1;
+    t = my_colcount(w + n, seq++, 1);
+    expect(&b, LK_DIR_SEND, 0, t - 4, LK_MSG_AFTER_RESYNC);
+    n += t;
+    t = my_coldef(w + n, seq++, "c");
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    t = my_textrow(w + n, seq++, "1");
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    t = my_eof(w + n, seq++, MY_FX_ST_AUTOCOMMIT);
+    expect(&b, LK_DIR_SEND, 0, t - 4, 0);
+    n += t;
+    call(&b, LK_DIR_SEND, w, n);
+
+    n = my_quit_cmd(w);
+    call(&b, LK_DIR_RECV, w, n);
+    expect(&b, LK_DIR_RECV, 0x01, 1, 0);
+    ev_close(&b);
+
+    b.x->resyncs = 2;
+}
+
 const struct fixture lk_fixtures[] = {
-    {"simple_query", build_simple_query},
-    {"error", build_error},
-    {"multi_statement", build_multi_statement},
-    {"cancel", build_cancel},
-    {"extended", build_extended},
-    {"prepared", build_prepared},
-    {"pipeline_error", build_pipeline_error},
-    {"bind_unknown", build_bind_unknown},
-    {"copy_in", build_copy_in},
-    {"copy_out", build_copy_out},
-    {"session_gap", build_session_gap},
-    {"ssl_plain", build_ssl_plain},
-    {"ssl_tls", build_ssl_tls},
-    {"synthetic_midsession", build_synthetic_midsession},
+    {"simple_query", build_simple_query, NULL},
+    {"error", build_error, NULL},
+    {"multi_statement", build_multi_statement, NULL},
+    {"cancel", build_cancel, NULL},
+    {"extended", build_extended, NULL},
+    {"prepared", build_prepared, NULL},
+    {"pipeline_error", build_pipeline_error, NULL},
+    {"bind_unknown", build_bind_unknown, NULL},
+    {"copy_in", build_copy_in, NULL},
+    {"copy_out", build_copy_out, NULL},
+    {"session_gap", build_session_gap, NULL},
+    {"ssl_plain", build_ssl_plain, NULL},
+    {"ssl_tls", build_ssl_tls, NULL},
+    {"synthetic_midsession", build_synthetic_midsession, NULL},
+    /* MySQL mirror set (MYSQL.md М7): framed and parsed as mysql. */
+    {"my_simple_query", build_my_simple_query, "mysql"},
+    {"my_error", build_my_error, "mysql"},
+    {"my_multi_statement", build_my_multi_statement, "mysql"},
+    {"my_prepared", build_my_prepared, "mysql"},
+    {"my_load_data", build_my_load_data, "mysql"},
+    {"my_cursor_fetch", build_my_cursor_fetch, "mysql"},
+    {"my_compressed", build_my_compressed, "mysql"},
+    {"my_ssl", build_my_ssl, "mysql"},
+    {"my_synthetic_midsession", build_my_synthetic_midsession, "mysql"},
 };
 const size_t lk_nfixtures = sizeof(lk_fixtures) / sizeof(lk_fixtures[0]);

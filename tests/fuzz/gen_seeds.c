@@ -531,13 +531,187 @@ static void pipe_seeds(const char *root)
     write_seed(root, "pipe", "raw_records");
 }
 
+/* --- mysql seeds: whole classic-protocol sessions (MYSQL.md М7) -------------
+ * Raw wire bytes for fuzz_my (fed to both directions). Little-endian ints and
+ * length-encoded scalars, one packet = len(u24) + seq(u8) + payload. */
+
+static uint8_t mybody[4096];
+static size_t myblen;
+
+static void mb(unsigned v)
+{
+    mybody[myblen++] = (uint8_t)v;
+}
+
+static void mb_str(const char *s)
+{
+    while (*s)
+        mybody[myblen++] = (uint8_t)*s++;
+}
+
+static void mb_lenstr(const char *s)
+{
+    size_t n = strlen(s);
+
+    mb(n); /* lenenc length (< 251) */
+    mb_str(s);
+}
+
+/* Emit the accumulated mybody as one packet with the given seq, reset it. */
+static void mypkt(unsigned seq)
+{
+    put_u8(myblen);
+    put_u8(myblen >> 8);
+    put_u8(myblen >> 16);
+    put_u8(seq);
+    put(mybody, myblen);
+    myblen = 0;
+}
+
+static void my_greeting(void)
+{
+    mb(10);          /* protocol version */
+    mb_str("8.4.0");
+    mb(0);           /* version NUL */
+    for (int i = 0; i < 4; i++)
+        mb(1);       /* thread id */
+    for (int i = 0; i < 27; i++)
+        mb(0);       /* auth data + caps + status + plugin-data-2 filler */
+    mb_str("caching_sha2_password");
+    mb(0);
+    mypkt(0);
+}
+
+static void my_handshake_response(unsigned caps)
+{
+    mb(caps);
+    mb(caps >> 8);
+    mb(caps >> 16);
+    mb(caps >> 24);
+    for (int i = 0; i < 4; i++)
+        mb(0);       /* max_packet */
+    mb(0xff);        /* charset */
+    for (int i = 0; i < 23; i++)
+        mb(0);       /* filler */
+    mb_str("root");
+    mb(0);
+    mb(0);           /* auth response length 0 */
+    mb_str("test");
+    mb(0);
+    mb_str("caching_sha2_password");
+    mb(0);
+    mypkt(1);
+}
+
+static void mb16(unsigned v)
+{
+    mb(v);
+    mb(v >> 8);
+}
+
+static void my_ok(unsigned seq, unsigned affected, unsigned status)
+{
+    mb(0x00);
+    mb(affected);
+    mb(0);           /* last_insert_id */
+    mb16(status);
+    mb16(0);         /* warnings */
+    mypkt(seq);
+}
+
+static void my_seeds(const char *root)
+{
+    unsigned caps = 0x01192209u; /* PROTOCOL_41|CONNECT_WITH_DB|PLUGIN_AUTH|
+                                  * DEPRECATE_EOF|... (fixtures_gen MY_FX_CAPS) */
+
+    /* A full simple-query session: handshake, COM_QUERY, 1-row resultset. */
+    my_greeting();
+    my_handshake_response(caps);
+    my_ok(2, 0, 0x0002);
+    mb(0x03);
+    mb_str("SELECT 1"); /* COM_QUERY */
+    mypkt(0);
+    mb(1);
+    mypkt(1); /* column count = 1 */
+    mb_lenstr("def");
+    mb_lenstr("");
+    mb_lenstr("");
+    mb_lenstr("");
+    mb_lenstr("c");
+    mb_lenstr("");
+    mb(0x0c);
+    mb16(0x3f);
+    for (int i = 0; i < 10; i++)
+        mb(0);
+    mypkt(2); /* column definition */
+    mb_lenstr("1");
+    mypkt(3); /* row */
+    mb(0xfe);
+    mb(0);
+    mb(0);
+    mb16(0x0002);
+    mb16(0);
+    mypkt(4); /* OK-0xFE terminator */
+    write_seed(root, "my", "simple_session");
+
+    /* An error reply to a query. */
+    my_greeting();
+    my_handshake_response(caps);
+    my_ok(2, 0, 0x0002);
+    mb(0x03);
+    mb_str("SELECT * FROM missing");
+    mypkt(0);
+    mb(0xff);
+    mb16(1146);
+    mb('#');
+    mb_str("42S02");
+    mb_str("no such table");
+    mypkt(1);
+    write_seed(root, "my", "error_reply");
+
+    /* A prepared-statement round-trip. */
+    my_greeting();
+    my_handshake_response(caps);
+    my_ok(2, 0, 0x0002);
+    mb(0x16);
+    mb_str("SELECT ?"); /* COM_STMT_PREPARE */
+    mypkt(0);
+    mb(0x00);
+    for (int i = 0; i < 4; i++)
+        mb(i == 0 ? 1 : 0); /* stmt_id = 1 */
+    mb16(1);               /* num_columns */
+    mb16(1);               /* num_params */
+    mb(0);
+    mb16(0);
+    mypkt(1); /* PREPARE_OK */
+    mb(0x17);
+    for (int i = 0; i < 4; i++)
+        mb(i == 0 ? 1 : 0); /* COM_STMT_EXECUTE stmt_id 1 */
+    mb(0);
+    for (int i = 0; i < 4; i++)
+        mb(i == 0 ? 1 : 0);
+    mypkt(0);
+    write_seed(root, "my", "prepared");
+
+    /* A compressed / SSL handshake shape (framer blind-zone + TLS flip bits). */
+    my_greeting();
+    my_handshake_response(caps | 0x0020); /* CLIENT_COMPRESS */
+    my_ok(2, 0, 0x0002);
+    write_seed(root, "my", "compressed_handshake");
+
+    my_greeting();
+    my_handshake_response(caps | 0x0800); /* CLIENT_SSL */
+    write_seed(root, "my", "ssl_request");
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
-        fprintf(stderr, "usage: gen_seeds <corpus-root>  (writes into pg/ norm/ pipe/)\n");
+        fprintf(stderr, "usage: gen_seeds <corpus-root>  (writes into pg/ my/ norm/ pipe/)\n");
         return 1;
     }
     pg_seeds(argv[1]);
+    my_seeds(argv[1]);
     norm_seeds(argv[1]);
     pipe_seeds(argv[1]);
     return 0;

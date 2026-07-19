@@ -1,0 +1,146 @@
+# Plaintext MySQL e2e stand (MYSQL.md М7): mysqld (no TLS) + a mysql-CLI load
+# loop + latkit + prometheus + otel-collector — the MySQL analogue of the
+# postgres docker-compose.yml, and the plaintext twin of the TLS stand
+# (docker-compose.mysql-tls.yml). Drive it with ./verify-mysql.sh.
+#
+#   docker compose -f docker-compose.mysql.yml up -d
+#
+# What it proves (the М7 e2e acceptance): a plaintext MySQL workload is observed
+# end to end — latkit_queries_total grows, the duration histogram is non-trivial,
+# an injected error lands in latkit_query_errors_total, and the sessions carry
+# the right db/user labels on the proto="mysql" axis; the same series reach the
+# OTel Collector over OTLP.
+#
+# Capture note (project memory): the load client talks to mysqld over the compose
+# network by service name, NOT a published localhost port — a localhost hop goes
+# through docker-proxy, which splice()s the payload and defeats the socket
+# capture. mysqld publishes nothing; latkit filters the server port 3306.
+
+name: latkit-mysql
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: latkit
+      MYSQL_DATABASE: latkit
+      MYSQL_USER: latkit
+      MYSQL_PASSWORD: latkit
+    # TLS off at the wire: this stand exercises the socket-capture path, not the
+    # uprobe channel (that is docker-compose.mysql-tls.yml). --skip-ssl makes the
+    # 8.x server offer no TLS so the CLI stays plaintext without --ssl-mode.
+    command:
+      - mysqld
+      - --skip-ssl
+    healthcheck:
+      # TCP + the app user over 127.0.0.1: passes only on the final server, not
+      # the socket-only temporary server the entrypoint runs during first-boot
+      # init (which would let mysql-init race the user creation).
+      test: ["CMD-SHELL",
+             "mysql --skip-ssl -h 127.0.0.1 -ulatkit -platkit latkit -e 'SELECT 1'"]
+      interval: 2s
+      timeout: 4s
+      retries: 60
+
+  # One-shot: create and seed the dataset, then exit.
+  mysql-init:
+    image: mysql:8.4
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_PWD: latkit
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        mysql --skip-ssl -h mysql -ulatkit latkit <<'SQL'
+        CREATE TABLE IF NOT EXISTS accounts (
+            id INT PRIMARY KEY, abalance INT NOT NULL, filler CHAR(84)
+        );
+        SET SESSION cte_max_recursion_depth = 10001;
+        INSERT INTO accounts (id, abalance, filler)
+            SELECT n, 0, 'x' FROM (
+                WITH RECURSIVE seq(n) AS (
+                    SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 10000
+                ) SELECT n FROM seq
+            ) s
+        ON DUPLICATE KEY UPDATE abalance = accounts.abalance;
+        SQL
+    restart: "no"
+
+  # Steady load: a fresh session per iteration with a small statement mix —
+  # point reads, an aggregate, a write, a transaction — plus one deliberately
+  # failing statement (a missing table, errno 1146 / SQLSTATE 42S02) so
+  # latkit_query_errors_total is provably non-zero for verify-mysql.sh.
+  mysql-load:
+    image: mysql:8.4
+    depends_on:
+      mysql-init:
+        condition: service_completed_successfully
+    environment:
+      MYSQL_PWD: latkit
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        while :; do
+          id=$$((RANDOM % 10000 + 1))
+          mysql --skip-ssl -h mysql -ulatkit latkit >/dev/null 2>&1 <<SQL || true
+        SELECT abalance FROM accounts WHERE id = $$id;
+        SELECT count(*), avg(abalance) FROM accounts WHERE id < 100;
+        UPDATE accounts SET abalance = abalance + 1 WHERE id = $$id;
+        BEGIN;
+        SELECT abalance FROM accounts WHERE id = $$((id + 1)) FOR UPDATE;
+        COMMIT;
+        SELECT * FROM this_table_does_not_exist;
+        SQL
+          sleep 0.1
+        done
+    restart: "no"
+
+  # The agent: privileged for BPF, pid:host, capturing the server port 3306 it
+  # sees kernel-wide. No --tls: this is the plaintext socket path.
+  latkit:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.latkit
+    depends_on:
+      mysql:
+        condition: service_healthy
+    privileged: true
+    pid: host
+    volumes:
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+    command:
+      - "-p"
+      - "3306=mysql"
+      - "--prom-listen"
+      - "0.0.0.0:9752"
+      - "--otlp-endpoint"
+      - "http://otel-collector:4318"
+      - "--otlp-interval"
+      - "5"
+      - "--otlp-spans"
+      - "0.1"
+      - "--otlp-spans-slow-ms"
+      - "100"
+    ports: ["9752:9752"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      - latkit
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=1h"
+    ports: ["19090:9090"]
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    ports:
+      - "4318:4318" # OTLP/HTTP
+      - "8889:8889" # collector's own Prometheus exporter (metrics readout)

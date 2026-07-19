@@ -1,0 +1,81 @@
+# libFuzzer dictionary for the MySQL-shaped targets (fuzz_my, and fuzz_pipe in
+# its mysql mode; MYSQL.md М7). Command bytes, response-head bytes, capability
+# flags, lenenc markers and the wire magics the mutator would otherwise have to
+# guess byte-by-byte. Passed with -dict= by campaign.sh and CI.
+
+# --- command bytes (frontend seq-0 packets) ---------------------------------
+com_quit="\x01"
+com_init_db="\x02"
+com_query="\x03"
+com_field_list="\x04"
+com_statistics="\x09"
+com_process_info="\x0a"
+com_ping="\x0e"
+com_change_user="\x11"
+com_binlog_dump="\x12"
+com_register_slave="\x15"
+com_stmt_prepare="\x16"
+com_stmt_execute="\x17"
+com_stmt_send_long="\x18"
+com_stmt_close="\x19"
+com_stmt_reset="\x1a"
+com_set_option="\x1b"
+com_stmt_fetch="\x1c"
+com_binlog_gtid="\x1e"
+com_reset_conn="\x1f"
+com_mariadb_bulk="\xfa"
+
+# --- response-head bytes (backend classification) ---------------------------
+head_ok="\x00"
+head_infile="\xfb"
+head_eof="\xfe"
+head_err="\xff"
+# protocol version 10 = the greeting's first byte
+head_greeting="\x0a"
+
+# --- length-encoded integer markers -----------------------------------------
+# < 0xfb is a literal; these are the multi-byte heads and the two non-lenenc
+# bytes (row-NULL / ERR) the readers must reject.
+lenenc_u16="\xfc"
+lenenc_u24="\xfd"
+lenenc_u64="\xfe"
+lenenc_null="\xfb"
+
+# --- packet framing ---------------------------------------------------------
+# u24 length ceiling: a 16MB payload travels as 0xFFFFFF-sized continuations.
+pkt_cont="\xff\xff\xff"
+pkt_seq0="\x00"
+pkt_seq1="\x01"
+# a bare header (len 1, seq 0) + COM_QUERY
+hdr_query="\x01\x00\x00\x00\x03"
+
+# --- capability flags in the HandshakeResponse (u32 LE, offset 0) -----------
+# CLIENT_PROTOCOL_41 | CONNECT_WITH_DB | PLUGIN_AUTH | DEPRECATE_EOF
+caps_plain="\x09\x22\x19\x01"
+# with CLIENT_SSL (0x0800): the short SSLRequest / TLS flip
+caps_ssl="\x09\x2a\x19\x01"
+# with CLIENT_COMPRESS (0x0020): the compressed blind zone
+caps_compress="\x29\x22\x19\x01"
+# with CLIENT_QUERY_ATTRIBUTES (0x0800'0000): the shifted COM_QUERY header
+caps_attrs="\x09\x22\x19\x09"
+
+# --- SQLSTATE + auth strings ------------------------------------------------
+sqlstate_mark="#"
+sqlstate_notfound="42S02"
+sqlstate_dup="23000"
+attr_program="program_name"
+attr_client="_client_name"
+plugin_native="mysql_native_password"
+plugin_sha2="caching_sha2_password"
+mariadb_prefix="5.5.5-"
+
+# --- SQL fragments the normaliser chews on ----------------------------------
+sql_select="SELECT "
+sql_from=" FROM "
+sql_where=" WHERE "
+sql_insert="INSERT INTO "
+sql_values=" VALUES "
+sql_backtick="`"
+sql_versioned="/*!80000 "
+sql_hash_comment="# "
+sql_load="LOAD DATA LOCAL INFILE "

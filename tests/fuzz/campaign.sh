@@ -21,8 +21,17 @@ ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 BUILD=${BUILD:-$ROOT/build-fuzz}
 TIME=${1:-1800}
 WORKERS=${2:-$(($(nproc) - 1))}
-DICT=$ROOT/tests/fuzz/dict/pg.dict
 WORK=${WORK:-$BUILD/campaign-$(date +%Y%m%d-%H%M%S)}
+
+# Per-target dictionary: MySQL has its own byte alphabet (command / lenenc /
+# capability bytes); pg.dict covers the pg framer, the norm SQL fragments and
+# the pipe scenarios well enough.
+dict_for() {
+    case "$1" in
+    my) echo "$ROOT/tests/fuzz/dict/my.dict" ;;
+    *) echo "$ROOT/tests/fuzz/dict/pg.dict" ;;
+    esac
+}
 
 # Stand trap: with DEBUGINFOD_URLS set, llvm-symbolizer stalls ~90 s per query
 # on the network — every NEW_FUNC line would freeze a worker. Never useful here;
@@ -31,29 +40,30 @@ export DEBUGINFOD_URLS=
 
 if [ ! -x "$BUILD/tests/fuzz/fuzz_pg" ]; then
     cmake -B "$BUILD" -DCMAKE_C_COMPILER=clang -DLATKIT_FUZZ=ON
-    cmake --build "$BUILD" --target fuzz_pg fuzz_norm fuzz_pipe gen_seeds -j"$(nproc)"
+    cmake --build "$BUILD" --target fuzz_pg fuzz_my fuzz_norm fuzz_pipe gen_seeds -j"$(nproc)"
 fi
 
-mkdir -p "$WORK/findings" "$WORK/seed"/{pg,norm,pipe}
+mkdir -p "$WORK/findings" "$WORK/seed"/{pg,my,norm,pipe}
 "$BUILD/tests/fuzz/gen_seeds" "$WORK/seed" >/dev/null
 
-echo "campaign: $TIME s/target x $WORKERS workers x 3 targets" \
-     "= $(((3 * TIME * WORKERS + 1800) / 3600)) CPU-hours; workdir $WORK"
+echo "campaign: $TIME s/target x $WORKERS workers x 4 targets" \
+     "= $(((4 * TIME * WORKERS + 1800) / 3600)) CPU-hours; workdir $WORK"
 
 fail=0
-for t in pg norm pipe; do
+for t in pg my norm pipe; do
     corp="$WORK/corpus-$t"
     mkdir -p "$corp"
     cp "$ROOT/tests/fuzz/corpus/$t"/* "$WORK/seed/$t"/* "$corp"/ 2>/dev/null || true
-    # The .lkt traces double as pg seeds: raw records through the same framer.
+    # The .lkt traces double as raw framer seeds for their protocol.
     [ "$t" = pg ] && cp "$ROOT"/tests/fixtures/*.lkt "$corp"/
+    [ "$t" = my ] && cp "$ROOT"/tests/traces/mysql/*/*.lkt "$corp"/ 2>/dev/null || true
 
     echo "=== fuzz_$t: $TIME s, $WORKERS workers ==="
     mkdir -p "$WORK/run-$t"
     (cd "$WORK/run-$t" &&
      "$BUILD/tests/fuzz/fuzz_$t" "$corp" \
         -jobs="$WORKERS" -workers="$WORKERS" -max_total_time="$TIME" \
-        -max_len=4096 -timeout=10 -rss_limit_mb=2048 -dict="$DICT" \
+        -max_len=4096 -timeout=10 -rss_limit_mb=2048 -dict="$(dict_for "$t")" \
         -print_final_stats=1 \
         -artifact_prefix="$WORK/findings/$t-" >"$WORK/run-$t/driver.log" 2>&1) || true
 

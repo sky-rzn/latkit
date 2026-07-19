@@ -17,7 +17,7 @@
 #     populated during tlspipe's post-handshake pause, before any data call
 #     could have triggered the nested-syscall fallback (Р37).
 #
-#   sudo tests/kernel/smoke.sh [--port N] [--repeat N] [--no-tls] [--build DIR]
+#   sudo tests/kernel/smoke.sh [--port N] [--repeat N] [--no-tls] [--mysql] [--build DIR]
 set -u
 
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -25,16 +25,26 @@ BUILD=${BUILD_DIR:-$REPO_ROOT/build}
 PORT=5499
 REPEAT=3
 DO_TLS=1
+MYSQL=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
     --port) PORT=$2; shift 2 ;;
     --repeat) REPEAT=$2; shift 2 ;;
     --no-tls) DO_TLS=0; shift ;;
+    # Stream the mysql fixtures with the agent framing the port as mysql
+    # (МYSQL.md М7: BPF is unchanged, so one plaintext replay confirms the
+    # classic protocol over a real socket). TLS is the M5 e2e stand's job.
+    --mysql) MYSQL=1; DO_TLS=0; shift ;;
     --build) BUILD=$2; shift 2 ;;
-    *) echo "usage: $0 [--port N] [--repeat N] [--no-tls] [--build DIR]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--port N] [--repeat N] [--no-tls] [--mysql] [--build DIR]" >&2; exit 2 ;;
     esac
 done
+
+# The agent frames the loopback port as pg by default, mysql with --mysql; the
+# replayer is told to match with -m (pgstream streams the right fixture set).
+if [ "$MYSQL" = 1 ]; then PORT_SPEC="$PORT=mysql"; PGSTREAM_PROTO="-m"
+else PORT_SPEC="$PORT"; PGSTREAM_PROTO=""; fi
 
 AGENT=$BUILD/latkit
 PGSTREAM=$BUILD/tests/kernel/pgstream
@@ -70,7 +80,7 @@ assert_gt0() { # assert_gt0 LABEL GOT
 
 start_agent() { # start_agent NAME EXTRA_ARGS...
     local name=$1; shift
-    "$AGENT" -p "$PORT" --prom-listen none --dump-metrics="$TMP/$name.prom" \
+    "$AGENT" -p "$PORT_SPEC" --prom-listen none --dump-metrics="$TMP/$name.prom" \
         "$@" 2>"$TMP/$name.log" &
     agent_pid=$!
     for _ in $(seq 1 40); do
@@ -130,7 +140,7 @@ ip link set lo up 2>/dev/null || true # a fresh VM may come up with lo down
 # --- plaintext: agent + pgstream ---------------------------------------------
 log "plaintext smoke (pgstream)"
 if start_agent plain; then
-    if summary=$("$PGSTREAM" -p "$PORT" -r "$REPEAT" 2>"$TMP/pgstream.log"); then
+    if summary=$("$PGSTREAM" -p "$PORT" -r "$REPEAT" $PGSTREAM_PROTO 2>"$TMP/pgstream.log"); then
         note "$summary"
         if stop_agent plain; then
             assert_phase plain "$summary"

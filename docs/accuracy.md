@@ -161,3 +161,96 @@ Knobs: `PROTOCOLS="simple extended"`, `TXNS`, `ERR_N`, `TOL` (percent),
 (asserted verdicts), `<proto>/join.tsv` (the full per-query table incl.
 raw/fine/grid percentile ladders), `<proto>/pgss.txt`, the agent dump and
 the csvlog.
+
+---
+
+# Accuracy validation — agent vs MySQL (MYSQL.md М7, РМ5)
+
+The MySQL track validates the same properties on a different ground truth.
+MySQL has no per-statement text log with durations that is as convenient as
+PostgreSQL's csvlog, so the reference here is
+**`performance_schema.events_statements_summary_by_digest`**: per-digest
+`COUNT_STAR` and the latency sums/percentiles the server itself measured.
+The comparison is produced by `tests/bench/accuracy/run-mysql.sh`.
+
+## Method
+
+Two views of one controlled workload against a fresh `mysql:8.4` (plaintext,
+`performance_schema` on, the digest table `TRUNCATE`d at the start of the
+measured phase):
+
+1. **the agent** — `--dump-metrics` at exit, the `proto="mysql"` series;
+2. **`events_statements_summary_by_digest`** — `DIGEST_TEXT`, `COUNT_STAR`,
+   `SUM_TIMER_WAIT`, the latency percentiles.
+
+**The join** maps each server digest onto the agent series that counted the
+same statements. The two normalisers are **not** the same — the server
+digests on its own parser, the agent on the РМ9 lexer — so, exactly as
+`pg_stat_statements` is kept out of the PG join, the digest text is
+re-normalised through the agent's `lk_norm_sql` (MySQL dialect) before the
+match. One MySQL-specific step: the digest text backtick-quotes every
+identifier (`` `abalance` ``) even though the client's raw statement did not,
+so the backticks are stripped before re-normalising, recovering the
+bare-identifier form the agent parsed off the wire (values are already `?`
+in the digest, so no backtick can hide inside a literal). The handful of
+digests that still straddle a lexer-vs-parser boundary are reconciled by
+grouping (documented per run in `join.tsv`); control-plane digests the
+agent never captured (`SET`, `SHOW`, the seeding CTE) appear one-sided and
+are skipped.
+Control-plane statements the load harness runs over the local socket never
+cross the capture point and are excluded from both views.
+
+**Workload** (exact repetition counts): a point `SELECT … WHERE id = ?`
+mix, an aggregate, a DML `UPDATE`, a `BEGIN…COMMIT` transaction, a
+`SELECT SLEEP(…)` bimodal tail (2 ms / 50 ms — one digest, straddling
+export buckets), a known-row-count `SELECT` over a seeded table, and an
+injected `SELECT … FROM <missing>` (errno 1146 / SQLSTATE 42S02) plus a
+duplicate-key `INSERT` (1062 / 23000).
+
+**Validity**: as on PG, a run counts only if the agent dump shows zero
+`latkit_ringbuf_dropped_total` and zero `latkit_resync_total` — the count
+equality is meaningless under loss (Р49/Р50).
+
+## Systematic differences (documented, not defects)
+
+- **Rows are a lower bound under capture holes (РМ5).** For a `SELECT` the
+  agent counts **row packets seen by the framer**; a capture hole over the
+  row stream drops the packets it swallowed, so `latkit_query_rows_total`
+  is a *lower* bound, never an over-count. On a lossless run (the only kind
+  the validity gate admits) it matches the server's `Rows_sent` exactly; the
+  bound only bites on a degraded capture, and the metrics that flag one
+  (`resync`, `ringbuf_dropped`) are dashboarded. DML rows come from the OK
+  packet's `affected_rows` and are exact regardless. This is the MySQL
+  analogue of the PG `PortalSuspended` caveat: latency is always honest,
+  the row *count* carries a capture-quality asterisk.
+
+- **One done-point, not two.** MySQL has no separate `ReadyForQuery`, so
+  `ts_ready == ts_complete`: the agent's span is command-packet →
+  terminator (OK/ERR/final EOF), i.e. network-to-network. Against the
+  server's own `TIMER_WAIT` (execution inside the server) the agent span is
+  strictly wider by the network round trip and the terminator-read latency —
+  the same nested-span relationship as PG (server exec ⊂ agent
+  network-to-network), never below the server's measurement.
+
+- **Multi-statement and stored-procedure resultsets** fold into one unit
+  (`LK_QO_MULTI_STMT`), so a `a; b; c` batch is one agent observation whose
+  rows are the sum, while the server records three digests. The join sums
+  the member digests before comparing; documented per run.
+
+- **Prepared statements**: the agent keys text off the `stmt_id` cache, so a
+  binary `COM_STMT_EXECUTE` carries the prepared text with `?` placeholders
+  intact — the same fingerprint the digest table shows, so these reconcile
+  directly.
+
+## Reproduction
+
+```sh
+cmake -B build-rel -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-rel --target latkit -j
+tests/bench/accuracy/run-mysql.sh      # ~2 min; exits non-zero on failure
+```
+
+Knobs (env): `SELECT_N`, `SLEEP2_N`, `SLEEP50_N`, `ROWS_N`, `ERR_N`,
+`TOL` (percent), `MIN_MS`, … — see the script header. Artifacts per run:
+`report.txt` (asserted verdicts), `join.tsv` (per-digest table: server
+count/latency vs agent), the digest dump and the agent dump.

@@ -45,8 +45,9 @@
 
 struct collector {
     struct lk_pipeline pipe;
-    struct lk_proto *proto;          /* PG handler under test */
-    const struct lk_msg_sink *psink; /* = lk_proto_sink(proto) */
+    struct lk_proto *proto;              /* handler under test (pg or mysql) */
+    const struct lk_proto_ops *ops;      /* its framer/handler vtable */
+    const struct lk_msg_sink *psink;     /* = lk_proto_sink(proto) */
     struct fx_msg got[FX_MAX_MSGS * 2];
     size_t ngot;
     bool overflow;
@@ -233,30 +234,52 @@ struct metric_expect {
     unsigned series;              /* latkit_metric_series (query-keyed series held) */
     unsigned long long other;     /* latkit_queries_other_total */
     const char *sqlstate;         /* NULL, or a code whose errors_total must be 1 */
+    /* Label triple on the query series. NULL falls back to the PG prelude's
+     * postgres/postgres/pg — the MySQL rows override with test/root/mysql. */
+    const char *db;
+    const char *user;
+    const char *proto;
 };
 
 static const struct metric_expect metric_expects[] = {
-    {"simple_query", "select ?", "ok", 1, 1, 1, 0, NULL},
-    {"error", "select ? / ?", "error", 1, 0, 1, 0, "22012"},
-    {"multi_statement", "select ? ; select ?", "ok", 1, 3, 1, 0, NULL},
-    {"cancel", NULL, NULL, 0, 0, 0, 0, NULL},
-    {"extended", "select ?", "ok", 1, 1, 1, 0, NULL},
-    {"prepared", "select ?", "ok", 2, 2, 1, 0, NULL},
+    {"simple_query", "select ?", "ok", 1, 1, 1, 0, NULL, NULL, NULL, NULL},
+    {"error", "select ? / ?", "error", 1, 0, 1, 0, "22012", NULL, NULL, NULL},
+    {"multi_statement", "select ? ; select ?", "ok", 1, 3, 1, 0, NULL, NULL, NULL, NULL},
+    {"cancel", NULL, NULL, 0, 0, 0, 0, NULL, NULL, NULL, NULL},
+    {"extended", "select ?", "ok", 1, 1, 1, 0, NULL, NULL, NULL, NULL},
+    {"prepared", "select ?", "ok", 2, 2, 1, 0, NULL, NULL, NULL, NULL},
     /* pipelined batch: unit 1 ok, unit 2 errors, unit 3 aborted -> two series
      * ("select ?" ok + error), the error counter ticks, nothing folds to other. */
-    {"pipeline_error", "select ?", "ok", 1, 1, 2, 0, "42P01"},
-    {"copy_in", "copy t from stdin", "ok", 1, 2, 1, 0, NULL},
-    {"copy_out", "copy t to stdout", "ok", 1, 2, 1, 0, NULL},
+    {"pipeline_error", "select ?", "ok", 1, 1, 2, 0, "42P01", NULL, NULL, NULL},
+    {"copy_in", "copy t from stdin", "ok", 1, 2, 1, 0, NULL, NULL, NULL, NULL},
+    {"copy_out", "copy t to stdout", "ok", 1, 2, 1, 0, NULL, NULL, NULL, NULL},
     /* Р19: a lost-event gap dirties the connection; no observation survives it,
      * so the dump carries no query series at all. */
-    {"session_gap", NULL, NULL, 0, 0, 0, 0, NULL},
+    {"session_gap", NULL, NULL, 0, 0, 0, 0, NULL, NULL, NULL, NULL},
     /* NO_TEXT (Bind on an un-Parsed name): honest latency under query="other". */
-    {"bind_unknown", "other", "ok", 1, 5, 1, 1, NULL},
-    {"ssl_plain", "select ?", "ok", 1, 1, 1, 0, NULL},
+    {"bind_unknown", "other", "ok", 1, 5, 1, 1, NULL, NULL, NULL, NULL},
+    {"ssl_plain", "select ?", "ok", 1, 1, 1, 0, NULL, NULL, NULL, NULL},
     /* Decrypted channel now carries the whole session (stage 6.4): the same
      * observation as its plaintext twin ssl_plain. */
-    {"ssl_tls", "select ?", "ok", 1, 1, 1, 0, NULL},
-    {"synthetic_midsession", NULL, NULL, 0, 0, 0, 0, NULL},
+    {"ssl_tls", "select ?", "ok", 1, 1, 1, 0, NULL, NULL, NULL, NULL},
+    {"synthetic_midsession", NULL, NULL, 0, 0, 0, 0, NULL, NULL, NULL, NULL},
+
+    /* --- MySQL mirror set (MYSQL.md М7): labels test/root/mysql -------------
+     * The same invariants as the PG rows, carried on the proto="mysql" axis.
+     * The RM6 proto label keeps these series apart from any PG series in a
+     * mixed dump. */
+    {"my_simple_query", "select ?", "ok", 1, 1, 1, 0, NULL, "test", "root", "mysql"},
+    {"my_error", "select * from missing", "error", 1, 0, 1, 0, "42S02", "test", "root", "mysql"},
+    {"my_multi_statement", "select ? ; select ?", "ok", 1, 2, 1, 0, NULL, "test", "root", "mysql"},
+    {"my_prepared", "select ?", "ok", 2, 2, 1, 0, NULL, "test", "root", "mysql"},
+    {"my_load_data", "load data local infile ? into table t", "ok", 1, 2, 1, 0, NULL, "test",
+     "root", "mysql"},
+    /* Cursor: execute + two fetches share the text; rows 0+2+1, all code=ok. */
+    {"my_cursor_fetch", "select id from t", "ok", 3, 3, 1, 0, NULL, "test", "root", "mysql"},
+    /* РМ7 blind zone: the handshake is parsed but no command is observed. */
+    {"my_compressed", NULL, NULL, 0, 0, 0, 0, NULL, NULL, NULL, NULL},
+    {"my_ssl", "select ?", "ok", 1, 1, 1, 0, NULL, "test", "root", "mysql"},
+    {"my_synthetic_midsession", NULL, NULL, 0, 0, 0, 0, NULL, NULL, NULL, NULL},
 };
 
 /* Numeric value on the dump line that begins (at column 0) with `prefix` and is
@@ -310,6 +333,9 @@ static int check_absent(const char *fixname, const char *buf, const char *prefix
 static int check_metrics(const struct metric_expect *e, const char *buf)
 {
     char pfx[512];
+    const char *db = e->db ? e->db : "postgres";
+    const char *user = e->user ? e->user : "postgres";
+    const char *proto = e->proto ? e->proto : "pg";
 
     if (check_line(e->name, buf, "latkit_metric_series", e->series) ||
         check_line(e->name, buf, "latkit_queries_other_total", e->other))
@@ -317,15 +343,15 @@ static int check_metrics(const struct metric_expect *e, const char *buf)
 
     if (e->query) {
         snprintf(pfx, sizeof(pfx),
-                 "latkit_query_duration_seconds_count{query=\"%s\",db=\"postgres\","
-                 "user=\"postgres\",proto=\"pg\",code=\"%s\"}",
-                 e->query, e->code);
+                 "latkit_query_duration_seconds_count{query=\"%s\",db=\"%s\","
+                 "user=\"%s\",proto=\"%s\",code=\"%s\"}",
+                 e->query, db, user, proto, e->code);
         if (check_line(e->name, buf, pfx, e->dur_count))
             return 1;
         snprintf(pfx, sizeof(pfx),
-                 "latkit_query_rows_total{query=\"%s\",db=\"postgres\",user=\"postgres\","
-                 "proto=\"pg\"}",
-                 e->query);
+                 "latkit_query_rows_total{query=\"%s\",db=\"%s\",user=\"%s\","
+                 "proto=\"%s\"}",
+                 e->query, db, user, proto);
         if (check_line(e->name, buf, pfx, e->rows))
             return 1;
     } else {
@@ -337,9 +363,9 @@ static int check_metrics(const struct metric_expect *e, const char *buf)
 
     if (e->sqlstate) {
         snprintf(pfx, sizeof(pfx),
-                 "latkit_query_errors_total{sqlstate=\"%s\",db=\"postgres\",user=\"postgres\","
-                 "proto=\"pg\"}",
-                 e->sqlstate);
+                 "latkit_query_errors_total{sqlstate=\"%s\",db=\"%s\",user=\"%s\","
+                 "proto=\"%s\"}",
+                 e->sqlstate, db, user, proto);
         if (check_line(e->name, buf, pfx, 1))
             return 1;
     }
@@ -420,7 +446,16 @@ static int run_fixture(const struct fixture *fix)
         return 1;
     }
     col.ssink = lk_spans_sink(col.spans);
-    col.proto = lk_proto_pg_new(&(struct lk_query_sink){
+    col.ops = fix->proto ? lk_proto_find(fix->proto, strlen(fix->proto)) : lk_proto_registry[0];
+    if (!col.ops) {
+        fprintf(stderr, "FAIL %s: unknown proto \"%s\"\n", fix->name, fix->proto);
+        lk_spans_free(col.spans);
+        lk_metrics_free(col.metrics);
+        free(committed);
+        free(x.buf);
+        return 1;
+    }
+    col.proto = col.ops->proto_new(&(struct lk_query_sink){
         .ctx = &col, .on_session = on_session, .on_query = on_query, .on_txn = on_txn});
     if (!col.proto) {
         lk_spans_free(col.spans);
@@ -442,6 +477,10 @@ static int run_fixture(const struct fixture *fix)
         free(x.buf);
         return 1;
     }
+    /* Force every connection to the fixture's protocol (the tuple's port is
+     * incidental in the offline harness — set_protos with a NULL map installs
+     * the default ops the framer and handler both key off c->ops). */
+    lk_conn_table_set_protos(col.pipe.conns, NULL, 0, col.ops);
     if (lk_replay_mem(committed, clen, feed_record, &col)) {
         fprintf(stderr, "FAIL %s: malformed trace\n", fix->name);
         goto fail;

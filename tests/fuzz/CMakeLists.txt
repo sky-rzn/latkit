@@ -49,6 +49,7 @@ function(latkit_fuzzer name)
 endfunction()
 
 latkit_fuzzer(fuzz_pg fuzz_pg.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC})
+latkit_fuzzer(fuzz_my fuzz_my.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC})
 latkit_fuzzer(fuzz_norm fuzz_norm.c ${FUZZ_NORM_SRC})
 latkit_fuzzer(fuzz_pipe fuzz_pipe.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC} ${FUZZ_NORM_SRC}
               ${CMAKE_SOURCE_DIR}/src/agent/decode.c ${CMAKE_SOURCE_DIR}/src/agent/pipeline.c)
@@ -62,5 +63,11 @@ add_executable(gen_seeds gen_seeds.c)
 set(FUZZ_CORPUS ${CMAKE_SOURCE_DIR}/tests/fuzz/corpus)
 add_test(NAME fuzz_pg_corpus
          COMMAND fuzz_pg -runs=0 ${FUZZ_CORPUS}/pg ${CMAKE_SOURCE_DIR}/tests/fixtures)
+# fuzz_my replays its own corpus plus the recorded MySQL traces (М0) and the
+# MySQL replay fixtures (М7) — raw .lkt bytes are also valid framer inputs.
+add_test(NAME fuzz_my_corpus
+         COMMAND fuzz_my -runs=0 ${FUZZ_CORPUS}/my
+                 ${CMAKE_SOURCE_DIR}/tests/traces/mysql/my84
+                 ${CMAKE_SOURCE_DIR}/tests/traces/mysql/maria1011)
 add_test(NAME fuzz_norm_corpus COMMAND fuzz_norm -runs=0 ${FUZZ_CORPUS}/norm)
 add_test(NAME fuzz_pipe_corpus COMMAND fuzz_pipe -runs=0 ${FUZZ_CORPUS}/pipe)

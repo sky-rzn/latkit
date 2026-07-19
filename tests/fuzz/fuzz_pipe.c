@@ -60,6 +60,8 @@ struct pipe_slot {
 struct pipe_ctx {
     struct lk_pipeline pipe;
     struct lk_proto *proto;
+    const struct lk_proto_ops *ops;  /* selected by the leading input byte */
+    bool mysql;                      /* the message contract to check against */
     const struct lk_msg_sink *psink; /* = lk_proto_sink(proto) */
     struct pipe_slot slot[PIPE_SLOTS];
     __u64 now;
@@ -80,7 +82,7 @@ static void pipe_on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const str
     struct pipe_ctx *px = ctx;
     struct pipe_slot *s = slot_of(px, c->cookie);
 
-    fz_check_msg(m);
+    fz_check_msg(m, px->mysql);
     /* Р19: nothing is emitted across a loss — the first message after it must
      * announce the resync. The len==0 one-byte SSL reply bypasses framing
      * (cross-direction flag, Р10) and is exempt. */
@@ -365,7 +367,22 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     for (int i = 0; i < PIPE_SLOTS; i++)
         px.slot[i].cookie = PIPE_COOKIE_BASE + (__u64)i * PIPE_COOKIE_STEP;
 
-    px.proto = lk_proto_pg_new(&qsink);
+    /* First input byte selects the wire protocol (МYSQL.md М7): mysql when
+     * bit 0 is set, else the pg default. The scenario proper starts at byte 1. */
+    {
+        const struct lk_proto_ops *ops = lk_proto_registry[0];
+
+        if (r.p < r.end && (*r.p++ & PIPE_PROTO_MYSQL)) {
+            const struct lk_proto_ops *my = lk_proto_find("mysql", 5);
+
+            if (my) {
+                ops = my;
+                px.mysql = true;
+            }
+        }
+        px.ops = ops;
+        px.proto = ops->proto_new(&qsink);
+    }
     if (!px.proto)
         return 0;
     px.psink = lk_proto_sink(px.proto);
@@ -377,6 +394,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         lk_proto_free(px.proto);
         return 0;
     }
+    /* Every connection frames and parses as the selected protocol. */
+    lk_conn_table_set_protos(px.pipe.conns, NULL, 0, px.ops);
 
     while (r.p < r.end) {
         uint32_t op = rd_u8(&r);

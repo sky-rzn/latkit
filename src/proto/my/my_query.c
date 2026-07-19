@@ -622,7 +622,13 @@ bad:
 static void reply_cols(struct lk_proto *p, struct lk_conn *c, struct my_conn *pc,
                        const struct lk_msg *m)
 {
-    __u8 head = m->body[0];
+    /* A definition packet whose body fell into a capture hole (body_cap == 0)
+     * still counts as one skipped definition — the dispatcher lets a blind
+     * packet through in MY_R_COLS for exactly that reason (my_query_backend).
+     * head == 0 is neither 0xFF nor an EOF, so it falls to the decrement
+     * below; reading body[0] unguarded would deref NULL (reply_rows /
+     * reply_prep_meta guard the same way). */
+    __u8 head = m->body_cap ? m->body[0] : 0;
 
     if (head == 0xff) {
         terminator_err(p, c, pc, m);
