@@ -683,7 +683,7 @@ static int test_blind_coldef(void)
         .ts_ns = 1011, .flags = LK_MSG_BODY_TRUNC, .len = 30, .body_cap = 0, .body = NULL};
 
     query(sink, &c, "SELECT 1", 1000);
-    be_count(sink, &c, 1, 1010); /* cols_left = 1 -> MY_R_COLS */
+    be_count(sink, &c, 1, 1010);                      /* cols_left = 1 -> MY_R_COLS */
     sink->on_msg(sink->ctx, &c, LK_DIR_SEND, &blind); /* blind coldef: no crash */
     be_row(sink, &c, 1020);
     be_ok_fe(sink, &c, 0, 0x0002, 1030);
@@ -770,8 +770,7 @@ int main(void)
         test_query_attributes() || test_synthetic_sniff() || test_cursor_fetch() ||
         test_anchor_discipline() || test_resync_drop() || test_close_drop() || test_text_trunc() ||
         test_blind_head() || test_blind_coldef() || test_service_and_unknown() ||
-        test_binlog_ignore() ||
-        test_corrupt_head())
+        test_binlog_ignore() || test_corrupt_head())
         return 1;
     printf("ok\n");
     return 0;

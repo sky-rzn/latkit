@@ -59,11 +59,11 @@ struct fx {
 };
 
 struct fixture {
-    const char *name;   /* file stem: tests/fixtures/<name>.lkt */
+    const char *name; /* file stem: tests/fixtures/<name>.lkt */
     void (*build)(struct fx *x);
-    const char *proto;  /* NULL = pg (the registry head); "mysql" for the
-                           MySQL mirror set (MYSQL.md М7) — selects both the
-                           framer and the handler run over the fixture */
+    const char *proto; /* NULL = pg (the registry head); "mysql" for the
+                          MySQL mirror set (MYSQL.md М7) — selects both the
+                          framer and the handler run over the fixture */
 };
 
 extern const struct fixture lk_fixtures[];

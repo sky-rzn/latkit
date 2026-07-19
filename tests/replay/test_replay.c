@@ -45,9 +45,9 @@
 
 struct collector {
     struct lk_pipeline pipe;
-    struct lk_proto *proto;              /* handler under test (pg or mysql) */
-    const struct lk_proto_ops *ops;      /* its framer/handler vtable */
-    const struct lk_msg_sink *psink;     /* = lk_proto_sink(proto) */
+    struct lk_proto *proto;          /* handler under test (pg or mysql) */
+    const struct lk_proto_ops *ops;  /* its framer/handler vtable */
+    const struct lk_msg_sink *psink; /* = lk_proto_sink(proto) */
     struct fx_msg got[FX_MAX_MSGS * 2];
     size_t ngot;
     bool overflow;

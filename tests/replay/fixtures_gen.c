@@ -1107,11 +1107,11 @@ static __u32 mypkt(__u8 *out, __u8 seq, const __u8 *body, __u32 blen)
 #define MY_FX_CAP_COMPR 0x00000020u
 
 /* Server status flags in OK / EOF terminators. */
-#define MY_FX_ST_INTRANS   0x0001
+#define MY_FX_ST_INTRANS    0x0001
 #define MY_FX_ST_AUTOCOMMIT 0x0002
-#define MY_FX_ST_MORE      0x0008
-#define MY_FX_ST_CURSOR    0x0040
-#define MY_FX_ST_LASTROW   0x0080
+#define MY_FX_ST_MORE       0x0008
+#define MY_FX_ST_CURSOR     0x0040
+#define MY_FX_ST_LASTROW    0x0080
 
 /* Initial Handshake (protocol 10). The session reads only the version; the
  * rest is realistic filler the parser skips. */
@@ -1119,21 +1119,21 @@ static __u32 my_greeting(__u8 *out)
 {
     __u8 b[128], *p = b;
 
-    *p++ = 10;               /* protocol version */
-    memcpy(p, "8.4.0", 6);   /* server_version + NUL */
+    *p++ = 10;             /* protocol version */
+    memcpy(p, "8.4.0", 6); /* server_version + NUL */
     p += 6;
-    p = le32(p, 1);          /* thread id */
-    memset(p, 0, 8);         /* auth-plugin-data part 1 */
+    p = le32(p, 1);  /* thread id */
+    memset(p, 0, 8); /* auth-plugin-data part 1 */
     p += 8;
-    *p++ = 0;                /* filler */
-    p = le16(p, 0xffff);     /* capability flags (lower) — server offer only */
-    *p++ = 0xff;             /* charset (utf8mb4) */
+    *p++ = 0;            /* filler */
+    p = le16(p, 0xffff); /* capability flags (lower) — server offer only */
+    *p++ = 0xff;         /* charset (utf8mb4) */
     p = le16(p, MY_FX_ST_AUTOCOMMIT);
-    p = le16(p, 0xffff);     /* capability flags (upper) */
-    *p++ = 21;               /* auth-plugin-data length */
-    memset(p, 0, 10);        /* reserved */
+    p = le16(p, 0xffff); /* capability flags (upper) */
+    *p++ = 21;           /* auth-plugin-data length */
+    memset(p, 0, 10);    /* reserved */
     p += 10;
-    memset(p, 0, 13);        /* auth-plugin-data part 2 */
+    memset(p, 0, 13); /* auth-plugin-data part 2 */
     p += 13;
     memcpy(p, "caching_sha2_password", 22); /* + NUL */
     p += 22;
@@ -1154,17 +1154,17 @@ static __u32 my_handshake_response(__u8 *out, __u32 caps)
     *p++ = 0xff;             /* charset */
     memset(p, 0, 23);        /* filler (mysql dialect: mcaps stays 0) */
     p += 23;
-    memcpy(p, "root", 5);    /* user + NUL */
+    memcpy(p, "root", 5); /* user + NUL */
     p += 5;
-    *p++ = 0;                /* auth response length 0 */
-    memcpy(p, "test", 5);    /* database + NUL */
+    *p++ = 0;             /* auth response length 0 */
+    memcpy(p, "test", 5); /* database + NUL */
     p += 5;
     memcpy(p, "caching_sha2_password", 22); /* plugin + NUL */
     p += 22;
     k = lenstr0(k, "program_name");
     k = lenstr0(k, "mysql");
     klen = (__u32)(k - kv);
-    p = lenenc(p, klen);     /* connect-attrs total length */
+    p = lenenc(p, klen); /* connect-attrs total length */
     memcpy(p, kv, klen);
     p += klen;
     return mypkt(out, 1, b, (__u32)(p - b));
@@ -1177,9 +1177,9 @@ static __u32 my_ok(__u8 *out, __u8 seq, __u64 affected, __u16 status)
 
     *p++ = 0x00;
     p = lenenc(p, affected);
-    p = lenenc(p, 0);        /* last_insert_id */
+    p = lenenc(p, 0); /* last_insert_id */
     p = le16(p, status);
-    p = le16(p, 0);          /* warnings */
+    p = le16(p, 0); /* warnings */
     return mypkt(out, seq, b, (__u32)(p - b));
 }
 
@@ -1189,10 +1189,10 @@ static __u32 my_eof(__u8 *out, __u8 seq, __u16 status)
     __u8 b[16], *p = b;
 
     *p++ = 0xfe;
-    p = lenenc(p, 0);        /* affected_rows */
-    p = lenenc(p, 0);        /* last_insert_id */
+    p = lenenc(p, 0); /* affected_rows */
+    p = lenenc(p, 0); /* last_insert_id */
     p = le16(p, status);
-    p = le16(p, 0);          /* warnings */
+    p = le16(p, 0); /* warnings */
     return mypkt(out, seq, b, (__u32)(p - b));
 }
 
@@ -1226,19 +1226,19 @@ static __u32 my_coldef(__u8 *out, __u8 seq, const char *name)
 {
     __u8 b[128], *p = b;
 
-    p = lenstr0(p, "def");   /* catalog */
-    p = lenstr0(p, "test");  /* schema */
-    p = lenstr0(p, "t");     /* table */
-    p = lenstr0(p, "t");     /* org_table */
-    p = lenstr0(p, name);    /* name */
-    p = lenstr0(p, name);    /* org_name */
-    *p++ = 0x0c;             /* length of the fixed-length fields */
-    p = le16(p, 0x003f);     /* charset (binary) */
-    p = le32(p, 11);         /* column length */
-    *p++ = 0x03;             /* column type: LONG */
-    p = le16(p, 0x0000);     /* flags */
-    *p++ = 0x00;             /* decimals */
-    p = le16(p, 0);          /* filler */
+    p = lenstr0(p, "def");  /* catalog */
+    p = lenstr0(p, "test"); /* schema */
+    p = lenstr0(p, "t");    /* table */
+    p = lenstr0(p, "t");    /* org_table */
+    p = lenstr0(p, name);   /* name */
+    p = lenstr0(p, name);   /* org_name */
+    *p++ = 0x0c;            /* length of the fixed-length fields */
+    p = le16(p, 0x003f);    /* charset (binary) */
+    p = le32(p, 11);        /* column length */
+    *p++ = 0x03;            /* column type: LONG */
+    p = le16(p, 0x0000);    /* flags */
+    *p++ = 0x00;            /* decimals */
+    p = le16(p, 0);         /* filler */
     return mypkt(out, seq, b, (__u32)(p - b));
 }
 
@@ -1256,9 +1256,9 @@ static __u32 my_binrow(__u8 *out, __u8 seq)
 {
     __u8 b[8], *p = b;
 
-    *p++ = 0x00;             /* binary row packet header */
-    *p++ = 0x00;             /* null bitmap */
-    p = le32(p, 1);          /* one 4-byte value */
+    *p++ = 0x00;    /* binary row packet header */
+    *p++ = 0x00;    /* null bitmap */
+    p = le32(p, 1); /* one 4-byte value */
     return mypkt(out, seq, b, (__u32)(p - b));
 }
 
@@ -1294,8 +1294,8 @@ static __u32 my_prepare_ok(__u8 *out, __u8 seq, __u32 stmt_id, __u16 ncols, __u1
     p = le32(p, stmt_id);
     p = le16(p, ncols);
     p = le16(p, nparams);
-    *p++ = 0x00;             /* reserved */
-    p = le16(p, 0);          /* warning count */
+    *p++ = 0x00;    /* reserved */
+    p = le16(p, 0); /* warning count */
     return mypkt(out, seq, b, (__u32)(p - b));
 }
 
@@ -1714,8 +1714,8 @@ static void build_my_cursor_fetch(struct fx *x)
 
     b.x->queries = 3;
     b.x->obs_kind = LK_Q_EXTENDED;
-    b.x->obs_rows = 1;      /* the last (draining) batch */
-    b.x->obs_flags = 0;     /* LAST_ROW_SENT: no SUSPENDED */
+    b.x->obs_rows = 1;  /* the last (draining) batch */
+    b.x->obs_flags = 0; /* LAST_ROW_SENT: no SUSPENDED */
     b.x->obs_text = "SELECT id FROM t";
 }
 

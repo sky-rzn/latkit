@@ -570,13 +570,13 @@ static void mypkt(unsigned seq)
 
 static void my_greeting(void)
 {
-    mb(10);          /* protocol version */
+    mb(10); /* protocol version */
     mb_str("8.4.0");
-    mb(0);           /* version NUL */
+    mb(0); /* version NUL */
     for (int i = 0; i < 4; i++)
-        mb(1);       /* thread id */
+        mb(1); /* thread id */
     for (int i = 0; i < 27; i++)
-        mb(0);       /* auth data + caps + status + plugin-data-2 filler */
+        mb(0); /* auth data + caps + status + plugin-data-2 filler */
     mb_str("caching_sha2_password");
     mb(0);
     mypkt(0);
@@ -589,13 +589,13 @@ static void my_handshake_response(unsigned caps)
     mb(caps >> 16);
     mb(caps >> 24);
     for (int i = 0; i < 4; i++)
-        mb(0);       /* max_packet */
-    mb(0xff);        /* charset */
+        mb(0); /* max_packet */
+    mb(0xff);  /* charset */
     for (int i = 0; i < 23; i++)
-        mb(0);       /* filler */
+        mb(0); /* filler */
     mb_str("root");
     mb(0);
-    mb(0);           /* auth response length 0 */
+    mb(0); /* auth response length 0 */
     mb_str("test");
     mb(0);
     mb_str("caching_sha2_password");
@@ -613,9 +613,9 @@ static void my_ok(unsigned seq, unsigned affected, unsigned status)
 {
     mb(0x00);
     mb(affected);
-    mb(0);           /* last_insert_id */
+    mb(0); /* last_insert_id */
     mb16(status);
-    mb16(0);         /* warnings */
+    mb16(0); /* warnings */
     mypkt(seq);
 }
 
@@ -679,8 +679,8 @@ static void my_seeds(const char *root)
     mb(0x00);
     for (int i = 0; i < 4; i++)
         mb(i == 0 ? 1 : 0); /* stmt_id = 1 */
-    mb16(1);               /* num_columns */
-    mb16(1);               /* num_params */
+    mb16(1);                /* num_columns */
+    mb16(1);                /* num_params */
     mb(0);
     mb16(0);
     mypkt(1); /* PREPARE_OK */
