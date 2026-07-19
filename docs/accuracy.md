@@ -166,6 +166,20 @@ the csvlog.
 
 # Accuracy validation — agent vs MySQL (MYSQL.md М7, РМ5)
 
+**Verdict: the acceptance holds.** On a lossless run (zero ringbuf drops, zero
+resyncs) the agent's `count` matches `performance_schema`'s per-digest
+`COUNT_STAR` **exactly** for every workload family — point SELECT, aggregate,
+UPDATE, `BEGIN`/`COMMIT`, `SELECT … FOR UPDATE`, `SELECT SLEEP(…)`, the
+known-row SELECT, and the injected missing-table error all reconcile at
+±0.0%. The only digests that do not enter the comparison are the mysql CLI's
+own per-connection control-plane probes (`SELECT @@version_comment`, session
+setup), filtered by shape on both sides — the classic-protocol analogue of
+the PG stand's `[local]` exclusion, except MySQL issues them over TCP so they
+cross the capture and must be filtered rather than skipped by transport.
+
+Everything below is produced by `tests/bench/accuracy/run-mysql.sh`; the
+verdict is asserted and the script exits non-zero on any regression.
+
 The MySQL track validates the same properties on a different ground truth.
 MySQL has no per-statement text log with durations that is as convenient as
 PostgreSQL's csvlog, so the reference here is

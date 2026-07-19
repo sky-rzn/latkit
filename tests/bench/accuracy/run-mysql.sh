@@ -212,10 +212,18 @@ for line in open(digests_path):
 texts = "\n".join(t.replace("`", "").replace("\n", " ") for _, _, t in rows) + "\n"
 norm = subprocess.run([lknorm, "-m"], input=texts, capture_output=True, text=True).stdout.splitlines()
 
+# Control-plane noise the mysql CLI / admin path issues, never the workload:
+# the per-connection `@@version_comment` probe, session setup, the digest
+# reset. It crosses the capture on TCP (unlike PG's [local] socket control
+# plane), so it is filtered by shape, on both sides, before the comparison.
+_CP = re.compile(r"^(select @@|set |show |use |truncate |flush |select database|select \$)")
+def control_plane(label):
+    return not label or bool(_CP.match(label))
+
 server = {}        # normalised text -> [count, latency_ms]
 for (cnt, lat, _), nline in zip(rows, norm):
     label = nline.split("\t", 1)[1] if "\t" in nline else ""
-    if not label or label.startswith("truncate performance_schema"):
+    if control_plane(label):
         continue
     e = server.setdefault(label, [0, 0.0])
     e[0] += cnt
@@ -240,7 +248,10 @@ for line in open(prom_path):
         lab = parse_labels("{" + rest)
         if lab.get("proto") != "mysql":
             continue
-        agent[lab.get("query", "")] = agent.get(lab.get("query", ""), 0) + int(float(val))
+        q = lab.get("query", "")
+        if control_plane(q):
+            continue
+        agent[q] = agent.get(q, 0) + int(float(val))
         if lab.get("code") == "error": agent_err += int(float(val))
         else: agent_ok += int(float(val))
 
