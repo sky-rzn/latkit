@@ -87,6 +87,7 @@ fine-grained set - diagnosis recipes in [docs/deploy.md](docs/deploy.md).
 ### systemd
 
 ```sh
+sudo apt install cmake clang libelf-dev
 cmake -B build && cmake --build build -j"$(nproc)"
 sudo cmake --install build                                        # /usr/local/bin/latkit
 sudo mkdir -p /etc/latkit
@@ -116,6 +117,7 @@ tabulated in [docs/deploy.md](docs/deploy.md).
 ### From source
 
 ```sh
+sudo apt install cmake clang libelf-dev
 git submodule update --init            # bundled libbpf
 cmake -B build
 cmake --build build -j"$(nproc)"
