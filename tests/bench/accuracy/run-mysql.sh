@@ -72,10 +72,14 @@ container_ip() {
     docker inspect "$MY" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'
 }
 # Workload client: the mysql:8.4 image on the host network, talking to the
-# container IP (never localhost — see the header).
+# container IP (never localhost — see the header). --ssl-mode=DISABLED keeps
+# the wire plaintext so the socket capture sees the classic protocol;
+# --get-server-public-key lets caching_sha2_password (the 8.4 default) do its
+# RSA key exchange over that plaintext link, no TLS needed (plan risk 2).
 myload() {
     docker run --rm -i --network host "$IMAGE" \
-        mysql --skip-ssl -h "$1" -u"$DB_USER" -p"$DB_PW" "$DB_NAME" 2>/dev/null
+        mysql --ssl-mode=DISABLED --get-server-public-key \
+        -h "$1" -u"$DB_USER" -p"$DB_PW" "$DB_NAME" 2>/dev/null
 }
 
 agent_pid() { pgrep -x latkit || true; }
@@ -114,9 +118,12 @@ command -v docker >/dev/null || die "docker not found"
 # --- 1. a fresh mysqld, performance_schema on, CPU-bound ---------------------
 log "starting $IMAGE ($MY)"
 docker rm -f "$MY" >/dev/null 2>&1 || true
+# No --skip-ssl: MySQL 8.4 removed it as a server option. TLS is auto-offered
+# but the workload clients opt out with --ssl-mode=DISABLED, so the wire stays
+# plaintext for the socket capture (myload).
 docker run -d --name "$MY" \
     -e MYSQL_ROOT_PASSWORD="$DB_PW" -e MYSQL_DATABASE="$DB_NAME" \
-    "$IMAGE" mysqld --skip-ssl \
+    "$IMAGE" mysqld \
     --performance_schema=ON \
     --performance-schema-consumer-statements-digest=ON \
     --innodb_flush_log_at_trx_commit=0 --sync_binlog=0 --skip-log-bin >/dev/null

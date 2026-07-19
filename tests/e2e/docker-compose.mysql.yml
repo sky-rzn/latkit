@@ -26,18 +26,20 @@ services:
       MYSQL_DATABASE: latkit
       MYSQL_USER: latkit
       MYSQL_PASSWORD: latkit
-    # TLS off at the wire: this stand exercises the socket-capture path, not the
-    # uprobe channel (that is docker-compose.mysql-tls.yml). --skip-ssl makes the
-    # 8.x server offer no TLS so the CLI stays plaintext without --ssl-mode.
+    # This stand exercises the socket-capture path, not the uprobe channel (that
+    # is docker-compose.mysql-tls.yml). MySQL 8.4 removed the server --skip-ssl
+    # option and always offers TLS, so the clients opt out with
+    # --ssl-mode=DISABLED to keep the wire plaintext; --get-server-public-key
+    # lets caching_sha2_password (the 8.4 default) auth over that plaintext link
+    # via RSA, no TLS (plan risk 2).
     command:
       - mysqld
-      - --skip-ssl
     healthcheck:
       # TCP + the app user over 127.0.0.1: passes only on the final server, not
       # the socket-only temporary server the entrypoint runs during first-boot
       # init (which would let mysql-init race the user creation).
       test: ["CMD-SHELL",
-             "mysql --skip-ssl -h 127.0.0.1 -ulatkit -platkit latkit -e 'SELECT 1'"]
+             "mysql --ssl-mode=DISABLED --get-server-public-key -h 127.0.0.1 -ulatkit -platkit latkit -e 'SELECT 1'"]
       interval: 2s
       timeout: 4s
       retries: 60
@@ -53,7 +55,7 @@ services:
     entrypoint: ["bash", "-c"]
     command:
       - |
-        mysql --skip-ssl -h mysql -ulatkit latkit <<'SQL'
+        mysql --ssl-mode=DISABLED --get-server-public-key -h mysql -ulatkit latkit <<'SQL'
         CREATE TABLE IF NOT EXISTS accounts (
             id INT PRIMARY KEY, abalance INT NOT NULL, filler CHAR(84)
         );
@@ -84,7 +86,7 @@ services:
       - |
         while :; do
           id=$$((RANDOM % 10000 + 1))
-          mysql --skip-ssl -h mysql -ulatkit latkit >/dev/null 2>&1 <<SQL || true
+          mysql --ssl-mode=DISABLED --get-server-public-key -h mysql -ulatkit latkit >/dev/null 2>&1 <<SQL || true
         SELECT abalance FROM accounts WHERE id = $$id;
         SELECT count(*), avg(abalance) FROM accounts WHERE id < 100;
         UPDATE accounts SET abalance = abalance + 1 WHERE id = $$id;

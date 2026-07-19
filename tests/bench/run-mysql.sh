@@ -10,8 +10,8 @@
 #   B  agent up, plaintext capture       fentry probes + ringbuf + pipeline +
 #                                         the classic-protocol parser
 #
-# The load is `mysqlslap` (ships in the mysql image — no external sysbench
-# dependency), a read-mostly point-query mix at fixed concurrency, driven at the
+# The load is CONCURRENCY parallel `mysql` clients (mysqlslap is not in the
+# mysql:8.4 image; the client binary is) streaming point selects, driven at the
 # container IP (never 127.0.0.1 — the docker-proxy relay would pollute the
 # capture). A run is VALID only if the agent dump shows zero
 # latkit_ringbuf_dropped_total and zero latkit_resync_total during it: an agent
@@ -24,7 +24,7 @@
 #   tests/bench/run-mysql.sh run     # the benchmark (default)
 #   tests/bench/run-mysql.sh down    # remove the container
 #
-# Knobs (env): PAIRS=5, CONCURRENCY=32, ITERATIONS=20, NUMBER_QUERIES=2000,
+# Knobs (env): PAIRS=5, CONCURRENCY=32, NUMBER_QUERIES=2000,
 #   SCALE=10000, AGENT_BIN=build-rel/latkit, OUT=tests/bench/out/mysql-<ts>.
 #
 # Requirements: docker; passwordless sudo for the agent (BPF); an OPTIMISED
@@ -42,7 +42,6 @@ PROM=http://127.0.0.1:9752/metrics
 
 PAIRS=${PAIRS:-5}
 CONCURRENCY=${CONCURRENCY:-32}
-ITERATIONS=${ITERATIONS:-20}
 NUMBER_QUERIES=${NUMBER_QUERIES:-2000}
 SCALE=${SCALE:-10000}
 OUT=${OUT:-$HERE/out/mysql-$(date -u +%Y%m%dT%H%M%SZ)}
@@ -79,9 +78,11 @@ agent_stop() {
 
 stack_up() {
     docker rm -f "$MY" >/dev/null 2>&1 || true
+    # No --skip-ssl (removed as a server option in 8.4); the load opts out of
+    # TLS client-side so the wire stays plaintext for the capture.
     docker run -d --name "$MY" \
         -e MYSQL_ROOT_PASSWORD="$DB_PW" -e MYSQL_DATABASE="$DB_NAME" \
-        "$IMAGE" mysqld --skip-ssl \
+        "$IMAGE" mysqld \
         --innodb_buffer_pool_size=512M --innodb_flush_log_at_trx_commit=0 \
         --sync_binlog=0 --skip-log-bin --max_connections=256 >/dev/null
     for _ in $(seq 90); do myx -e 'SELECT 1' >/dev/null 2>&1 && break; sleep 1; done
@@ -98,14 +99,28 @@ ON DUPLICATE KEY UPDATE abalance = accounts.abalance;
 SQL
 }
 
-# One mysqlslap run at the container IP; prints "seconds to run all queries".
+# One load run at the container IP: mysqlslap is NOT in the mysql:8.4 image, so
+# the load is CONCURRENCY parallel `mysql` clients (the client binary IS in the
+# image), forked inside ONE container so process spawn is cheap, each streaming
+# NUMBER_QUERIES/CONCURRENCY point selects. Prints the wall seconds for the
+# whole batch. --ssl-mode=DISABLED --get-server-public-key: plaintext wire +
+# caching_sha2 RSA auth (the capture needs cleartext).
 slap() {
-    docker run --rm --network host "$IMAGE" mysqlslap \
-        --no-defaults -h "$1" -uroot -p"$DB_PW" --create-schema="$DB_NAME" \
-        --concurrency="$CONCURRENCY" --iterations="$ITERATIONS" \
-        --number-of-queries="$NUMBER_QUERIES" --delimiter=';' \
-        --query="SELECT abalance FROM accounts WHERE id = FLOOR(1+RAND()*$SCALE)" 2>/dev/null \
-        | awk '/seconds to run all queries/ { print $(NF-4) }' | head -1
+    docker run --rm --network host -e IP="$1" -e DB_PW="$DB_PW" -e DB_NAME="$DB_NAME" \
+        -e CONCURRENCY="$CONCURRENCY" -e NUMBER_QUERIES="$NUMBER_QUERIES" -e SCALE="$SCALE" \
+        "$IMAGE" bash -c '
+            per=$(( NUMBER_QUERIES / CONCURRENCY )); [ "$per" -lt 1 ] && per=1
+            t0=$(date +%s.%N)
+            for _ in $(seq 1 "$CONCURRENCY"); do
+              ( for _ in $(seq 1 "$per"); do
+                  echo "SELECT abalance FROM accounts WHERE id=FLOOR(1+RAND()*$SCALE);"
+                done | mysql --ssl-mode=DISABLED --get-server-public-key \
+                  -h "$IP" -uroot -p"$DB_PW" "$DB_NAME" >/dev/null 2>&1 ) &
+            done
+            wait
+            t1=$(date +%s.%N)
+            awk "BEGIN{printf \"%.4f\", $t1-$t0}"
+        ' 2>/dev/null | tail -1
 }
 
 metric() { awk -v m="$2" '$1==m || substr($1,1,length(m)+1)==m"{" {s+=$NF} END{printf "%.0f",s+0}' "$1"; }

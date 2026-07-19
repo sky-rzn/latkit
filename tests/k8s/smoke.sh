@@ -103,13 +103,17 @@ pgb() { kubectl -n "$NS" exec pg -- pgbench -h 127.0.0.1 -U postgres "$@" postgr
 # db_deploy — bring up the workload pod and wait for it to accept TCP.
 db_deploy() {
     if [ "$DB" = mysql ]; then
+        # MySQL 8.4 has no server --skip-ssl; the clients opt out of TLS with
+        # --ssl-mode=DISABLED so the wire stays plaintext for the capture, and
+        # --get-server-public-key auths caching_sha2 over that link (plan risk 2).
         kubectl -n "$NS" run db --image="$DB_IMAGE" \
             --env=MYSQL_ROOT_PASSWORD=pw --env=MYSQL_DATABASE=bench \
-            --port=3306 -- mysqld --skip-ssl >/dev/null
+            --port=3306 -- mysqld >/dev/null
         kubectl -n "$NS" wait --for=condition=Ready pod/db --timeout=180s >/dev/null
         for _ in $(seq 1 60); do
             kubectl -n "$NS" exec db -- \
-                mysql --skip-ssl -h 127.0.0.1 -uroot -ppw -e 'SELECT 1' >/dev/null 2>&1 && break
+                mysql --ssl-mode=DISABLED --get-server-public-key -h 127.0.0.1 -uroot -ppw \
+                -e 'SELECT 1' >/dev/null 2>&1 && break
             sleep 2
         done
     else
@@ -130,7 +134,7 @@ db_load() {
         kubectl -n "$NS" exec db -- bash -c '
             end=$(( $(date +%s) + '"$secs"' ))
             while [ "$(date +%s)" -lt "$end" ]; do
-                mysql --skip-ssl -h 127.0.0.1 -uroot -ppw bench \
+                mysql --ssl-mode=DISABLED --get-server-public-key -h 127.0.0.1 -uroot -ppw bench \
                     -e "SELECT 1; SELECT COUNT(*) FROM information_schema.tables;" \
                     >/dev/null 2>&1
             done' >/dev/null 2>&1
