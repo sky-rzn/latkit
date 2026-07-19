@@ -12,6 +12,11 @@
 #     a syntax error                         -> error rate + SQLSTATE breakdown
 #                                               (42S02 / 23000 / 42000);
 #   - a multi-row SELECT                     -> rows/query, time-to-first-row.
+#   - explicit START TRANSACTION..COMMIT
+#     and ..ROLLBACK                         -> transaction duration (ok/aborted);
+#                                               autocommit statements never set
+#                                               SERVER_STATUS_IN_TRANS, so without
+#                                               these the txn panel is dead.
 set -u
 
 HOST="${MYSQL_HOST:-mysql}"
@@ -58,6 +63,20 @@ done
 ( while :; do
     printf 'SELECT count(*), avg(abalance) FROM accounts WHERE id < 100;\n'
     printf 'SELECT id, abalance FROM accounts WHERE id <= 500;\n'
+  done ) | "${MY[@]}" >/dev/null 2>&1 &
+
+# Explicit transactions: give latkit_txn_duration_seconds its IN_TRANS edge. A
+# COMMIT (status 'ok') and a ROLLBACK (status 'aborted') per loop so both series
+# of the "Transaction duration (p95 by status)" panel are populated.
+( while :; do
+    id1=$(( RANDOM % 10000 + 1 )); id2=$(( RANDOM % 10000 + 1 ))
+    printf 'START TRANSACTION;\n'
+    printf 'UPDATE accounts SET abalance = abalance + 1 WHERE id = %d;\n' "$id1"
+    printf 'SELECT abalance FROM accounts WHERE id = %d;\n' "$id2"
+    printf 'COMMIT;\n'
+    printf 'START TRANSACTION;\n'
+    printf 'UPDATE accounts SET abalance = abalance - 1 WHERE id = %d;\n' "$id1"
+    printf 'ROLLBACK;\n'
   done ) | "${MY[@]}" >/dev/null 2>&1 &
 
 # Spice: a visible tail and the three error classes, each on its own short-lived
