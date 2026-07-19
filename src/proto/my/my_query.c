@@ -35,6 +35,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h> /* strncasecmp for the ROLLBACK verb probe */
 
 #include "my_wire.h"
 #include "reassembly.h" /* LK_MSG_* flags, LK_MSG_BODY_MAX */
@@ -135,23 +136,60 @@ void my_query_rescue_ref(struct my_conn *pc, int slot)
     u->prep_idx = -1;
 }
 
-/* Resolve the unit's text into the observation (borrowed for on_query). */
-static void fill_text(struct my_conn *pc, const struct my_unit *u, struct lk_query_obs *o)
+/* Resolve the unit's borrowed SQL text: prepared statements read from the stmt
+ * cache, COM_QUERY from the owned buffer. *text stays NULL / *len 0 when the
+ * text is unknown (NO_TEXT, stale prepared reference, empty). */
+static void unit_text(const struct my_conn *pc, const struct my_unit *u, const char **text,
+                      __u32 *len)
 {
+    *text = NULL;
+    *len = 0;
     if (u->flags & LK_QO_NO_TEXT)
         return;
     if (u->prep_idx >= 0 && pc->prep) {
         const struct my_prep *e = &pc->prep->e[u->prep_idx];
 
         if (e->used && e->gen == u->prep_gen && e->text_len) {
-            o->text = e->text;
-            o->text_len = e->text_len;
+            *text = e->text;
+            *len = e->text_len;
         }
         /* else: a stale reference the rescue missed — no text, defensive */
     } else if (u->own_len) {
-        o->text = u->own_text;
-        o->text_len = u->own_len;
+        *text = u->own_text;
+        *len = u->own_len;
     }
+}
+
+/* Resolve the unit's text into the observation (borrowed for on_query). */
+static void fill_text(struct my_conn *pc, const struct my_unit *u, struct lk_query_obs *o)
+{
+    unit_text(pc, u, &o->text, &o->text_len);
+}
+
+/* Did the statement that closed the transaction close it with an explicit
+ * ROLLBACK? MySQL answers a ROLLBACK with a plain OK — no error, and its status
+ * flags are indistinguishable from a COMMIT — so the statement verb is the only
+ * signal that maps a MySQL transaction to the 'aborted' half of
+ * latkit_txn_duration_seconds. ROLLBACK TO SAVEPOINT keeps SERVER_STATUS_IN_TRANS
+ * set and so never reaches the T->I edge this runs on, making a leading-token
+ * match unambiguous. */
+static bool unit_is_rollback(const struct my_conn *pc, const struct my_unit *u)
+{
+    const char *t;
+    __u32 n, i = 0;
+
+    unit_text(pc, u, &t, &n);
+    if (!t)
+        return false;
+    while (i < n && (t[i] == ' ' || t[i] == '\t' || t[i] == '\n' || t[i] == '\r'))
+        i++;
+    if (n - i < 8 || strncasecmp(t + i, "ROLLBACK", 8) != 0)
+        return false;
+    i += 8; /* word boundary: reject ROLLBACKS / ROLLBACK_x identifiers */
+    if (i == n)
+        return true;
+    return !((t[i] >= 'A' && t[i] <= 'Z') || (t[i] >= 'a' && t[i] <= 'z') ||
+             (t[i] >= '0' && t[i] <= '9') || t[i] == '_');
 }
 
 /* Skip one binary-protocol parameter value by its type (the value part of a
@@ -439,8 +477,15 @@ static void txn_track(struct lk_proto *p, struct lk_conn *c, struct my_conn *pc,
     status = (ok->status & MY_ST_IN_TRANS) ? 'T' : 'I';
     if (status == 'T' && pc->txn_status != 'T')
         pc->txn_start_ns = ts_ns;
-    else if (status == 'I' && pc->txn_status == 'T' && p->out.on_txn)
-        p->out.on_txn(p->out.ctx, c, pc->txn_start_ns, ts_ns, 'T');
+    else if (status == 'I' && pc->txn_status == 'T' && p->out.on_txn) {
+        /* 'E' (aborted) when the closing statement was an explicit ROLLBACK,
+         * else 'T' (committed) — the sink maps 'E' to status="aborted". Only a
+         * live unit carries a trustworthy verb; a status-bearing service OK
+         * reuses a stale text buffer, so treat it as committed. */
+        char final = (pc->unit_open && unit_is_rollback(pc, &pc->u)) ? 'E' : 'T';
+
+        p->out.on_txn(p->out.ctx, c, pc->txn_start_ns, ts_ns, final);
+    }
     pc->txn_status = status;
 }
 

@@ -378,6 +378,30 @@ static int test_txn(void)
     return 0;
 }
 
+/* A transaction closed by an explicit ROLLBACK reports 'E' (aborted): MySQL
+ * answers ROLLBACK with a plain OK whose status is identical to a COMMIT's, so
+ * the verb of the closing statement is the only signal. */
+static int test_txn_rollback(void)
+{
+    SETUP(CAPS_NEW, 0);
+
+    query(sink, &c, "BEGIN", 1000);
+    be_ok(sink, &c, 0, MY_ST_IN_TRANS, 1010);
+    CHECK(r.last.txn_status == 'T');
+    query(sink, &c, "UPDATE t SET x = 1", 2000);
+    be_ok(sink, &c, 1, MY_ST_IN_TRANS, 2010);
+    CHECK(r.ntxn == 0);
+    query(sink, &c, "ROLLBACK", 3000);
+    be_ok(sink, &c, 0, 0x0002, 3010);
+
+    CHECK(r.ntxn == 1);
+    CHECK(r.txn_start == 1010 && r.txn_end == 3010 && r.txn_final == 'E');
+
+    TEARDOWN();
+    printf("ok txn-rollback\n");
+    return 0;
+}
+
 /* LOAD DATA LOCAL: 0xFB + filename -> COPY_IN, client data packets counted by
  * length, the empty packet ends the stream, the final OK supplies rows. */
 static int test_load_data(void)
@@ -766,11 +790,11 @@ static int test_corrupt_head(void)
 int main(void)
 {
     if (test_select_old() || test_select_deprecate() || test_dml() || test_error() ||
-        test_progress() || test_multi_resultset() || test_txn() || test_load_data() ||
-        test_query_attributes() || test_synthetic_sniff() || test_cursor_fetch() ||
-        test_anchor_discipline() || test_resync_drop() || test_close_drop() || test_text_trunc() ||
-        test_blind_head() || test_blind_coldef() || test_service_and_unknown() ||
-        test_binlog_ignore() || test_corrupt_head())
+        test_progress() || test_multi_resultset() || test_txn() || test_txn_rollback() ||
+        test_load_data() || test_query_attributes() || test_synthetic_sniff() ||
+        test_cursor_fetch() || test_anchor_discipline() || test_resync_drop() ||
+        test_close_drop() || test_text_trunc() || test_blind_head() || test_blind_coldef() ||
+        test_service_and_unknown() || test_binlog_ignore() || test_corrupt_head())
         return 1;
     printf("ok\n");
     return 0;
