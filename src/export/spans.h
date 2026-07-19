@@ -56,10 +56,13 @@ struct lk_span {
     uint64_t rows;
     char name[LK_SPAN_NAME_MAX]; /* normalised text prefix, NUL-terminated */
     char db[64], user[64];       /* db.namespace, db.user */
+    const char *db_system;       /* OTel db.system.name; borrowed static string
+                                    from lk_proto_ops.db_system (М6) */
     char *text;                  /* db.query.text bytes; NULL if none */
     uint32_t text_len;
-    char sqlstate[6]; /* on error, C-string */
-    uint8_t kind;     /* enum lk_query_kind */
+    char sqlstate[6];  /* on error, C-string */
+    uint16_t err_code; /* vendor error code (MySQL errno); 0 = none (М6) */
+    uint8_t kind;      /* enum lk_query_kind */
     bool error;
     bool have_rows;
 };

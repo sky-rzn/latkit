@@ -195,8 +195,14 @@ static void session_ok(struct lk_proto *p, struct lk_conn *c, struct my_conn *pc
     pc->sess = MY_S_DONE;
     /* Compression negotiated (РМ7): the framer flipped the connection to
      * LK_CONN_IGNORE on this very OK — the labels above are the whole point
-     * of parsing a compressed connection's handshake (a named blind spot). */
-    pc->phase = (c->flags & LK_CONN_IGNORE) ? MY_PH_IGNORE : MY_PH_READY;
+     * of parsing a compressed connection's handshake (a named blind spot).
+     * Counted per reason (М6): latkit_ignored_conns_total{reason="compressed"}. */
+    if (c->flags & LK_CONN_IGNORE) {
+        pc->phase = MY_PH_IGNORE;
+        p->st.compressed_conns++;
+    } else {
+        pc->phase = MY_PH_READY;
+    }
     if (!pc->session_emitted) {
         pc->session_emitted = true;
         p->st.sessions++;

@@ -85,13 +85,15 @@ static int test_ok_query(void)
     feed(m, &o);
     dump(m, buf, sizeof(buf));
 
-    CHECK(has(buf,
-              "latkit_queries_total{db=\"app\",user=\"alice\",kind=\"simple\",code=\"ok\"} 1\n"));
+    CHECK(has(buf, "latkit_queries_total{db=\"app\",user=\"alice\",proto=\"pg\",kind=\"simple\","
+                   "code=\"ok\"} 1\n"));
     CHECK(has(buf, "latkit_query_duration_seconds_count{query=\"select ?\",db=\"app\","
-                   "user=\"alice\",code=\"ok\"} 1\n"));
+                   "user=\"alice\",proto=\"pg\",code=\"ok\"} 1\n"));
     CHECK(has(buf, "latkit_query_duration_seconds_sum{query=\"select ?\",db=\"app\","
-                   "user=\"alice\",code=\"ok\"} 0.5\n"));
-    CHECK(has(buf, "latkit_query_rows_total{query=\"select ?\",db=\"app\",user=\"alice\"} 3\n"));
+                   "user=\"alice\",proto=\"pg\",code=\"ok\"} 0.5\n"));
+    CHECK(has(buf,
+              "latkit_query_rows_total{query=\"select ?\",db=\"app\",user=\"alice\",proto=\"pg\"} "
+              "3\n"));
     lk_metrics_free(m);
     return 0;
 }
@@ -118,10 +120,11 @@ static int test_error_query(void)
     feed(m, &o);
     dump(m, buf, sizeof(buf));
 
-    CHECK(has(
-        buf, "latkit_queries_total{db=\"app\",user=\"alice\",kind=\"simple\",code=\"error\"} 1\n"));
+    CHECK(has(buf, "latkit_queries_total{db=\"app\",user=\"alice\",proto=\"pg\",kind=\"simple\","
+                   "code=\"error\"} 1\n"));
     CHECK(has(buf, "code=\"error\"} 1\n")); /* duration series carries code=error */
-    CHECK(has(buf, "latkit_query_errors_total{sqlstate=\"22012\",db=\"app\",user=\"alice\"} 1\n"));
+    CHECK(has(buf, "latkit_query_errors_total{sqlstate=\"22012\",db=\"app\",user=\"alice\","
+                   "proto=\"pg\"} 1\n"));
     lk_metrics_free(m);
     return 0;
 }
@@ -171,7 +174,7 @@ static int test_no_text_other(void)
 
     CHECK(has(buf, "kind=\"extended\",code=\"ok\"} 1\n"));
     CHECK(has(buf, "latkit_query_duration_seconds_count{query=\"other\",db=\"app\","
-                   "user=\"alice\",code=\"ok\"} 1\n"));
+                   "user=\"alice\",proto=\"pg\",code=\"ok\"} 1\n"));
     CHECK(has(buf, "latkit_queries_other_total 1\n"));
     lk_metrics_free(m);
     return 0;
@@ -223,13 +226,13 @@ static int test_pipelined_duration(void)
     feed(standalone, &o); /* not pipelined -> ts_ready = 0.5 */
     dump(standalone, buf, sizeof(buf));
     CHECK(has(buf, "latkit_query_duration_seconds_sum{query=\"select ?\",db=\"app\","
-                   "user=\"alice\",code=\"ok\"} 0.5\n"));
+                   "user=\"alice\",proto=\"pg\",code=\"ok\"} 0.5\n"));
 
     o.flags = LK_QO_PIPELINED; /* pipelined -> ts_complete = 0.25 */
     feed(pipelined, &o);
     dump(pipelined, buf, sizeof(buf));
     CHECK(has(buf, "latkit_query_duration_seconds_sum{query=\"select ?\",db=\"app\","
-                   "user=\"alice\",code=\"ok\"} 0.25\n"));
+                   "user=\"alice\",proto=\"pg\",code=\"ok\"} 0.25\n"));
 
     lk_metrics_free(standalone);
     lk_metrics_free(pipelined);
@@ -251,13 +254,12 @@ static int test_txn(void)
     g_sink->on_txn(g_sink->ctx, &g_conn, 0, NS_250MS, 'E'); /* rolled back */
     dump(m, buf, sizeof(buf));
 
-    CHECK(
-        has(buf, "latkit_txn_duration_seconds_count{db=\"app\",user=\"alice\",status=\"ok\"} 1\n"));
-    CHECK(
-        has(buf, "latkit_txn_duration_seconds_sum{db=\"app\",user=\"alice\",status=\"ok\"} 0.5\n"));
-    CHECK(
-        has(buf,
-            "latkit_txn_duration_seconds_count{db=\"app\",user=\"alice\",status=\"aborted\"} 1\n"));
+    CHECK(has(buf, "latkit_txn_duration_seconds_count{db=\"app\",user=\"alice\",proto=\"pg\","
+                   "status=\"ok\"} 1\n"));
+    CHECK(has(buf, "latkit_txn_duration_seconds_sum{db=\"app\",user=\"alice\",proto=\"pg\","
+                   "status=\"ok\"} 0.5\n"));
+    CHECK(has(buf, "latkit_txn_duration_seconds_count{db=\"app\",user=\"alice\",proto=\"pg\","
+                   "status=\"aborted\"} 1\n"));
     lk_metrics_free(m);
     return 0;
 }
@@ -292,9 +294,9 @@ static int test_first_row_flag(void)
     feed(on, &o);
     dump(on, buf, sizeof(buf));
     CHECK(has(buf, "latkit_query_first_row_seconds_count{query=\"select ?\",db=\"app\","
-                   "user=\"alice\"} 1\n"));
+                   "user=\"alice\",proto=\"pg\"} 1\n"));
     CHECK(has(buf, "latkit_query_first_row_seconds_sum{query=\"select ?\",db=\"app\","
-                   "user=\"alice\"} 0.125\n"));
+                   "user=\"alice\",proto=\"pg\"} 0.125\n"));
     lk_metrics_free(off);
     lk_metrics_free(on);
     return 0;
@@ -376,6 +378,42 @@ static int test_providers(void)
     return 0;
 }
 
+/* A MySQL connection (conn->ops = lk_proto_my_ops) is labelled proto="mysql"
+ * (М6): the facade resolves the protocol through the connection, not the port. */
+static int test_mysql_proto_label(void)
+{
+    struct lk_metrics *m = lk_metrics_new(NULL);
+    struct lk_conn myconn = {.cookie = 0x5151, .ops = &lk_proto_my_ops};
+    char buf[65536];
+    struct lk_query_obs o = {
+        .ts_start_ns = 0,
+        .ts_complete_ns = NS_250MS,
+        .ts_ready_ns = NS_500MS,
+        .text = "select 1",
+        .text_len = 8,
+        .rows = 1,
+        .kind = LK_Q_SIMPLE,
+    };
+
+    CHECK(m);
+    set_session("shop", "root");
+    g_sink = lk_metrics_query_sink(m);
+    g_sink->on_query(g_sink->ctx, &myconn, &g_sess, &o);
+    dump(m, buf, sizeof(buf));
+
+    CHECK(has(buf, "latkit_queries_total{db=\"shop\",user=\"root\",proto=\"mysql\",kind=\"simple\","
+                   "code=\"ok\"} 1\n"));
+    CHECK(has(buf, "latkit_query_duration_seconds_count{query=\"select ?\",db=\"shop\","
+                   "user=\"root\",proto=\"mysql\",code=\"ok\"} 1\n"));
+    /* on_txn also inherits the connection's protocol via the session cache. */
+    g_sink->on_txn(g_sink->ctx, &myconn, 0, NS_500MS, 'T');
+    dump(m, buf, sizeof(buf));
+    CHECK(has(buf, "latkit_txn_duration_seconds_count{db=\"shop\",user=\"root\",proto=\"mysql\","
+                   "status=\"ok\"} 1\n"));
+    lk_metrics_free(m);
+    return 0;
+}
+
 /* The selfstats provider (task 4.4) emits the standard process_* series. */
 static int test_selfstats_provider(void)
 {
@@ -400,7 +438,8 @@ int main(void)
 {
     if (test_ok_query() || test_error_query() || test_no_duration() || test_no_text_other() ||
         test_truncated() || test_pipelined_duration() || test_txn() || test_first_row_flag() ||
-        test_scalars() || test_labeled_scalars() || test_providers() || test_selfstats_provider())
+        test_scalars() || test_labeled_scalars() || test_providers() || test_selfstats_provider() ||
+        test_mysql_proto_label())
         return 1;
     printf("test_metrics: all passed\n");
     return 0;

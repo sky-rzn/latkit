@@ -26,19 +26,26 @@ carry the `_total` suffix, per Prometheus convention.
 
 | Series | Type | Labels |
 |---|---|---|
-| `latkit_queries_total` | counter | `db, user, kind, code` — `kind`=`simple\|extended\|function\|copy_in\|copy_out\|cancel`; `code`=`ok\|error\|aborted\|canceled` |
-| `latkit_query_duration_seconds` | histogram | `query, db, user, code` — `code`=`ok\|error` (Р23/Р25) |
-| `latkit_query_first_row_seconds` | histogram | `query, db, user` — opt-in, `--first-row-hist` (Р24) |
-| `latkit_query_rows_total` | counter | `query, db, user` — rows from `CommandComplete` |
-| `latkit_query_errors_total` | counter | `sqlstate, db, user` — **no** `query` label (Р23) |
+| `latkit_queries_total` | counter | `db, user, proto, kind, code` — `kind`=`simple\|extended\|function\|copy_in\|copy_out\|cancel`; `code`=`ok\|error\|aborted\|canceled` |
+| `latkit_query_duration_seconds` | histogram | `query, db, user, proto, code` — `code`=`ok\|error` (Р23/Р25) |
+| `latkit_query_first_row_seconds` | histogram | `query, db, user, proto` — opt-in, `--first-row-hist` (Р24) |
+| `latkit_query_rows_total` | counter | `query, db, user, proto` — rows from `CommandComplete` |
+| `latkit_query_errors_total` | counter | `sqlstate, db, user, proto` — **no** `query` label (Р23) |
 | `latkit_queries_truncated_total` | counter | — observations whose SQL was a budget-truncated prefix |
 | `latkit_queries_other_total` | counter | — observations folded into `query="other"` (top-K honesty) |
-| `latkit_txn_duration_seconds` | histogram | `db, user, status` — `status`=`ok\|aborted` (`T→I` vs `E→I` at `ReadyForQuery`) |
+| `latkit_txn_duration_seconds` | histogram | `db, user, proto, status` — `status`=`ok\|aborted` (PG: `T→I` vs `E→I` at `ReadyForQuery`; MySQL: the `SERVER_STATUS_IN_TRANS` edge) |
 
 `code="error"` in the duration histogram is deliberately just `ok|error`, not
 the raw SQLSTATE: a SQLSTATE label in the `query × db × user` product would
 explode the series count. Per-SQLSTATE detail lives, query-free, in
 `latkit_query_errors_total`.
+
+The `proto` label (`pg`\|`mysql`, РМ6) is present on every query family
+**always**, not only when both protocols run: it is the wire protocol of the
+connection (from `lk_conn.ops`), so a single-DBMS deployment simply pins it to
+one value while a mixed one never blurs the two `(db,user,query)` spaces. It is
+an orthogonal axis to the `(db,user)` cardinality limit — the per-`(db,user)`
+`other` spill stays split per protocol.
 
 ### Connection and self metrics (Р27)
 
@@ -50,9 +57,10 @@ explode the series count. Per-SQLSTATE detail lives, query-free, in
 | `latkit_ringbuf_dropped_total` | counter | kernel per-CPU `stats` (summed) |
 | `latkit_events_total{dir}` | counter | kernel per-CPU `stats` |
 | `latkit_resync_total` | counter | framer `lk_reasm_stats.resyncs` |
-| `latkit_parse_errors_total` | counter | PG parser |
-| `latkit_unknown_msgs_total` | counter | PG parser |
-| `latkit_queries_dropped_total{reason}` | counter | parser `units_dropped_*` — `reason`=`resync\|disconnect\|overflow` (Р19) |
+| `latkit_parse_errors_total{proto}` | counter | protocol parser, split by `proto`=`pg\|mysql` (РМ6) |
+| `latkit_unknown_msgs_total{proto}` | counter | protocol parser, per `proto` |
+| `latkit_queries_dropped_total{reason, proto}` | counter | parser `units_dropped_*` — `reason`=`resync\|disconnect\|overflow` (Р19), per `proto` |
+| `latkit_ignored_conns_total{reason, proto}` | counter | deliberate blind zones — `reason`=`replication\|compressed` (РМ7/РМ8), per `proto` |
 | `latkit_metric_series` | gauge | the registry itself — live count of cardinality-controlled series |
 | `process_cpu_seconds_total` | counter | `getrusage(2)` |
 | `process_resident_memory_bytes` | gauge | `/proc/self/statm` |

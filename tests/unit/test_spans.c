@@ -217,6 +217,37 @@ static int test_text(void)
     return 0;
 }
 
+/* A MySQL connection stamps the span's db_system and, on error, the vendor
+ * errno alongside the SQLSTATE (М6). */
+static int test_mysql_span(void)
+{
+    struct lk_spans_cfg cfg = {.sample_ratio = 1.0, .seed = 1};
+    struct lk_spans *s = lk_spans_new(&cfg);
+    struct capture cap = {0};
+    const struct lk_query_sink *sink = lk_spans_sink(s);
+    struct lk_conn c = {.cookie = 7, .ops = &lk_proto_my_ops};
+    struct lk_query_obs o = {
+        .ts_start_ns = 1000,
+        .ts_complete_ns = 1000 + 5000000,
+        .text = "select 1/0",
+        .text_len = 10,
+        .kind = LK_Q_SIMPLE,
+        .flags = LK_QO_ERROR,
+        .err_code = 1365, /* ER_DIVISION_BY_ZERO */
+    };
+
+    set_session("shop", "root");
+    snprintf(o.sqlstate, sizeof(o.sqlstate), "%s", "22012");
+    sink->on_query(sink->ctx, &c, &g_sess, &o);
+    lk_spans_drain(s, cap_emit, &cap);
+    EXPECT(cap.n == 1 && cap.spans[0].db_system && !strcmp(cap.spans[0].db_system, "mysql"),
+           "span db_system = mysql");
+    EXPECT(cap.n == 1 && cap.spans[0].err_code == 1365, "span carries mysql errno");
+    EXPECT(cap.n == 1 && !strcmp(cap.spans[0].sqlstate, "22012"), "span keeps sqlstate too");
+    lk_spans_free(s);
+    return 0;
+}
+
 /* ---- text truncation ----------------------------------------------------- */
 
 static int test_text_max(void)
@@ -240,6 +271,7 @@ int main(void)
     test_overflow();
     test_text();
     test_text_max();
+    test_mysql_span();
     printf(failures ? "\n%d FAILURES\n" : "\nall span tests passed\n", failures);
     return failures ? 1 : 0;
 }

@@ -170,7 +170,10 @@ set(PROTO_INC ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
               ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/pg
               ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/my
               ${CMAKE_CURRENT_SOURCE_DIR}/src/agent
-              ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf)
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf
+              # proto.h carries enum lk_sql_dialect (lk_proto_ops.sql_dialect,
+              # М6) — a header-only dependency, latkit_norm is not linked here
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/norm)
 add_library(latkit_proto STATIC ${PROTO_SRC})
 target_include_directories(latkit_proto PUBLIC ${PROTO_INC})
 
@@ -191,14 +194,16 @@ target_include_directories(latkit_norm SYSTEM PRIVATE
 # (proto.h, types only) — hence the proto/agent/bpf header dirs — but still no
 # libbpf. selfstats.c (task 4.4) is the one impure member: it reads getrusage /
 # procfs for the process_* series, still with no libbpf. The histogram needs
-# libm (frexp/ldexp).
+# libm (frexp/ldexp). Since М6 the aggregator resolves a connection's protocol
+# through lk_conn_proto (proto.h), which references lk_proto_pg_ops as the NULL
+# default — so it links latkit_proto (pure, no cycle: proto has no link deps).
 add_library(latkit_metrics STATIC
     src/metrics/hist.c src/metrics/registry.c src/metrics/metrics.c src/metrics/selfstats.c)
 target_include_directories(latkit_metrics PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/metrics)
 target_include_directories(latkit_metrics PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/proto ${CMAKE_CURRENT_SOURCE_DIR}/src/agent
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf)
-target_link_libraries(latkit_metrics PUBLIC m latkit_norm)
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/norm ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf)
+target_link_libraries(latkit_metrics PUBLIC m latkit_norm latkit_proto)
 
 # --- exporters (stage 5) ---------------------------------------------------
 # src/export/** is the pull/push export layer (Р29-Р31): it depends only on

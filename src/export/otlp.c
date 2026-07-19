@@ -212,7 +212,7 @@ static void enc_span(struct pbuf *pb, const struct lk_span *sp, const struct lk_
     pb_field_fixed64(pb, 7, lk_wall_ns(tb, sp->start_ns));
     pb_field_fixed64(pb, 8, lk_wall_ns(tb, sp->end_ns));
 
-    enc_str_kv(pb, 9, "db.system.name", "postgresql");
+    enc_str_kv(pb, 9, "db.system.name", sp->db_system ? sp->db_system : "postgresql");
     if (sp->db[0])
         enc_str_kv(pb, 9, "db.namespace", sp->db);
     if (sp->user[0])
@@ -226,6 +226,10 @@ static void enc_span(struct pbuf *pb, const struct lk_span *sp, const struct lk_
 
         if (sp->sqlstate[0])
             enc_str_kv(pb, 9, "db.response.status_code", sp->sqlstate);
+        /* MySQL vendor error number, when the parser captured one (М6): SQLSTATE
+         * carries the class, errno the specific code. PG has no numeric code. */
+        if (sp->err_code)
+            enc_int_kv(pb, 9, "db.mysql.error_code", sp->err_code);
         st = pb_submsg_begin(pb, 15); /* Status */
         pb_field_varint(pb, 3, OTLP_STATUS_ERROR);
         pb_submsg_end(pb, st);

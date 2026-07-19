@@ -4,7 +4,8 @@
   "description": "Top-N normalised queries by p99 / total time / frequency / errors.",
   "tags": [
     "latkit",
-    "postgres"
+    "postgres",
+    "mysql"
   ],
   "timezone": "browser",
   "schemaVersion": 39,
@@ -48,6 +49,29 @@
         "regex": "",
         "skipUrlSync": false,
         "type": "datasource"
+      },
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(latkit_queries_total, proto)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "proto",
+        "multi": true,
+        "name": "proto",
+        "options": [],
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query",
+        "query": {
+          "query": "label_values(latkit_queries_total, proto)",
+          "refId": "StandardVariableQuery"
+        },
+        "allValue": ".*"
       },
       {
         "current": {
@@ -178,7 +202,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "topk($topk, histogram_quantile(0.99, sum by (le, query) (rate(latkit_query_duration_seconds_bucket[$__rate_interval]))))",
+          "expr": "topk($topk, histogram_quantile(0.99, sum by (le, query) (rate(latkit_query_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval]))))",
           "refId": "A",
           "range": false,
           "instant": true,
@@ -274,7 +298,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "topk($topk, sum by (query) (rate(latkit_query_duration_seconds_sum[$__rate_interval])))",
+          "expr": "topk($topk, sum by (query) (rate(latkit_query_duration_seconds_sum{proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "A",
           "range": false,
           "instant": true,
@@ -370,7 +394,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "topk($topk, sum by (query) (rate(latkit_query_duration_seconds_count[$__rate_interval])))",
+          "expr": "topk($topk, sum by (query) (rate(latkit_query_duration_seconds_count{proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "A",
           "range": false,
           "instant": true,
@@ -466,7 +490,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "topk($topk, sum by (query) (rate(latkit_query_duration_seconds_count{code=\"error\"}[$__rate_interval])))",
+          "expr": "topk($topk, sum by (query) (rate(latkit_query_duration_seconds_count{code=\"error\",proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "A",
           "range": false,
           "instant": true,
@@ -534,7 +558,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(latkit_query_duration_seconds_bucket{query=~\"$query\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(latkit_query_duration_seconds_bucket{query=~\"$query\",proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "A",
           "range": true,
           "instant": false,
@@ -546,7 +570,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_query_duration_seconds_bucket{query=~\"$query\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_query_duration_seconds_bucket{query=~\"$query\",proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "B",
           "range": true,
           "instant": false,
@@ -558,7 +582,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_query_duration_seconds_bucket{query=~\"$query\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_query_duration_seconds_bucket{query=~\"$query\",proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "C",
           "range": true,
           "instant": false,

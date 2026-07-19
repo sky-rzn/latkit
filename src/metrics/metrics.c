@@ -47,13 +47,17 @@ struct sess_ent {
     uint64_t cookie;
     bool used;
     char db[64], user[64];
+    const char *proto; /* lk_proto_ops.name (static string); NULL -> "pg" */
 };
 
 /* Flat named scalar series (Р27): connections in task 4.3, the self-metric
  * providers in 4.4. Each series is keyed by (name, one optional label); several
  * label values of one name form a single family. Bounded by the fixed set. */
 enum { LK_SC_COUNTER, LK_SC_GAUGE };
-#define LK_MAX_SCALARS 64
+/* Headroom for the per-protocol self-metric split (М6/РМ6): parser counters,
+ * queries_dropped{reason} and ignored_conns{reason} are now emitted once per
+ * registered protocol, several-fold more series than the flat pre-М6 set. */
+#define LK_MAX_SCALARS 128
 
 struct scalar {
     char name[64];
@@ -94,7 +98,8 @@ static uint32_t sess_slot(uint64_t cookie)
     return (uint32_t)((cookie ^ (cookie >> 29)) & (LK_SESS_CACHE - 1));
 }
 
-static void sess_store(struct lk_metrics *m, uint64_t cookie, const char *db, const char *user)
+static void sess_store(struct lk_metrics *m, uint64_t cookie, const char *db, const char *user,
+                       const char *proto)
 {
     struct sess_ent *e = &m->sess[sess_slot(cookie)];
 
@@ -102,6 +107,7 @@ static void sess_store(struct lk_metrics *m, uint64_t cookie, const char *db, co
     e->used = true;
     snprintf(e->db, sizeof(e->db), "%s", db ? db : "");
     snprintf(e->user, sizeof(e->user), "%s", user ? user : "");
+    e->proto = proto; /* borrowed static string from lk_proto_ops.name */
 }
 
 static const struct sess_ent *sess_get(struct lk_metrics *m, uint64_t cookie)
@@ -115,7 +121,7 @@ static const struct sess_ent *sess_get(struct lk_metrics *m, uint64_t cookie)
 
 static void mx_on_session(void *ctx, const struct lk_conn *c, const struct lk_session *s)
 {
-    sess_store(ctx, c->cookie, s->database, s->user);
+    sess_store(ctx, c->cookie, s->database, s->user, lk_conn_proto(c)->name);
 }
 
 /* One observation -> the registry families. The flag mapping (Р23/Р25/Р28):
@@ -129,12 +135,14 @@ static void mx_on_query(void *ctx, const struct lk_conn *c, const struct lk_sess
     struct lk_metrics *m = ctx;
     struct lk_reg_obs ro = {0};
     struct lk_norm_out norm;
+    const struct lk_proto_ops *ops = lk_conn_proto(c);
     uint16_t fl = o->flags;
 
-    sess_store(m, c->cookie, s->database, s->user);
+    sess_store(m, c->cookie, s->database, s->user, ops->name);
 
     ro.db = s->database;
     ro.user = s->user;
+    ro.proto = ops->name;
     ro.kind = o->kind;
 
     if (o->kind == LK_Q_CANCEL) {
@@ -175,9 +183,7 @@ static void mx_on_query(void *ctx, const struct lk_conn *c, const struct lk_sess
     if ((fl & LK_QO_NO_TEXT) || o->kind == LK_Q_CANCEL || !o->text) {
         ro.force_other = true;
     } else {
-        /* Dialect stays pinned to PG until М6 threads the protocol through
-         * the observation path (conn->ops), together with the proto label. */
-        lk_norm_sql(o->text, o->text_len, LK_SQL_PG, &norm);
+        lk_norm_sql(o->text, o->text_len, ops->sql_dialect, &norm);
         ro.fp = norm.fp;
         ro.label = norm.text;
         ro.truncated = norm.trunc || (fl & LK_QO_TEXT_TRUNC);
@@ -192,8 +198,11 @@ static void mx_on_txn(void *ctx, const struct lk_conn *c, __u64 start_ns, __u64 
     struct lk_metrics *m = ctx;
     const struct sess_ent *e = sess_get(m, c->cookie);
     double dur = end_ns > start_ns ? (double)(end_ns - start_ns) / LK_NS : 0.0;
+    /* Prefer the protocol cached with the session; fall back to the connection's
+     * own ops if the txn fired before any session/query was cached. */
+    const char *proto = (e && e->proto) ? e->proto : lk_conn_proto(c)->name;
 
-    lk_reg_observe_txn(m->reg, e ? e->db : "", e ? e->user : "", final_status == 'E', dur);
+    lk_reg_observe_txn(m->reg, e ? e->db : "", e ? e->user : "", proto, final_status == 'E', dur);
 }
 
 const struct lk_query_sink *lk_metrics_query_sink(struct lk_metrics *m)

@@ -7,7 +7,7 @@ set(KERNEL_SRC
     ${CMAKE_SOURCE_DIR}/src/agent/record.c)
 set(KERNEL_INC ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent
     ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/pg
-    ${CMAKE_SOURCE_DIR}/tests/replay)
+    ${CMAKE_SOURCE_DIR}/src/norm ${CMAKE_SOURCE_DIR}/tests/replay)
 
 add_executable(pgstream pgstream.c ${KERNEL_SRC})
 target_include_directories(pgstream PRIVATE ${KERNEL_INC})

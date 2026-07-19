@@ -79,6 +79,12 @@ for f in "${files[@]}"; do
             "$f" >/dev/null; then
         err "$base: missing \$datasource template variable"
     fi
+    # proto template variable present (РМ6/М6): every dashboard filters by
+    # protocol so pg / mysql query spaces never blur together.
+    if ! jq -e '[.templating.list[]? | select(.name=="proto")] | length > 0' \
+            "$f" >/dev/null; then
+        err "$base: missing \$proto template variable (РМ6)"
+    fi
     # every datasource reference must be the variable (string form or {uid:${datasource}}),
     # or the built-in grafana datasource used by the default annotation.
     while IFS= read -r ds; do

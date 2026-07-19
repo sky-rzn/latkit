@@ -240,6 +240,8 @@ static bool my_resync_boundary(const struct lk_conn *c, enum lk_dir dir,
 
 const struct lk_proto_ops lk_proto_my_ops = {
     .name = "mysql",
+    .db_system = "mysql",
+    .sql_dialect = LK_SQL_MYSQL,
     .proto_new = lk_proto_my_new, /* the М3 handler, src/proto/my/my.c */
     .hdr_size = my_hdr_size,
     .parse_hdr = my_parse_hdr,

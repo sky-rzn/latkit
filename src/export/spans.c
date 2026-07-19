@@ -90,7 +90,8 @@ static bool should_sample(struct lk_spans *s, const struct lk_conn *c, const str
 /* db.system.name value plus enum kind pass-through are the encoder's job; here we
  * only capture what dangles after the callback. name = normalised prefix; text =
  * raw (or, masked, normalised) SQL bounded by text_max. */
-static void fill_text_and_name(struct lk_spans *s, struct lk_span *sp, const struct lk_query_obs *o)
+static void fill_text_and_name(struct lk_spans *s, struct lk_span *sp, const struct lk_query_obs *o,
+                               enum lk_sql_dialect dialect)
 {
     struct lk_norm_out norm;
 
@@ -100,9 +101,7 @@ static void fill_text_and_name(struct lk_spans *s, struct lk_span *sp, const str
     if (!o->text || (o->flags & LK_QO_NO_TEXT) || o->text_len == 0)
         return;
 
-    /* Dialect stays pinned to PG until М6 threads the protocol through the
-     * observation path (conn->ops), together with the proto span attribute. */
-    lk_norm_sql(o->text, o->text_len, LK_SQL_PG, &norm);
+    lk_norm_sql(o->text, o->text_len, dialect, &norm);
     {
         uint32_t nn = norm.text_len < sizeof(sp->name) - 1 ? norm.text_len : sizeof(sp->name) - 1;
 
@@ -129,6 +128,7 @@ static void spans_on_query(void *ctx, const struct lk_conn *c, const struct lk_s
                            const struct lk_query_obs *o)
 {
     struct lk_spans *s = ctx;
+    const struct lk_proto_ops *ops = lk_conn_proto(c);
     struct lk_span *sp;
     unsigned slot;
 
@@ -156,10 +156,12 @@ static void spans_on_query(void *ctx, const struct lk_conn *c, const struct lk_s
     if (o->flags & LK_QO_ERROR) {
         sp->error = true;
         snprintf(sp->sqlstate, sizeof(sp->sqlstate), "%s", o->sqlstate);
+        sp->err_code = o->err_code;
     }
+    sp->db_system = ops->db_system;
     snprintf(sp->db, sizeof(sp->db), "%s", sess->database);
     snprintf(sp->user, sizeof(sp->user), "%s", sess->user);
-    fill_text_and_name(s, sp, o);
+    fill_text_and_name(s, sp, o, ops->sql_dialect);
 
     s->count++;
     if (!s->wm_fired && s->count >= (LK_SPAN_BUF * 3) / 4) {

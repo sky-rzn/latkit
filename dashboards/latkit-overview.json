@@ -4,7 +4,8 @@
   "description": "QPS, latency percentiles, errors, connections, capture honesty.",
   "tags": [
     "latkit",
-    "postgres"
+    "postgres",
+    "mysql"
   ],
   "timezone": "browser",
   "schemaVersion": 39,
@@ -62,6 +63,29 @@
         "regex": "",
         "skipUrlSync": false,
         "type": "datasource"
+      },
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(latkit_queries_total, proto)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "proto",
+        "multi": true,
+        "name": "proto",
+        "options": [],
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query",
+        "query": {
+          "query": "label_values(latkit_queries_total, proto)",
+          "refId": "StandardVariableQuery"
+        },
+        "allValue": ".*"
       }
     ]
   },
@@ -118,7 +142,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(latkit_query_duration_seconds_count[$__rate_interval]))",
+          "expr": "sum(rate(latkit_query_duration_seconds_count{proto=~\"$proto\"}[$__rate_interval]))",
           "refId": "A",
           "range": true,
           "instant": false,
@@ -178,7 +202,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_query_duration_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_query_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "A",
           "range": true,
           "instant": false,
@@ -238,7 +262,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(latkit_query_errors_total[$__rate_interval])) / clamp_min(sum(rate(latkit_queries_total[$__rate_interval])), 1)",
+          "expr": "sum(rate(latkit_query_errors_total{proto=~\"$proto\"}[$__rate_interval])) / clamp_min(sum(rate(latkit_queries_total{proto=~\"$proto\"}[$__rate_interval])), 1)",
           "refId": "A",
           "range": true,
           "instant": false,
@@ -351,7 +375,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(latkit_query_duration_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(latkit_query_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "A",
           "range": true,
           "instant": false,
@@ -363,7 +387,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_query_duration_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_query_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "B",
           "range": true,
           "instant": false,
@@ -375,7 +399,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_query_duration_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_query_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "C",
           "range": true,
           "instant": false,
@@ -429,7 +453,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(latkit_queries_total[$__rate_interval]))",
+          "expr": "sum(rate(latkit_queries_total{proto=~\"$proto\"}[$__rate_interval]))",
           "refId": "A",
           "range": true,
           "instant": false,
@@ -441,7 +465,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(latkit_query_errors_total[$__rate_interval]))",
+          "expr": "sum(rate(latkit_query_errors_total{proto=~\"$proto\"}[$__rate_interval]))",
           "refId": "B",
           "range": true,
           "instant": false,
@@ -571,7 +595,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (sqlstate) (rate(latkit_query_errors_total[$__rate_interval]))",
+          "expr": "sum by (sqlstate) (rate(latkit_query_errors_total{proto=~\"$proto\"}[$__rate_interval]))",
           "refId": "A",
           "range": true,
           "instant": false,
@@ -624,14 +648,14 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le, status) (rate(latkit_txn_duration_seconds_bucket[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le, status) (rate(latkit_txn_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "A",
           "range": true,
           "instant": false,
           "legendFormat": "{{status}}"
         }
       ],
-      "description": "ReadyForQuery status: ok (I from T) / aborted (I from E)."
+      "description": "Transaction outcome: ok (committed) / aborted (rolled back). PG reads it from ReadyForQuery (I from T / I from E); MySQL from the SERVER_STATUS_IN_TRANS edge on the statement terminator."
     },
     {
       "id": 10,

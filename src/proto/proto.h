@@ -38,6 +38,7 @@
 #include <stddef.h>
 
 #include "conn_table.h" /* struct lk_conn, enum lk_dir */
+#include "norm_sql.h"   /* enum lk_sql_dialect (lk_proto_ops.sql_dialect, РМ9/М6) */
 #include "reassembly.h" /* struct lk_msg, struct lk_msg_sink (down contract) */
 
 /* --- up contract: protocol-independent query observations ----------------- */
@@ -78,6 +79,8 @@ struct lk_query_obs {
     __u64 rows;       /* from the CommandComplete tag; summed on MULTI_STMT */
     __u64 bytes;      /* COPY: summed len of CopyData */
     char sqlstate[6]; /* on LK_QO_ERROR, C-string */
+    __u16 err_code;   /* vendor error code (MySQL errno) on LK_QO_ERROR; 0 =
+                         none/unknown (PG has no numeric code) — М6 span attr */
     __u8 kind;        /* enum lk_query_kind */
     char txn_status;  /* I/T/E from the closing Z; 0 = unknown */
     __u16 flags;      /* LK_QO_* */
@@ -112,7 +115,8 @@ struct lk_proto_stats {
     __u64 units_dropped_overflow; /* ... over LK_PG_MAX_INFLIGHT */
     __u64 prep_evictions;         /* prepared-statement cache evictions */
     __u64 sessions;               /* on_session emitted */
-    __u64 replication_conns;      /* CopyBoth -> IGNORE connections */
+    __u64 replication_conns;      /* CopyBoth / binlog dump -> IGNORE connections */
+    __u64 compressed_conns;       /* CLIENT_COMPRESS/_ZSTD -> IGNORE connections (РМ7) */
     __u64 by_type[2][256];        /* [enum lk_dir][type byte]; startup at [.][0] */
 };
 
@@ -183,7 +187,12 @@ struct lk_ev_data;
  *    a dirty direction before the bytes are fed (PG: frontend off==0 + valid
  *    type + plausible len). */
 struct lk_proto_ops {
-    const char *name;
+    const char *name;                /* the `--port N=<name>` selector AND the `proto`
+                                        metric label value (РМ6): "pg" / "mysql" */
+    const char *db_system;           /* OTel semconv db.system.name for the spans (М6):
+                                        "postgresql" / "mysql" */
+    enum lk_sql_dialect sql_dialect; /* normaliser dialect for this protocol's
+                                        SQL (РМ9; М6 threads it to the sinks) */
 
     struct lk_proto *(*proto_new)(const struct lk_query_sink *out);
 
@@ -203,6 +212,16 @@ struct lk_proto_ops {
  * default: a bare `--port N` and a connection without an assigned protocol
  * (lazily created entry, bare unit-test lk_conn) frame as PG (РМ2). */
 extern const struct lk_proto_ops lk_proto_pg_ops;
+
+/* A connection's effective protocol: NULL ops (no port map / lazily created
+ * entry / bare unit-test lk_conn) means the PG default, mirroring the framer's
+ * fallback in reassembly.c (РМ2). The observation sinks (metrics.c / spans.c)
+ * read the dialect, the `proto` label and db.system.name through this — never
+ * by guessing from the port (М6). */
+static inline const struct lk_proto_ops *lk_conn_proto(const struct lk_conn *c)
+{
+    return c->ops ? c->ops : &lk_proto_pg_ops;
+}
 
 /* MySQL classic protocol: framing in src/proto/my/my_frame.c (РМ3/РМ4), the
  * handler in src/proto/my/my.c + my_session/my_query/my_prep (М3, РМ8) —

@@ -397,13 +397,14 @@ void my_query_parse_ok(struct my_conn *pc, const struct lk_msg *m, bool eof_shap
  * false for a MariaDB progress packet (errno 0xFFFF under MARIADB_CLIENT_
  * PROGRESS) — an event, not an error, and not a terminator either. */
 static bool parse_err(struct lk_proto *p, struct my_conn *pc, const struct lk_msg *m,
-                      char sqlstate[6])
+                      char sqlstate[6], __u16 *err_code)
 {
     struct my_wire w;
     __u16 eno;
     __u8 mark;
 
     sqlstate[0] = '\0';
+    *err_code = 0;
     my_wire_init(&w, m->body, m->body_cap);
     if (!my_wire_skip(&w, 1) || !my_wire_get_u16(&w, &eno)) {
         if (!(m->flags & LK_MSG_BODY_TRUNC))
@@ -412,6 +413,7 @@ static bool parse_err(struct lk_proto *p, struct my_conn *pc, const struct lk_ms
     }
     if (eno == 0xffff && (pc->mcaps & MY_MCAP_PROGRESS))
         return false; /* progress report: swallow */
+    *err_code = eno;
     if (my_wire_get_u8(&w, &mark) && mark == '#') {
         const __u8 *s = w.p;
 
@@ -458,8 +460,10 @@ static void emit_unit(struct lk_proto *p, struct lk_conn *c, struct my_conn *pc)
     };
 
     fill_text(pc, u, &o);
-    if (u->flags & LK_QO_ERROR)
+    if (u->flags & LK_QO_ERROR) {
         memcpy(o.sqlstate, u->sqlstate, sizeof(o.sqlstate));
+        o.err_code = u->err_code;
+    }
     p->st.queries++;
     if (u->flags & LK_QO_ERROR)
         p->st.errors_sql++;
@@ -509,8 +513,9 @@ static void terminator_err(struct lk_proto *p, struct lk_conn *c, struct my_conn
                            const struct lk_msg *m)
 {
     char sqlstate[6];
+    __u16 err_code;
 
-    if (!parse_err(p, pc, m, sqlstate))
+    if (!parse_err(p, pc, m, sqlstate, &err_code))
         return; /* MariaDB progress packet: not a terminator */
     if (pc->phase == MY_PH_INFILE)
         pc->phase = MY_PH_READY;
@@ -520,6 +525,7 @@ static void terminator_err(struct lk_proto *p, struct lk_conn *c, struct my_conn
         return; /* auth/service errors carry no unit */
     pc->u.flags |= LK_QO_ERROR;
     memcpy(pc->u.sqlstate, sqlstate, sizeof(pc->u.sqlstate));
+    pc->u.err_code = err_code;
     pc->u.ts_complete_ns = m->ts_ns;
     if (pc->u.ncomplete == 0)
         pc->u.ncomplete = 1; /* the error is this statement's completion */

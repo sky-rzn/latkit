@@ -125,6 +125,7 @@ struct my_unit {
                               arrives — the reported observation kind */
     __u16 flags;           /* accumulated LK_QO_* */
     char sqlstate[6];      /* from ERR; valid on LK_QO_ERROR */
+    __u16 err_code;        /* MySQL errno from ERR; 0 = unknown (М6 span attr) */
 
     int prep_idx;   /* prep-cache slot referenced, or -1 (own_text / none) */
     __u32 prep_gen; /* generation of that slot at EXECUTE, validity check */

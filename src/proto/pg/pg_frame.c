@@ -194,6 +194,8 @@ static bool pg_resync_boundary(const struct lk_conn *c, enum lk_dir dir,
 
 const struct lk_proto_ops lk_proto_pg_ops = {
     .name = "pg",
+    .db_system = "postgresql",
+    .sql_dialect = LK_SQL_PG,
     .proto_new = lk_proto_pg_new,
     .hdr_size = pg_hdr_size,
     .parse_hdr = pg_parse_hdr,

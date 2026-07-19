@@ -16,10 +16,16 @@
  *   - a (db,user) dimension limit: cfg.max_session_dims distinct pairs, then
  *     db="other",user="other".
  *
- * The family carried here is latkit_query_duration_seconds{query,db,user,code}
- * (the cardinality-critical one); the flat self / connection counters attach at
- * the facade in tasks 4.3-4.4. Pure: no libbpf, I/O only via lk_reg_dump's
- * FILE. */
+ * Every dimensioned family additionally carries proto="pg"|"mysql" (РМ6, М6):
+ * the protocol is part of the interned dimension tuple, so the (db,user,query)
+ * spaces of two DBMSes never merge. proto is bounded by the protocol registry
+ * (LK_REG_MAX_PROTOS), not by max_session_dims — the (other,other) spill stays
+ * split per protocol for the same reason.
+ *
+ * The family carried here is latkit_query_duration_seconds{query,db,user,proto,
+ * code} (the cardinality-critical one); the flat self / connection counters
+ * attach at the facade in tasks 4.3-4.4. Pure: no libbpf, I/O only via
+ * lk_reg_dump's FILE. */
 #ifndef LATKIT_METRICS_REGISTRY_H
 #define LATKIT_METRICS_REGISTRY_H
 
@@ -42,20 +48,22 @@ void lk_reg_free(struct lk_registry *r);
  * that a single observation touches, so all of them share one dim interning and
  * one query-slot resolution:
  *
- *   - latkit_queries_total{db,user,kind,code}  (always; code = qcode, 4 values)
- *   - latkit_query_duration_seconds{query,db,user,code}   (if has_duration)
- *   - latkit_query_rows_total{query,db,user}              (if has_duration)
- *   - latkit_query_first_row_seconds{query,db,user}       (if enabled + has_first_row)
- *   - latkit_query_errors_total{sqlstate,db,user}         (if sqlstate != NULL)
- *   - latkit_queries_truncated_total                      (if truncated)
+ *   - latkit_queries_total{db,user,proto,kind,code}  (always; code = qcode)
+ *   - latkit_query_duration_seconds{query,db,user,proto,code}  (if has_duration)
+ *   - latkit_query_rows_total{query,db,user,proto}             (if has_duration)
+ *   - latkit_query_first_row_seconds{query,db,user,proto}      (if enabled + has_first_row)
+ *   - latkit_query_errors_total{sqlstate,db,user,proto}        (if sqlstate != NULL)
+ *   - latkit_queries_truncated_total                           (if truncated)
  *
  * `fp`/`label` come from the normaliser; `label` NULL or `force_other` routes
  * the query-keyed families to query="other" without consulting the dictionary
- * (NO_TEXT / CANCEL, Р28). db/user "" = unknown. */
+ * (NO_TEXT / CANCEL, Р28). db/user "" = unknown; proto NULL = "pg" (the
+ * protocol default, РМ2 — bare unit-test observations stay PG-shaped). */
 struct lk_reg_obs {
     uint64_t fp;
     const char *label; /* canonical text; NULL -> query="other" */
     const char *db, *user;
+    const char *proto;        /* lk_proto_ops.name; NULL -> "pg" (РМ6) */
     uint8_t kind;             /* enum lk_qkind (== enum lk_query_kind) */
     uint8_t qcode;            /* enum lk_qcode: ok|error|aborted|canceled */
     bool force_other;         /* skip the dictionary, record under query="other" */
@@ -72,10 +80,11 @@ struct lk_reg_obs {
 /* Fan one observation into all the families above, applying cardinality control. */
 void lk_reg_observe(struct lk_registry *r, const struct lk_reg_obs *o);
 
-/* Record one transaction span into latkit_txn_duration_seconds{db,user,status}
- * (status ok = T->I, aborted = E->I, Р16). db/user are the session labels. */
-void lk_reg_observe_txn(struct lk_registry *r, const char *db, const char *user, bool aborted,
-                        double dur_seconds);
+/* Record one transaction span into latkit_txn_duration_seconds{db,user,proto,
+ * status} (status ok = T->I, aborted = E->I, Р16). db/user are the session
+ * labels; proto as in lk_reg_obs (NULL -> "pg"). */
+void lk_reg_observe_txn(struct lk_registry *r, const char *db, const char *user, const char *proto,
+                        bool aborted, double dur_seconds);
 
 /* Prometheus text exposition of every registry-owned family, each as a
  * HELP/TYPE block followed by its series in a stable (sorted) order — a valid

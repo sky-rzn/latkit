@@ -199,7 +199,7 @@ static int test_dump_format(void)
     CHECK(contains(buf, "# HELP latkit_query_duration_seconds "));
     CHECK(contains(buf, "# TYPE latkit_query_duration_seconds histogram\n"));
     CHECK(contains(buf, "latkit_query_duration_seconds_count{query=\"select ?\",db=\"app\","
-                        "user=\"alice\",code=\"ok\"} 2\n"));
+                        "user=\"alice\",proto=\"pg\",code=\"ok\"} 2\n"));
     CHECK(contains(buf, "code=\"error\""));
     CHECK(contains(buf, "query=\"upd\\\"ate\"")); /* the " is backslash-escaped */
     CHECK(contains(buf, "le=\"+Inf\""));
@@ -207,10 +207,54 @@ static int test_dump_format(void)
     return 0;
 }
 
+/* The proto label (РМ6) is an orthogonal axis: the same (db,user,query) under
+ * two protocols yields two independent series, never a merged one. */
+static int test_proto_split(void)
+{
+    struct lk_registry *r = reg(8, 8);
+    char buf[16384];
+    struct lk_reg_obs pg = {
+        .fp = 1,
+        .label = "select ?",
+        .db = "app",
+        .user = "alice",
+        .proto = "pg",
+        .kind = LK_QK_SIMPLE,
+        .qcode = LK_QCODE_OK,
+        .has_duration = true,
+        .dcode = LK_CODE_OK,
+        .dur_seconds = 0.2,
+    };
+    struct lk_reg_obs my = pg;
+
+    CHECK(r);
+    my.proto = "mysql";
+    lk_reg_observe(r, &pg);
+    lk_reg_observe(r, &pg);
+    lk_reg_observe(r, &my); /* same fp/db/user, different protocol */
+
+    dump(r, buf, sizeof(buf));
+    /* Two separate duration series, each with its own count. */
+    CHECK(contains(buf, "latkit_query_duration_seconds_count{query=\"select ?\",db=\"app\","
+                        "user=\"alice\",proto=\"pg\",code=\"ok\"} 2\n"));
+    CHECK(contains(buf, "latkit_query_duration_seconds_count{query=\"select ?\",db=\"app\","
+                        "user=\"alice\",proto=\"mysql\",code=\"ok\"} 1\n"));
+    /* queries_total keeps them apart too. */
+    CHECK(contains(buf, "proto=\"pg\",kind=\"simple\",code=\"ok\"} 2\n"));
+    CHECK(contains(buf, "proto=\"mysql\",kind=\"simple\",code=\"ok\"} 1\n"));
+    /* A NULL proto folds to "pg" (the protocol default, РМ2). */
+    my.proto = NULL;
+    lk_reg_observe(r, &my);
+    dump(r, buf, sizeof(buf));
+    CHECK(contains(buf, "user=\"alice\",proto=\"pg\",code=\"ok\"} 3\n"));
+    lk_reg_free(r);
+    return 0;
+}
+
 int main(void)
 {
     if (test_overflow_to_other() || test_evict_reset() || test_doorkeeper() ||
-        test_cardinality_ceiling() || test_dim_limit() || test_dump_format())
+        test_cardinality_ceiling() || test_dim_limit() || test_dump_format() || test_proto_split())
         return 1;
     printf("test_registry: all passed\n");
     return 0;

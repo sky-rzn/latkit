@@ -184,12 +184,14 @@ candidate). `start = ts_start_ns`, `end = ts_complete_ns` (the precise
 per-request model — spans need no averaging compromise, cf. Р25), converted to
 wall clock by `timebase.c` (Р33).
 
-**Attributes** (OTel semconv for databases): `db.system.name="postgresql"`,
-`db.query.text` (raw SQL; omitted under `NO_TEXT`), `db.namespace` (database),
-`db.user`, `db.response.returned_rows`; the span name is the normalised text
-truncated to 64 chars (the normaliser Р22 runs only for sampled queries — a
-negligible cost). An error sets `otel.status = ERROR` and
-`db.response.status_code = SQLSTATE`.
+**Attributes** (OTel semconv for databases): `db.system.name` (`postgresql` or
+`mysql`, from the connection's protocol, РМ6/М6), `db.query.text` (raw SQL;
+omitted under `NO_TEXT`), `db.namespace` (database), `db.user`,
+`db.response.returned_rows`; the span name is the normalised text truncated to
+64 chars (the normaliser Р22 runs only for sampled queries — a negligible cost).
+An error sets `otel.status = ERROR` and `db.response.status_code = SQLSTATE`,
+plus `db.mysql.error_code` = the MySQL vendor errno when one was captured (PG has
+no numeric code).
 
 **Exemplars** (optional tail of 5.3, **deferred** — not an M3 criterion): the
 last sampled `{trace_id, span_id, value}` per histogram row, emitted in the

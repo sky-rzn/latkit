@@ -4,7 +4,8 @@
   "description": "Per db/user/query latency, first-row, rows, SQLSTATE.",
   "tags": [
     "latkit",
-    "postgres"
+    "postgres",
+    "mysql"
   ],
   "timezone": "browser",
   "schemaVersion": 39,
@@ -48,6 +49,29 @@
         "regex": "",
         "skipUrlSync": false,
         "type": "datasource"
+      },
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(latkit_queries_total, proto)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "proto",
+        "multi": true,
+        "name": "proto",
+        "options": [],
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query",
+        "query": {
+          "query": "label_values(latkit_queries_total, proto)",
+          "refId": "StandardVariableQuery"
+        },
+        "allValue": ".*"
       },
       {
         "current": {},
@@ -173,7 +197,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(latkit_query_duration_seconds_count{db=~\"$db\",user=~\"$user\",query=~\"$query\"}[$__rate_interval]))",
+          "expr": "sum(rate(latkit_query_duration_seconds_count{db=~\"$db\",user=~\"$user\",query=~\"$query\",proto=~\"$proto\"}[$__rate_interval]))",
           "refId": "A",
           "range": true,
           "instant": false,
@@ -233,7 +257,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(latkit_query_rows_total{db=~\"$db\",user=~\"$user\",query=~\"$query\"}[$__rate_interval])) / clamp_min(sum(rate(latkit_query_duration_seconds_count{db=~\"$db\",user=~\"$user\",query=~\"$query\"}[$__rate_interval])), 1)",
+          "expr": "sum(rate(latkit_query_rows_total{db=~\"$db\",user=~\"$user\",query=~\"$query\",proto=~\"$proto\"}[$__rate_interval])) / clamp_min(sum(rate(latkit_query_duration_seconds_count{db=~\"$db\",user=~\"$user\",query=~\"$query\",proto=~\"$proto\"}[$__rate_interval])), 1)",
           "refId": "A",
           "range": true,
           "instant": false,
@@ -293,7 +317,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(latkit_query_errors_total{db=~\"$db\",user=~\"$user\"}[$__rate_interval])) / clamp_min(sum(rate(latkit_query_duration_seconds_count{db=~\"$db\",user=~\"$user\",query=~\"$query\"}[$__rate_interval])), 1)",
+          "expr": "sum(rate(latkit_query_errors_total{db=~\"$db\",user=~\"$user\",proto=~\"$proto\"}[$__rate_interval])) / clamp_min(sum(rate(latkit_query_duration_seconds_count{db=~\"$db\",user=~\"$user\",query=~\"$query\",proto=~\"$proto\"}[$__rate_interval])), 1)",
           "refId": "A",
           "range": true,
           "instant": false,
@@ -346,7 +370,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(latkit_query_duration_seconds_bucket{db=~\"$db\",user=~\"$user\",query=~\"$query\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(latkit_query_duration_seconds_bucket{db=~\"$db\",user=~\"$user\",query=~\"$query\",proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "A",
           "range": true,
           "instant": false,
@@ -358,7 +382,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_query_duration_seconds_bucket{db=~\"$db\",user=~\"$user\",query=~\"$query\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_query_duration_seconds_bucket{db=~\"$db\",user=~\"$user\",query=~\"$query\",proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "B",
           "range": true,
           "instant": false,
@@ -370,7 +394,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_query_duration_seconds_bucket{db=~\"$db\",user=~\"$user\",query=~\"$query\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_query_duration_seconds_bucket{db=~\"$db\",user=~\"$user\",query=~\"$query\",proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "C",
           "range": true,
           "instant": false,
@@ -423,7 +447,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_query_first_row_seconds_bucket{db=~\"$db\",user=~\"$user\",query=~\"$query\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_query_first_row_seconds_bucket{db=~\"$db\",user=~\"$user\",query=~\"$query\",proto=~\"$proto\"}[$__rate_interval])))",
           "refId": "A",
           "range": true,
           "instant": false,
@@ -477,7 +501,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (query) (rate(latkit_query_rows_total{db=~\"$db\",user=~\"$user\",query=~\"$query\"}[$__rate_interval]))",
+          "expr": "sum by (query) (rate(latkit_query_rows_total{db=~\"$db\",user=~\"$user\",query=~\"$query\",proto=~\"$proto\"}[$__rate_interval]))",
           "refId": "A",
           "range": true,
           "instant": false,
@@ -530,7 +554,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (sqlstate) (rate(latkit_query_errors_total{db=~\"$db\",user=~\"$user\"}[$__rate_interval]))",
+          "expr": "sum by (sqlstate) (rate(latkit_query_errors_total{db=~\"$db\",user=~\"$user\",proto=~\"$proto\"}[$__rate_interval]))",
           "refId": "A",
           "range": true,
           "instant": false,

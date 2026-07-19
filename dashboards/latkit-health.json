@@ -4,7 +4,8 @@
   "description": "All self-metrics: losses, cardinality, OTLP, TLS, cgroup, process, pipeline overhead.",
   "tags": [
     "latkit",
-    "postgres"
+    "postgres",
+    "mysql"
   ],
   "timezone": "browser",
   "schemaVersion": 39,
@@ -48,6 +49,29 @@
         "regex": "",
         "skipUrlSync": false,
         "type": "datasource"
+      },
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(latkit_queries_total, proto)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "proto",
+        "multi": true,
+        "name": "proto",
+        "options": [],
+        "refresh": 2,
+        "regex": "",
+        "sort": 1,
+        "type": "query",
+        "query": {
+          "query": "label_values(latkit_queries_total, proto)",
+          "refId": "StandardVariableQuery"
+        },
+        "allValue": ".*"
       }
     ]
   },

@@ -206,10 +206,11 @@ static void print_proto_stats(const char *name, const struct lk_proto_stats *ps)
             (unsigned long long)ps->resyncs, (unsigned long long)ps->conns);
     fprintf(stderr,
             "latkit: %s sessions=%llu queries=%llu errors_sql=%llu "
-            "parse_errors=%llu unknown=%llu replication=%llu\n",
+            "parse_errors=%llu unknown=%llu replication=%llu compressed=%llu\n",
             name, (unsigned long long)ps->sessions, (unsigned long long)ps->queries,
             (unsigned long long)ps->errors_sql, (unsigned long long)ps->parse_errors,
-            (unsigned long long)ps->unknown_msgs, (unsigned long long)ps->replication_conns);
+            (unsigned long long)ps->unknown_msgs, (unsigned long long)ps->replication_conns,
+            (unsigned long long)ps->compressed_conns);
     fprintf(stderr,
             "latkit: %s units_dropped resync=%llu close=%llu overflow=%llu prep_evictions=%llu\n",
             name, (unsigned long long)ps->units_dropped_resync,
@@ -327,33 +328,37 @@ static void ev_provide_stats(void *ctx, struct lk_metrics *m)
     lk_metrics_set_counter(m, "latkit_resync_total",
                            "Stream directions resynchronised after a loss.", (double)rs->resyncs);
 
-    /* Parser counters, summed over the per-protocol handler instances (РМ1) —
-     * the series stay protocol-wide; the per-protocol split is М6 (РМ6). */
-    __u64 parse_errors = 0, unknown_msgs = 0;
-    __u64 drop_resync = 0, drop_close = 0, drop_overflow = 0;
-
+    /* Parser counters, split per protocol (РМ6): each handler instance carries
+     * its registry name as the `proto` label, so a PG-only deployment reads the
+     * same numbers under proto="pg" while a mixed one keeps the two apart. */
     for (unsigned i = 0; i < lk_proto_nregistry; i++) {
         const struct lk_proto_stats *ps = lk_proto_stats(e->protos[i]);
+        const char *proto = lk_proto_registry[i]->name;
 
-        parse_errors += ps->parse_errors;
-        unknown_msgs += ps->unknown_msgs;
-        drop_resync += ps->units_dropped_resync;
-        drop_close += ps->units_dropped_close;
-        drop_overflow += ps->units_dropped_overflow;
+        lk_metrics_set_counter_l(m, "latkit_parse_errors_total",
+                                 "Protocol fields the parser rejected as corrupt.", "proto", proto,
+                                 (double)ps->parse_errors);
+        lk_metrics_set_counter_l(m, "latkit_unknown_msgs_total",
+                                 "Unknown message types skipped by length.", "proto", proto,
+                                 (double)ps->unknown_msgs);
+        /* Р19 blind spot ("query cut off mid-flight"), split by why the
+         * in-flight unit was dropped and by protocol. */
+        lk_metrics_set_counter_l2(m, "latkit_queries_dropped_total",
+                                  "In-flight query units dropped before completion.", "reason",
+                                  "resync", "proto", proto, (double)ps->units_dropped_resync);
+        lk_metrics_set_counter_l2(m, "latkit_queries_dropped_total", NULL, "reason", "disconnect",
+                                  "proto", proto, (double)ps->units_dropped_close);
+        lk_metrics_set_counter_l2(m, "latkit_queries_dropped_total", NULL, "reason", "overflow",
+                                  "proto", proto, (double)ps->units_dropped_overflow);
+        /* Deliberate blind zones (РМ7/РМ8): replication/binlog streams and
+         * MySQL compressed connections are left unparsed on purpose — counted
+         * per reason so the coverage gaps stay visible and honest. */
+        lk_metrics_set_counter_l2(m, "latkit_ignored_conns_total",
+                                  "Connections deliberately left unparsed (blind zones).", "reason",
+                                  "replication", "proto", proto, (double)ps->replication_conns);
+        lk_metrics_set_counter_l2(m, "latkit_ignored_conns_total", NULL, "reason", "compressed",
+                                  "proto", proto, (double)ps->compressed_conns);
     }
-    lk_metrics_set_counter(m, "latkit_parse_errors_total",
-                           "Protocol fields the parser rejected as corrupt.", (double)parse_errors);
-    lk_metrics_set_counter(m, "latkit_unknown_msgs_total",
-                           "Unknown message types skipped by length.", (double)unknown_msgs);
-    /* Р19 blind spot ("query cut off mid-flight") now has a counter, split by
-     * why the in-flight unit was dropped. */
-    lk_metrics_set_counter_l(m, "latkit_queries_dropped_total",
-                             "In-flight query units dropped before completion.", "reason", "resync",
-                             (double)drop_resync);
-    lk_metrics_set_counter_l(m, "latkit_queries_dropped_total", NULL, "reason", "disconnect",
-                             (double)drop_close);
-    lk_metrics_set_counter_l(m, "latkit_queries_dropped_total", NULL, "reason", "overflow",
-                             (double)drop_overflow);
 
     const struct lk_conn_table_stats *cs = lk_conn_table_stats(e->pipe.conns);
 

@@ -318,12 +318,13 @@ static int check_metrics(const struct metric_expect *e, const char *buf)
     if (e->query) {
         snprintf(pfx, sizeof(pfx),
                  "latkit_query_duration_seconds_count{query=\"%s\",db=\"postgres\","
-                 "user=\"postgres\",code=\"%s\"}",
+                 "user=\"postgres\",proto=\"pg\",code=\"%s\"}",
                  e->query, e->code);
         if (check_line(e->name, buf, pfx, e->dur_count))
             return 1;
         snprintf(pfx, sizeof(pfx),
-                 "latkit_query_rows_total{query=\"%s\",db=\"postgres\",user=\"postgres\"}",
+                 "latkit_query_rows_total{query=\"%s\",db=\"postgres\",user=\"postgres\","
+                 "proto=\"pg\"}",
                  e->query);
         if (check_line(e->name, buf, pfx, e->rows))
             return 1;
@@ -336,7 +337,8 @@ static int check_metrics(const struct metric_expect *e, const char *buf)
 
     if (e->sqlstate) {
         snprintf(pfx, sizeof(pfx),
-                 "latkit_query_errors_total{sqlstate=\"%s\",db=\"postgres\",user=\"postgres\"}",
+                 "latkit_query_errors_total{sqlstate=\"%s\",db=\"postgres\",user=\"postgres\","
+                 "proto=\"pg\"}",
                  e->sqlstate);
         if (check_line(e->name, buf, pfx, 1))
             return 1;
