@@ -73,9 +73,15 @@ for trace in "$DIR"/*/*.lkt; do
         # README: the error scenario targets a missing table (1146 / 42S02).
         has 'kind=simple .*sqlstate=42S02'
         ;;
+    cli-transaction)
+        # The CLI scenario closes its single BEGIN..ROLLBACK transaction: since
+        # 84067ea a ROLLBACK-closed txn is reported aborted (final=E), never T.
+        has 'txn=T'
+        has '^txn .*final=E'
+        ;;
     *transaction*)
-        # BEGIN/COMMIT/ROLLBACK: units observed inside the transaction and at
-        # least one IN_TRANS -> idle edge.
+        # jdbc/py commit at least one transaction (alongside a rolled-back one):
+        # the COMMIT closes the IN_TRANS -> idle edge with final=T.
         has 'txn=T'
         has '^txn .*final=T'
         ;;
