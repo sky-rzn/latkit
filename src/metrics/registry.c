@@ -662,8 +662,8 @@ static void esc(const char *s, char *out)
 
 static const char *qkind_str(uint8_t k)
 {
-    static const char *const s[LK_N_QKINDS] = {"simple",  "extended", "function",
-                                               "copy_in", "copy_out", "cancel"};
+    static const char *const s[LK_N_QKINDS] = {"simple",   "extended", "function", "copy_in",
+                                               "copy_out", "cancel",   "request"};
     return k < LK_N_QKINDS ? s[k] : "?";
 }
 

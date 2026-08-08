@@ -142,7 +142,7 @@ static inline void fz_check_http_msg(const struct lk_msg *m)
  * surfaces at emit time, not only at parse time. */
 static inline void fz_check_obs(const struct lk_query_obs *o)
 {
-    FZ_ASSERT(o->kind <= LK_Q_CANCEL);
+    FZ_ASSERT(o->kind <= LK_Q_REQUEST);
     FZ_ASSERT(memchr(o->sqlstate, '\0', sizeof(o->sqlstate)) != NULL);
     if (o->flags & LK_QO_NO_TEXT)
         FZ_ASSERT(!o->text && !o->text_len);
@@ -152,7 +152,21 @@ static inline void fz_check_obs(const struct lk_query_obs *o)
     } else {
         FZ_ASSERT(o->text_len == 0);
     }
+    /* Borrowed-for-the-callback strings must be readable in full, or not
+     * offered at all: `op` and `err_name` are the HTTP/S3 half of the contract
+     * and a dangling one would be invisible without this read (РH8). */
+    if (o->op)
+        fz_read_bytes(o->op, strlen(o->op));
+    if (o->err_name)
+        fz_read_bytes(o->err_name, strlen(o->err_name));
+    /* РH5's ordering: the request cannot finish before it started. The other
+     * three stamps are deliberately *not* ordered against each other — a
+     * response head can precede the end of the request body (an early 413), and
+     * a degraded unit may carry zeros. */
+    if (o->ts_req_done_ns)
+        FZ_ASSERT(o->ts_req_done_ns >= o->ts_start_ns);
     fz_byte_sink += o->ts_start_ns ^ o->ts_first_row_ns ^ o->ts_complete_ns ^ o->ts_ready_ns;
+    fz_byte_sink += o->ts_req_done_ns ^ o->bytes_in ^ o->bytes_out;
     fz_byte_sink += o->rows + o->bytes + o->flags + (unsigned char)o->txn_status;
 }
 

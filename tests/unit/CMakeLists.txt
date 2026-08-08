@@ -79,6 +79,23 @@ target_include_directories(test_http_frame PRIVATE
 target_link_libraries(test_http_frame latkit_proto)
 add_test(NAME http_frame COMMAND test_http_frame)
 
+# HTTP handler (PLAN-HTTP.md М3): the header-value readers (test_http_wire), the
+# two head parsers (test_http_req / test_http_resp) and the unit lifecycle with
+# its four timings (test_http_unit). The last three drive the real chain —
+# bytes -> framer -> lk_msg -> handler -> lk_query_obs — through http_obs.h.
+add_executable(test_http_wire test_http_wire.c)
+target_include_directories(test_http_wire PRIVATE ${CMAKE_SOURCE_DIR}/src/proto/http)
+add_test(NAME http_wire COMMAND test_http_wire)
+
+foreach(t http_req http_resp http_unit)
+    add_executable(test_${t} test_${t}.c)
+    target_include_directories(test_${t} PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf
+        ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/http)
+    target_link_libraries(test_${t} latkit_proto)
+    add_test(NAME ${t} COMMAND test_${t})
+endforeach()
+
 # Startup/auth/session (task 3.2): white-box over the PG handler (links the
 # libbpf-free proto lib; includes the internal pg.h for state assertions).
 add_executable(test_pg_session test_pg_session.c)

@@ -55,6 +55,11 @@ static const struct lk_proto_ops *opt_port_ops[LK_MAX_PORTS];
  * absent from --help until then — an advertised knob that does nothing is
  * worse than an undocumented one that will. */
 static __u32 opt_port_caps[LK_MAX_PORTS];
+/* `--http-user basic` (РH10): take the `user` label from the name half of an
+ * `Authorization: Basic` header. Off by default — an identity is not something
+ * to lift off the wire unless it was asked for (РH12) — and, like the port
+ * budget above, absent from --help until М9 documents the HTTP surface. */
+static bool opt_http_user_basic;
 static struct lk_port_proto opt_port_protos[LK_MAX_PORTS];
 static int opt_nports;
 static __u64 opt_ringbuf_bytes = LK_RINGBUF_SZ;
@@ -235,6 +240,7 @@ enum {
     OPT_OTLP_SPANS_SLOW_MS,
     OPT_OTLP_SPAN_TEXT_MAX,
     OPT_OTLP_SPAN_MASKED,
+    OPT_HTTP_USER,
     OPT_TLS,
     OPT_LIBSSL,
     OPT_TLS_COMM,
@@ -470,6 +476,20 @@ static int set_option(int c, char *optarg)
             return -1;
         }
         break;
+    case OPT_HTTP_USER:
+        /* РH10: `--http-user basic` takes the `user` label from the name half of
+         * `Authorization: Basic`. Off by default, and deliberately absent from
+         * --help until М9 documents the HTTP surface as a whole — the same
+         * treatment the per-port capture budget gets (РH14). */
+        if (!strcmp(optarg, "basic")) {
+            opt_http_user_basic = true;
+        } else if (!strcmp(optarg, "none")) {
+            opt_http_user_basic = false;
+        } else {
+            fprintf(stderr, "--http-user: expected 'basic' or 'none', got '%s'\n", optarg);
+            return -1;
+        }
+        break;
     case OPT_LIBSSL:
         opt_libssl = optarg;
         break;
@@ -622,6 +642,7 @@ static int parse_args(int argc, char **argv)
         {"otlp-spans-slow-ms", required_argument, NULL, OPT_OTLP_SPANS_SLOW_MS},
         {"otlp-span-text-max", required_argument, NULL, OPT_OTLP_SPAN_TEXT_MAX},
         {"otlp-span-masked", no_argument, NULL, OPT_OTLP_SPAN_MASKED},
+        {"http-user", required_argument, NULL, OPT_HTTP_USER},
         {"tls", required_argument, NULL, OPT_TLS},
         {"libssl", required_argument, NULL, OPT_LIBSSL},
         {"tls-comm", required_argument, NULL, OPT_TLS_COMM},
@@ -732,6 +753,7 @@ static void print_config(void)
     printf("events=%d\n", opt_events);
     printf("messages=%d\n", opt_messages);
     printf("queries=%d\n", opt_queries);
+    printf("http_user=%s\n", opt_http_user_basic ? "basic" : "none");
     printf("top_queries=%u\n", opt_top_queries ? opt_top_queries : LK_TOP_QUERIES_DEFAULT);
     printf("query_label_len=%u\n",
            opt_query_label_len ? opt_query_label_len : LK_QUERY_LABEL_LEN_DEFAULT);
@@ -992,6 +1014,11 @@ int main(int argc, char **argv)
         .otlp_span_text_max = (unsigned)opt_otlp_span_text_max,
         .otlp_span_masked = opt_otlp_span_masked,
     };
+
+    /* Handler-wide HTTP settings (РH10). Applied before the first event; the
+     * http handler reads them through http_cfg(). М4 folds this into the
+     * per-port dialect config (РH8) together with the route knobs. */
+    lk_proto_http_configure(&(struct lk_http_cfg){.user_basic = opt_http_user_basic});
 
     events = lk_events_new(&ecfg);
     if (!events) {

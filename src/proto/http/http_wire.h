@@ -111,16 +111,26 @@ static inline int http_hex_val(char c)
 
 /* --- span helpers --------------------------------------------------------- */
 
-/* Case-insensitive compare against a lowercase NUL-terminated literal. */
+/* Case-insensitive compare against a lowercase NUL-terminated literal.
+ *
+ * The length is settled first rather than by walking off the end of `lit` and
+ * checking its NUL afterwards. That earlier shape was safe — the walk returns
+ * false at the terminator, so the trailing index can only ever land *on* it —
+ * but the compiler cannot see that, and at -O2 it reports the read as an
+ * out-of-bounds subscript on the longest literal in the file
+ * ("content-length", 14 chars). This form is provably in bounds, and it is also
+ * the faster one: a header name that does not match is usually the wrong length
+ * and now costs a compare rather than a loop. strlen on a literal folds to a
+ * constant. */
 static inline bool http_span_eq_ci(struct http_span s, const char *lit)
 {
-    __u32 i;
-
-    for (i = 0; i < s.n; i++) {
-        if (!lit[i] || http_lc(s.p[i]) != lit[i])
+    if (s.n != strlen(lit))
+        return false;
+    for (__u32 i = 0; i < s.n; i++) {
+        if (http_lc(s.p[i]) != lit[i])
             return false;
     }
-    return lit[i] == 0;
+    return true;
 }
 
 static inline struct http_span http_trim_ows(struct http_span s)
@@ -337,6 +347,67 @@ enum http_method {
     HTTP_M_PATCH,
 };
 
+/* The canonical spelling of a known method, for the `op` field of an
+ * observation and the `method` label. NULL for HTTP_M_OTHER: an unknown method
+ * is reported by its own bytes (bounded, copied by the caller), never by a
+ * guess. */
+static inline const char *http_method_name(enum http_method id)
+{
+    switch (id) {
+    case HTTP_M_GET:
+        return "GET";
+    case HTTP_M_HEAD:
+        return "HEAD";
+    case HTTP_M_POST:
+        return "POST";
+    case HTTP_M_PUT:
+        return "PUT";
+    case HTTP_M_DELETE:
+        return "DELETE";
+    case HTTP_M_CONNECT:
+        return "CONNECT";
+    case HTTP_M_OPTIONS:
+        return "OPTIONS";
+    case HTTP_M_TRACE:
+        return "TRACE";
+    case HTTP_M_PATCH:
+        return "PATCH";
+    default:
+        return NULL;
+    }
+}
+
+/* One letter per method for the per-direction message tally (lk_proto_stats
+ * .by_type, printed by the stats line): a stream framer's own message types
+ * carry no information a caller wants counted, the methods do. Distinct from
+ * the response side's status-class digits by construction — different
+ * direction, and letters vs digits anyway. */
+static inline char http_method_tag(enum http_method id)
+{
+    switch (id) {
+    case HTTP_M_GET:
+        return 'G';
+    case HTTP_M_HEAD:
+        return 'H';
+    case HTTP_M_POST:
+        return 'P';
+    case HTTP_M_PUT:
+        return 'U';
+    case HTTP_M_DELETE:
+        return 'D';
+    case HTTP_M_CONNECT:
+        return 'C';
+    case HTTP_M_OPTIONS:
+        return 'O';
+    case HTTP_M_TRACE:
+        return 'T';
+    case HTTP_M_PATCH:
+        return 'A';
+    default:
+        return '?';
+    }
+}
+
 static inline enum http_method http_method_id(struct http_span m)
 {
     static const struct {
@@ -420,6 +491,191 @@ static inline bool http_parse_status_line(struct http_span line, __u16 *code, __
     *minor = (__u8)(line.p[7] - '0');
     *code = (__u16)((line.p[9] - '0') * 100 + (line.p[10] - '0') * 10 + (line.p[11] - '0'));
     return true;
+}
+
+/* --- request-target and header values the handler reads (М3) -------------- */
+
+/* Split a request-target into the three pieces the handler labels with. All
+ * four forms of RFC 9112 §3.2 are accepted, because all four are in the М0
+ * corpus:
+ *
+ *   origin-form     /orders/42?x=1        path=/orders/42  query=x=1
+ *   absolute-form   http://h:8080/o?x=1   authority=h:8080, then as above
+ *   authority-form  h:443                 authority=h:443, path empty (CONNECT)
+ *   asterisk-form   *                     path=*           (OPTIONS *)
+ *
+ * The authority of an absolute-form target *overrides* the Host header
+ * (notes-httpproto.md §"Start lines"): a proxy request carries the real target
+ * host there, and Host may name the proxy. Any piece may come back empty; none
+ * is ever NUL-terminated. The scheme is recognised but not returned — `http` vs
+ * `https` on the wire says nothing useful when the observer is the one
+ * decrypting. */
+static inline void http_target_split(struct http_span t, struct http_span *path,
+                                     struct http_span *query, struct http_span *authority)
+{
+    __u32 i = 0, s;
+
+    *authority = http_span(t.p, 0);
+    /* scheme "://" — only ever at the very start, and only ASCII letters,
+     * digits, "+", "-", "." before it (RFC 3986 §3.1). */
+    while (i < t.n && t.p[i] != ':' && t.p[i] != '/' && t.p[i] != '?')
+        i++;
+    if (i && i + 2 < t.n && t.p[i] == ':' && t.p[i + 1] == '/' && t.p[i + 2] == '/') {
+        i += 3;
+        s = i;
+        while (i < t.n && t.p[i] != '/' && t.p[i] != '?')
+            i++;
+        *authority = http_span(t.p + s, i - s);
+    } else if (t.n && t.p[0] != '/' && t.p[0] != '*') {
+        /* authority-form: no scheme, no leading slash — CONNECT's target. */
+        *authority = t;
+        *path = http_span(t.p, 0);
+        *query = http_span(t.p, 0);
+        return;
+    } else {
+        i = 0;
+    }
+    s = i;
+    while (i < t.n && t.p[i] != '?')
+        i++;
+    *path = http_span(t.p + s, i - s);
+    if (i < t.n)
+        i++; /* the '?' itself belongs to neither piece */
+    *query = http_span(t.p + i, t.n - i);
+}
+
+/* The first token of a comma/semicolon-parameterised value: `text/html` out of
+ * `text/html; charset=utf-8`. Used for Content-Type, which goes into a span
+ * attribute and must not carry the parameters (they are low-value and
+ * occasionally identifying). */
+static inline struct http_span http_first_token(struct http_span v)
+{
+    __u32 i = 0;
+
+    while (i < v.n && v.p[i] != ';' && v.p[i] != ',')
+        i++;
+    return http_trim_ows(http_span(v.p, i));
+}
+
+/* W3C Trace Context (РH11):
+ *
+ *   traceparent: 00-<32 hex trace-id>-<16 hex parent-id>-<2 hex flags>
+ *
+ * Accepted only in that exact shape: version `00`, four dash-separated fields
+ * of the right lengths, hex only, and neither id all-zero. Anything else is
+ * ignored rather than patched up — a malformed header must not produce a span
+ * attached to a made-up trace, which is worse than no parent at all. Lowercase
+ * is what the spec mandates; uppercase hex is accepted on the read side because
+ * rejecting a trace over letter case would be pedantry with a real cost.
+ *
+ * A version other than `00` is *not* accepted here even though the spec asks
+ * forward-compatible parsers to try: a future version may reorder the fields,
+ * and this parser has no way to know. */
+static inline bool http_parse_traceparent(struct http_span v, __u8 trace_id[16], __u8 parent_id[8],
+                                          __u8 *flags)
+{
+    static const __u8 zeros[16] = {0};
+    __u8 buf[1 + 16 + 8 + 1]; /* version, trace-id, parent-id, flags */
+    __u32 i = 0;
+    /* field byte lengths, in order: version, trace-id, parent-id, flags */
+    static const __u8 want[4] = {1, 16, 8, 1};
+    __u8 *out = buf;
+
+    for (unsigned f = 0; f < 4; f++) {
+        for (unsigned b = 0; b < want[f]; b++) {
+            int hi, lo;
+
+            if (i + 1 >= v.n)
+                return false;
+            hi = http_hex_val(v.p[i]);
+            lo = http_hex_val(v.p[i + 1]);
+            if (hi < 0 || lo < 0)
+                return false;
+            *out++ = (__u8)(hi * 16 + lo);
+            i += 2;
+        }
+        if (f < 3) {
+            if (i >= v.n || v.p[i] != '-')
+                return false;
+            i++;
+        }
+    }
+    /* Trailing garbage after the flags field is how a *later* version would
+     * look; the spec says to ignore it, and a version-00 prefix is still
+     * unambiguous, so only a non-dash separator is a reject. */
+    if (i < v.n && v.p[i] != '-')
+        return false;
+    if (buf[0] != 0x00)
+        return false;
+    if (!memcmp(buf + 1, zeros, 16) || !memcmp(buf + 17, zeros, 8))
+        return false;
+    memcpy(trace_id, buf + 1, 16);
+    memcpy(parent_id, buf + 17, 8);
+    *flags = buf[25];
+    return true;
+}
+
+static inline int http_b64_val(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return c - 'A';
+    if (c >= 'a' && c <= 'z')
+        return c - 'a' + 26;
+    if (http_is_digit(c))
+        return c - '0' + 52;
+    if (c == '+')
+        return 62;
+    if (c == '/')
+        return 63;
+    return -1;
+}
+
+/* `Authorization: Basic <base64(user ":" password)>` → the user half, and only
+ * with --http-user basic (РH10).
+ *
+ * The decode stops at the first colon by construction. base64 is a 4-character
+ * → 3-byte code, so up to two bytes past the colon pass through a local
+ * variable; they are never written to `out` and the buffer dies with the call.
+ * That is the whole guarantee the plan asks for: the password is not decoded
+ * past the colon and reaches nothing that outlives this function.
+ *
+ * Any other scheme — `Bearer` above all — returns false without a byte being
+ * looked at. false also for a name that does not fit `cap`, an unterminated
+ * name, or invalid base64: a truncated identity is worse than none. */
+static inline bool http_basic_user(struct http_span v, char *out, __u32 cap)
+{
+    __u32 i = 0, n = 0;
+    __u32 acc = 0, bits = 0;
+
+    if (v.n < 6 || !http_span_eq_ci(http_span(v.p, 5), "basic") || v.p[5] != ' ')
+        return false;
+    for (i = 6; i < v.n && http_is_ows(v.p[i]); i++)
+        ;
+    for (; i < v.n; i++) {
+        int d = http_b64_val(v.p[i]);
+
+        if (v.p[i] == '=')
+            break;
+        if (d < 0)
+            return false;
+        acc = (acc << 6) | (__u32)d;
+        bits += 6;
+        if (bits < 8)
+            continue;
+        bits -= 8;
+        char c = (char)((acc >> bits) & 0xff);
+
+        if (c == ':') {
+            out[n] = '\0';
+            return n > 0;
+        }
+        if (n + 1 >= cap)
+            return false;
+        if (c < 0x20 || c == 0x7f)
+            return false; /* control bytes in a label: reject the whole value */
+        out[n++] = c;
+    }
+    return false; /* no colon: not a user:password pair, so not a user */
 }
 
 #endif /* LATKIT_HTTP_WIRE_H */

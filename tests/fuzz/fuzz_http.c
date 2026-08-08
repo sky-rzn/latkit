@@ -9,6 +9,12 @@
  * take: bytes -> framer (http_frame.c) -> lk_msg -> handler (http.c), through
  * one function, lk_http_fuzz_one().
  *
+ * Since М3 the handler also emits observations, so the target carries a query
+ * sink whose callbacks re-read every borrowed string and assert the shared
+ * lk_query_obs invariants (fz_check_obs): a unit's target and method outlive
+ * the head buffer they were copied out of only if the copy really happened, and
+ * a fuzzer that never looked at them would not notice.
+ *
  * The connection is forced to the http vtable (lk_conn_table_set_protos):
  * without it the framer would fall back to PG. One input feeds both directions
  * of one connection — the RECV pass drives request heads and their bodies, the
@@ -40,6 +46,30 @@
 /* Input larger than this is clamped: the framer takes a __u32 length, and a
  * multi-megabyte single feed exercises nothing the low kilobytes do not. */
 #define LK_FUZZ_MAX_INPUT (1u << 20)
+
+static void fz_on_query(void *ctx, const struct lk_conn *c, const struct lk_session *s,
+                        const struct lk_query_obs *o)
+{
+    (void)ctx;
+    (void)c;
+    fz_check_obs(o);
+    FZ_ASSERT(o->kind == LK_Q_REQUEST); /* every http observation is one exchange */
+    if (s) {
+        fz_read_bytes(s->database, strnlen(s->database, sizeof(s->database)));
+        fz_read_bytes(s->user, strnlen(s->user, sizeof(s->user)));
+    }
+}
+
+static void fz_on_session(void *ctx, const struct lk_conn *c, const struct lk_session *s)
+{
+    (void)ctx;
+    (void)c;
+    fz_read_bytes(s->database, strnlen(s->database, sizeof(s->database)));
+    fz_read_bytes(s->user, strnlen(s->user, sizeof(s->user)));
+    fz_read_bytes(s->app, strnlen(s->app, sizeof(s->app)));
+    fz_read_bytes(s->server_version, strnlen(s->server_version, sizeof(s->server_version)));
+    fz_byte_sink += s->complete;
+}
 
 /* --- framer -> handler tee (identical in shape to fuzz_pg / fuzz_my) ------ */
 struct fz_tee {
@@ -101,7 +131,12 @@ int lk_http_fuzz_one(const uint8_t *data, size_t n)
 
     if (!ops)
         return 0;
-    proto = ops->proto_new(NULL); /* М2 emits no observations; М3 wires a sink */
+    /* Alternate the one configurable read of a credential header (РH10) so the
+     * base64 decoder is on the fuzzed path rather than only in unit tests. The
+     * switch is derived from the input so a crash reproduces from the file. */
+    lk_proto_http_configure(&(struct lk_http_cfg){.user_basic = (n & 1) != 0});
+    proto = ops->proto_new(&(struct lk_query_sink){
+        .on_query = fz_on_query, .on_session = fz_on_session}); /* М3: observations */
     if (!proto)
         return 0;
     tee.psink = lk_proto_sink(proto);

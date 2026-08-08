@@ -3,10 +3,10 @@
  * the way pg.h / my.h serve their protocols. Not included by the core: the
  * outside world sees only lk_proto_http_ops and lk_proto_http_new (proto.h).
  *
- * PLAN-HTTP.md М2 fills in the framer the М1 seam left as a stub: the
- * direction machine (head → body → head), the body-length decision list of
- * РH4, the blind zones and the textual resync anchors. The handler is still
- * М3's — it tallies here and emits no observations.
+ * PLAN-HTTP.md М2 filled in the framer the М1 seam left as a stub — the
+ * direction machine (head → body → head), the body-length decision list of РH4,
+ * the blind zones and the textual resync anchors — and М3 the handler above it:
+ * the in-flight ring, the four timings of РH5 and the two head parsers.
  *
  * The split of state is the one М1 set up and the stages after this rely on:
  * *framing* state lives in lk_conn.frame_state (struct http_frame below, one
@@ -14,7 +14,14 @@
  * lk_conn.proto_state (struct http_conn, freed by the handler). The bulk
  * scratch — the header block being assembled — is neither: it lives in
  * lk_frame.buf, drawn from the reassembly slab pool, so Р11's memory bound
- * covers it and the connection table frees it on every removal path. */
+ * covers it and the connection table frees it on every removal path.
+ *
+ * The two never share an understanding of a head. The framer reads a head to
+ * decide where the body ends; the handler reads the same bytes again to decide
+ * what to report about it. That is a deliberate second parse of a few hundred
+ * bytes per exchange: a shared mutable view of the same head is how the two
+ * would drift apart under a degradation, which is the one situation where the
+ * framing must stay right whatever the labels do. */
 #ifndef LATKIT_HTTP_H
 #define LATKIT_HTTP_H
 
@@ -187,14 +194,197 @@ struct http_frame {
 
 /* --- handler state (lk_conn.proto_state, Р15) ----------------------------- */
 
-/* Per-connection handler state, allocated lazily on the first message and
- * freed in on_conn_close. М3 grows the unit ring and the four timings here. */
-struct http_conn {
-    __u64 msgs;    /* messages dispatched on this connection */
-    bool degraded; /* joined mid-session (synthetic entry, or after a resync):
-                      the next head is the first trustworthy boundary, so no
-                      unit may open before it (М3 acts on this; М2 only
-                      records it) */
+/* Bounds on what a unit copies out of a head. Everything here is a *label* or a
+ * span attribute, so the ceilings are set by what a label may usefully be, not
+ * by what HTTP permits: an identity longer than this is not an identity we
+ * would put in a metric anyway. The two variable-length ones (the target and
+ * tracestate) are owned buffers reused across the units of a ring slot, exactly
+ * like pg_unit.own_text — a connection that never sees a trace context never
+ * allocates for one. */
+#define LK_HTTP_TARGET_MAX 2048 /* request-target: path + query, raw (М4 templates it) */
+#define LK_HTTP_TSTATE_MAX 256  /* tracestate, carried through verbatim (РH11) */
+#define LK_HTTP_METHOD_MAX 16   /* method token, incl. the NUL: unknown ones too */
+#define LK_HTTP_HOST_MAX   64   /* == sizeof lk_session.database (РH10) */
+#define LK_HTTP_USER_MAX   40   /* Authorization: Basic name half */
+#define LK_HTTP_REQID_MAX  48   /* X-Request-Id / X-Amzn-Trace-Id (a UUID is 36) */
+#define LK_HTTP_CTYPE_MAX  32   /* Content-Type, first token only */
+
+/* W3C trace context lifted off the request (РH11). Kept in its compact binary
+ * form — 25 bytes rather than the 55-character header — because it is small
+ * enough to sit inline in every unit and М6 needs the ids, not the text. */
+struct http_trace {
+    __u8 trace_id[16];
+    __u8 parent_id[8];
+    __u8 flags; /* W3C trace-flags; bit 0 = sampled */
+    bool valid; /* the header was present *and* well-formed */
 };
+
+/* One request/response exchange (РH6). Opened by a request head, closed by the
+ * end of the response body, and emitted exactly once — as an observation if a
+ * response was seen, into a units_dropped_* counter otherwise.
+ *
+ * The four timings of РH5 are the reason the unit exists at all; everything
+ * else on it is a label or a size. ts_interim_ns is a fifth stamp with no
+ * family of its own yet: the gap between the request head and a `100 Continue`
+ * is the only server-side signal available before an upload starts, so it is
+ * recorded now and spent in М6's span attributes. */
+struct http_unit {
+    __u64 ts_start_ns;     /* first byte of the request head */
+    __u64 ts_req_done_ns;  /* last byte of the request body (РH5) */
+    __u64 ts_first_row_ns; /* first byte of the response head — TTFB */
+    __u64 ts_complete_ns;  /* last byte of the response body */
+    __u64 ts_interim_ns;   /* first 1xx head; 0 = none */
+    __u64 bytes_in;        /* request body bytes, captured or holed */
+    __u64 bytes_out;       /* response body bytes */
+
+    char *target; /* owned, reused across the slot's units; freed on conn close */
+    __u32 target_len, target_cap;
+    char *tracestate; /* owned likewise, allocated only when one arrives */
+    __u32 tracestate_len, tracestate_cap;
+
+    struct http_trace tp;
+    char method[LK_HTTP_METHOD_MAX]; /* NUL-terminated; unknown methods verbatim */
+    char host[LK_HTTP_HOST_MAX];     /* absolute-form authority, else Host */
+    char user[LK_HTTP_USER_MAX];     /* --http-user basic only; "" otherwise */
+    char req_id[LK_HTTP_REQID_MAX];  /* X-Request-Id / X-Amzn-Trace-Id */
+    char ctype[LK_HTTP_CTYPE_MAX];   /* response Content-Type, first token */
+
+    __u16 status;     /* final response status; 0 = no response head yet */
+    __u16 flags;      /* accumulated LK_QO_* */
+    __u8 method_id;   /* enum http_method */
+    __u8 minor;       /* request HTTP/1.<minor> */
+    __u8 resp_minor;  /* response HTTP/1.<minor> */
+    bool used;        /* slot holds a live unit */
+    bool req_done;    /* the request body ended */
+    bool have_resp;   /* a *final* (non-1xx) response head arrived */
+    bool expect_cont; /* the request carried `Expect: 100-continue`, so the
+                         upload interval (ts_req_done − ts_start) contains a
+                         server round trip and is not the client's alone —
+                         М5's upload family excludes such units (РH5) */
+    bool to_close;    /* rule 6: the response body ends only at CONN_CLOSE, so
+                         the connection dying completes this unit instead of
+                         truncating it (notes-httpproto.md §"Body length") */
+};
+
+/* Per-connection handler state, allocated lazily on the first message and freed
+ * in on_conn_close.
+ *
+ * The in-flight units live in a ring addressed by a monotonic sequence rather
+ * than by index: pipelining means a request body and a response body are being
+ * accounted at the same time on two different units, and a stale reference to
+ * an already-emitted unit (a request body still trickling in after the server
+ * answered early with a 413) must be *detected*, not followed into whatever now
+ * occupies the slot. Comparing seq against head_seq does that for free.
+ *
+ * Size, since this is per connection and the table's ceiling is 65536: 5.5 KB,
+ * of which the 16-unit ring is 5.2 KB — the same order as the PG handler's
+ * 64-deep ring (and smaller), and allocated only for connections that actually
+ * carry a message. The two variable-length copies live outside it, in owned
+ * buffers reused across a slot's units, so a connection that never meets a
+ * trace context never allocates for one. */
+struct http_conn {
+    struct lk_session session; /* host -> db, UA -> app, user "-" unless basic (РH10) */
+    __u64 msgs;                /* messages dispatched on this connection */
+
+    struct http_unit ring[LK_HTTP_MAX_INFLIGHT];
+    __u64 head_seq; /* oldest live unit; the one a response belongs to */
+    __u64 open_seq; /* next seq to hand out; live units are [head_seq, open_seq) */
+    __u64 req_seq;  /* unit currently receiving a request body; ~0 = none */
+
+    __u32 owed;       /* responses still owed for requests the ring could not hold.
+                         Responses arrive in request order, so the untracked ones
+                         are the newest and their responses come last — which is
+                         what makes a plain counter sufficient (РH6) */
+    bool resp_orphan; /* skipping the body of one of those owed responses */
+    bool session_emitted;
+    bool degraded; /* joined mid-session (synthetic entry, or after a resync):
+                      no unit may open before the next request head, which is
+                      the first boundary the framer can vouch for */
+};
+
+/* The unit a sequence number refers to, or NULL when it has been emitted (or
+ * never existed). Inline because every message dispatch calls it. */
+static inline struct http_unit *http_unit_at(struct http_conn *hc, __u64 seq)
+{
+    if (seq < hc->head_seq || seq >= hc->open_seq)
+        return NULL;
+    return &hc->ring[seq % LK_HTTP_MAX_INFLIGHT];
+}
+
+/* The unit a response belongs to: the oldest live one (РH6 — the queue is a
+ * FIFO because HTTP/1.1 responses come back in request order). */
+static inline struct http_unit *http_unit_front(struct http_conn *hc)
+{
+    return http_unit_at(hc, hc->head_seq);
+}
+
+/* Copy a span into a fixed char[] as a C string, truncating rather than
+ * failing: a clipped Host is a worse label than a full one and a better one
+ * than none. Control bytes are dropped — every one of these values ends up in a
+ * Prometheus label or an OTLP attribute, and both have opinions about those. */
+static inline void http_copy_label(char *dst, __u32 cap, struct http_span s)
+{
+    __u32 n = 0;
+
+    for (__u32 i = 0; i < s.n && n + 1 < cap; i++) {
+        unsigned char b = (unsigned char)s.p[i];
+
+        if (b < 0x20 || b == 0x7f)
+            continue;
+        dst[n++] = (char)b;
+    }
+    dst[n] = '\0';
+}
+
+/* Copy one C string into a fixed char[], truncating. The obvious snprintf("%s")
+ * costs a few hundred nanoseconds of format machinery per call and this runs
+ * twice on every observation — enough to show up next to the whole rest of the
+ * handler in a microbenchmark, which is a silly thing to pay for a copy. */
+static inline void http_copy_cstr(char *dst, __u32 cap, const char *src)
+{
+    __u32 n = 0;
+
+    while (src[n] && n + 1 < cap) {
+        dst[n] = src[n];
+        n++;
+    }
+    dst[n] = '\0';
+}
+
+/* A framer message that found no live unit to attach itself to. On a connection
+ * we know we joined mid-stream — a synthetic entry, or one that has just
+ * resynced — this is the expected shape rather than an anomaly, and counting
+ * every such message would swamp the tally exactly where it stops being able to
+ * tell us anything. So `orphan_msgs` means "a message we had no business
+ * losing", and hc->degraded is what separates the two; it clears on the next
+ * request head, the first boundary the framer can vouch for. */
+static inline void http_orphan(struct lk_proto *p, const struct http_conn *hc)
+{
+    if (!hc->degraded)
+        p->st.orphan_msgs++;
+}
+
+/* --- http.c: the ring and the observation ---------------------------------- */
+
+/* Open a unit for a request head. NULL when the ring is full — the caller emits
+ * nothing and the connection remembers it owes a response (hc->owed). */
+struct http_unit *http_unit_open(struct lk_proto *p, struct http_conn *hc, __u64 ts_ns);
+
+/* --- http_req.c: the request head ------------------------------------------ */
+
+/* Parse a request head ('R') into a fresh unit and update the session labels;
+ * emits on_session the first time a connection produces one. The head bytes are
+ * borrowed for the call only, so everything kept is copied. */
+void http_req_head(struct lk_proto *p, struct lk_conn *c, struct http_conn *hc,
+                   const struct lk_msg *m);
+
+/* --- http_resp.c: the response head ---------------------------------------- */
+
+/* Parse a response head into the unit it answers. `interim` marks a 1xx ('I'):
+ * it records a timestamp and returns, because a 1xx closes nothing (РH6). */
+void http_resp_head(struct lk_proto *p, struct http_conn *hc, const struct lk_msg *m, bool interim);
+
+/* The active configuration (РH10), read by http_req.c. */
+const struct lk_http_cfg *http_cfg(void);
 
 #endif /* LATKIT_HTTP_H */

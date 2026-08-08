@@ -58,6 +58,9 @@ enum lk_qkind {
     LK_QK_COPY_IN,
     LK_QK_COPY_OUT,
     LK_QK_CANCEL,
+    LK_QK_REQUEST, /* HTTP request/response exchange (РH6); the http profile of
+                      М5 gives it its own families, this keeps the shared
+                      latkit_queries_total honest until then */
     LK_N_QKINDS,
 };
 

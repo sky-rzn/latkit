@@ -166,7 +166,8 @@ set(PROTO_SRC src/proto/registry.c src/proto/pg/pg.c src/proto/pg/pg_frame.c
               src/proto/pg/pg_session.c src/proto/pg/pg_query.c src/proto/pg/pg_prep.c
               src/proto/my/my_frame.c src/proto/my/my.c src/proto/my/my_session.c
               src/proto/my/my_query.c src/proto/my/my_prep.c
-              src/proto/http/http_frame.c src/proto/http/http.c)
+              src/proto/http/http_frame.c src/proto/http/http.c
+              src/proto/http/http_req.c src/proto/http/http_resp.c)
 set(PROTO_INC ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
               ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/pg
               ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/my

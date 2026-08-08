@@ -59,6 +59,11 @@ enum lk_query_kind {
     LK_Q_COPY_IN,  /* COPY FROM STDIN */
     LK_Q_COPY_OUT, /* COPY TO STDOUT */
     LK_Q_CANCEL,   /* CancelRequest */
+    LK_Q_REQUEST,  /* one HTTP request/response exchange (РH6, PLAN-HTTP.md М3):
+                      opened by a request head, closed by the end of the response
+                      body. Kept in the same enum rather than given a parallel one
+                      because every consumer downstream already switches on it —
+                      enum lk_qkind in metrics.h mirrors it value for value. */
 };
 
 /* lk_query_obs.flags */
@@ -70,6 +75,18 @@ enum lk_query_kind {
 #define LK_QO_SUSPENDED  (1 << 5) /* PortalSuspended: Execute with a row limit */
 #define LK_QO_ABORTED    (1 << 6) /* extended: killed by an earlier batch error */
 #define LK_QO_PIPELINED  (1 << 7) /* more than one unit in the batch */
+/* HTTP (РH10): a 4xx is an error too, but it is the *client's*, and mixing it
+ * into LK_QO_ERROR would make every 404-heavy service look broken. The two are
+ * separate flags rather than one status field so the DB protocols keep the
+ * single "did this fail" bit they have always had. */
+#define LK_QO_CLIENT_ERR (1 << 8) /* HTTP status 4xx: counted apart from ERROR */
+#define LK_QO_BODY_UNSEEN                                                                          \
+    (1 << 9) /* РH4: the response body was promised and did not                                   \
+                arrive in full — an old-kernel sendfile that                                     \
+                bypassed the socket, or a connection that died                                     \
+                mid-transfer. The head timings are honest and                                      \
+                bytes_out is a lower bound; the unit was closed                                    \
+                by something other than its own last byte */
 
 struct lk_session {
     char user[64], database[64], app[64]; /* truncated copies; "" = unknown */
@@ -77,22 +94,51 @@ struct lk_session {
     bool complete; /* startup seen in full */
 };
 
+/* One completed unit of work, whatever the protocol calls it: a query, a COPY,
+ * or an HTTP request/response exchange. The four timestamps are the reason the
+ * struct exists — everything else is labels.
+ *
+ * The HTTP track (РH5) needs one stamp the database protocols never did. There,
+ * `ts_start … ts_complete` covers the client's upload of the request body,
+ * which is time the server did not spend and cannot control, so a POST of a
+ * gigabyte would report a "slow server". ts_req_done_ns splits the interval:
+ *
+ *   ts_start ──request head+body──▶ ts_req_done ──server──▶ ts_first_row ──▶ ts_complete
+ *   duration = ts_complete − ts_req_done   ttfb = ts_first_row − ts_req_done
+ *   upload   = ts_req_done − ts_start      (its own family, РH9)
+ *
+ * For PG and MySQL ts_req_done_ns is simply 0 and every consumer keeps reading
+ * ts_start as it always has. */
 struct lk_query_obs {
-    __u64 ts_start_ns;     /* first frontend message of the unit */
-    __u64 ts_first_row_ns; /* first DataRow; 0 = none */
-    __u64 ts_complete_ns;  /* backend message that closed the unit */
-    __u64 ts_ready_ns;     /* nearest following Z; 0 = not yet (ABORTED/CANCEL) */
-    const char *text;      /* raw SQL prefix, NOT normalised; NULL on NO_TEXT;
-                              valid only for the duration of on_query */
+    __u64 ts_start_ns;     /* first frontend message of the unit / request head */
+    __u64 ts_req_done_ns;  /* HTTP: last byte of the request body (РH5); 0 = n/a */
+    __u64 ts_first_row_ns; /* first DataRow / response head (TTFB); 0 = none */
+    __u64 ts_complete_ns;  /* backend message that closed the unit / last body byte */
+    __u64 ts_ready_ns;     /* nearest following Z; 0 = not yet (ABORTED/CANCEL).
+                              HTTP has no separate ready point: == ts_complete */
+    const char *text;      /* raw SQL prefix / raw request target (path+query),
+                              NOT normalised; NULL on NO_TEXT; valid only for the
+                              duration of on_query */
     __u32 text_len;
-    __u64 rows;       /* from the CommandComplete tag; summed on MULTI_STMT */
-    __u64 bytes;      /* COPY: summed len of CopyData */
-    char sqlstate[6]; /* on LK_QO_ERROR, C-string */
-    __u16 err_code;   /* vendor error code (MySQL errno) on LK_QO_ERROR; 0 =
-                         none/unknown (PG has no numeric code) — М6 span attr */
-    __u8 kind;        /* enum lk_query_kind */
-    char txn_status;  /* I/T/E from the closing Z; 0 = unknown */
-    __u16 flags;      /* LK_QO_* */
+    __u64 rows;           /* from the CommandComplete tag; summed on MULTI_STMT */
+    __u64 bytes;          /* COPY: summed len of CopyData */
+    __u64 bytes_in;       /* HTTP: request body bytes, captured or holed (РH9) */
+    __u64 bytes_out;      /* HTTP: response body bytes */
+    const char *op;       /* protocol operation name, borrowed for the callback:
+                             the HTTP method ("GET"), later the S3 operation
+                             (РH8). NULL for the DB protocols, whose operation
+                             lives in `text` */
+    const char *err_name; /* symbolic error name, borrowed for the callback; the
+                             S3 dialect's error code (РH8). NULL everywhere in
+                             v1 — HTTP's error identity is err_code */
+    char sqlstate[6];     /* on LK_QO_ERROR, C-string */
+    __u16 err_code;       /* vendor error code (MySQL errno) on LK_QO_ERROR; 0 =
+                             none/unknown (PG has no numeric code) — М6 span attr.
+                             HTTP reuses it for the status code, which is set on
+                             *every* observation, not only failing ones (РH10) */
+    __u8 kind;            /* enum lk_query_kind */
+    char txn_status;      /* I/T/E from the closing Z; 0 = unknown (HTTP: none) */
+    __u16 flags;          /* LK_QO_* */
 };
 
 struct lk_query_sink {
@@ -122,6 +168,11 @@ struct lk_proto_stats {
     __u64 units_dropped_resync;   /* in-flight units dropped on a resync */
     __u64 units_dropped_close;    /* ... on a CONN_CLOSE with a non-empty queue */
     __u64 units_dropped_overflow; /* ... over LK_PG_MAX_INFLIGHT */
+    __u64 orphan_msgs;            /* a framer message with no live unit to attach it
+                                     to (РH6): a response on a connection joined
+                                     mid-stream, or one arriving after its unit was
+                                     emitted. Not a parse error — the input was
+                                     fine, we simply never saw its request */
     __u64 prep_evictions;         /* prepared-statement cache evictions */
     __u64 sessions;               /* on_session emitted */
     __u64 replication_conns;      /* CopyBoth / binlog dump -> IGNORE connections */
@@ -297,12 +348,24 @@ static inline const struct lk_proto_ops *lk_conn_proto(const struct lk_conn *c)
 extern const struct lk_proto_ops lk_proto_my_ops;
 struct lk_proto *lk_proto_my_new(const struct lk_query_sink *out);
 
-/* HTTP/1.x: stream framing (РH1) in src/proto/http/http_frame.c, the handler
- * in src/proto/http/http.c — `--port 8080=http`. М1 is the seam only: the
- * framer emits one message per capture event and the handler emits no
- * observations; the real framer is М2, the unit lifecycle М3. */
+/* HTTP/1.x: stream framing (РH1) in src/proto/http/http_frame.c, the handler in
+ * src/proto/http/http.c + http_req.c / http_resp.c — `--port 8080=http`. */
 extern const struct lk_proto_ops lk_proto_http_ops;
 struct lk_proto *lk_proto_http_new(const struct lk_query_sink *out);
+
+/* Handler-wide HTTP settings (РH10). Process-wide rather than per-handler
+ * because there is exactly one http handler instance per agent and the values
+ * are fixed at startup from the CLI — this is the seam М4 replaces with the
+ * per-port `struct lk_http_dialect` config (РH8), at which point the route
+ * knobs join it. Call before the first event; NULL restores the defaults. */
+struct lk_http_cfg {
+    bool user_basic; /* --http-user basic: take the `user` label from the name
+                        half of `Authorization: Basic`. Off by default — it is
+                        an identity, and the plan's rule is that nothing leaves
+                        the wire unless it was asked for (РH12). The password
+                        half is never decoded past the colon, ever. */
+};
+void lk_proto_http_configure(const struct lk_http_cfg *cfg);
 
 /* The registry: one entry per supported protocol, PG first (the default).
  * LK_PROTO_MAX caps it so consumers can size parallel arrays statically.

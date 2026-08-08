@@ -1,8 +1,8 @@
 # notes-httpproto: HTTP/1.x on the wire — framing, units, body length, blind spots
 
 Design notes backing the HTTP track ([PLAN-HTTP.md](../PLAN-HTTP.md), Russian,
-decisions РH1–РH16). This is the wire-level conspectus the М2 framer and М3
-handler will be written against — the same genre as
+decisions РH1–РH16). This is the wire-level conspectus the М2 framer and the М3
+handler were written against — the same genre as
 [notes-pgproto](notes-pgproto.md) and [notes-myproto](notes-myproto.md), and,
 like the latter, written *before* the code: it fixes what we believe the
 protocol does, which headers we read, how we decide where a body ends, and
@@ -465,10 +465,92 @@ desynchronisation shape, where the resync then finds the smuggled request),
 `huge-head` on the two servers that accept a 16 KB block (over the message
 ceiling), and the two TLS traces above.
 
+## What the М3 handler makes of it
+
+The framer says where messages begin and end; the handler
+(`src/proto/http/http.c` + `http_req.c` / `http_resp.c`) says what an exchange
+*was*. One `lk_query_obs` per request/response pair, and everything below is a
+decision that shows up in the numbers.
+
+**A unit is emitted exactly once, or dropped and counted.** It opens on a
+request head, closes on the last byte of the response body, and waits in a FIFO
+of at most 16 in between (`LK_HTTP_MAX_INFLIGHT`, the framer's own ring depth).
+Every other exit is a counter: `units_dropped_resync` when the stream broke,
+`units_dropped_close` when the connection died before an answer,
+`units_dropped_overflow` when pipelining ran deeper than the ring. A message
+that finds no unit at all — a response on a connection joined mid-stream — is
+`orphan_msgs`, and *not* a parse error: nothing was wrong with the input.
+
+**The four timings, and the one that is not the server's.** `ts_start` is the
+first byte of the request head, `ts_req_done` the last byte of its body,
+`ts_first_row` the first byte of the response head, `ts_complete` its last body
+byte. `duration = ts_complete − ts_req_done` is the only one that is the
+server's own; `upload = ts_req_done − ts_start` is the client's and gets its own
+family (РH9). On the corpus the difference is exactly as predicted: every
+`get.lkt` reports `upload=0` and all three models coincide, every `continue.lkt`
+reports a ~50 ms upload against a sub-millisecond duration — the client waiting
+for the interim `100`, which is time no server-side model should charge to the
+server. When the answer arrives before the upload finishes (an early `413`)
+there is no request-body end at all, and `ts_req_done` falls back to `ts_start`:
+that unit leaves the upload family rather than reporting a negative interval.
+
+**Three ways a status can land, not two.** `5xx` is `LK_QO_ERROR`, `4xx` is
+`LK_QO_CLIENT_ERR`, everything else is neither, and `err_code` carries the
+status on *every* observation because it is the response's identity rather than
+its error code (РH10). Folding 4xx into ERROR is the easiest way to make a
+404-heavy service read as broken, and once the metric is aggregated there is no
+way back.
+
+**Two directions, one unit.** The response side reads the request's method: a
+`HEAD` answer's `Content-Length` describes a body that never arrives, and the
+corpus `head.lkt` traces report `out=0` against a declared megabyte. Rule 6 is
+recognised at the response head, not at the connection's end — a response with
+no length and no chunked framing is *completed* by `CONN_CLOSE`, while one whose
+declared length never finished is emitted with `LK_QO_BODY_UNSEEN` and a byte
+count that is a lower bound. That second case is what makes `nginx/get.lkt` — a
+single 200 with a 17-byte body the capture's last call never delivered —
+produce an observation instead of nothing.
+
+**A resync drops by direction.** A loss on the request side means a request may
+have gone by unseen, so the queue no longer lines up with the responses still to
+come and everything in flight is dropped (Р19). A loss on the *response* side
+ruins the unit being answered and nothing else: the units behind it still have
+honest request heads and the FIFO still puts their responses next. The
+distinction is not cosmetic — a resync is reported late, when the framer finds
+its anchor, by which time the next request has already opened its unit, so
+dropping everything would discard the exchange the resync just recovered on
+every connection the agent joins mid-stream.
+
+**What the handler reads, and what it refuses to.** The header list is the one
+in §"Headers of interest" and nothing else is copied anywhere. `Cookie` is never
+read. `Authorization` is never read either unless `--http-user basic` asks for
+it, and then only the name half — the base64 decode stops at the colon, so at
+most two bytes of the password pass through a local variable and none reaches a
+label. `Bearer` is untouched whatever the flag says. The request target travels
+**raw** into `lk_query_obs.text`, query string included: templating it is М4's
+job and redacting it for a span is М6's, and doing either here would move those
+rules somewhere they cannot be tested.
+
+Per-connection cost: `struct http_conn` is the 16-unit ring plus a session, with
+the two variable-length copies (the target, and `tracestate` when one arrives)
+as owned buffers reused across the units of a slot — a keep-alive connection
+serving 50 requests does one allocation per slot, not 50.
+
+Measured over the corpus (`lkt_queries --proto http`, expectations pinned in
+`tests/replay/http_queries_traces.sh`): **266 observations over the 113
+traces**, `parse_errors` zero everywhere except the scenarios built to be
+rejected, and every `orphan_msgs` accounted for by a trace that is degraded on
+purpose. Three per-server disagreements are recorded rather than smoothed over,
+because they are findings and not noise: gunicorn's sync worker answers exactly
+one request per connection whatever arrives (its `keepalive-50` yields one
+observation and 49 counted drops, where nginx, Go and node yield 50); nginx
+answers `405` to `OPTIONS` on a static file; and only Go delivers the whole 1 MB
+of `get-large` through the socket before the capture's last call is cut short.
+
 ## What the corpus proves
 
 `tests/traces/http/` (113 traces, four servers) is the material every claim
-above was checked against, and the shapes М2/М3 will be regression-tested on:
+above was checked against, and the shapes М2/М3 are regression-tested on:
 the framing edge cases (`cl-te`, `lf-only`, `torn-body`, `truncated-resp`,
 `abort-midbody`, `bad-request`), the blind zones (`h2-preface`, `h2c-upgrade`,
 `websocket`, `connect`, `tls`), the degradations (`sendfile-static` vs

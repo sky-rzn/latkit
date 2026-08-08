@@ -50,3 +50,10 @@ target_link_libraries(lkt_queries latkit_proto)
 add_test(NAME my_queries_traces
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/queries_traces.sh
                  $<TARGET_FILE:lkt_queries> ${CMAKE_SOURCE_DIR}/tests/traces/mysql)
+
+# The same for HTTP (PLAN-HTTP.md М3 acceptance): the expected observation per
+# М0 scenario — method, status, sizes, the four timings — plus parse_errors == 0
+# on every clean trace.
+add_test(NAME http_queries_traces
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/http_queries_traces.sh
+                 $<TARGET_FILE:lkt_queries> ${CMAKE_SOURCE_DIR}/tests/traces/http)
