@@ -86,6 +86,17 @@ the replay harness, the fuzzers and the protocol handlers cannot tell the two
 modes apart, which is what keeps PostgreSQL and MySQL behaviour bit-for-bit
 unchanged (РH15).
 
+Bulk scratch is shared rather than duplicated. A stream framer needs a buffer
+the message mode gets for free — HTTP assembles a header block that may span
+events — and it takes one from the same freelist through
+`lk_reasm_buf_get()` / `lk_reasm_buf_put()`, parking it in `lk_frame.buf`. That
+placement is the whole point: Р11's ceiling
+(`LK_REASM_POOL_MAX × LK_MSG_BODY_MAX`, independent of connection count) keeps
+covering it, the connection table frees it on every removal path, and
+`do_resync` recycles it without knowing which mode put it there. `frame_state`
+stays what its contract says it is — one flat allocation with no owned pointers
+inside.
+
 The one thing a stream protocol does inherit rather than own is the loss
 *signal*: the connection table's `seq` detector still marks both directions
 `LK_FR_DIRTY`, and the framer reads that flag as "the stream broke here".

@@ -130,6 +130,19 @@ void lk_reasm_resync(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir)
     do_resync(r, c, dir, &c->frame[dir]);
 }
 
+/* The slab pool, lent to a stream framer for its own bulk scratch (HTTP's
+ * header-block accumulator). Same slabs, same ceiling, same recycling as a
+ * message-mode body prefix — Р11's bound is one number for both modes. */
+__u8 *lk_reasm_buf_get(struct lk_reasm *r)
+{
+    return buf_get(r);
+}
+
+void lk_reasm_buf_put(struct lk_reasm *r, __u8 *buf)
+{
+    buf_put(r, buf);
+}
+
 static void emit(struct lk_reasm *r, const struct lk_proto_ops *ops, struct lk_conn *c,
                  enum lk_dir dir, struct lk_frame *f, const __u8 *body, __u32 body_cap)
 {

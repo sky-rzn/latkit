@@ -378,6 +378,93 @@ truncated head is a normal, flagged outcome (`LK_QO_TEXT_TRUNC`): the start
 line and the first headers always arrive first, and those carry the route, the
 method and the framing fields.
 
+## What the М2 framer emits, and what it decided along the way
+
+The framer is `src/proto/http/http_frame.c`, in the stream mode of РH1; the
+text helpers it and the М3 handler read heads with are `http_wire.h`, the
+`pg_wire.h` of this protocol. Everything it publishes is an ordinary `lk_msg`,
+so `--messages`, the replay harness and the fuzzers are unchanged:
+
+| Type | Meaning | `len` | `body` |
+|---|---|---|---|
+| `R` / `S` | request / response head | the header block's length | the block itself |
+| `I` | interim `1xx` head — does not close the unit | likewise | likewise |
+| `D` | body bytes accounted (captured **or** holed) | that count | none, ever |
+| `E` | end of body | the message's total body size | none |
+| `!` | framer note: a degradation or a blind zone | `enum lk_http_note` | none |
+
+Four points where the implementation is sharper than the sketch above:
+
+- **`D` never carries payload.** A body's *length* is observable and its
+  content is not (РH12), so the count travels and the bytes do not. Holes
+  report through `D` too — they were on the wire, `total_len` is honest — which
+  is what keeps `bytes_in`/`bytes_out` exact under any capture budget. For a
+  chunked body `D` counts *decoded* bytes, so chunked and `Content-Length`
+  responses of the same size report the same number.
+- **`LK_MSG_BODY_TRUNC` means something else here.** In the message mode it
+  means "the captured prefix is shorter than the length the header declared".
+  A head has no such declaration, so on `R`/`S` the flag reads "the block never
+  terminated — a hole ate the rest, its real length is unknown and larger".
+  `len == body_cap` always.
+- **The notes are the framer's only channel.** A stream framer has no stats
+  object of its own (it is a `const` vtable entry), so every degradation it
+  recognises — a malformed start line, CL+TE, a conflicting `Content-Length`,
+  an obs-fold, an oversized head, a hole on a head or in a chunked body, bare
+  LF, pipelining past the ring, an unseen body, the three blind zones — becomes
+  a `!` message. The handler turns the corrupt-input subset into
+  `latkit_parse_errors_total` and the blind zones into the ignored-connection
+  tally; capture losses are counted as holes and are deliberately *not* parse
+  errors.
+- **The request anchor is `METHOD SP`, not the whole request line.** The notes
+  above describe the anchor as the three-part line with its version tail. As
+  written that would resynchronise *after* the start line and lose the method
+  and the route with it — the two fields the whole track exists to report. The
+  framer instead matches the method token plus its space (a sliding match that
+  survives event boundaries, like PG's `Z`), **keeps the matched bytes and
+  feeds them back into the head assembler**, so framing resumes at the first
+  byte of the start line. The version tail still has to be there: the head
+  parser rejects anything that is not `… SP HTTP/1.[01]`, so a false anchor
+  costs one head-parse and returns to the scan. Same guarantee, one recovered
+  unit more.
+
+Two limits worth stating plainly, because they are visible on the corpus:
+
+- **The last call of a connection.** An under-captured call's tail becomes a
+  hole only when the *next* call arrives (the generic lazy-tail rule, Р9), so a
+  direction whose last call was cut short never learns those bytes existed.
+  Two shapes in the corpus: `nginx/get.lkt`, where the 17-byte body goes out by
+  `sendfile` with an uncopyable page iterator and the connection closes — no
+  `E`, the unit is still open at `CONN_CLOSE` where М3 closes it; and
+  `nginx/huge-head.lkt`, where nginx reads the whole 16 KB head in one call,
+  the budget cuts it, nothing follows on that direction, and the request is
+  never published at all. Making the close path flush the pending tail would
+  fix both, but it is generic-layer surgery that would change PG and MySQL
+  message counts, which РH15 forbids for this track.
+- **TLS traces frame as garbage until М7.** PG and MySQL negotiate TLS in
+  band, so the framer knows when a connection turns into ciphertext; HTTPS
+  carries no such marker on the socket, and `LK_CONN_TLS` is set by the
+  uprobe router, not by anything HTTP can see. Until the TLS stage the
+  ciphertext of `tls-decrypted*.lkt` is fed to the framer alongside the
+  plaintext channel and produces rejected heads. That is expected and is why
+  those two traces are the only "clean" files with a nonzero `parse_errors`.
+
+The boundary check that covers the whole corpus in one number: replay all 113
+traces and count `R`/`S` against `E` per connection *and* per direction. Across
+the 207 streams that produces, **175 balance exactly and 32 end with one open
+head — never two, never a negative**. Every one of those 32 is a documented
+tail: a body that runs until close (`Connection: close`, HTTP/1.0), a
+deliberately truncated one (`torn-body`, `truncated-resp`, `abort-midbody`), a
+head cut by the capture budget (`huge-head*`), or the last-call case above. A
+desynchronised framer would show drift in the middle of a connection, not a
+single unclosed unit at its end.
+
+Measured over the same corpus (`lkt_queries --proto http`):
+`parse_errors` is zero everywhere except the scenarios built to be rejected —
+`bad-request` (binary garbage where a start line belongs), `cl-te` (the
+desynchronisation shape, where the resync then finds the smuggled request),
+`huge-head` on the two servers that accept a 16 KB block (over the message
+ceiling), and the two TLS traces above.
+
 ## What the corpus proves
 
 `tests/traces/http/` (113 traces, four servers) is the material every claim

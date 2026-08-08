@@ -69,6 +69,16 @@ target_include_directories(test_http_stream PRIVATE
 target_link_libraries(test_http_stream latkit_proto)
 add_test(NAME http_stream COMMAND test_http_stream)
 
+# HTTP/1.x framer (PLAN-HTTP.md М2): the reassembly matrix over lk_proto_http_ops
+# — torn heads, holes on head/body/chunked, the body-length decision list, the
+# blind zones, the textual resync anchors — plus the http_wire.h helpers.
+add_executable(test_http_frame test_http_frame.c)
+target_include_directories(test_http_frame PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent
+    ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/http)
+target_link_libraries(test_http_frame latkit_proto)
+add_test(NAME http_frame COMMAND test_http_frame)
+
 # Startup/auth/session (task 3.2): white-box over the PG handler (links the
 # libbpf-free proto lib; includes the internal pg.h for state assertions).
 add_executable(test_pg_session test_pg_session.c)

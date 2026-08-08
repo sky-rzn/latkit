@@ -1,20 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Unit tests for the framer's stream mode (РH1, PLAN-HTTP.md М1) — the second
  * framing mode of lk_proto_ops, driven through the very lk_reasm_data path the
- * agent uses, with the М1 HTTP stub as its only implementation.
+ * agent uses, with HTTP as its only implementation.
  *
  * What is asserted here is the *seam*, not HTTP: that a LK_PROTO_F_STREAM
  * protocol receives the byte stream after every generic step and none of the
  * message-machine ones; that lk_reasm_emit/lk_reasm_resync keep the lk_msg
- * contract and the counters the message mode keeps; that frame_state follows
- * the connection through every removal path; and — the point of the whole
- * exercise (РH15) — that a stream protocol on one connection changes nothing
- * for a PG connection on the same framer.
+ * contract and the counters the message mode keeps; that frame_state and the
+ * borrowed slab follow the connection through every removal path; and — the
+ * point of the whole exercise (РH15) — that a stream protocol on one
+ * connection changes nothing for a PG connection on the same framer.
  *
- * The М1 stub's own behaviour (one message per capture event, typed by
- * direction) is asserted as a contract because that is what the М1 acceptance
- * check runs over the trace corpus; М2 replaces it with the real framer and
- * this file keeps only the seam tests. */
+ * HTTP's own behaviour — heads, bodies, the four degradations, the anchors —
+ * belongs to test_http_frame.c (М2). This file uses the smallest HTTP that
+ * will drive the seam and asserts nothing about its meaning. */
 #include <linux/types.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,7 +48,7 @@ static int nresyncs;
 static void on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struct lk_msg *m)
 {
     struct rec *r = &recs[nrecs % 16];
-    __u32 nbody = m->body_cap < sizeof(r->body) ? m->body_cap : sizeof(r->body);
+    __u32 nbody = m->body_cap < sizeof(r->body) ? m->body_cap : (__u32)sizeof(r->body);
 
     (void)ctx;
     (void)c;
@@ -120,54 +119,52 @@ static const char RESP[] = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
 
 /* --- tests ---------------------------------------------------------------- */
 
-/* The baseline contract: every captured event becomes exactly one message,
- * typed by direction, carrying that event's bytes and timestamp. Nothing is
- * accumulated across events and no header is parsed — the М1 stub frames
- * nothing, which is what makes "one message per event" checkable over the М0
- * corpus. */
-static int test_event_per_message(void)
+/* The seam itself: bytes reach the protocol, messages come back out through
+ * lk_reasm_emit, and none of the message-machine state was touched on the way.
+ * The generic counters are kept in one place for both modes. */
+static int test_stream_reaches_protocol(void)
 {
     reset();
     feed_call(LK_DIR_RECV, REQ, sizeof(REQ) - 1, 100);
     feed_call(LK_DIR_SEND, RESP, sizeof(RESP) - 1, 200);
 
-    CHECK(nrecs == 2);
-    CHECK(recs[0].type == LK_HTTP_MSG_REQ && recs[0].dir == LK_DIR_RECV);
-    CHECK(recs[0].ts == 100 && recs[0].len == sizeof(REQ) - 1);
+    CHECK(nrecs == 5); /* R E | S D E */
+    CHECK(recs[0].dir == LK_DIR_RECV && recs[0].ts == 100);
     CHECK(recs[0].cap == sizeof(REQ) - 1 && !memcmp(recs[0].body, REQ, 20));
-    CHECK(recs[1].type == LK_HTTP_MSG_RESP && recs[1].dir == LK_DIR_SEND);
-    CHECK(recs[1].ts == 200 && recs[1].len == sizeof(RESP) - 1);
-    CHECK(recs[0].flags == 0 && recs[1].flags == 0);
-    CHECK(reasm.st.msgs == 2 && reasm.st.holes == 0 && reasm.st.resyncs == 0);
-    /* The message machine never ran: no header was accumulated, no body
-     * buffered, no state left behind. */
+    CHECK(recs[2].dir == LK_DIR_SEND && recs[2].ts == 200);
+    CHECK(reasm.st.msgs == 5 && reasm.st.holes == 0 && reasm.st.resyncs == 0);
+    /* The message machine never ran: no header accumulated, no body buffered,
+     * no state left behind. */
     CHECK(conn.frame[LK_DIR_RECV].hdr_len == 0 && conn.frame[LK_DIR_RECV].buf == NULL);
     CHECK(conn.frame[LK_DIR_SEND].st == LK_FR_HEADER);
+    CHECK(conn.frame_state != NULL);
     return 0;
 }
 
-/* A chunk larger than the body-prefix ceiling is published as a prefix with
- * LK_MSG_BODY_TRUNC, and the truncation counter follows — lk_reasm_emit keeps
- * the same accounting the message mode does. */
-static int test_body_trunc(void)
+/* The scratch a stream framer needs comes from the reassembly slab pool, not
+ * from frame_state (which must stay one flat allocation) and not from a
+ * private malloc: it is parked in lk_frame.buf, so Р11's ceiling covers it and
+ * the connection table frees it on every removal path. The message boundary
+ * gives it back. */
+static int test_slab_borrowed_and_returned(void)
 {
-    static __u8 big[LK_MSG_BODY_MAX + 1024];
-
     reset();
-    memset(big, 'x', sizeof(big));
-    feed_call(LK_DIR_SEND, big, sizeof(big), 10);
+    feed_call(LK_DIR_RECV, REQ, 12, 10); /* half a head: the slab is taken */
+    CHECK(nrecs == 0);
+    CHECK(conn.frame[LK_DIR_RECV].buf != NULL);
+    CHECK(conn.frame[LK_DIR_RECV].buf_len == 12);
+    CHECK(reasm.pool_n == 0);
 
-    CHECK(nrecs == 1);
-    CHECK(recs[0].len == sizeof(big) && recs[0].cap == LK_MSG_BODY_MAX);
-    CHECK(recs[0].flags & LK_MSG_BODY_TRUNC);
-    CHECK(reasm.st.msgs == 1 && reasm.st.msgs_trunc == 1);
+    feed_call(LK_DIR_RECV, REQ + 12, sizeof(REQ) - 13, 11);
+    CHECK(nrecs == 2);
+    CHECK(conn.frame[LK_DIR_RECV].buf == NULL); /* ... and given back */
+    CHECK(reasm.pool_n == 1);
     return 0;
 }
 
-/* A hole reaches the protocol as a hole and is counted generically; the stub
- * publishes no message for it (there is nothing to publish — the bytes are
- * gone), and framing continues on the next event. */
-static int test_hole_counted_not_emitted(void)
+/* A hole reaches the protocol as a hole and is counted generically, whatever
+ * the protocol then decides it means. */
+static int test_hole_counted(void)
 {
     struct http_frame *hf;
 
@@ -175,9 +172,8 @@ static int test_hole_counted_not_emitted(void)
     /* An uncaptured call tail: 200 bytes promised, 8 captured. The remainder
      * is only recognised at the next call — the generic lazy-tail rule. */
     feed(LK_DIR_SEND, 200, 0, RESP, 8, 10);
-    CHECK(nrecs == 1 && reasm.st.holes == 0);
+    CHECK(reasm.st.holes == 0);
     feed_call(LK_DIR_SEND, RESP, sizeof(RESP) - 1, 20);
-    CHECK(nrecs == 2);
     CHECK(reasm.st.holes == 1 && reasm.st.hole_bytes == 192);
 
     /* An intra-call gap between two chunks is a hole of known size too. */
@@ -186,16 +182,15 @@ static int test_hole_counted_not_emitted(void)
     memset(filler, 'b', sizeof(filler));
     feed(LK_DIR_RECV, 100, 0, filler, 10, 30);
     feed(LK_DIR_RECV, 100, 40, filler, 60, 31);
-    CHECK(nrecs == 4);
     CHECK(reasm.st.holes == 2 && reasm.st.hole_bytes == 192 + 30);
 
     hf = conn.frame_state;
     CHECK(hf != NULL);
-    CHECK(hf->events[LK_DIR_SEND] == 2 && hf->holes[LK_DIR_SEND] == 1);
-    CHECK(hf->events[LK_DIR_RECV] == 2 && hf->holes[LK_DIR_RECV] == 1);
+    CHECK(hf->d[LK_DIR_SEND].events == 2 && hf->d[LK_DIR_SEND].holes == 1);
+    CHECK(hf->d[LK_DIR_RECV].events == 2 && hf->d[LK_DIR_RECV].holes == 1);
     /* off tracks every byte the direction owned, captured or not. */
-    CHECK(hf->off[LK_DIR_SEND] == 8 + 192 + sizeof(RESP) - 1);
-    CHECK(hf->off[LK_DIR_RECV] == 10 + 30 + 60);
+    CHECK(hf->d[LK_DIR_SEND].off == 8 + 192 + sizeof(RESP) - 1);
+    CHECK(hf->d[LK_DIR_RECV].off == 10 + 30 + 60);
     return 0;
 }
 
@@ -213,16 +208,16 @@ static int test_resync_from_dirty(void)
 
     feed_call(LK_DIR_SEND, RESP, sizeof(RESP) - 1, 10);
     CHECK(nresyncs == 1 && reasm.st.resyncs == 1);
-    CHECK(nrecs == 1 && (recs[0].flags & LK_MSG_AFTER_RESYNC));
+    CHECK(nrecs == 3 && (recs[0].flags & LK_MSG_AFTER_RESYNC));
     CHECK(conn.frame[LK_DIR_SEND].st != LK_FR_DIRTY);
 
     /* Only the direction that got bytes resynchronised; the stamp is one-shot. */
     feed_call(LK_DIR_SEND, RESP, sizeof(RESP) - 1, 20);
-    CHECK(nresyncs == 1 && nrecs == 2 && !(recs[1].flags & LK_MSG_AFTER_RESYNC));
+    CHECK(nresyncs == 1 && !(recs[3 % 16].flags & LK_MSG_AFTER_RESYNC));
     CHECK(conn.frame[LK_DIR_RECV].st == LK_FR_DIRTY);
 
     feed_call(LK_DIR_RECV, REQ, sizeof(REQ) - 1, 30);
-    CHECK(nresyncs == 2 && nrecs == 3 && (recs[2].flags & LK_MSG_AFTER_RESYNC));
+    CHECK(nresyncs == 2);
     return 0;
 }
 
@@ -244,14 +239,18 @@ static int test_generic_guards_apply(void)
 }
 
 /* An off-anomaly (off past total_len) dirties the direction through the
- * generic path; the stream framer then resynchronises on the next sane event
- * rather than silently framing corrupt input. */
+ * generic path; the stream framer then resynchronises on its own anchor rather
+ * than silently framing corrupt input. */
 static int test_off_anomaly(void)
 {
     reset();
-    feed(LK_DIR_SEND, 50, 60, RESP, 8, 10);
+    feed(LK_DIR_SEND, 50, 60, "\x01\x02\x03\x04\x05\x06\x07\x08", 8, 10);
     CHECK(reasm.st.off_anomalies == 1);
-    CHECK(nrecs == 1 && nresyncs == 1 && (recs[0].flags & LK_MSG_AFTER_RESYNC));
+    CHECK(nrecs == 0 && nresyncs == 0);
+    CHECK(conn.frame[LK_DIR_SEND].st == LK_FR_DIRTY);
+
+    feed_call(LK_DIR_SEND, RESP, sizeof(RESP) - 1, 20);
+    CHECK(nresyncs == 1 && (recs[0].flags & LK_MSG_AFTER_RESYNC));
     return 0;
 }
 
@@ -282,11 +281,9 @@ static int test_pg_unaffected_alongside(void)
     lk_frame_bytes(&reasm, &pgconn, LK_DIR_RECV, wire, n, 20);
     feed_call(LK_DIR_SEND, RESP, sizeof(RESP) - 1, 30);
 
-    CHECK(nrecs == 3);
-    CHECK(recs[0].type == LK_HTTP_MSG_REQ);
-    CHECK(recs[1].type == 'Q' && recs[1].len == 13 && recs[1].cap == 9);
-    CHECK(!strcmp((char *)recs[1].body, "select 1"));
-    CHECK(recs[2].type == LK_HTTP_MSG_RESP);
+    CHECK(nrecs == 6);
+    CHECK(recs[2].type == 'Q' && recs[2].len == 13 && recs[2].cap == 9);
+    CHECK(!strcmp((char *)recs[2].body, "select 1"));
     /* The PG connection ran the message machine: header consumed, back at a
      * message boundary, and it grew no stream state. */
     CHECK(pgconn.frame[LK_DIR_RECV].st == LK_FR_HEADER && pgconn.frame_state == NULL);
@@ -296,9 +293,9 @@ static int test_pg_unaffected_alongside(void)
 
 int main(void)
 {
-    if (test_event_per_message() || test_body_trunc() || test_hole_counted_not_emitted() ||
-        test_resync_from_dirty() || test_generic_guards_apply() || test_off_anomaly() ||
-        test_pg_unaffected_alongside())
+    if (test_stream_reaches_protocol() || test_slab_borrowed_and_returned() ||
+        test_hole_counted() || test_resync_from_dirty() || test_generic_guards_apply() ||
+        test_off_anomaly() || test_pg_unaffected_alongside())
         return 1;
     free(conn.frame[0].buf);
     free(conn.frame[1].buf);

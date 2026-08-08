@@ -1,0 +1,11 @@
+GET /json/1234 HTTP/1.1
+Host: h
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+tracestate: rojo=00f067aa0ba902b7
+X-Request-Id: abc-123
+Authorization: Bearer secret
+Cookie: sid=deadbeef
+
+HTTP/1.1 500 Internal Server Error
+Content-Length: 0
+

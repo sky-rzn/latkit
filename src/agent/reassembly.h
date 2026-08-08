@@ -164,8 +164,19 @@ void lk_frame_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64
  * lk_reasm_resync is do_resync for a stream framer: the direction leaves
  * LK_FR_DIRTY (the state the conn table's seq detector and the lazily created
  * entries set), the resyncs counter and the on_resync callback fire, and the
- * next emitted message carries LK_MSG_AFTER_RESYNC. */
+ * next emitted message carries LK_MSG_AFTER_RESYNC.
+ *
+ * lk_reasm_buf_get/put lend the direction a body-prefix slab. A stream framer
+ * needs bulk scratch of its own — HTTP assembles a header block that spans
+ * events — and taking it from the same pool as the message mode's body
+ * prefixes is what keeps Р11's bound one number: the pool ceiling stays
+ * LK_REASM_POOL_MAX * LK_MSG_BODY_MAX however many connections are open. Park
+ * the slab in lk_frame.buf (never in frame_state, which must stay one flat
+ * allocation) so the connection table frees it on every removal path and
+ * do_resync recycles it; buf_put is NULL-safe. */
 void lk_reasm_emit(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, struct lk_msg *m);
 void lk_reasm_resync(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir);
+__u8 *lk_reasm_buf_get(struct lk_reasm *r);
+void lk_reasm_buf_put(struct lk_reasm *r, __u8 *buf);
 
 #endif /* LATKIT_REASSEMBLY_H */

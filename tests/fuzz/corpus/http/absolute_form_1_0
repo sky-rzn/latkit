@@ -1,0 +1,5 @@
+GET http://shop.example/orders/42?x=1 HTTP/1.0
+
+HTTP/1.0 200 OK
+
+body until close

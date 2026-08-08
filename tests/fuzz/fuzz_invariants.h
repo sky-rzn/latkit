@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "http.h" /* the HTTP framer's synthetic dictionary (РH3) */
 #include "norm_sql.h"
 #include "proto.h"
 
@@ -87,6 +88,51 @@ static inline void fz_check_msg(const struct lk_msg *m, bool mysql)
     if (m->body_cap) {
         FZ_ASSERT(m->body != NULL);
         fz_read_bytes(m->body, m->body_cap);
+    }
+}
+
+/* HTTP framer message contract (http.h, РH3). The stream mode publishes a
+ * dictionary of its own, and the invariants are shape rules rather than length
+ * arithmetic — there is no length field on the wire to cross-check against:
+ *
+ *   'R' / 'S' / 'I'  a header block: len is its length, the captured prefix is
+ *                    body_cap, and "truncated" is exactly "prefix shorter than
+ *                    the block". Never longer than the Р11 cap, because the
+ *                    framer refuses a head that would not fit;
+ *   'D' / 'E' / '!'  counts and codes, never payload: body is NULL by
+ *                    construction (РH12 — bodies are not read, so they cannot
+ *                    leak), so a non-NULL one here means the framer handed out
+ *                    a pointer it had no business having.
+ *
+ * A note's code must be a defined one: an out-of-range code would mean the
+ * handler tallies a degradation it cannot name. */
+static inline void fz_check_http_msg(const struct lk_msg *m)
+{
+    FZ_ASSERT(m->body_cap <= LK_MSG_BODY_MAX);
+    FZ_ASSERT(!(m->flags & LK_MSG_STARTUP)); /* HTTP has no startup framing */
+    switch (m->type) {
+    case LK_HTTP_MSG_REQ:
+    case LK_HTTP_MSG_RESP:
+    case LK_HTTP_MSG_INTER:
+        /* len is the block we captured and body_cap is all of it — unlike the
+         * message mode there is no length field to compare against, so
+         * LK_MSG_BODY_TRUNC means "the block never terminated, its real length
+         * is unknown and larger" rather than "cap < len" (http.h). */
+        FZ_ASSERT(m->len && m->len <= LK_MSG_BODY_MAX);
+        FZ_ASSERT(m->body_cap == m->len);
+        FZ_ASSERT(m->body != NULL);
+        fz_read_bytes(m->body, m->body_cap);
+        break;
+    case LK_HTTP_MSG_NOTE:
+        FZ_ASSERT(m->len > 0 && m->len < (__u32)LK_HTTP_NOTE_MAX);
+        /* fall through */
+    case LK_HTTP_MSG_DATA:
+    case LK_HTTP_MSG_END:
+        FZ_ASSERT(m->body == NULL && m->body_cap == 0);
+        FZ_ASSERT(!(m->flags & LK_MSG_BODY_TRUNC));
+        break;
+    default:
+        FZ_ASSERT(0); /* a type outside the dictionary */
     }
 }
 

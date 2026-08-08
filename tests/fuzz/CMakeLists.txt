@@ -1,9 +1,11 @@
-# Fuzzing profile (task 8.3, Р51). Three libFuzzer targets over the pure
-# pipeline code, clang-only, with fuzzer+ASAN+UBSAN baked into the profile:
+# Fuzzing profile (task 8.3, Р51). libFuzzer targets over the pure pipeline
+# code, clang-only, with fuzzer+ASAN+UBSAN baked into the profile:
 #
 #   cmake -B build-fuzz -DCMAKE_C_COMPILER=clang -DLATKIT_FUZZ=ON
 #
 #   fuzz_pg    bytes -> framer -> lk_msg -> PG parser (harness from task 3.6)
+#   fuzz_my    the same over the MySQL framer + handler (MYSQL.md М7)
+#   fuzz_http  the same over the HTTP/1.x stream framer (PLAN-HTTP.md М2)
 #   fuzz_norm  bytes -> lk_norm_sql (harness from task 4.1)
 #   fuzz_pipe  event scenario -> decode + conn_table + framer + parser + norm
 #
@@ -11,7 +13,7 @@
 # latkit_proto/latkit_norm: the libraries are built without sanitizers, and an
 # uninstrumented dependency is exactly where a fuzzer goes blind.
 #
-# Corpus lives in tests/fuzz/corpus/{pg,norm,pipe} (committed; minimised with
+# Corpus lives in tests/fuzz/corpus/{pg,my,http,norm,pipe} (committed; minimised with
 # -merge=1 by campaign.sh). The ctest entries below replay it with -runs=0 —
 # the corpus-regression mode CI runs on every PR; fuzzing time budgets live in
 # ci.yml, not here.
@@ -51,6 +53,7 @@ endfunction()
 
 latkit_fuzzer(fuzz_pg fuzz_pg.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC})
 latkit_fuzzer(fuzz_my fuzz_my.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC})
+latkit_fuzzer(fuzz_http fuzz_http.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC})
 latkit_fuzzer(fuzz_norm fuzz_norm.c ${FUZZ_NORM_SRC})
 latkit_fuzzer(fuzz_pipe fuzz_pipe.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC} ${FUZZ_NORM_SRC}
               ${CMAKE_SOURCE_DIR}/src/agent/decode.c ${CMAKE_SOURCE_DIR}/src/agent/pipeline.c)
@@ -70,5 +73,11 @@ add_test(NAME fuzz_my_corpus
          COMMAND fuzz_my -runs=0 ${FUZZ_CORPUS}/my
                  ${CMAKE_SOURCE_DIR}/tests/traces/mysql/my84
                  ${CMAKE_SOURCE_DIR}/tests/traces/mysql/maria1011)
+# fuzz_http replays its own corpus plus the recorded HTTP traces (М0): raw .lkt
+# bytes are also valid framer input, and they carry the real header shapes.
+add_test(NAME fuzz_http_corpus
+         COMMAND fuzz_http -runs=0 ${FUZZ_CORPUS}/http
+                 ${CMAKE_SOURCE_DIR}/tests/traces/http/nginx
+                 ${CMAKE_SOURCE_DIR}/tests/traces/http/go)
 add_test(NAME fuzz_norm_corpus COMMAND fuzz_norm -runs=0 ${FUZZ_CORPUS}/norm)
 add_test(NAME fuzz_pipe_corpus COMMAND fuzz_pipe -runs=0 ${FUZZ_CORPUS}/pipe)

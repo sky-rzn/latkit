@@ -1,0 +1,74 @@
+# libFuzzer dictionary for the HTTP-shaped target (fuzz_http; PLAN-HTTP.md М2).
+# CR and LF are spelled \x0d / \x0a: libFuzzer's parser understands only \\, \"
+# and \xNN, and rejects the whole file on anything else.
+# HTTP is text, so the mutator's problem is not guessing byte values but
+# assembling tokens that make the framer take an interesting branch: the start
+# lines, the framing headers, the values that change how a body is delimited,
+# and the shapes that desynchronise real proxies. Passed with -dict= by
+# campaign.sh and CI.
+
+# --- line structure ---------------------------------------------------------
+crlf="\x0d\x0a"
+crlfcrlf="\x0d\x0a\x0d\x0a"
+lf="\x0a"
+lflf="\x0a\x0a"
+
+# --- methods (also the resync anchor alphabet) ------------------------------
+m_get="GET "
+m_head="HEAD "
+m_post="POST "
+m_put="PUT "
+m_delete="DELETE "
+m_connect="CONNECT "
+m_options="OPTIONS "
+m_trace="TRACE "
+m_patch="PATCH "
+m_unknown="PROPFIND "
+
+# --- versions and status lines ----------------------------------------------
+v11=" HTTP/1.1\x0d\x0a"
+v10=" HTTP/1.0\x0d\x0a"
+v20=" HTTP/2.0\x0d\x0a"
+st200="HTTP/1.1 200 OK\x0d\x0a"
+st101="HTTP/1.1 101 Switching Protocols\x0d\x0a"
+st100="HTTP/1.1 100 Continue\x0d\x0a\x0d\x0a"
+st103="HTTP/1.1 103 Early Hints\x0d\x0a"
+st204="HTTP/1.1 204 No Content\x0d\x0a"
+st304="HTTP/1.1 304 Not Modified\x0d\x0a"
+st404="HTTP/1.1 404 Not Found\x0d\x0a"
+st500="HTTP/1.1 500 Internal Server Error\x0d\x0a"
+
+# --- framing headers: the whole body-length decision list -------------------
+h_cl="Content-Length: "
+h_cl0="Content-Length: 0\x0d\x0a"
+h_cl_dup="Content-Length: 5, 5\x0d\x0a"
+h_te="Transfer-Encoding: chunked\x0d\x0a"
+h_te_gzip="Transfer-Encoding: gzip\x0d\x0a"
+h_conn_close="Connection: close\x0d\x0a"
+h_conn_ka="Connection: keep-alive\x0d\x0a"
+h_conn_up="Connection: Upgrade\x0d\x0a"
+h_upgrade_ws="Upgrade: websocket\x0d\x0a"
+h_upgrade_h2c="Upgrade: h2c\x0d\x0a"
+h_expect="Expect: 100-continue\x0d\x0a"
+h_host="Host: shop.example\x0d\x0a"
+
+# --- headers the handler stages read (М3/М6) --------------------------------
+h_ua="User-Agent: curl/8.5.0\x0d\x0a"
+h_ct="Content-Type: application/json\x0d\x0a"
+h_traceparent="traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\x0d\x0a"
+h_tracestate="tracestate: rojo=00f067aa0ba902b7\x0d\x0a"
+h_reqid="X-Request-Id: 0123456789abcdef\x0d\x0a"
+h_authz_basic="Authorization: Basic dXNlcjpwYXNz\x0d\x0a"
+
+# --- chunked framing --------------------------------------------------------
+ch_last="0\x0d\x0a\x0d\x0a"
+ch_small="5\x0d\x0ahello\x0d\x0a"
+ch_ext="3;ext=value\x0d\x0aabc\x0d\x0a"
+ch_hex="ffffffffffffffff\x0d\x0a"
+
+# --- shapes that desynchronise hops ----------------------------------------
+h2_preface="PRI * HTTP/2.0\x0d\x0a\x0d\x0aSM\x0d\x0a\x0d\x0a"
+obs_fold="\x0d\x0a\x09folded\x0d\x0a"
+space_colon="Header : value\x0d\x0a"
+target_star="* "
+target_abs="http://shop.example/a/b"

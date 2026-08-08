@@ -1,0 +1,9 @@
+GET /hello HTTP/1.1
+Host: shop.example
+User-Agent: curl/8.5.0
+
+HTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Length: 5
+
+hello

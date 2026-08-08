@@ -24,11 +24,13 @@ WORKERS=${2:-$(($(nproc) - 1))}
 WORK=${WORK:-$BUILD/campaign-$(date +%Y%m%d-%H%M%S)}
 
 # Per-target dictionary: MySQL has its own byte alphabet (command / lenenc /
-# capability bytes); pg.dict covers the pg framer, the norm SQL fragments and
-# the pipe scenarios well enough.
+# capability bytes) and HTTP is text with its own token set (methods, framing
+# headers, chunk shapes); pg.dict covers the pg framer, the norm SQL fragments
+# and the pipe scenarios well enough.
 dict_for() {
     case "$1" in
     my) echo "$ROOT/tests/fuzz/dict/my.dict" ;;
+    http) echo "$ROOT/tests/fuzz/dict/http.dict" ;;
     *) echo "$ROOT/tests/fuzz/dict/pg.dict" ;;
     esac
 }
@@ -40,23 +42,25 @@ export DEBUGINFOD_URLS=
 
 if [ ! -x "$BUILD/tests/fuzz/fuzz_pg" ]; then
     cmake -B "$BUILD" -DCMAKE_C_COMPILER=clang -DLATKIT_FUZZ=ON
-    cmake --build "$BUILD" --target fuzz_pg fuzz_my fuzz_norm fuzz_pipe gen_seeds -j"$(nproc)"
+    cmake --build "$BUILD" --target fuzz_pg fuzz_my fuzz_http fuzz_norm fuzz_pipe gen_seeds \
+        -j"$(nproc)"
 fi
 
-mkdir -p "$WORK/findings" "$WORK/seed"/{pg,my,norm,pipe}
+mkdir -p "$WORK/findings" "$WORK/seed"/{pg,my,http,norm,pipe}
 "$BUILD/tests/fuzz/gen_seeds" "$WORK/seed" >/dev/null
 
-echo "campaign: $TIME s/target x $WORKERS workers x 4 targets" \
-     "= $(((4 * TIME * WORKERS + 1800) / 3600)) CPU-hours; workdir $WORK"
+echo "campaign: $TIME s/target x $WORKERS workers x 5 targets" \
+     "= $(((5 * TIME * WORKERS + 1800) / 3600)) CPU-hours; workdir $WORK"
 
 fail=0
-for t in pg my norm pipe; do
+for t in pg my http norm pipe; do
     corp="$WORK/corpus-$t"
     mkdir -p "$corp"
     cp "$ROOT/tests/fuzz/corpus/$t"/* "$WORK/seed/$t"/* "$corp"/ 2>/dev/null || true
     # The .lkt traces double as raw framer seeds for their protocol.
     [ "$t" = pg ] && cp "$ROOT"/tests/fixtures/*.lkt "$corp"/
     [ "$t" = my ] && cp "$ROOT"/tests/traces/mysql/*/*.lkt "$corp"/ 2>/dev/null || true
+    [ "$t" = http ] && cp "$ROOT"/tests/traces/http/*/*.lkt "$corp"/ 2>/dev/null || true
 
     echo "=== fuzz_$t: $TIME s, $WORKERS workers ==="
     mkdir -p "$WORK/run-$t"

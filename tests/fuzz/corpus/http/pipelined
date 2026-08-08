@@ -1,0 +1,17 @@
+GET /a HTTP/1.1
+Host: h
+
+GET /b HTTP/1.1
+Host: h
+
+HEAD /c HTTP/1.1
+Host: h
+
+HTTP/1.1 200 OK
+Content-Length: 1
+
+xHTTP/1.1 304 Not Modified
+
+HTTP/1.1 200 OK
+Content-Length: 999
+

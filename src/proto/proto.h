@@ -126,6 +126,12 @@ struct lk_proto_stats {
     __u64 sessions;               /* on_session emitted */
     __u64 replication_conns;      /* CopyBoth / binlog dump -> IGNORE connections */
     __u64 compressed_conns;       /* CLIENT_COMPRESS/_ZSTD -> IGNORE connections (РМ7) */
+    __u64 blind_conns;            /* protocol switched away from what we parse ->
+                                     IGNORE connections (РH4: the HTTP/2 preface,
+                                     a 101 upgrade, a CONNECT tunnel). The reason
+                                     travels in the message stream (РH3) so the
+                                     per-reason split lands in М5 with the rest of
+                                     the http metric families. */
     __u64 by_type[2][256];        /* [enum lk_dir][type byte]; startup at [.][0] */
 };
 

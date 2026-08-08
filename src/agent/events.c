@@ -206,11 +206,11 @@ static void print_proto_stats(const char *name, const struct lk_proto_stats *ps)
             (unsigned long long)ps->resyncs, (unsigned long long)ps->conns);
     fprintf(stderr,
             "latkit: %s sessions=%llu queries=%llu errors_sql=%llu "
-            "parse_errors=%llu unknown=%llu replication=%llu compressed=%llu\n",
+            "parse_errors=%llu unknown=%llu replication=%llu compressed=%llu blind=%llu\n",
             name, (unsigned long long)ps->sessions, (unsigned long long)ps->queries,
             (unsigned long long)ps->errors_sql, (unsigned long long)ps->parse_errors,
             (unsigned long long)ps->unknown_msgs, (unsigned long long)ps->replication_conns,
-            (unsigned long long)ps->compressed_conns);
+            (unsigned long long)ps->compressed_conns, (unsigned long long)ps->blind_conns);
     fprintf(stderr,
             "latkit: %s units_dropped resync=%llu close=%llu overflow=%llu prep_evictions=%llu\n",
             name, (unsigned long long)ps->units_dropped_resync,
@@ -358,6 +358,11 @@ static void ev_provide_stats(void *ctx, struct lk_metrics *m)
                                   "replication", "proto", proto, (double)ps->replication_conns);
         lk_metrics_set_counter_l2(m, "latkit_ignored_conns_total", NULL, "reason", "compressed",
                                   "proto", proto, (double)ps->compressed_conns);
+        /* РH4: the connection stopped speaking what we parse — an HTTP/2
+         * preface, a 101 upgrade (websocket, h2c), a CONNECT tunnel. М5 splits
+         * this by reason; the reason itself is already in the message stream. */
+        lk_metrics_set_counter_l2(m, "latkit_ignored_conns_total", NULL, "reason", "blind", "proto",
+                                  proto, (double)ps->blind_conns);
     }
 
     const struct lk_conn_table_stats *cs = lk_conn_table_stats(e->pipe.conns);

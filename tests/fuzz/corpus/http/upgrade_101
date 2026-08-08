@@ -1,0 +1,10 @@
+GET /ws HTTP/1.1
+Host: h
+Connection: Upgrade
+Upgrade: websocket
+Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
+
+HTTP/1.1 101 Switching Protocols
+Upgrade: websocket
+
+Åhello
