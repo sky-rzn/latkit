@@ -14,10 +14,10 @@
  *
  * The head bytes are borrowed for the duration of the callback, so everything
  * kept is copied under a bounded ceiling (LK_HTTP_*_MAX). The target is the one
- * variable-length copy on the common path, and it is kept **raw**: М4's route
- * templating is a pure function of the method, path and query, and feeding it a
- * value this file already normalised would move the templating rules somewhere
- * nobody can test them. */
+ * variable-length copy on the common path, and it is kept **raw**: the route
+ * templater (РH7) is a pure function of the method, path and query, and feeding
+ * it a value this file had already normalised would move the templating rules
+ * somewhere nobody can test them. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -160,6 +160,13 @@ void http_req_head(struct lk_proto *p, struct lk_conn *c, struct http_conn *hc,
                    http_span_eq_ci(name, "x-amzn-trace-id")) {
             if (!u->req_id[0]) /* first one wins: a proxy chain may add a second */
                 http_copy_label(u->req_id, sizeof(u->req_id), val);
+        } else if (cfg->route_header[0] && http_span_eq_ci(name, cfg->route_header)) {
+            /* The route the application declares for itself (РH7). Read only
+             * because a flag named this exact header, and kept as a bounded,
+             * control-byte-free label — http_route.c decides what to do with it.
+             * The configured name is lower-cased by
+             * lk_proto_http_configure, which is what http_span_eq_ci needs. */
+            http_copy_label(u->route_hdr, sizeof(u->route_hdr), val);
         } else if (cfg->user_basic && http_span_eq_ci(name, "authorization")) {
             /* Read only because it was asked for, and only ever the name half:
              * the base64 decode stops at the colon (РH10, http_basic_user). */

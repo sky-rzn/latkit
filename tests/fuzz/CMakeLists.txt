@@ -6,7 +6,7 @@
 #   fuzz_pg    bytes -> framer -> lk_msg -> PG parser (harness from task 3.6)
 #   fuzz_my    the same over the MySQL framer + handler (MYSQL.md М7)
 #   fuzz_http  the same over the HTTP/1.x stream framer (PLAN-HTTP.md М2)
-#   fuzz_norm  bytes -> lk_norm_sql (harness from task 4.1)
+#   fuzz_norm  bytes -> lk_norm_sql / lk_norm_route (harness from task 4.1)
 #   fuzz_pipe  event scenario -> decode + conn_table + framer + parser + norm
 #
 # The dependency sources are compiled INTO each target rather than linked from
@@ -39,10 +39,14 @@ set(FUZZ_PROTO_SRC
     ${CMAKE_SOURCE_DIR}/src/proto/my/my_session.c
     ${CMAKE_SOURCE_DIR}/src/proto/my/my_query.c ${CMAKE_SOURCE_DIR}/src/proto/my/my_prep.c
     ${CMAKE_SOURCE_DIR}/src/proto/http/http_frame.c ${CMAKE_SOURCE_DIR}/src/proto/http/http.c
-    ${CMAKE_SOURCE_DIR}/src/proto/http/http_req.c ${CMAKE_SOURCE_DIR}/src/proto/http/http_resp.c)
+    ${CMAKE_SOURCE_DIR}/src/proto/http/http_req.c ${CMAKE_SOURCE_DIR}/src/proto/http/http_resp.c
+    ${CMAKE_SOURCE_DIR}/src/proto/http/http_route.c)
 set(FUZZ_CORE_SRC
     ${CMAKE_SOURCE_DIR}/src/agent/conn_table.c ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
-set(FUZZ_NORM_SRC ${CMAKE_SOURCE_DIR}/src/norm/norm_sql.c)
+# Since М4 the HTTP handler classifies through the route templater, so every
+# target that compiles the proto sources needs the normaliser sources too.
+set(FUZZ_NORM_SRC ${CMAKE_SOURCE_DIR}/src/norm/norm_sql.c
+                  ${CMAKE_SOURCE_DIR}/src/norm/norm_route.c)
 
 function(latkit_fuzzer name)
     add_executable(${name} ${ARGN})
@@ -52,9 +56,9 @@ function(latkit_fuzzer name)
     target_link_options(${name} PRIVATE ${FUZZ_SAN})
 endfunction()
 
-latkit_fuzzer(fuzz_pg fuzz_pg.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC})
-latkit_fuzzer(fuzz_my fuzz_my.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC})
-latkit_fuzzer(fuzz_http fuzz_http.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC})
+latkit_fuzzer(fuzz_pg fuzz_pg.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC} ${FUZZ_NORM_SRC})
+latkit_fuzzer(fuzz_my fuzz_my.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC} ${FUZZ_NORM_SRC})
+latkit_fuzzer(fuzz_http fuzz_http.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC} ${FUZZ_NORM_SRC})
 latkit_fuzzer(fuzz_norm fuzz_norm.c ${FUZZ_NORM_SRC})
 latkit_fuzzer(fuzz_pipe fuzz_pipe.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC} ${FUZZ_NORM_SRC}
               ${CMAKE_SOURCE_DIR}/src/agent/decode.c ${CMAKE_SOURCE_DIR}/src/agent/pipeline.c)

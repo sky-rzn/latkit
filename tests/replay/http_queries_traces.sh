@@ -1,7 +1,8 @@
 #!/bin/sh
-# М3 acceptance (PLAN-HTTP.md): the --queries view over the М0 trace corpus must
-# yield the expected observations per scenario — method, status, sizes and the
-# four timings — with parse_errors == 0 on every clean trace. This is the plan's
+# М3/М4 acceptance (PLAN-HTTP.md): the --queries view over the М0 trace corpus
+# must yield the expected observations per scenario — method, status, sizes, the
+# four timings and, since М4, the templated route (РH7) — with parse_errors == 0
+# on every clean trace. This is the plan's
 # "expectation table in a test": one row of checks per scenario family, applied
 # to every server directory (nginx / go / node / gunicorn) that recorded it.
 #
@@ -62,6 +63,23 @@ for trace in "$DIR"/*/*.lkt; do
     lacks "REPLAY FAILED"
     lacks " unknown=[1-9]"
 
+    # --- М4 (РH7): the route label, asserted on every trace ---------------
+    # Two ways this label turns into unbounded cardinality, and both are
+    # checked here rather than in one scenario: a raw numeric segment that the
+    # classifier failed to collapse, and any byte of the query string (dropped
+    # whole unless --http-query-keys asks otherwise).
+    bad=$(printf '%s\n' "$out" | sed -n 's/^http .* route=\([^ ]*\) .*/\1/p' |
+          grep -E '\?|/[0-9]+(/|$)' | head -1)
+    [ -n "$bad" ] && fail "route carries an id or a query string: '$bad'"
+    # An observation always reports one, except where there is no target at all
+    # (an authority-form CONNECT), where it must report none rather than "/".
+    nroute=$(printf '%s\n' "$out" | grep -c '^http .* route=[^- ]')
+    nhttp=$(printf '%s\n' "$out" | grep -c '^http ')
+    case "$srv/$base" in
+    go/connect) [ "$nroute" = 0 ] || fail "CONNECT reported a route" ;;
+    *) [ "$nroute" = "$nhttp" ] || fail "$((nhttp - nroute)) observation(s) without a route" ;;
+    esac
+
     case "$srv/$base" in
     # The scenarios built to be rejected, and the two TLS traces where
     # ciphertext is framed as plaintext until М7 — the exact set М2 documented
@@ -76,7 +94,7 @@ for trace in "$DIR"/*/*.lkt; do
     # --- the base case ---------------------------------------------------
     */get)
         nobs 1
-        has '^http .* method=GET status=200 .* target=/hello$'
+        has '^http .* method=GET status=200 .* route=/hello target=/hello$'
         # A GET has nothing to upload, so the three duration models coincide —
         # РH5's own statement of when the extra timestamp is invisible.
         has '^http .* upload=0ns '
@@ -101,9 +119,9 @@ for trace in "$DIR"/*/*.lkt; do
     # --- statuses (РH10: 4xx and 5xx are different things) ---------------
     */statuses)
         nobs 3
-        has '^http .* status=404 .* flags=0x100 target=/nope$'   # client error
-        has '^http .* status=500 .* flags=0x1 target=/boom$'     # server error
-        has '^http .* status=302 .* flags=0x0 target=/redirect$' # neither
+        has '^http .* status=404 .* flags=0x100 route=/nope target=/nope$'   # client error
+        has '^http .* status=500 .* flags=0x1 route=/boom target=/boom$'     # server error
+        has '^http .* status=302 .* flags=0x0 route=/redirect target=/redirect$' # neither
         ;;
     # --- the request decides how to read the response --------------------
     */head)
@@ -237,12 +255,16 @@ for trace in "$DIR"/*/*.lkt; do
         # it never answers, so it is dropped and counted rather than observed.
         nobs 1
         has '^http .* target=/json/[^ ]*token=s3cr3t'
+        has '^http .* route=/json/\{id\} '
         ;;
     */traceparent)
         nobs 2
-        # The raw target reaches the sink unredacted — templating is М4's job
-        # and the span redactor is М6's; what М3 owes is the bytes as sent.
+        # The raw target reaches the sink unredacted — the span redactor is
+        # М6's job — while the *route* beside it is the template, with the id
+        # collapsed and the query gone: the two identities of РH7, side by side
+        # on one line.
         has '^http .* target=/json/[^ ]*token=s3cr3t'
+        has '^http .* route=/json/\{id\} '
         # Without --http-user the credential header is not read at all.
         has '^http .* user=- '
         with_user=$("$LKT" --proto http --http-user basic "$trace" 2>&1)
@@ -257,7 +279,7 @@ done
 
 echo "---"
 if [ "$fails" -eq 0 ]; then
-    echo "http М3: trace expectations met"
+    echo "http М3/М4: trace expectations met"
     exit 0
 fi
 echo "$fails check(s) failed"

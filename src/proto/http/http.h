@@ -5,8 +5,10 @@
  *
  * PLAN-HTTP.md М2 filled in the framer the М1 seam left as a stub — the
  * direction machine (head → body → head), the body-length decision list of РH4,
- * the blind zones and the textual resync anchors — and М3 the handler above it:
- * the in-flight ring, the four timings of РH5 and the two head parsers.
+ * the blind zones and the textual resync anchors — М3 the handler above it (the
+ * in-flight ring, the four timings of РH5, the two head parsers), and М4 the one
+ * step between a unit and a label: the dialect that turns a request into a route
+ * (http_route.c, РH7/РH8).
  *
  * The split of state is the one М1 set up and the stages after this rely on:
  * *framing* state lives in lk_conn.frame_state (struct http_frame below, one
@@ -208,6 +210,7 @@ struct http_frame {
 #define LK_HTTP_USER_MAX   40   /* Authorization: Basic name half */
 #define LK_HTTP_REQID_MAX  48   /* X-Request-Id / X-Amzn-Trace-Id (a UUID is 36) */
 #define LK_HTTP_CTYPE_MAX  32   /* Content-Type, first token only */
+#define LK_HTTP_ROUTE_MAX  96   /* --http-route-header value (РH7); "" = none */
 
 /* W3C trace context lifted off the request (РH11). Kept in its compact binary
  * form — 25 bytes rather than the 55-character header — because it is small
@@ -243,11 +246,14 @@ struct http_unit {
     __u32 tracestate_len, tracestate_cap;
 
     struct http_trace tp;
-    char method[LK_HTTP_METHOD_MAX]; /* NUL-terminated; unknown methods verbatim */
-    char host[LK_HTTP_HOST_MAX];     /* absolute-form authority, else Host */
-    char user[LK_HTTP_USER_MAX];     /* --http-user basic only; "" otherwise */
-    char req_id[LK_HTTP_REQID_MAX];  /* X-Request-Id / X-Amzn-Trace-Id */
-    char ctype[LK_HTTP_CTYPE_MAX];   /* response Content-Type, first token */
+    char method[LK_HTTP_METHOD_MAX];   /* NUL-terminated; unknown methods verbatim */
+    char host[LK_HTTP_HOST_MAX];       /* absolute-form authority, else Host */
+    char user[LK_HTTP_USER_MAX];       /* --http-user basic only; "" otherwise */
+    char req_id[LK_HTTP_REQID_MAX];    /* X-Request-Id / X-Amzn-Trace-Id */
+    char ctype[LK_HTTP_CTYPE_MAX];     /* response Content-Type, first token */
+    char route_hdr[LK_HTTP_ROUTE_MAX]; /* the route the app declared, read only
+                                          when --http-route-header named a header
+                                          (РH7); "" means "classify the target" */
 
     __u16 status;     /* final response status; 0 = no response head yet */
     __u16 flags;      /* accumulated LK_QO_* */
@@ -384,7 +390,17 @@ void http_req_head(struct lk_proto *p, struct lk_conn *c, struct http_conn *hc,
  * it records a timestamp and returns, because a 1xx closes nothing (РH6). */
 void http_resp_head(struct lk_proto *p, struct http_conn *hc, const struct lk_msg *m, bool interim);
 
-/* The active configuration (РH10), read by http_req.c. */
+/* --- http_route.c: the dialect seam (РH8) ---------------------------------- */
+
+/* The route this unit is reported under: the header the application declared if
+ * `--http-route-header` asked for one, otherwise the connection's dialect
+ * classifying the raw target (РH7). `out->text_len == 0` means "no route" — a
+ * CONNECT, or a request head we never read — and the observation carries none
+ * rather than a made-up one. */
+void http_route_resolve(const struct lk_conn *c, const struct http_unit *u,
+                        struct lk_route_out *out);
+
+/* The active configuration (РH10/РH7), read by http_req.c and http_route.c. */
 const struct lk_http_cfg *http_cfg(void);
 
 #endif /* LATKIT_HTTP_H */

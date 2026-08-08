@@ -125,6 +125,7 @@ design: what is not read cannot leak (РH12).
 | `traceparent`, `tracestate` | request | W3C trace context (РH11) |
 | `X-Request-Id`, `X-Amzn-Trace-Id` | request | span attribute; the join key of the accuracy bench |
 | `Authorization` | request | **only** with `--http-user basic`, and only the name before the colon (РH10); `Bearer` is never touched |
+| the `--http-route-header` header | request | **only** when the flag names one: the app's own route, off by default (РH7, §"Route templating") |
 | `Cookie`, `Set-Cookie`, `Proxy-Authorization` | both | never read — masked in `--messages` output (РH3) |
 
 ## Body length: the decision list, in order
@@ -527,9 +528,10 @@ read. `Authorization` is never read either unless `--http-user basic` asks for
 it, and then only the name half — the base64 decode stops at the colon, so at
 most two bytes of the password pass through a local variable and none reaches a
 label. `Bearer` is untouched whatever the flag says. The request target travels
-**raw** into `lk_query_obs.text`, query string included: templating it is М4's
-job and redacting it for a span is М6's, and doing either here would move those
-rules somewhere they cannot be tested.
+**raw** into `lk_query_obs.text`, query string included — redacting it for a span
+is М6's job, and doing it here would move that rule somewhere it cannot be
+tested. The *templated* identity travels beside it in `lk_query_obs.route`
+(§"Route templating").
 
 Per-connection cost: `struct http_conn` is the 16-unit ring plus a session, with
 the two variable-length copies (the target, and `tracestate` when one arrives)
@@ -546,6 +548,93 @@ one request per connection whatever arrives (its `keepalive-50` yields one
 observation and 49 counted drops, where nginx, Go and node yield 50); nginx
 answers `405` to `OPTIONS` on a static file; and only Go delivers the whole 1 MB
 of `get-large` through the socket before the capture's last call is cut short.
+
+## Route templating (РH7, М4)
+
+The route is the one label in this track that cannot be read off the wire — it
+has to be *reconstructed*, because a URL is unbounded by construction and a
+metric label may not be. Three layers, and the guarantee comes from the third.
+
+**Layer 1, the explicit map** (`--http-routes FILE`). Lines of
+`METHOD /users/{id}/orders/{id}`, `*` for any method, `#` for comments. Matching
+is segment by segment — `{...}` matches exactly one segment, everything else
+matches byte for byte, segment counts must agree — and the first pattern that
+matches wins. No regular expressions and no wildcards spanning segments, so the
+cost of a lookup stays proportional to the path, which is what lets it run on
+every observation. A pattern containing `?` or `#` is rejected at load with a
+counted warning: it could never match, since the query is not part of matching.
+
+**Layer 2, the heuristic** (the default). Each path segment is classified, and
+one that looks like a *value* rather than a *name* becomes `{id}`:
+
+| Rule | Templated | Not templated |
+|---|---|---|
+| all digits | `/42`, `/0` | — |
+| UUID (8-4-4-4-12 hex, either case) | `3f2504e0-4f89-11d3-9a0c-0305e82c3301` | — |
+| ULID (26 Crockford base32) | `01ARZ3NDEKTSV4RRFFQ69G5FAV` | a 26-letter word with `I`/`L`/`O`/`U` |
+| hex, ≥ 8 chars | `a83bf2ef`, a git sha | `decade` |
+| `YYYY-MM-DD` | `2024-01-02` | — (`2024/01/02` is three segments, each templated by the digit rule) |
+| longer than 24 chars | any | — |
+| base64-ish, ≥ 16 chars, mixed case + digits | `aGVsbG8gd29ybGQx` | a long lowercase word |
+| more than 40 % digits **and ≥ 6 chars** | `2024q1`, `user1234` | **`v1`**, `2x` |
+| any control byte | always | — |
+
+The length floor on the digit-ratio rule is not decoration: `/api/v1/users` is
+the most common route shape there is and `v1` is 50 % digits, so without a floor
+the heuristic would report `/api/{id}/users` for half the internet. The
+control-byte rule is a privacy rule wearing a classifier's clothes — it is what
+guarantees no byte outside the printable range can reach a label through this
+path, whatever arrives on the wire.
+
+A file-shaped segment keeps its extension: `app.a83bf2ef.js` → `{file}.js`,
+because a spike in `.js` next to a flat `.png` is a story that `{id}` would not
+tell. The stem is judged component by component, which is what catches the
+build-hash-in-the-middle convention every bundler uses; `index.html` and
+`logo.2x.png` stay verbatim, and a version like `1.2.3` is not a file name at
+all (an extension must contain a letter).
+
+Depth is capped at `--http-route-depth` (default 8) with the tail folded into
+`/...` rather than dropped, so `/a/b/...` and `/a/b` stay different routes.
+The query string is dropped **whole** — the fuzzer checks this as a byte
+property, not a formatting one — except for the keys `--http-query-keys` names,
+for the RPC-over-GET APIs where `?action=…` *is* the handler; a promoted value
+goes through the same classifiers, so `?id=42` templates instead of forking the
+route per id.
+
+**Layer 3, the top-K dictionary** (М5). Whatever the first two layers produce,
+the registry keeps the busiest routes and folds the rest into `route="other"`.
+That is what makes the cardinality bound structural rather than a hope about the
+heuristic, and the *share* of `route="other"` is the quality signal on the
+dashboard: a heuristic that reads someone's API wrong shows up as that share
+climbing, which is diagnosable, rather than as a series explosion, which is not.
+
+Two escapes above the heuristic, both off by default: `--http-routes` (layer 1)
+and `--http-route-header X-Route`, which takes the application's own name for
+its handler. The header is trusted for its *content* — a framework knows
+`/posts/{slug}` is one route and no shape test on `why-we-left-the-cloud` ever
+will — but not for its cardinality: it arrives from the network like any other
+header, and layer 3 is the only thing bounding it.
+
+The identity of a route is `XXH3-64(method NUL template)`. The method is in the
+fingerprint because `GET /orders/{id}` and `DELETE /orders/{id}` are two routes;
+it is not in the *text*, because the label set carries it in its own dimension.
+A template that outgrows the 256-byte label is clipped while the hash keeps
+consuming, so a clipped label never merges two identities — the norm_sql
+property, for the same reason.
+
+Measured. Over the whole М0 corpus the 266 observations collapse into **18
+distinct routes**, and the only templating that fires is the `/json/<id>`
+scenario (160 observations → `/json/{id}`); the one observation with no route at
+all is the authority-form `CONNECT`, which has no path to template. Against a
+generator of a million paths in the shape of real traffic — REST ids, UUIDs,
+content-addressed assets, date partitions, session tokens, query strings —
+the templater produces **224 distinct templates**, the number pinned in
+`tests/unit/test_norm_route.c` so a leakier classifier is caught by a test rather
+than by a Prometheus bill. One classification costs ~157 ns.
+
+The documented miss stays documented: a slug (`/posts/why-we-left-the-cloud`) is
+not templated by any shape rule, and never will be. That is what layer 1 and the
+route header are for, and what layer 3 makes survivable in the meantime.
 
 ## What the corpus proves
 

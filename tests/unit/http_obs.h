@@ -42,6 +42,8 @@ struct h_obs {
     char method[16];
     char target[512];
     __u32 target_len;
+    char route[LK_ROUTE_TEXT_MAX]; /* the template (РH7); "" = none reported */
+    __u64 route_fp;
     char host[64], user[64], app[64], ver[16];
 };
 
@@ -82,6 +84,12 @@ static inline void h_on_query(void *ctx, const struct lk_conn *c, const struct l
     if (o->text && n)
         memcpy(r->target, o->text, n);
     r->target_len = o->text_len;
+    /* The route is borrowed for the callback like the target, and it is a
+     * separate field on purpose: М4 templates the identity without touching the
+     * raw path the span still needs (РH7). */
+    if (o->route && o->route_len < sizeof(r->route))
+        memcpy(r->route, o->route, o->route_len);
+    r->route_fp = o->route_fp;
     snprintf(r->host, sizeof(r->host), "%s", s->database);
     snprintf(r->user, sizeof(r->user), "%s", s->user);
     snprintf(r->app, sizeof(r->app), "%s", s->app);

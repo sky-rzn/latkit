@@ -156,6 +156,13 @@ add_executable(test_norm_sql test_norm_sql.c)
 target_link_libraries(test_norm_sql latkit_norm)
 add_test(NAME norm_sql COMMAND test_norm_sql)
 
+# HTTP route templater (PLAN-HTTP.md М4, РH7): the segment classifiers, the
+# explicit map, the query rules, and the cardinality invariant — a million
+# generated paths must collapse into a bounded number of templates.
+add_executable(test_norm_route test_norm_route.c)
+target_link_libraries(test_norm_route latkit_norm)
+add_test(NAME norm_route COMMAND test_norm_route)
+
 # Exponential histogram (task 4.2): grid boundaries vs the ldexp reference,
 # clamping, merge, classic-bucket text export. Links the pure metrics lib.
 add_executable(test_hist test_hist.c)

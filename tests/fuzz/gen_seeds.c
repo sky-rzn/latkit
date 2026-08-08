@@ -212,6 +212,15 @@ static void write_text_my(const char *root, const char *name, const char *sql)
     write_seed(root, "norm", name);
 }
 
+/* The route half of the same target (М4, РH7): 0xFE selects it, and the body is
+ * `method \n target [ \n route-map ]` — see lk_norm_route_fuzz_one. */
+static void write_route(const char *root, const char *name, const char *body)
+{
+    put_u8(0xFE);
+    put(body, strlen(body));
+    write_seed(root, "norm", name);
+}
+
 /* --- pg seeds: whole sessions, frontend and backend bytes concatenated ------ */
 
 static void pg_seeds(const char *root)
@@ -343,6 +352,17 @@ static void norm_seeds(const char *root)
                   "_binary\"raw\", X'ff', B'1010', 0xFF, 0b01");
     write_text_my(root, "my_backtick", "select `From`, `a``b` from `T` where id in (1,2,3)");
     write_text_my(root, "my_unterminated", "select /*!50000 `oo");
+
+    /* Route templater (РH7): one seed per layer — heuristic shapes, the query
+     * rules, the explicit map, and the degenerate paths that stress the walk. */
+    write_route(root, "route_rest", "GET\n/api/v1/orders/8123/items/9?token=secret");
+    write_route(root, "route_shapes",
+                "POST\n/u/3f2504e0-4f89-11d3-9a0c-0305e82c3301/01ARZ3NDEKTSV4RRFFQ69G5FAV/"
+                "2024-01-02/app.a83bf2ef.js");
+    write_route(root, "route_query", "action\n/api?action=DescribeInstances&sub=list&x=1");
+    write_route(root, "route_map",
+                "GET\n/users/7/orders/9\n# map\nGET /users/{id}/orders/{id}\n* /health\n");
+    write_route(root, "route_degenerate", "\n//a//..//%2E%2E/*?");
 }
 
 /* --- pipe seeds: scenarios over the ops format ------------------------------ */

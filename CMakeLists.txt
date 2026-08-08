@@ -167,7 +167,8 @@ set(PROTO_SRC src/proto/registry.c src/proto/pg/pg.c src/proto/pg/pg_frame.c
               src/proto/my/my_frame.c src/proto/my/my.c src/proto/my/my_session.c
               src/proto/my/my_query.c src/proto/my/my_prep.c
               src/proto/http/http_frame.c src/proto/http/http.c
-              src/proto/http/http_req.c src/proto/http/http_resp.c)
+              src/proto/http/http_req.c src/proto/http/http_resp.c
+              src/proto/http/http_route.c)
 set(PROTO_INC ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
               ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/pg
               ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/my
@@ -175,7 +176,8 @@ set(PROTO_INC ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
               ${CMAKE_CURRENT_SOURCE_DIR}/src/agent
               ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf
               # proto.h carries enum lk_sql_dialect (lk_proto_ops.sql_dialect,
-              # М6) — a header-only dependency, latkit_norm is not linked here
+              # М6) and, since М4, the route-templater contract the HTTP dialect
+              # calls into (РH7/РH8) — hence the link dependency below
               ${CMAKE_CURRENT_SOURCE_DIR}/src/norm)
 
 # reassembly.c lives under src/agent/ but is pure (no libbpf, no I/O) and is the
@@ -188,13 +190,19 @@ set(PROTO_INC ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
 # the library it already links.
 add_library(latkit_proto STATIC ${PROTO_SRC} src/agent/reassembly.c)
 target_include_directories(latkit_proto PUBLIC ${PROTO_INC})
+# The HTTP dialect (РH8, М4) classifies a request through the route templater,
+# so the header-only dependency on src/norm became a link one. latkit_norm has
+# no link deps of its own, so this stays a straight line rather than a cycle.
+target_link_libraries(latkit_proto PUBLIC latkit_norm)
 
-# --- SQL normaliser (stage 4) ----------------------------------------------
+# --- normalisers (stage 4; route templater in PLAN-HTTP.md М4) -------------
 # src/norm/** is pure like src/proto/**: no libbpf, no I/O beyond the caller's
 # buffer, so it links into the agent and the offline harnesses alike. It depends
 # on nothing but libc and the vendored xxhash (XXH3-64, header-only, BSD) — kept
-# as a SYSTEM include so -Werror does not police third-party code.
-add_library(latkit_norm STATIC src/norm/norm_sql.c)
+# as a SYSTEM include so -Werror does not police third-party code. Two members:
+# the SQL normaliser (Р22) and the HTTP route templater (РH7), which share the
+# "collapse the volatile part, hash the whole input" contract and nothing else.
+add_library(latkit_norm STATIC src/norm/norm_sql.c src/norm/norm_route.c)
 target_include_directories(latkit_norm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/norm)
 target_include_directories(latkit_norm SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xxhash)

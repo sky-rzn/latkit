@@ -870,6 +870,10 @@ const struct lk_proto_ops lk_proto_http_ops = {
     .role = LK_ROLE_SERVER, /* v1 observes servers only (РH2) */
     .flags = LK_PROTO_F_STREAM,
     .sql_dialect = LK_SQL_PG, /* unused: nothing here reaches the SQL normaliser */
+    /* The base flavour: heuristic route templating (РH7). The S3 entry
+     * (PLAN-MINIO.md РS1) is this same framer and handler with another dialect
+     * hanging here — that is the whole of what "a dialect, not a fork" means. */
+    .dialect = &lk_http_dialect_base,
     .proto_new = lk_proto_http_new,
     /* The message-framing hooks (hdr_size, parse_hdr, pre_emit, both
      * intercept_ and both resync_) stay NULL: in stream mode the two hooks

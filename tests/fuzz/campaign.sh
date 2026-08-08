@@ -26,11 +26,14 @@ WORK=${WORK:-$BUILD/campaign-$(date +%Y%m%d-%H%M%S)}
 # Per-target dictionary: MySQL has its own byte alphabet (command / lenenc /
 # capability bytes) and HTTP is text with its own token set (methods, framing
 # headers, chunk shapes); pg.dict covers the pg framer, the norm SQL fragments
-# and the pipe scenarios well enough.
+# and the pipe scenarios well enough. fuzz_norm carries two input languages
+# behind one selector byte (SQL and, since М4, HTTP routes), and libFuzzer takes
+# a single -dict, so its dictionary is the concatenation — built once below.
 dict_for() {
     case "$1" in
     my) echo "$ROOT/tests/fuzz/dict/my.dict" ;;
     http) echo "$ROOT/tests/fuzz/dict/http.dict" ;;
+    norm) echo "$WORK/norm.dict" ;;
     *) echo "$ROOT/tests/fuzz/dict/pg.dict" ;;
     esac
 }
@@ -47,6 +50,7 @@ if [ ! -x "$BUILD/tests/fuzz/fuzz_pg" ]; then
 fi
 
 mkdir -p "$WORK/findings" "$WORK/seed"/{pg,my,http,norm,pipe}
+cat "$ROOT/tests/fuzz/dict/pg.dict" "$ROOT/tests/fuzz/dict/route.dict" > "$WORK/norm.dict"
 "$BUILD/tests/fuzz/gen_seeds" "$WORK/seed" >/dev/null
 
 echo "campaign: $TIME s/target x $WORKERS workers x 5 targets" \

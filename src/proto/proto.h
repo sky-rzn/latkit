@@ -47,6 +47,7 @@
 #include <stddef.h>
 
 #include "conn_table.h" /* struct lk_conn, enum lk_dir */
+#include "norm_route.h" /* struct lk_route_cfg / lk_route_out (РH7/РH8, М4) */
 #include "norm_sql.h"   /* enum lk_sql_dialect (lk_proto_ops.sql_dialect, РМ9/М6) */
 #include "reassembly.h" /* struct lk_msg, struct lk_msg_sink (down contract) */
 
@@ -120,14 +121,25 @@ struct lk_query_obs {
                               NOT normalised; NULL on NO_TEXT; valid only for the
                               duration of on_query */
     __u32 text_len;
-    __u64 rows;           /* from the CommandComplete tag; summed on MULTI_STMT */
-    __u64 bytes;          /* COPY: summed len of CopyData */
-    __u64 bytes_in;       /* HTTP: request body bytes, captured or holed (РH9) */
-    __u64 bytes_out;      /* HTTP: response body bytes */
-    const char *op;       /* protocol operation name, borrowed for the callback:
-                             the HTTP method ("GET"), later the S3 operation
-                             (РH8). NULL for the DB protocols, whose operation
-                             lives in `text` */
+    __u64 rows;        /* from the CommandComplete tag; summed on MULTI_STMT */
+    __u64 bytes;       /* COPY: summed len of CopyData */
+    __u64 bytes_in;    /* HTTP: request body bytes, captured or holed (РH9) */
+    __u64 bytes_out;   /* HTTP: response body bytes */
+    const char *op;    /* protocol operation name, borrowed for the callback:
+                          the HTTP method ("GET"), later the S3 operation
+                          (РH8). NULL for the DB protocols, whose operation
+                          lives in `text` */
+    const char *route; /* HTTP (РH7, М4): the *templated* request identity —
+                          `/orders/{id}` for the base dialect, an operation
+                          name for a dialect that has one (РH8). Borrowed for
+                          the callback like `text`, and never the raw path:
+                          `text` keeps that for the span, this is what may
+                          become a label. NULL for the DB protocols, and for
+                          an HTTP unit whose target never arrived */
+    __u32 route_len;
+    __u64 route_fp;       /* XXH3-64 of `method NUL route`: the identity the М5
+                             top-K keys on. The method is in it because two
+                             methods on one path are two routes (РH7) */
     const char *err_name; /* symbolic error name, borrowed for the callback; the
                              S3 dialect's error code (РH8). NULL everywhere in
                              v1 — HTTP's error identity is err_code */
@@ -247,6 +259,43 @@ enum lk_otel_kind {
     LK_OTEL_KIND_HTTP,   /* http.request.method / http.route / http.response.* */
 };
 
+/* --- the HTTP dialect seam (РH8) ------------------------------------------ */
+
+/* What a classifier is shown of a request. Spans, borrowed for the call, in the
+ * shape the handler already holds them: the method token, the raw request-target
+ * minus any absolute-form authority (path plus `?query`), and the host — the
+ * base dialect ignores the last, and the S3 one reads a bucket out of it
+ * (PLAN-MINIO.md РS3). Passing the pieces rather than the whole head is what
+ * keeps a dialect from becoming a second header parser. */
+struct lk_http_req {
+    const char *method;
+    __u32 method_len;
+    const char *target;
+    __u32 target_len;
+    const char *host;
+    __u32 host_len;
+};
+
+/* One flavour of HTTP. The framer, the unit lifecycle and the four timings are
+ * the protocol and are shared; what an exchange is *called* is the dialect, and
+ * that is the whole difference between `--port 8080=http` (a templated route,
+ * РH7) and `--port 9000=s3` (an operation out of a closed table). Two registry
+ * entries, one implementation — the alternative was forking the handler, and a
+ * fork is where the second copy stops getting the bug fixes.
+ *
+ * `classify` is called once per observation, from the handler, with the config
+ * the CLI built. It must be pure: same request, same config, same answer, no
+ * state between calls. */
+struct lk_http_dialect {
+    const char *name; /* "http", later "s3"; matches lk_proto_ops.name */
+    void (*classify)(const struct lk_http_req *rq, const struct lk_route_cfg *cfg,
+                     struct lk_route_out *out);
+};
+
+/* The base dialect (РH7): heuristic route templating over the explicit map.
+ * src/proto/http/http_route.c. */
+extern const struct lk_http_dialect lk_http_dialect_base;
+
 /* One wire protocol: its name (the `--port N=<name>` selector), its handler
  * constructor, and the framer knowledge reassembly.c calls out for. The framer
  * hooks are pure state manipulation over lk_frame / lk_conn flags — no I/O, no
@@ -299,16 +348,19 @@ enum lk_otel_kind {
  *    through lk_reasm_resync and publishes assembled messages with
  *    lk_reasm_emit — so consumers still see nothing but lk_msg. */
 struct lk_proto_ops {
-    const char *name;                /* the `--port N=<name>` selector AND the `proto`
-                                        metric label value (РМ6): "pg" / "mysql" / "http" */
-    const char *db_system;           /* OTel semconv db.system.name for the spans (М6):
-                                        "postgresql" / "mysql". Read only when
-                                        otel_kind == LK_OTEL_KIND_DB. */
-    enum lk_otel_kind otel_kind;     /* span shape the observations produce (РH11) */
-    enum lk_proto_role role;         /* which side the port filter puts us on (РH2) */
-    __u16 flags;                     /* LK_PROTO_F_* */
-    enum lk_sql_dialect sql_dialect; /* normaliser dialect for this protocol's
-                                        SQL (РМ9; М6 threads it to the sinks) */
+    const char *name;                      /* the `--port N=<name>` selector AND the `proto`
+                                              metric label value (РМ6): "pg" / "mysql" / "http" */
+    const char *db_system;                 /* OTel semconv db.system.name for the spans (М6):
+                                              "postgresql" / "mysql". Read only when
+                                              otel_kind == LK_OTEL_KIND_DB. */
+    enum lk_otel_kind otel_kind;           /* span shape the observations produce (РH11) */
+    enum lk_proto_role role;               /* which side the port filter puts us on (РH2) */
+    __u16 flags;                           /* LK_PROTO_F_* */
+    enum lk_sql_dialect sql_dialect;       /* normaliser dialect for this protocol's
+                                              SQL (РМ9; М6 threads it to the sinks) */
+    const struct lk_http_dialect *dialect; /* HTTP flavour (РH8); NULL for the
+                                              database protocols, which have no
+                                              classification step at all */
 
     struct lk_proto *(*proto_new)(const struct lk_query_sink *out);
 
@@ -353,17 +405,29 @@ struct lk_proto *lk_proto_my_new(const struct lk_query_sink *out);
 extern const struct lk_proto_ops lk_proto_http_ops;
 struct lk_proto *lk_proto_http_new(const struct lk_query_sink *out);
 
-/* Handler-wide HTTP settings (РH10). Process-wide rather than per-handler
+/* Handler-wide HTTP settings (РH10/РH7). Process-wide rather than per-handler
  * because there is exactly one http handler instance per agent and the values
- * are fixed at startup from the CLI — this is the seam М4 replaces with the
- * per-port `struct lk_http_dialect` config (РH8), at which point the route
- * knobs join it. Call before the first event; NULL restores the defaults. */
+ * are fixed at startup from the CLI; the *dialect* is per port and travels on
+ * lk_proto_ops instead, which is the split РH8 asked for — what an exchange is
+ * called depends on the port, how much of it we are allowed to read does not.
+ * Call before the first event; NULL restores the defaults.
+ *
+ * Everything the route config points at is borrowed and must outlive the agent's
+ * event loop: in main.c that is argv and the map parsed at startup. */
 struct lk_http_cfg {
-    bool user_basic; /* --http-user basic: take the `user` label from the name
-                        half of `Authorization: Basic`. Off by default — it is
-                        an identity, and the plan's rule is that nothing leaves
-                        the wire unless it was asked for (РH12). The password
-                        half is never decoded past the colon, ever. */
+    bool user_basic;           /* --http-user basic: take the `user` label from the name
+                                  half of `Authorization: Basic`. Off by default — it is
+                                  an identity, and the plan's rule is that nothing leaves
+                                  the wire unless it was asked for (РH12). The password
+                                  half is never decoded past the colon, ever. */
+    struct lk_route_cfg route; /* --http-routes / --http-route-depth /
+                                  --http-query-keys (РH7) */
+    char route_header[32];     /* --http-route-header X-Route: trust this header
+                                  as the route when present. "" = off, and off is
+                                  the default — the value arrives from the network
+                                  like every other header, so the only thing
+                                  protecting cardinality here is the top-K
+                                  dictionary downstream (РH7) */
 };
 void lk_proto_http_configure(const struct lk_http_cfg *cfg);
 

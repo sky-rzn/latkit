@@ -79,14 +79,15 @@ static void on_http_query(const struct lk_conn *c, const struct lk_session *s,
     int tlen = o->text_len > TEXT_LOG_MAX ? TEXT_LOG_MAX : (int)o->text_len;
 
     printf("http conn=%llx method=%s status=%u dur=%lluns ttfb=%lluns upload=%lluns "
-           "in=%llu out=%llu host=%s user=%s flags=0x%x target=%.*s%s\n",
+           "in=%llu out=%llu host=%s user=%s flags=0x%x route=%s target=%.*s%s\n",
            (unsigned long long)c->cookie, o->op ? o->op : "?", o->err_code,
            (unsigned long long)delta(o->ts_req_done_ns, o->ts_complete_ns),
            (unsigned long long)delta(o->ts_req_done_ns, o->ts_first_row_ns),
            (unsigned long long)delta(o->ts_start_ns, o->ts_req_done_ns),
            (unsigned long long)o->bytes_in, (unsigned long long)o->bytes_out,
-           s->database[0] ? s->database : "-", s->user[0] ? s->user : "-", o->flags, tlen,
-           o->text ? o->text : "", o->text_len > TEXT_LOG_MAX ? "..." : "");
+           s->database[0] ? s->database : "-", s->user[0] ? s->user : "-", o->flags,
+           o->route ? o->route : "-", tlen, o->text ? o->text : "",
+           o->text_len > TEXT_LOG_MAX ? "..." : "");
 }
 
 static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session *s,

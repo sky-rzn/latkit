@@ -25,9 +25,11 @@
  *     Every other in-flight unit is still dropped there, as in PG: a request cut
  *     off by a disconnect is not an observation.
  *   - **there is no transaction and no row count.** on_txn is never called,
- *     `rows` stays zero, and the identity of a unit is the method plus the
- *     target rather than a normalised statement. The target travels raw: М4's
- *     route templating is a pure function of it.
+ *     `rows` stays zero, and a unit's identity is the method plus the *route*
+ *     — the template the target came from (РH7), resolved through the
+ *     connection's dialect (РH8) as the unit is emitted. The raw target travels
+ *     beside it untouched, because a span needs the path and a label must not
+ *     have it.
  *
  * The framer's '!' note messages (РH3) are the only channel a stream framer has
  * for reporting a degradation, so this is also where they become counters:
@@ -52,6 +54,17 @@ void lk_proto_http_configure(const struct lk_http_cfg *cfg)
     static const struct lk_http_cfg defaults = {0};
 
     http_cfg_cur = cfg ? *cfg : defaults;
+    /* The route header is folded to lower case once, here, rather than at every
+     * comparison: field names are case-insensitive and http_span_eq_ci wants its
+     * literal lowercase, so a caller that spelled `X-Route` would otherwise
+     * configure a header that can never match — a silent misconfiguration, and
+     * the worst kind (РH7). */
+    for (unsigned i = 0; i < sizeof(http_cfg_cur.route_header); i++) {
+        char c = http_cfg_cur.route_header[i];
+
+        if (c >= 'A' && c <= 'Z')
+            http_cfg_cur.route_header[i] = (char)(c - 'A' + 'a');
+    }
 }
 
 const struct lk_http_cfg *http_cfg(void)
@@ -132,6 +145,7 @@ struct http_unit *http_unit_open(struct lk_proto *p, struct http_conn *hc, __u64
 static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct http_conn *hc,
                       struct http_unit *u)
 {
+    struct lk_route_out route;
     struct lk_query_obs o = {
         .ts_start_ns = u->ts_start_ns,
         .ts_req_done_ns = u->ts_req_done_ns ? u->ts_req_done_ns : u->ts_start_ns,
@@ -157,6 +171,18 @@ static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct http_conn *h
         o.text_len = u->target_len;
     } else {
         o.flags |= LK_QO_NO_TEXT;
+    }
+    /* The two identities of an HTTP observation travel side by side and neither
+     * replaces the other (РH7): `text` is the raw target, for the span that М6
+     * will redact and sample, and `route` is the template, the only one of the
+     * two that may become a metric label. Computing it here rather than in each
+     * sink means the dialect (РH8) is consulted once per observation, by the one
+     * component that knows which connection — hence which dialect — this is. */
+    http_route_resolve(c, u, &route);
+    if (route.text_len) {
+        o.route = route.text;
+        o.route_len = route.text_len;
+        o.route_fp = route.fp;
     }
     /* РH10: the host of *this* request, not of the connection — one keep-alive
      * socket can serve several virtual hosts, and the session only remembers

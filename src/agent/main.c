@@ -60,6 +60,15 @@ static __u32 opt_port_caps[LK_MAX_PORTS];
  * to lift off the wire unless it was asked for (РH12) — and, like the port
  * budget above, absent from --help until М9 documents the HTTP surface. */
 static bool opt_http_user_basic;
+/* Route templating knobs (РH7, М4), all of them equally absent from --help for
+ * now and all borrowed by the handler for the process lifetime: the query-key
+ * pointers are argv, the map is parsed once here and freed at exit. */
+static const char *opt_http_routes;             /* --http-routes FILE */
+static struct lk_route_map *opt_http_route_map; /* ... parsed */
+static __u32 opt_http_route_depth;              /* 0 = LK_ROUTE_DEPTH_DEF */
+static const char *opt_http_query_keys[LK_ROUTE_QUERY_KEYS_MAX];
+static int opt_http_nquery_keys;
+static char opt_http_route_header[32]; /* --http-route-header, folded lowercase */
 static struct lk_port_proto opt_port_protos[LK_MAX_PORTS];
 static int opt_nports;
 static __u64 opt_ringbuf_bytes = LK_RINGBUF_SZ;
@@ -241,6 +250,10 @@ enum {
     OPT_OTLP_SPAN_TEXT_MAX,
     OPT_OTLP_SPAN_MASKED,
     OPT_HTTP_USER,
+    OPT_HTTP_ROUTES,
+    OPT_HTTP_ROUTE_DEPTH,
+    OPT_HTTP_QUERY_KEYS,
+    OPT_HTTP_ROUTE_HEADER,
     OPT_TLS,
     OPT_LIBSSL,
     OPT_TLS_COMM,
@@ -490,6 +503,82 @@ static int set_option(int c, char *optarg)
             return -1;
         }
         break;
+    case OPT_HTTP_ROUTES:
+        /* The file is read after parsing, not here: an option handler that does
+         * I/O runs from the env layer too, and "the config was rejected" should
+         * be one message from one place. */
+        opt_http_routes = optarg;
+        break;
+    case OPT_HTTP_ROUTE_DEPTH:
+        if (parse_num(optarg, 1, LK_ROUTE_DEPTH_MAX, &v)) {
+            fprintf(stderr, "--http-route-depth: expected 1..%d, got '%s'\n", LK_ROUTE_DEPTH_MAX,
+                    optarg);
+            return -1;
+        }
+        opt_http_route_depth = (__u32)v;
+        break;
+    case OPT_HTTP_QUERY_KEYS: {
+        /* `a,b,c` — the query keys promoted into the route (РH7). Each one is a
+         * multiplier on the series count, hence the small ceiling and the
+         * explicit error instead of silently keeping the first few. */
+        const char *s = optarg;
+
+        /* The flag replaces rather than appends (the --otlp-header rule), so a
+         * second spelling of it frees the first one's copies. */
+        for (int i = 0; i < opt_http_nquery_keys; i++)
+            free((char *)opt_http_query_keys[i]);
+        opt_http_nquery_keys = 0;
+        while (*s) {
+            const char *e = strchr(s, ',');
+            size_t n = e ? (size_t)(e - s) : strlen(s);
+
+            if (n) {
+                char *key;
+
+                if (opt_http_nquery_keys == LK_ROUTE_QUERY_KEYS_MAX) {
+                    fprintf(stderr, "--http-query-keys: at most %d keys\n",
+                            LK_ROUTE_QUERY_KEYS_MAX);
+                    return -1;
+                }
+                if (n >= LK_ROUTE_QUERY_KEY_MAX) {
+                    fprintf(stderr, "--http-query-keys: key longer than %d chars\n",
+                            LK_ROUTE_QUERY_KEY_MAX - 1);
+                    return -1;
+                }
+                /* Copied rather than pointed into optarg: the env layer hands
+                 * this function a buffer it owns and frees. */
+                key = strndup(s, n);
+                if (!key) {
+                    fprintf(stderr, "--http-query-keys: out of memory\n");
+                    return -1;
+                }
+                opt_http_query_keys[opt_http_nquery_keys++] = key;
+            }
+            if (!e)
+                break;
+            s = e + 1;
+        }
+        break;
+    }
+    case OPT_HTTP_ROUTE_HEADER: {
+        /* Lower-cased here as well as in lk_proto_http_configure, so that
+         * --print-config shows the name the handler will actually compare
+         * against rather than the spelling that was typed. */
+        size_t n = strlen(optarg);
+
+        if (!n || n >= sizeof(opt_http_route_header)) {
+            fprintf(stderr, "--http-route-header: expected 1..%zu chars, got '%s'\n",
+                    sizeof(opt_http_route_header) - 1, optarg);
+            return -1;
+        }
+        for (size_t i = 0; i < n; i++) {
+            char ch = optarg[i];
+
+            opt_http_route_header[i] = (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : ch;
+        }
+        opt_http_route_header[n] = '\0';
+        break;
+    }
     case OPT_LIBSSL:
         opt_libssl = optarg;
         break;
@@ -643,6 +732,10 @@ static int parse_args(int argc, char **argv)
         {"otlp-span-text-max", required_argument, NULL, OPT_OTLP_SPAN_TEXT_MAX},
         {"otlp-span-masked", no_argument, NULL, OPT_OTLP_SPAN_MASKED},
         {"http-user", required_argument, NULL, OPT_HTTP_USER},
+        {"http-routes", required_argument, NULL, OPT_HTTP_ROUTES},
+        {"http-route-depth", required_argument, NULL, OPT_HTTP_ROUTE_DEPTH},
+        {"http-query-keys", required_argument, NULL, OPT_HTTP_QUERY_KEYS},
+        {"http-route-header", required_argument, NULL, OPT_HTTP_ROUTE_HEADER},
         {"tls", required_argument, NULL, OPT_TLS},
         {"libssl", required_argument, NULL, OPT_LIBSSL},
         {"tls-comm", required_argument, NULL, OPT_TLS_COMM},
@@ -721,6 +814,89 @@ static void apply_otlp_env_defaults(void)
                                       &env_nresource);
 }
 
+/* Largest `--http-routes` file we will read. A route map is written by hand and
+ * bounded by LK_ROUTE_MAP_MAX patterns anyway; the cap is here so a wrong path
+ * (a core dump, a log) fails as a config error rather than as an allocation. */
+#define LK_HTTP_ROUTES_MAX_BYTES (1u << 20)
+
+/* Read and parse `--http-routes FILE` (РH7 layer 1). Returns 0 when there is
+ * nothing to load or the map is in place, -1 with a printed message otherwise:
+ * an operator who asked for an explicit route map and got a typo instead should
+ * hear about it at startup, not by finding `route="other"` on a dashboard. */
+static int load_route_map(void)
+{
+    char *buf;
+    size_t len = 0, cap = 8192;
+    __u32 rejected = 0;
+    FILE *f;
+
+    if (!opt_http_routes)
+        return 0;
+    f = fopen(opt_http_routes, "re");
+    if (!f) {
+        fprintf(stderr, "--http-routes: cannot open '%s': %s\n", opt_http_routes, strerror(errno));
+        return -1;
+    }
+    buf = malloc(cap);
+    while (buf) {
+        size_t n = fread(buf + len, 1, cap - len, f);
+
+        len += n;
+        if (len < cap)
+            break; /* EOF or error; ferror is checked below */
+        if (cap >= LK_HTTP_ROUTES_MAX_BYTES) {
+            fprintf(stderr, "--http-routes: '%s' is larger than %u bytes\n", opt_http_routes,
+                    LK_HTTP_ROUTES_MAX_BYTES);
+            free(buf);
+            fclose(f);
+            return -1;
+        }
+        cap *= 2;
+        char *nb = realloc(buf, cap);
+
+        if (!nb)
+            free(buf);
+        buf = nb;
+    }
+    if (!buf || ferror(f)) {
+        fprintf(stderr, "--http-routes: cannot read '%s'\n", opt_http_routes);
+        free(buf);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+    opt_http_route_map = lk_route_map_parse(buf, len, &rejected);
+    free(buf); /* the map owns its own copy */
+    if (!opt_http_route_map) {
+        fprintf(stderr, "--http-routes: no usable pattern in '%s'\n", opt_http_routes);
+        return -1;
+    }
+    if (rejected)
+        fprintf(stderr,
+                "latkit: --http-routes: %u line(s) of '%s' rejected "
+                "(expected `METHOD /path/{id}`)\n",
+                rejected, opt_http_routes);
+    return 0;
+}
+
+/* Everything the http handler needs from the CLI, in one place (РH10/РH7).
+ * Applied before the first event; the handler reads it through http_cfg(), and
+ * every pointer in it — the map, the query keys, the header name — outlives the
+ * event loop by construction (statics and startup allocations). */
+static void configure_http(void)
+{
+    struct lk_http_cfg cfg = {
+        .user_basic = opt_http_user_basic,
+        .route = {.map = opt_http_route_map, .depth = (uint8_t)opt_http_route_depth},
+    };
+
+    for (int i = 0; i < opt_http_nquery_keys; i++)
+        cfg.route.query_keys[i] = opt_http_query_keys[i];
+    cfg.route.nquery_keys = (uint8_t)opt_http_nquery_keys;
+    memcpy(cfg.route_header, opt_http_route_header, sizeof(cfg.route_header));
+    lk_proto_http_configure(&cfg);
+}
+
 /* Print the effective configuration after CLI + env resolution and exit:
  * a no-BPF way to confirm flag > LATKIT_* > OTEL_* > default without a running
  * agent. The `0 = default` sentinels are resolved to their concrete values so
@@ -754,6 +930,16 @@ static void print_config(void)
     printf("messages=%d\n", opt_messages);
     printf("queries=%d\n", opt_queries);
     printf("http_user=%s\n", opt_http_user_basic ? "basic" : "none");
+    /* The map prints as its pattern count, not its path: what matters for "is
+     * my config live" is how many patterns actually parsed (РH7). */
+    printf("http_routes=%u\n", lk_route_map_count(opt_http_route_map));
+    printf("http_route_depth=%u\n",
+           opt_http_route_depth ? opt_http_route_depth : LK_ROUTE_DEPTH_DEF);
+    printf("http_query_keys=");
+    for (int i = 0; i < opt_http_nquery_keys; i++)
+        printf("%s%s", i ? "," : "", opt_http_query_keys[i]);
+    printf("\n");
+    printf("http_route_header=%s\n", opt_http_route_header);
     printf("top_queries=%u\n", opt_top_queries ? opt_top_queries : LK_TOP_QUERIES_DEFAULT);
     printf("query_label_len=%u\n",
            opt_query_label_len ? opt_query_label_len : LK_QUERY_LABEL_LEN_DEFAULT);
@@ -857,6 +1043,8 @@ int main(int argc, char **argv)
         return 0;
     }
     apply_otlp_env_defaults();
+    if (load_route_map())
+        return 1;
     if (opt_print_config) {
         print_config();
         return 0;
@@ -1015,10 +1203,11 @@ int main(int argc, char **argv)
         .otlp_span_masked = opt_otlp_span_masked,
     };
 
-    /* Handler-wide HTTP settings (РH10). Applied before the first event; the
-     * http handler reads them through http_cfg(). М4 folds this into the
-     * per-port dialect config (РH8) together with the route knobs. */
-    lk_proto_http_configure(&(struct lk_http_cfg){.user_basic = opt_http_user_basic});
+    /* Handler-wide HTTP settings (РH10/РH7): the identity knobs and the route
+     * templater's config. Applied before the first event; the per-port half of
+     * the seam — which dialect classifies a request (РH8) — travels on
+     * lk_proto_ops instead, chosen by `--port N=<name>`. */
+    configure_http();
 
     events = lk_events_new(&ecfg);
     if (!events) {
@@ -1078,6 +1267,9 @@ cleanup:
     latkit_bpf__destroy(skel);
     for (int i = 0; i < opt_ncgroup; i++)
         free((char *)opt_cgroup[i]);
+    for (int i = 0; i < opt_http_nquery_keys; i++)
+        free((char *)opt_http_query_keys[i]);
+    lk_route_map_free(opt_http_route_map);
     lk_free_pairs(env_headers, env_nheaders);
     lk_free_pairs(env_resource, env_nresource);
     return err < 0 ? 1 : 0;

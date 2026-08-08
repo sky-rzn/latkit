@@ -187,4 +187,35 @@ static inline void fz_check_norm_stable(const char *sql, size_t len, enum lk_sql
     fz_read_bytes(a.text, a.text_len);
 }
 
+/* Route templater contract (norm_route.h, РH7). Same two properties as the SQL
+ * normaliser — bounded, terminated, deterministic — plus the two the route has
+ * of its own and the whole track depends on:
+ *
+ *   - **no byte of the query reaches the template** unless a key was named.
+ *     Checked structurally rather than by comparing strings: with no query keys
+ *     configured, a '?' in the output can only have come from the query.
+ *   - **no control byte reaches the template**, whatever the input. This is the
+ *     privacy/format invariant of РH12 at its narrowest point: everything
+ *     downstream (a Prometheus label, an OTLP attribute) assumes it. */
+static inline void fz_check_route_stable(const char *method, size_t mlen, const char *target,
+                                         size_t tlen, const struct lk_route_cfg *cfg)
+{
+    struct lk_route_out a, b;
+
+    lk_norm_route(method, (uint32_t)mlen, target, (uint32_t)tlen, cfg, &a);
+    lk_norm_route(method, (uint32_t)mlen, target, (uint32_t)tlen, cfg, &b);
+    FZ_ASSERT(a.text_len < LK_ROUTE_TEXT_MAX);
+    FZ_ASSERT(a.text[a.text_len] == '\0');
+    FZ_ASSERT(a.fp == b.fp && a.text_len == b.text_len && a.flags == b.flags);
+    FZ_ASSERT(memcmp(a.text, b.text, a.text_len + 1) == 0);
+    for (uint32_t i = 0; i < a.text_len; i++) {
+        unsigned char c = (unsigned char)a.text[i];
+
+        FZ_ASSERT(c >= 0x20 && c != 0x7f);
+        if (!cfg || !cfg->nquery_keys)
+            FZ_ASSERT(c != '?');
+    }
+    fz_read_bytes(a.text, a.text_len);
+}
+
 #endif /* LATKIT_FUZZ_INVARIANTS_H */

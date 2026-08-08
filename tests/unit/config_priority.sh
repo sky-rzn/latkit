@@ -66,6 +66,30 @@ check "OTEL_SERVICE_NAME"        "$(get otlp_service_name OTEL_SERVICE_NAME=svc)
 # --- repeatable port via a comma-separated env list ---
 check "env port list count"   "$(env LATKIT_PORT=6000,6001,6002 "$LATKIT" --print-config | grep -c '^port=')" "3"
 
+# --- the HTTP route knobs (РH7, PLAN-HTTP.md М4) ---
+# They have no LATKIT_* equivalent yet (the whole HTTP surface lands in the
+# README at М9), so what is checked here is defaulting, parsing and the one
+# place the agent reads a file at startup.
+check "route depth default"   "$(get http_route_depth)"                             "8"
+check "route depth flag"      "$(get http_route_depth -- --http-route-depth 3)"     "3"
+check "query keys"            "$(get http_query_keys -- --http-query-keys action,op)" "action,op"
+check "route header folded"   "$(get http_route_header -- --http-route-header X-Route)" "x-route"
+check "no route map"          "$(get http_routes)"                                  "0"
+
+routes="$(mktemp)"
+printf '# a map\nGET /users/{id}\n* /health\nnonsense\n' > "$routes"
+check "route map loaded"      "$(get http_routes -- --http-routes "$routes")"       "2"
+rm -f "$routes"
+
+# A route map that is entirely unusable is a config error, not a silent
+# fallback to the heuristic: the operator asked for exact routes.
+if "$LATKIT" --print-config --http-routes /nonexistent/routes.txt >/dev/null 2>&1; then
+    echo "FAIL - a missing --http-routes file should exit non-zero"
+    fails=$((fails + 1))
+else
+    echo "ok   - missing --http-routes file rejected"
+fi
+
 # --- a bad env value is a hard error (exit != 0) ---
 if env LATKIT_PORT=99999 "$LATKIT" --print-config >/dev/null 2>&1; then
     echo "FAIL - bad env value should exit non-zero"

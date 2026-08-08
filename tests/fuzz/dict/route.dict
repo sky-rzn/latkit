@@ -1,0 +1,59 @@
+# libFuzzer dictionary for the route half of fuzz_norm (PLAN-HTTP.md М4, РH7).
+# The 0xFE selector byte plus the token shapes the templater actually branches
+# on: the classifier boundaries (a hex run of exactly 8, a 26-character ULID, a
+# UUID, a date), the structural characters a path is made of, and the map
+# syntax. Everything here is a *shape*; the values are irrelevant, which is why
+# the entries are the shortest thing that reaches a branch. Passed with -dict=
+# by campaign.sh and CI, alongside pg.dict for the SQL half of the same target.
+
+# --- the input selector and its two separators ------------------------------
+sel_route="\xfe"
+sel_mysql="\xff"
+nl="\x0a"
+method_get="GET\x0a"
+method_post="POST\x0a"
+method_star="*"
+
+# --- path structure ---------------------------------------------------------
+slash="/"
+dslash="//"
+dot="."
+dotdot=".."
+question="?"
+amp="&"
+eq="="
+percent="%2E"
+star_path="*"
+brace_open="{"
+brace_close="}"
+placeholder="{id}"
+
+# --- classifier boundaries --------------------------------------------------
+num="42"
+num_long="1234567890"
+hex7="a83bf2e"
+hex8="a83bf2ef"
+uuid="3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+ulid="01ARZ3NDEKTSV4RRFFQ69G5FAV"
+date="2024-01-02"
+b64="aGVsbG8gd29ybGQx"
+version="v1"
+long24="abcdefghijklmnopqrstuvwx"
+long25="abcdefghijklmnopqrstuvwxy"
+
+# --- file names -------------------------------------------------------------
+ext_js=".js"
+ext_html=".html"
+asset="app.a83bf2ef.js"
+index="index.html"
+
+# --- query keys the harness promotes ----------------------------------------
+q_action="?action="
+q_token="?token=secret"
+q_page="&page=2"
+
+# --- route map lines --------------------------------------------------------
+map_get="GET /users/{id}\x0a"
+map_any="* /health\x0a"
+map_comment="# comment\x0a"
+map_deep="GET /a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q\x0a"

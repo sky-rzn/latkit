@@ -272,11 +272,85 @@ static int test_authorization(void)
     return 0;
 }
 
+/* --- the route reaches the observation (М4, РH7/РH8) ---------------------- */
+
+/* The templating rules themselves live in test_norm_route.c; what is asserted
+ * here is the wiring: the dialect runs once per observation, the raw target
+ * survives beside the template, and a unit with no target reports no route
+ * rather than a plausible-looking one. */
+static int test_route(void)
+{
+    struct lk_http_cfg cfg = {0};
+
+    lk_proto_http_configure(NULL);
+    h_reset();
+    h_call(LK_DIR_RECV, "GET /orders/42?token=secret HTTP/1.1\r\nHost: h\r\n\r\n", 1000);
+    answer(2000);
+    CHECK(h_nobs == 1);
+    CHECK(!strcmp(h_obs[0].route, "/orders/{id}"));
+    CHECK(h_target_is(0, "/orders/42?token=secret")); /* the raw one is untouched */
+    CHECK(h_obs[0].route_fp != 0);
+
+    /* Two ids, one route: the whole point of the label. And two methods on one
+     * path are two routes (РH7), which the fingerprint has to carry. */
+    h_reset();
+    h_call(LK_DIR_RECV, "GET /orders/1 HTTP/1.1\r\nHost: h\r\n\r\n", 1000);
+    answer(2000);
+    h_call(LK_DIR_RECV, "GET /orders/999 HTTP/1.1\r\nHost: h\r\n\r\n", 3000);
+    answer(4000);
+    h_call(LK_DIR_RECV, "DELETE /orders/1 HTTP/1.1\r\nHost: h\r\n\r\n", 5000);
+    answer(6000);
+    CHECK(h_nobs == 3);
+    CHECK(h_obs[0].route_fp == h_obs[1].route_fp);
+    CHECK(h_obs[0].route_fp != h_obs[2].route_fp);
+
+    /* The knobs travel through the same config the CLI fills. */
+    cfg.route.depth = 2;
+    cfg.route.query_keys[0] = "action";
+    cfg.route.nquery_keys = 1;
+    lk_proto_http_configure(&cfg);
+    h_reset();
+    h_call(LK_DIR_RECV, "GET /a/b/c/d?action=List&x=9 HTTP/1.1\r\nHost: h\r\n\r\n", 1000);
+    answer(2000);
+    CHECK(h_nobs == 1 && !strcmp(h_obs[0].route, "/a/b/...?action=List"));
+
+    /* --http-route-header: the app's own name wins over the classifier, and is
+     * read only because a header was named. */
+    memset(&cfg, 0, sizeof(cfg));
+    h_reset();
+    h_call(LK_DIR_RECV,
+           "GET /posts/why-we-left HTTP/1.1\r\nHost: h\r\nX-Route: /posts/{slug}\r\n\r\n", 1000);
+    answer(2000);
+    CHECK(h_nobs == 1 && !strcmp(h_obs[0].route, "/posts/why-we-left"));
+
+    snprintf(cfg.route_header, sizeof(cfg.route_header), "x-route");
+    lk_proto_http_configure(&cfg);
+    h_reset();
+    h_call(LK_DIR_RECV,
+           "GET /posts/why-we-left HTTP/1.1\r\nHost: h\r\nX-Route: /posts/{slug}\r\n\r\n", 1000);
+    answer(2000);
+    CHECK(h_nobs == 1 && !strcmp(h_obs[0].route, "/posts/{slug}"));
+    /* ... and a request without the header still gets classified */
+    h_call(LK_DIR_RECV, "GET /posts/17 HTTP/1.1\r\nHost: h\r\n\r\n", 3000);
+    answer(4000);
+    CHECK(h_nobs == 2 && !strcmp(h_obs[1].route, "/posts/{id}"));
+    lk_proto_http_configure(NULL);
+
+    /* No target, no route: an authority-form CONNECT reports neither a path nor
+     * an invented "/" (the blind-zone note is test_http_frame.c's business). */
+    h_reset();
+    h_call(LK_DIR_RECV, "CONNECT h:443 HTTP/1.1\r\nHost: h:443\r\n\r\n", 1000);
+    h_call(LK_DIR_SEND, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n", 2000);
+    CHECK(h_nobs == 1);
+    CHECK(h_obs[0].route[0] == '\0' && h_obs[0].route_fp == 0);
+    return 0;
+}
+
 int main(void)
 {
     int rc = test_basic_fields() || test_session_once() || test_target_forms() ||
              test_missing_headers() || test_torn_head() || test_truncated_head() ||
-             test_long_target() || test_trace_headers() || test_authorization();
+             test_long_target() || test_trace_headers() || test_authorization() || test_route();
 
     h_free();
     if (rc)
