@@ -165,16 +165,27 @@ add_custom_target(latkit_skel DEPENDS ${SKEL_H})
 set(PROTO_SRC src/proto/registry.c src/proto/pg/pg.c src/proto/pg/pg_frame.c
               src/proto/pg/pg_session.c src/proto/pg/pg_query.c src/proto/pg/pg_prep.c
               src/proto/my/my_frame.c src/proto/my/my.c src/proto/my/my_session.c
-              src/proto/my/my_query.c src/proto/my/my_prep.c)
+              src/proto/my/my_query.c src/proto/my/my_prep.c
+              src/proto/http/http_frame.c src/proto/http/http.c)
 set(PROTO_INC ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
               ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/pg
               ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/my
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/http
               ${CMAKE_CURRENT_SOURCE_DIR}/src/agent
               ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf
               # proto.h carries enum lk_sql_dialect (lk_proto_ops.sql_dialect,
               # М6) — a header-only dependency, latkit_norm is not linked here
               ${CMAKE_CURRENT_SOURCE_DIR}/src/norm)
-add_library(latkit_proto STATIC ${PROTO_SRC})
+
+# reassembly.c lives under src/agent/ but is pure (no libbpf, no I/O) and is the
+# other half of the vtable contract, so it is compiled *into* this library and
+# into no other target. Since РH1 the dependency runs both ways: the framer
+# calls out to the protocol's hooks, and a stream-framing protocol calls back
+# into lk_reasm_emit / lk_reasm_resync — an undefined symbol for anyone who
+# links latkit_proto without the framer object. One home for it removes the
+# question; every consumer (agent, replay, unit tests, benches) gets it through
+# the library it already links.
+add_library(latkit_proto STATIC ${PROTO_SRC} src/agent/reassembly.c)
 target_include_directories(latkit_proto PUBLIC ${PROTO_INC})
 
 # --- SQL normaliser (stage 4) ----------------------------------------------
@@ -224,7 +235,7 @@ target_link_libraries(latkit_export PUBLIC latkit_metrics latkit_norm)
 
 # --- agent -----------------------------------------------------------------
 add_executable(latkit src/agent/main.c src/agent/loop.c src/agent/events.c
-               src/agent/decode.c src/agent/conn_table.c src/agent/reassembly.c
+               src/agent/decode.c src/agent/conn_table.c
                src/agent/pipeline.c src/agent/record.c src/agent/tls_attach.c
                src/agent/cgroup_filter.c src/agent/cgroup_match.c
                src/common/otel_env.c)

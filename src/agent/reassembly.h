@@ -150,4 +150,22 @@ void lk_frame_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, cons
                     __u64 ts_ns);
 void lk_frame_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64 n);
 
+/* --- the stream-framing mode (РH1) ---------------------------------------- */
+/* A protocol flagged LK_PROTO_F_STREAM (proto.h) assembles messages itself out
+ * of the bytes/holes it receives through stream_bytes/stream_hole; these two
+ * are how it rejoins the generic bookkeeping.
+ *
+ * lk_reasm_emit publishes one assembled message: the caller fills type/len/
+ * body/body_cap/ts_ns (and LK_MSG_BODY_TRUNC when body_cap is a prefix), and
+ * this stamps LK_MSG_AFTER_RESYNC when one is pending on the direction, keeps
+ * the msgs/msgs_trunc counters and calls the sink. There is no pre_emit hook
+ * on this path — the protocol already built the message.
+ *
+ * lk_reasm_resync is do_resync for a stream framer: the direction leaves
+ * LK_FR_DIRTY (the state the conn table's seq detector and the lazily created
+ * entries set), the resyncs counter and the on_resync callback fire, and the
+ * next emitted message carries LK_MSG_AFTER_RESYNC. */
+void lk_reasm_emit(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, struct lk_msg *m);
+void lk_reasm_resync(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir);
+
 #endif /* LATKIT_REASSEMBLY_H */

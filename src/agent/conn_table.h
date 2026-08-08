@@ -146,6 +146,17 @@ struct lk_conn {
     void *proto_state;        /* owned by the protocol handler (Р15, STAGE3):
                                  allocated lazily on the first message, released
                                  by the destroy hook on every removal path */
+    /* Stream-framer state of a LK_PROTO_F_STREAM protocol (РH1), covering both
+     * directions: what the header/body/skip machine holds in lk_frame for the
+     * message-framed protocols has no equivalent there, so the framer keeps its
+     * own. Allocated lazily by the framer on the connection's first bytes.
+     * Contract: **one flat allocation, no owned pointers inside** — the table
+     * frees it with the frame buffers on every removal path (CONN_CLOSE, LRU
+     * eviction, idle sweep, teardown), so it cannot leak through a harness that
+     * installs no protocol handler (lkt_messages). Bulk scratch belongs in the
+     * framer's lk_frame.buf slabs, which come from the reassembly pool and are
+     * bounded by construction (Р11). */
+    void *frame_state;
 };
 
 /* Cumulative counters; `active` is the current entry count. Reported in the
@@ -244,7 +255,8 @@ void lk_conn_table_note_tls_open(struct lk_conn_table *t);
  * the router when a connection flips to LK_CONN_TLS. The real StartupMessage
  * arrives inside TLS, so the decrypted frontend stream must begin in startup
  * framing exactly like a fresh plaintext connection. Frees the partial-message
- * buffers; cookie, tuple, seq spaces and flags are kept. */
+ * buffers and the stream framer's state (РH1 — the plaintext stream it
+ * described is over); cookie, tuple, seq spaces and flags are kept. */
 void lk_conn_tls_reset_framing(struct lk_conn *c);
 
 /* Evict entries with last_activity_ns + idle_timeout <= now_ns; returns how

@@ -5,7 +5,6 @@ set(REPLAY_SRC
     ${CMAKE_SOURCE_DIR}/src/agent/pipeline.c
     ${CMAKE_SOURCE_DIR}/src/agent/decode.c
     ${CMAKE_SOURCE_DIR}/src/agent/conn_table.c
-    ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c
     ${CMAKE_SOURCE_DIR}/src/agent/record.c
     fixtures_gen.c)
 

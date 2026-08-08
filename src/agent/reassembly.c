@@ -3,7 +3,14 @@
  * size/parse, startup framing, special transitions, resync anchors — come
  * from the connection's lk_proto_ops (РМ1, proto.h). A connection without
  * assigned ops frames as PG: the default protocol (РМ2), and what keeps the
- * pre-vtable unit tests and fixtures running unchanged. */
+ * pre-vtable unit tests and fixtures running unchanged.
+ *
+ * Two framing modes (РH1): the message machine below (PG/MySQL), and the
+ * stream mode of a protocol that has no length-prefixed header at all
+ * (HTTP/1.x). The fork is deliberately late — a stream protocol gets the
+ * bytes and holes only after every generic step has run — and deliberately
+ * narrow: three `if`s, one per primitive, leaving the machine itself
+ * untouched. */
 #include "reassembly.h"
 
 #include <stdbool.h>
@@ -98,6 +105,31 @@ static void do_resync(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, st
         r->sink.on_resync(r->sink.ctx, c, dir);
 }
 
+/* Stream-framing entry points (РH1). A protocol that assembles its own
+ * messages (HTTP/1.x: no length prefix, a CRLF-delimited header block that
+ * does not fit lk_frame.hdr[8]) reaches the sink and the resync bookkeeping
+ * through these, so the counters, the AFTER_RESYNC stamp and the lk_msg
+ * contract stay in one place for both modes. */
+void lk_reasm_emit(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, struct lk_msg *m)
+{
+    struct lk_frame *f = &c->frame[dir];
+
+    if (f->after_resync) {
+        m->flags |= LK_MSG_AFTER_RESYNC;
+        f->after_resync = 0;
+    }
+    if (m->flags & LK_MSG_BODY_TRUNC)
+        r->st.msgs_trunc++;
+    r->st.msgs++;
+    if (r->sink.on_msg)
+        r->sink.on_msg(r->sink.ctx, c, dir, m);
+}
+
+void lk_reasm_resync(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir)
+{
+    do_resync(r, c, dir, &c->frame[dir]);
+}
+
 static void emit(struct lk_reasm *r, const struct lk_proto_ops *ops, struct lk_conn *c,
                  enum lk_dir dir, struct lk_frame *f, const __u8 *body, __u32 body_cap)
 {
@@ -154,6 +186,17 @@ void lk_frame_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, cons
     const struct lk_proto_ops *ops = conn_ops(c);
     struct lk_frame *f = &c->frame[dir];
     __u16 entry_flags = c->flags;
+
+    /* Stream framing (РH1): the protocol owns the state machine from here on.
+     * Nothing above this point is skipped — the caller (lk_reasm_data) already
+     * ran the chunk arithmetic, the anomaly and TLS/IGNORE handling and the
+     * counters; what is bypassed is the HEADER/BODY/SKIP/DIRTY machine and the
+     * header accumulator, neither of which fits a length-prefix-less protocol. */
+    if (ops->flags & LK_PROTO_F_STREAM) {
+        if (n)
+            ops->stream_bytes(r, c, dir, p, n, ts_ns);
+        return;
+    }
 
     /* Cross-direction special bytes before framing (PG: the one-byte SSL
      * reply). false = the rest of the chunk is ciphertext, drop it. */
@@ -292,6 +335,14 @@ void lk_frame_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64
 
     if (n == 0)
         return;
+    if (ops->flags & LK_PROTO_F_STREAM) {
+        /* Stream framing (РH1): the loss counters are generic, what the hole
+         * means for the message being assembled is the protocol's call. */
+        r->st.holes++;
+        r->st.hole_bytes += n;
+        ops->stream_hole(r, c, dir, n);
+        return;
+    }
     if (ops->intercept_hole && ops->intercept_hole(r, c, dir)) {
         /* A pending special reply fell into the hole (PG: the SSL byte —
          * whether the stream is now ciphertext is unknown): dirty and let
@@ -412,8 +463,11 @@ void lk_reasm_data(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir,
     /* Call-boundary resync anchor (Р10): where messages start at call
      * boundaries, a dirty direction may safely re-enter framing (PG:
      * frontend, valid type + plausible len). Checked after the hole/anomaly
-     * bookkeeping, right before the bytes are fed. */
-    if (f->st == LK_FR_DIRTY && ops->resync_boundary(c, dir, ev, cap_len))
+     * bookkeeping, right before the bytes are fed. A stream protocol (РH1)
+     * decides this inside stream_bytes, where it has the bytes themselves —
+     * its anchors are textual, not call-shaped. */
+    if (f->st == LK_FR_DIRTY && !(ops->flags & LK_PROTO_F_STREAM) &&
+        ops->resync_boundary(c, dir, ev, cap_len))
         do_resync(r, c, dir, f);
 
     if (cap_len)

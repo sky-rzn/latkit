@@ -7,8 +7,9 @@
 #include <string.h>
 
 const struct lk_proto_ops *const lk_proto_registry[] = {
-    &lk_proto_pg_ops, /* index 0 is the default (РМ2: a bare --port N is pg) */
-    &lk_proto_my_ops, /* MySQL classic (М2): `--port 3306=mysql` */
+    &lk_proto_pg_ops,   /* index 0 is the default (РМ2: a bare --port N is pg) */
+    &lk_proto_my_ops,   /* MySQL classic (М2): `--port 3306=mysql` */
+    &lk_proto_http_ops, /* HTTP/1.x, stream framing (РH1): `--port 8080=http` */
 };
 const unsigned lk_proto_nregistry = sizeof(lk_proto_registry) / sizeof(lk_proto_registry[0]);
 

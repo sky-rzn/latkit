@@ -96,6 +96,7 @@ static void destroy(struct lk_conn_table *t, struct lk_conn *c)
         t->st.tls_active--; /* mirrors the ++ at the TLS flip (Р41) */
     free(c->frame[0].buf);
     free(c->frame[1].buf);
+    free(c->frame_state); /* stream-framer state (РH1): one flat allocation */
     free(c);
     t->st.active--;
 }
@@ -272,6 +273,11 @@ void lk_conn_table_note_tls_open(struct lk_conn_table *t)
 
 void lk_conn_tls_reset_framing(struct lk_conn *c)
 {
+    /* A stream framer's state (РH1) belongs to the plaintext stream that just
+     * ended; the decrypted channel starts a fresh one, so drop it and let the
+     * framer re-allocate lazily. */
+    free(c->frame_state);
+    c->frame_state = NULL;
     for (int i = 0; i < 2; i++) {
         free(c->frame[i].buf);
         /* Zeroing yields the startup state: st == LK_FR_HEADER, startup_done ==

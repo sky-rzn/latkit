@@ -45,9 +45,16 @@ static bool opt_events;
 static bool opt_messages;
 static bool opt_queries;
 static __u16 opt_ports[LK_MAX_PORTS];
-/* Protocol per port (РМ2): parallel to opt_ports, from `--port N[=pg|mysql]`;
+/* Protocol per port (РМ2): parallel to opt_ports, from `--port N[=pg|mysql|http]`;
  * a bare number is the default protocol (pg, the registry head). */
 static const struct lk_proto_ops *opt_port_ops[LK_MAX_PORTS];
+/* Per-port capture budget (РH14): the `:BYTES` suffix of `--port 8080=http:2048`,
+ * 0 = follow --capture-limit. Parsed, validated and echoed by --print-config
+ * here; the kernel-side `ports` map still holds a plain u8 flag, so the value
+ * has no effect until М7 turns that map value into a struct. Deliberately
+ * absent from --help until then — an advertised knob that does nothing is
+ * worse than an undocumented one that will. */
+static __u32 opt_port_caps[LK_MAX_PORTS];
 static struct lk_port_proto opt_port_protos[LK_MAX_PORTS];
 static int opt_nports;
 static __u64 opt_ringbuf_bytes = LK_RINGBUF_SZ;
@@ -101,8 +108,9 @@ static void usage(FILE *out, const char *argv0)
     fprintf(out,
             "latkit %s\n"
             "usage: %s [options]\n"
-            "  -p, --port PORT[=pg]  local (server) port to capture, optionally\n"
-            "                        with its wire protocol (default: pg);\n"
+            "  -p, --port PORT[=PROTO]\n"
+            "                        local (server) port to capture, optionally with\n"
+            "                        its wire protocol (default: pg);\n"
             "                        repeatable, up to %d ports (default: %d)\n"
             "      --ringbuf-bytes N ringbuf size, power-of-two bytes (default: %d)\n"
             "      --capture-limit N capture budget per send/recv call, bytes\n"
@@ -243,9 +251,12 @@ static int set_option(int c, char *optarg)
 
     switch (c) {
     case 'p': {
-        /* PORT[=proto] (РМ2): a bare number keeps the pg default. */
+        /* PORT[=PROTO[:BYTES]] — the protocol selector is РМ2, the capture
+         * budget РH14: a bare number keeps the pg default and the global
+         * --capture-limit. */
         const char *eq = strchr(optarg, '=');
         const struct lk_proto_ops *ops = lk_proto_registry[0];
+        __u32 cap = 0;
         char port_str[8];
 
         if (opt_nports == LK_MAX_PORTS) {
@@ -253,13 +264,28 @@ static int set_option(int c, char *optarg)
             return -1;
         }
         if (eq) {
-            ops = lk_proto_find(eq + 1, strlen(eq + 1));
+            const char *name = eq + 1;
+            const char *colon = strchr(name, ':');
+            size_t name_len = colon ? (size_t)(colon - name) : strlen(name);
+
+            ops = lk_proto_find(name, name_len);
             if (!ops) {
-                fprintf(stderr, "--port: unknown protocol '%s' (supported:", eq + 1);
+                fprintf(stderr, "--port: unknown protocol '%.*s' (supported:", (int)name_len, name);
                 for (unsigned i = 0; i < lk_proto_nregistry; i++)
                     fprintf(stderr, " %s", lk_proto_registry[i]->name);
                 fprintf(stderr, ")\n");
                 return -1;
+            }
+            if (colon) {
+                /* Same ceiling as --capture-limit: the BPF data path emits at
+                 * most LK_MAX_CHUNKS chunks per call, so a larger per-port
+                 * budget could not be honoured either. */
+                if (parse_num(colon + 1, 1, LK_MAX_CHUNKS * LK_CHUNK_FULL, &v)) {
+                    fprintf(stderr, "--port: expected a capture budget of 1..%d, got '%s'\n",
+                            LK_MAX_CHUNKS * LK_CHUNK_FULL, colon + 1);
+                    return -1;
+                }
+                cap = (__u32)v;
             }
             if ((size_t)(eq - optarg) >= sizeof(port_str)) {
                 fprintf(stderr, "--port: bad port '%s'\n", optarg);
@@ -274,6 +300,7 @@ static int set_option(int c, char *optarg)
             return -1;
         }
         opt_port_ops[opt_nports] = ops;
+        opt_port_caps[opt_nports] = cap;
         opt_ports[opt_nports++] = v;
         break;
     }
@@ -681,12 +708,17 @@ static void apply_otlp_env_defaults(void)
 static void print_config(void)
 {
     for (int i = 0; i < opt_nports; i++) {
-        /* The pg default prints bare — the pre-РМ2 format, pinned by
-         * config_priority.sh; an explicit protocol prints as given. */
-        if (opt_port_ops[i] == lk_proto_registry[0])
+        /* The pg default with no per-port budget prints bare — the pre-РМ2
+         * format, pinned by config_priority.sh; anything explicit prints as
+         * it was given. */
+        char cap[16] = "";
+
+        if (opt_port_caps[i])
+            snprintf(cap, sizeof(cap), ":%u", opt_port_caps[i]);
+        if (opt_port_ops[i] == lk_proto_registry[0] && !cap[0])
             printf("port=%u\n", opt_ports[i]);
         else
-            printf("port=%u=%s\n", opt_ports[i], opt_port_ops[i]->name);
+            printf("port=%u=%s%s\n", opt_ports[i], opt_port_ops[i]->name, cap);
     }
     printf("ringbuf_bytes=%llu\n", (unsigned long long)opt_ringbuf_bytes);
     printf("capture_limit=%u\n", opt_capture_limit);
@@ -990,10 +1022,14 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "latkit %s: attached, capturing local port(s)", LK_VERSION);
     for (int i = 0; i < opt_nports; i++) {
-        if (opt_port_ops[i] == lk_proto_registry[0])
+        char cap[16] = "";
+
+        if (opt_port_caps[i])
+            snprintf(cap, sizeof(cap), ":%u", opt_port_caps[i]);
+        if (opt_port_ops[i] == lk_proto_registry[0] && !cap[0])
             fprintf(stderr, " %u", opt_ports[i]);
         else
-            fprintf(stderr, " %u=%s", opt_ports[i], opt_port_ops[i]->name);
+            fprintf(stderr, " %u=%s%s", opt_ports[i], opt_port_ops[i]->name, cap);
     }
     if (opt_comm[0])
         fprintf(stderr, ", comm=%s", opt_comm);

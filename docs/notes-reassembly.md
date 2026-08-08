@@ -52,6 +52,48 @@ recovery carries `LK_MSG_AFTER_RESYNC` so the consumer knows prior context is
 lost. Synthetic connections (the agent attached mid-session) start dirty and
 join through the exact same mechanism.
 
+## Two framing modes over one set of primitives (РH1)
+
+Everything above is about the *primitives* — bytes and holes — and none of it
+assumes a message shape. What sits on top of them does, and since the HTTP
+track (PLAN-HTTP.md, РH1) there are two variants of it, chosen per protocol by
+`LK_PROTO_F_STREAM` in `lk_proto_ops.flags`:
+
+- **Message framing** (PostgreSQL, MySQL). A fixed-size header, accumulated in
+  `lk_frame.hdr[8]`, carries the body length; the generic
+  `HEADER → BODY → SKIP` machine in `reassembly.c` does the rest, calling out
+  to the protocol only for `hdr_size` / `parse_hdr` / `pre_emit` and the two
+  resync anchors. This is the machine described in the sections above.
+- **Stream framing** (HTTP/1.x). There is no length-prefixed header to
+  accumulate: an HTTP message starts with a text start line, ends its header
+  block at the first `CRLFCRLF` — kilobytes in, no bound that fits `hdr[8]` —
+  and only then reveals its body length, or hides it in chunk headers scattered
+  through the body itself. So the protocol receives the byte stream directly
+  through `stream_bytes(p, n, ts)` / `stream_hole(n)` and runs its own machine
+  over it, keeping state in `lk_conn.frame_state`.
+
+The fork is deliberately late and deliberately narrow. A stream protocol is
+handed its bytes only **after** every generic step has run — the chunk
+arithmetic and `off`-anomaly detection of `lk_reasm_data`, the drop of
+ciphertext and blind-zone (`LK_CONN_IGNORE`) events, the hole and loss
+counters — so nothing about honesty under loss is re-implemented per protocol;
+what it skips is the header/body/skip machine, which has nothing to offer it.
+Coming back out, it publishes assembled messages with `lk_reasm_emit()` and
+leaves a dirty direction with `lk_reasm_resync()`, the same two operations the
+machine performs internally, with the same counters and the same
+`LK_MSG_AFTER_RESYNC` stamp. Consumers see `lk_msg` either way: `--messages`,
+the replay harness, the fuzzers and the protocol handlers cannot tell the two
+modes apart, which is what keeps PostgreSQL and MySQL behaviour bit-for-bit
+unchanged (РH15).
+
+The one thing a stream protocol does inherit rather than own is the loss
+*signal*: the connection table's `seq` detector still marks both directions
+`LK_FR_DIRTY`, and the framer reads that flag as "the stream broke here".
+Where the message machine would re-enter on a byte-pattern or call-boundary
+anchor, a stream protocol decides for itself — for HTTP the anchors are
+textual (`METHOD SP … SP HTTP/1.x`, `HTTP/1.x SP NNN`) and, unlike the other
+two protocols', they are strong enough to find inside a body.
+
 ## Timestamp precision = syscall boundaries (Р13)
 
 A reassembled message is stamped with `ts_ns` of the event (chunk) that carried

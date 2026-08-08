@@ -14,7 +14,7 @@ add_test(NAME conn_table COMMAND test_conn_table)
 
 # The framer's protocol knowledge lives behind the lk_proto_ops vtable (РМ1),
 # so reassembly.c pulls in the proto lib for the PG entry (pg_frame.c).
-add_executable(test_reassembly test_reassembly.c ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
+add_executable(test_reassembly test_reassembly.c)
 target_include_directories(test_reassembly PRIVATE
     ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
 target_link_libraries(test_reassembly latkit_proto)
@@ -26,8 +26,7 @@ add_test(NAME reassembly COMMAND test_reassembly)
 add_executable(test_tls_route test_tls_route.c
     ${CMAKE_SOURCE_DIR}/src/agent/pipeline.c
     ${CMAKE_SOURCE_DIR}/src/agent/decode.c
-    ${CMAKE_SOURCE_DIR}/src/agent/conn_table.c
-    ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
+    ${CMAKE_SOURCE_DIR}/src/agent/conn_table.c)
 target_include_directories(test_tls_route PRIVATE
     ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
 target_link_libraries(test_tls_route latkit_proto)
@@ -53,11 +52,22 @@ add_test(NAME my_wire COMMAND test_my_wire)
 # MySQL framer (МYSQL.md М2): the reassembly matrix over lk_proto_my_ops plus
 # continuation glue, connection phase, TLS/compress transitions and the РМ4
 # anchors. Same shape as test_reassembly: reassembly.c + the proto lib.
-add_executable(test_my_frame test_my_frame.c ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
+add_executable(test_my_frame test_my_frame.c)
 target_include_directories(test_my_frame PRIVATE
     ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
 target_link_libraries(test_my_frame latkit_proto)
 add_test(NAME my_frame COMMAND test_my_frame)
+
+# Framer stream mode (PLAN-HTTP.md М1, РH1): the second framing mode of the
+# vtable, driven over lk_reasm_data with the М1 HTTP stub — emit/resync
+# accounting, hole handling, frame_state lifetime, and the РH15 invariant that
+# a PG connection on the same framer is untouched.
+add_executable(test_http_stream test_http_stream.c)
+target_include_directories(test_http_stream PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent
+    ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/http)
+target_link_libraries(test_http_stream latkit_proto)
+add_test(NAME http_stream COMMAND test_http_stream)
 
 # Startup/auth/session (task 3.2): white-box over the PG handler (links the
 # libbpf-free proto lib; includes the internal pg.h for state assertions).

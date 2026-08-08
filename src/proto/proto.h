@@ -27,6 +27,15 @@
  * src/proto/pg/pg_frame.c; a connection picks its ops from the port→protocol
  * map at creation (РМ2), NULL falling back to PG — the CLI default.
  *
+ * The vtable has two framing modes since РH1 (PLAN-HTTP.md М1). PG and MySQL
+ * are *message-framed*: a fixed-size header the generic machine accumulates in
+ * lk_frame.hdr[8], then a body of known length. HTTP/1.x has neither — its
+ * header block is CRLF-delimited and kilobytes long — so LK_PROTO_F_STREAM
+ * hands the protocol the raw byte/hole stream (stream_bytes/stream_hole) after
+ * the generic mechanics and lets it assemble messages itself, publishing them
+ * through lk_reasm_emit. Both modes emit lk_msg, so everything downstream —
+ * --messages, the replay harness, fuzz_pipe, the handlers — is unaware.
+ *
  * Everything under src/proto/ is pure (no I/O, no libbpf), like decode /
  * conn_table / reassembly: unit tests feed synthetic lk_msg, replay tests feed
  * .lkt fixtures through the shared pipeline. */
@@ -151,10 +160,46 @@ void lk_proto_free(struct lk_proto *p);
 struct lk_reasm; /* reassembly.h (included above); for the hook signatures */
 struct lk_ev_data;
 
+/* lk_proto_ops.flags
+ *
+ * LK_PROTO_F_STREAM (РH1) — stream framing: the protocol assembles messages
+ * itself out of the raw bytes and holes it receives through stream_bytes /
+ * stream_hole and publishes them with lk_reasm_emit; the generic
+ * HEADER/BODY/SKIP/DIRTY machine and the hdr_size/parse_hdr/pre_emit/resync_*
+ * hooks are not used. For protocols whose header block carries no length
+ * prefix and has no bound that fits lk_frame.hdr[8] — HTTP/1.x ends its one
+ * at the first CRLFCRLF, kilobytes in. */
+#define LK_PROTO_F_STREAM (1 << 0)
+
+/* Which side of the conversation the port filter puts us on (РH2). v1 captures
+ * by *local* port, so every protocol is observed server-side: RECV is the
+ * request stream, SEND the response one. The field is the seam for the client
+ * mode (`--peer-port 80=http`, filtering by skc_dport) — it exists so the
+ * assumption is named rather than implied by the direction constants. */
+enum lk_proto_role {
+    LK_ROLE_SERVER = 0, /* the capture filter matched our local port */
+    LK_ROLE_CLIENT,     /* (not in v1) the filter matched the remote port */
+};
+
+/* Span shape a protocol's observations produce (РH11, wired in М6). Not every
+ * protocol is a database: the field replaces the unconditional db_system, which
+ * silently assumed one. db.* attributes and db_system are read only for
+ * LK_OTEL_KIND_DB; LK_OTEL_KIND_HTTP takes the HTTP semconv path. */
+enum lk_otel_kind {
+    LK_OTEL_KIND_DB = 0, /* db.system.name / db.query.text / db.namespace */
+    LK_OTEL_KIND_HTTP,   /* http.request.method / http.route / http.response.* */
+};
+
 /* One wire protocol: its name (the `--port N=<name>` selector), its handler
  * constructor, and the framer knowledge reassembly.c calls out for. The framer
  * hooks are pure state manipulation over lk_frame / lk_conn flags — no I/O, no
- * allocation. All hooks except the two intercept_* are mandatory.
+ * allocation. Which hooks are mandatory depends on the framing mode:
+ *
+ *   - message framing (flags == 0, PG/MySQL): everything but the two
+ *     intercept_* hooks, and stream_bytes/stream_hole are unused;
+ *   - stream framing (LK_PROTO_F_STREAM, HTTP): stream_bytes/stream_hole only —
+ *     the whole hdr_size/parse_hdr/pre_emit/resync_* set is unused, because
+ *     the protocol owns its own state machine (see below).
  *
  * Contract notes:
  *  - hdr_size returns how many header bytes to accumulate in f->hdr before
@@ -185,12 +230,26 @@ struct lk_ev_data;
  *    (f->resync_matched is the protocol's scratch, zeroed on holes).
  *  - resync_boundary is the call-boundary anchor, checked by lk_reasm_data on
  *    a dirty direction before the bytes are fed (PG: frontend off==0 + valid
- *    type + plausible len). */
+ *    type + plausible len).
+ *  - stream_bytes/stream_hole (LK_PROTO_F_STREAM only, РH1) receive the
+ *    direction's byte stream after *all* the generic mechanics have run —
+ *    chunk arithmetic, off-anomalies, the TLS/IGNORE drop, the hole and
+ *    loss counters — but before any framing interpretation: there is no
+ *    header accumulator, no arithmetic body skip and no LK_FR_* transition
+ *    behind them. The protocol keeps its state in lk_conn.frame_state,
+ *    reads lk_frame.st == LK_FR_DIRTY as "the connection table saw loss"
+ *    (the seq detector still dirties both directions), leaves that state
+ *    through lk_reasm_resync and publishes assembled messages with
+ *    lk_reasm_emit — so consumers still see nothing but lk_msg. */
 struct lk_proto_ops {
     const char *name;                /* the `--port N=<name>` selector AND the `proto`
-                                        metric label value (РМ6): "pg" / "mysql" */
+                                        metric label value (РМ6): "pg" / "mysql" / "http" */
     const char *db_system;           /* OTel semconv db.system.name for the spans (М6):
-                                        "postgresql" / "mysql" */
+                                        "postgresql" / "mysql". Read only when
+                                        otel_kind == LK_OTEL_KIND_DB. */
+    enum lk_otel_kind otel_kind;     /* span shape the observations produce (РH11) */
+    enum lk_proto_role role;         /* which side the port filter puts us on (РH2) */
+    __u16 flags;                     /* LK_PROTO_F_* */
     enum lk_sql_dialect sql_dialect; /* normaliser dialect for this protocol's
                                         SQL (РМ9; М6 threads it to the sinks) */
 
@@ -206,6 +265,9 @@ struct lk_proto_ops {
                          __u32 n, bool *found);
     bool (*resync_boundary)(const struct lk_conn *c, enum lk_dir dir, const struct lk_ev_data *ev,
                             __u32 cap_len);
+    void (*stream_bytes)(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, const __u8 *p,
+                         __u32 n, __u64 ts_ns);
+    void (*stream_hole)(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64 n);
 };
 
 /* PG v3 framing behind the vtable (src/proto/pg/pg_frame.c). Also the
@@ -229,9 +291,19 @@ static inline const struct lk_proto_ops *lk_conn_proto(const struct lk_conn *c)
 extern const struct lk_proto_ops lk_proto_my_ops;
 struct lk_proto *lk_proto_my_new(const struct lk_query_sink *out);
 
+/* HTTP/1.x: stream framing (РH1) in src/proto/http/http_frame.c, the handler
+ * in src/proto/http/http.c — `--port 8080=http`. М1 is the seam only: the
+ * framer emits one message per capture event and the handler emits no
+ * observations; the real framer is М2, the unit lifecycle М3. */
+extern const struct lk_proto_ops lk_proto_http_ops;
+struct lk_proto *lk_proto_http_new(const struct lk_query_sink *out);
+
 /* The registry: one entry per supported protocol, PG first (the default).
- * LK_PROTO_MAX caps it so consumers can size parallel arrays statically. */
-#define LK_PROTO_MAX 4
+ * LK_PROTO_MAX caps it so consumers can size parallel arrays statically.
+ * Raised to 8 for the HTTP track (РH9): pg + mysql + http + the s3 dialect
+ * (PLAN-MINIO.md) already fill the old ceiling of 4, and a protocol that does
+ * not fit the registry would silently disappear from the `proto` label. */
+#define LK_PROTO_MAX 8
 extern const struct lk_proto_ops *const lk_proto_registry[];
 extern const unsigned lk_proto_nregistry;
 

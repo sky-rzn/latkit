@@ -158,7 +158,11 @@ static void spans_on_query(void *ctx, const struct lk_conn *c, const struct lk_s
         snprintf(sp->sqlstate, sizeof(sp->sqlstate), "%s", o->sqlstate);
         sp->err_code = o->err_code;
     }
-    sp->db_system = ops->db_system;
+    /* db.* attributes describe a database, and since РH11 not every protocol
+     * is one: a non-DB protocol leaves db_system NULL and takes its own semconv
+     * path in М6. Today only PG and MySQL produce observations, so this reads
+     * exactly as it did before. */
+    sp->db_system = ops->otel_kind == LK_OTEL_KIND_DB ? ops->db_system : NULL;
     snprintf(sp->db, sizeof(sp->db), "%s", sess->database);
     snprintf(sp->user, sizeof(sp->user), "%s", sess->user);
     fill_text_and_name(s, sp, o, ops->sql_dialect);

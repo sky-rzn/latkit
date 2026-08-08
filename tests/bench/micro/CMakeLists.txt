@@ -18,7 +18,7 @@ set_tests_properties(bench_spans PROPERTIES LABELS bench)
 # reassembly body-prefix buffer (Р11): links reassembly.c directly (no libbpf,
 # no conn_table calls), mirroring test_reassembly. The proto lib supplies the
 # PG framer vtable entry (РМ1).
-add_executable(bench_reasm bench_reasm.c bench_wrap.c ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
+add_executable(bench_reasm bench_reasm.c bench_wrap.c)
 target_include_directories(bench_reasm PRIVATE
     ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent)
 target_link_libraries(bench_reasm latkit_proto)
