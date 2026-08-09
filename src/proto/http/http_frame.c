@@ -867,7 +867,8 @@ const struct lk_proto_ops lk_proto_http_ops = {
     /* db_system stays NULL: HTTP is not a database, and otel_kind is what
      * tells the span builder so (РH11; М6 acts on it). */
     .otel_kind = LK_OTEL_KIND_HTTP,
-    .role = LK_ROLE_SERVER, /* v1 observes servers only (РH2) */
+    .profile = LK_PROTO_PROF_HTTP, /* latkit_http_* rather than latkit_query_* (РH10) */
+    .role = LK_ROLE_SERVER,        /* v1 observes servers only (РH2) */
     .flags = LK_PROTO_F_STREAM,
     .sql_dialect = LK_SQL_PG, /* unused: nothing here reaches the SQL normaliser */
     /* The base flavour: heuristic route templating (РH7). The S3 entry

@@ -4,7 +4,7 @@ Monitoring-only stack — **latkit + Prometheus + Grafana**, pointed at a
 MySQL or MariaDB you already run on the host. Unlike
 [`../demo-mysql`](../demo-mysql), it brings **no** server and **no** load
 generator: the agent captures the real database. Grafana and Prometheus reuse
-the postgres demo's provisioning and the four dashboards from
+the postgres demo's provisioning and the bundled dashboards from
 [`../../dashboards`](../../dashboards); the `$proto` variable selects `mysql`.
 
 ## Requirements

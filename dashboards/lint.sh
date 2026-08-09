@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# dashboards/lint.sh — structural + nomenclature lint for the four latkit
-# dashboards (Р42). Runs in CI (job dashboards-lint) with only jq installed:
+# dashboards/lint.sh — structural + nomenclature lint for the five latkit
+# dashboards (Р42, РH9). Runs in CI (job dashboards-lint) with only jq installed:
 # no build, no root, no BPF.
 #
 # Checks, per dashboards/latkit-*.json:
@@ -12,8 +12,10 @@
 #      datasource template var exists, and every panel/target/annotation that
 #      names a datasource points at ${datasource} (no hardcoded uid);
 #   5. every rate()/_bucket window is $__rate_interval, never a literal [30s];
-#   6. no unbounded query fan-out: an expr that groups `by (... query ...)`
-#      must be bounded by topk(...) or filtered to a single query=~"$query";
+#   6. no unbounded fan-out: an expr that groups `by (... query ...)` or
+#      `by (... route ...)` must be bounded by topk(...) or filtered to a single
+#      query=~"$query" / route=~"$route". Both labels come from the same top-K
+#      dictionary and both are unbounded in a dashboard that graphs them all;
 #   7. every metric named in any PromQL expr (targets, annotations, template
 #      label_values) exists in the agent's metric nomenclature — the set of
 #      metric-name string literals in src/. Rename a metric in the code and
@@ -57,7 +59,7 @@ JQ_DS='.. | objects | select(has("datasource")) | .datasource'
 
 shopt -s nullglob
 files=("$here"/latkit-*.json)
-[ ${#files[@]} -eq 4 ] || err "expected 4 dashboards, found ${#files[@]}"
+[ ${#files[@]} -eq 5 ] || err "expected 5 dashboards, found ${#files[@]}"
 
 for f in "${files[@]}"; do
     base="$(basename "$f" .json)"
@@ -105,12 +107,14 @@ for f in "${files[@]}"; do
             err "$base: literal rate window in: $expr"
         fi
 
-        # 6. unbounded query fan-out
-        if grep -qE 'by \([^)]*query' <<<"$expr"; then
-            if ! grep -qE 'topk\(|query=~' <<<"$expr"; then
-                err "$base: 'by (query)' not bounded by topk()/query=~: $expr"
+        # 6. unbounded fan-out over a top-K label
+        for lbl in query route; do
+            if grep -qE "by \\([^)]*$lbl" <<<"$expr"; then
+                if ! grep -qE "topk\\(|$lbl=~" <<<"$expr"; then
+                    err "$base: 'by ($lbl)' not bounded by topk()/$lbl=~: $expr"
+                fi
             fi
-        fi
+        done
 
         # 7. nomenclature
         while IFS= read -r m; do

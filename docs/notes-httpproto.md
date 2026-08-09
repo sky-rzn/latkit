@@ -636,6 +636,60 @@ The documented miss stays documented: a slug (`/posts/why-we-left-the-cloud`) is
 not templated by any shape rule, and never will be. That is what layer 1 and the
 route header are for, and what layer 3 makes survivable in the meantime.
 
+## What an exchange becomes: the metric families (РH9/РH10, М5)
+
+The observation above is not itself a metric — it is what the aggregator reads.
+Turning it into series is where the HTTP track stops looking like the database
+one, and the design decision is that the *engine* does not change: the top-K
+dictionary, the doorkeeper, the dimension limit and the `other` fold are the
+same code (`registry.c`), while the family names and label keys come from a
+**profile** table. `pg`/`mysql` use the `query` profile, `http` the `http` one,
+and the numbers a PostgreSQL user sees are byte-for-byte what they were (РH15).
+
+What an exchange lands in — the full table with the label sets is in
+[notes-metrics.md](notes-metrics.md#http-metrics-рh9рh10):
+
+| From the unit | Family |
+|---|---|
+| the exchange itself, by status class | `latkit_http_requests_total{…,status}` |
+| `ts_complete − ts_req_done` | `latkit_http_request_duration_seconds{…,code}` |
+| `ts_first_row − ts_req_done` | `latkit_http_ttfb_seconds` |
+| `ts_req_done − ts_start` | `latkit_http_request_upload_seconds` |
+| status ≥ 400, exact code | `latkit_http_errors_total{code,host,user,proto}` |
+| `bytes_in` / `bytes_out` | `latkit_http_bytes_total{…,direction}` |
+| `bytes_out` as a distribution | `latkit_http_response_size_bytes` |
+
+Four things about that table are decisions rather than bookkeeping:
+
+1. **the duration starts at the end of the request.** `ts_start … ts_complete`
+   contains the client's upload, which the server neither spent nor controls; a
+   1 GB POST would otherwise read as a slow server. The upload interval is its
+   own family, and only for units where it means something — an `Expect:
+   100-continue` request contains a server round trip and is excluded;
+2. **the method is part of the route's identity.** The fingerprint is
+   `XXH3(method NUL template)`, so `GET /orders/{id}` and `POST /orders/{id}`
+   are two dictionary slots. `/hello` in the corpus produces separate `GET`,
+   `HEAD` and `OPTIONS` series, which is the point — their latencies have
+   nothing to do with each other;
+3. **a 4xx is not an error.** `code="error"` means 5xx. A 404 is the server
+   correctly saying no, and mixing the two would make every 404-heavy service
+   look broken; both are still counted, by exact code, in
+   `latkit_http_errors_total`;
+4. **a body that never reached the socket is counted but not histogrammed.**
+   `LK_QO_BODY_UNSEEN` (the `sendfile` case, and a connection that died
+   mid-transfer) means `bytes_out` is a lower bound: honest as a total, actively
+   misleading as a distribution.
+
+The blind zones get the same treatment as the sizes — counted, named, visible:
+`latkit_ignored_conns_total{reason}` splits into `h2`, `upgrade` and `connect`,
+so "this dashboard is thin because half the traffic is HTTP/2" is a number
+rather than a hypothesis.
+
+One rename came with the families and is the track's only breaking change: the
+agent's own exporter counter, which used to be called
+`latkit_http_requests_total`, is now `latkit_exporter_requests_total` (РH9). The
+old name now belongs to the traffic being observed.
+
 ## What the corpus proves
 
 `tests/traces/http/` (113 traces, four servers) is the material every claim

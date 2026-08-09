@@ -358,11 +358,17 @@ static void ev_provide_stats(void *ctx, struct lk_metrics *m)
                                   "replication", "proto", proto, (double)ps->replication_conns);
         lk_metrics_set_counter_l2(m, "latkit_ignored_conns_total", NULL, "reason", "compressed",
                                   "proto", proto, (double)ps->compressed_conns);
-        /* РH4: the connection stopped speaking what we parse — an HTTP/2
-         * preface, a 101 upgrade (websocket, h2c), a CONNECT tunnel. М5 splits
-         * this by reason; the reason itself is already in the message stream. */
-        lk_metrics_set_counter_l2(m, "latkit_ignored_conns_total", NULL, "reason", "blind", "proto",
-                                  proto, (double)ps->blind_conns);
+        /* РH4: the connection stopped speaking what we parse, split by what it
+         * started speaking instead. h2 is the one that matters — it is the
+         * documented hole in the coverage (gRPC, browser traffic over TLS), and
+         * an operator staring at a thin dashboard deserves to see it named
+         * rather than inferred from a total. */
+        lk_metrics_set_counter_l2(m, "latkit_ignored_conns_total", NULL, "reason", "h2", "proto",
+                                  proto, (double)ps->blind_h2);
+        lk_metrics_set_counter_l2(m, "latkit_ignored_conns_total", NULL, "reason", "upgrade",
+                                  "proto", proto, (double)ps->blind_upgrade);
+        lk_metrics_set_counter_l2(m, "latkit_ignored_conns_total", NULL, "reason", "connect",
+                                  "proto", proto, (double)ps->blind_connect);
     }
 
     const struct lk_conn_table_stats *cs = lk_conn_table_stats(e->pipe.conns);

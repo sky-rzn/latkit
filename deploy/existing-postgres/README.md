@@ -4,7 +4,7 @@ Monitoring-only stack — **latkit + Prometheus + Grafana**, pointed at a
 PostgreSQL you already run on the host (a website's database, say). Unlike
 [`../demo`](../demo), it brings **no** postgres and **no** load generator: the
 agent captures the real database. Grafana and Prometheus reuse the demo's
-provisioning and the four dashboards from [`../../dashboards`](../../dashboards).
+provisioning and the bundled dashboards from [`../../dashboards`](../../dashboards).
 
 ## Requirements
 

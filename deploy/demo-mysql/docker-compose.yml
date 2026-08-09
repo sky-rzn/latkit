@@ -1,6 +1,6 @@
 # latkit MySQL demo stack (MYSQL.md М8): mysql + load + latkit + prometheus +
 # grafana — the MySQL twin of ../demo, wired so `docker compose up` on a Linux
-# host gives live Grafana with the four dashboards (proto="mysql") in about a
+# host gives live Grafana with the bundled dashboards (proto="mysql") in about a
 # minute after the images are there. See README.md for the requirements and a
 # tour.
 #

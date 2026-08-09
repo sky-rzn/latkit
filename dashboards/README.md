@@ -1,6 +1,6 @@
 # Grafana dashboards
 
-Four provisioned dashboards for latkit (Р42). Fixed `uid`s — cross-links and
+Five provisioned dashboards for latkit (Р42, РH9). Fixed `uid`s — cross-links and
 provisioning depend on them, so don't change them:
 
 | file | uid | what |
@@ -9,6 +9,7 @@ provisioning depend on them, so don't change them:
 | `latkit-queries.json` | `latkit-queries` | top-N normalised queries by p99 / total time / frequency / errors (data link → drilldown) |
 | `latkit-drilldown.json` | `latkit-drilldown` | one `$db`/`$user`/`$query` selection: latency, first-row, rows, SQLSTATE |
 | `latkit-health.json` | `latkit-health` | every agent self-metric: losses, cardinality, OTLP, TLS, cgroup, `process_*`, pipeline overhead |
+| `latkit-http.json` | `latkit-http` | HTTP ports (`--port 8080=http`): RPS and duration/TTFB by route, status classes, sizes and throughput, blind zones, `route="other"` share |
 
 ## Design rules (enforced by `lint.sh`)
 
@@ -20,12 +21,19 @@ provisioning depend on them, so don't change them:
 - **Quantiles from classic `le` buckets** with `$__rate_interval`, never a
   literal window:
   `histogram_quantile(0.95, sum by (le) (rate(latkit_query_duration_seconds_bucket[$__rate_interval])))`.
-- **Bounded cardinality.** Nothing graphs an unbounded set of `query` series.
-  Top-N panels are instant tables over `topk($topk, ...)`; the only per-`query`
-  timeseries is the single selected `$query`. `$topk` is 5/10/20 (default 10).
+- **Bounded cardinality.** Nothing graphs an unbounded set of `query` — or, on
+  the HTTP dashboard, `route` — series. Top-N panels are instant tables over
+  `topk($topk, ...)`; the only per-`query` timeseries is the single selected
+  `$query`. `$topk` is 5/10/20 (default 10).
 - **Data honesty on the overview.** A `capture degraded` annotation fires from
   `latkit_ringbuf_dropped_total` / `latkit_resync_total`, and a dedicated panel
   plots them — when capture is lossy, the operator sees it (Р5/Р27).
+
+The HTTP dashboard's headline row carries the two honesty numbers of the track:
+the 5xx share, and the share of requests reported as `route="other"` — the
+signal for whether route templating (РH7) is working on *your* API. A large or
+growing `other` share means the heuristic is losing: raise `--top-queries`, or
+name the routes explicitly with `--http-routes`.
 
 Note: the drilldown's *time to first row* panel needs the agent's
 `--first-row-hist` (`LATKIT_FIRST_ROW_HIST=1`); without it that histogram family

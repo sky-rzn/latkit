@@ -28,8 +28,33 @@ label set is called out explicitly.
   `performance_schema.events_statements_summary_by_digest`
   ([docs/accuracy.md](docs/accuracy.md)).
 
+- **HTTP metric families and the `latkit-http` dashboard** (PLAN-HTTP.md М5).
+  Observations from an `--port 8080=http` port are reported under their own
+  family set rather than borrowed database ones:
+  `latkit_http_requests_total{route,method,host,user,proto,status}`,
+  `latkit_http_request_duration_seconds{…,code}`, `latkit_http_ttfb_seconds`,
+  `latkit_http_request_upload_seconds`,
+  `latkit_http_errors_total{code,host,user,proto}`,
+  `latkit_http_bytes_total{…,direction}` and
+  `latkit_http_response_size_bytes` (an octave grid, 64 B … 1 GiB, separate from
+  the latency one). `route` is the *template*, bounded by the same top-K
+  dictionary the `query` label uses; the share of `route="other"` is on the
+  dashboard as the honesty signal for how well the templater is doing.
+  The four timings of РH5 are visible here: duration and TTFB both start at the
+  *end of the request*, so a slow upload is not reported as a slow server, and
+  the upload interval is its own family.
+- `latkit_ignored_conns_total{reason}` gained `h2`, `upgrade` and `connect` —
+  the HTTP blind zones, split by what the connection switched to (they replace
+  the single `blind` reason introduced during the HTTP track's development).
+
 ### Changed
 
+- **Renamed self-metric: `latkit_http_requests_total` →
+  `latkit_exporter_requests_total`** (labels `{path,code}` unchanged). The old
+  name described the agent's *own* `/metrics` server; with HTTP observation it
+  would have collided with the traffic being observed. This is the one breaking
+  change of the HTTP track: alerts or dashboards referring to the agent's
+  exporter request count must be updated. The bundled dashboards already are.
 - **Metric label set: every query-family series now carries a
   `proto="pg"|"mysql"` label** (`latkit_query_duration_seconds`,
   `latkit_queries_total`, `latkit_query_errors_total`, `latkit_query_rows_total`

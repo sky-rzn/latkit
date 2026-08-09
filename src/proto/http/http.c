@@ -166,6 +166,12 @@ static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct http_conn *h
      * observation whose duration is "since the epoch" is worse than one whose
      * upload interval reads as zero. The upload family loses that unit; the
      * duration and TTFB stay right. */
+    /* РH5: the client waited for a `100 Continue` before uploading, so the
+     * interval before ts_req_done holds a server round trip and is not the
+     * client's upload time. М5's upload family drops such units rather than
+     * reporting a number that means two different things. */
+    if (u->expect_cont)
+        o.flags |= LK_QO_EXPECT_CONT;
     if (!(u->flags & LK_QO_NO_TEXT) && u->target_len) {
         o.text = u->target;
         o.text_len = u->target_len;
@@ -315,8 +321,19 @@ static void framer_note(struct lk_proto *p, struct http_conn *hc, const struct l
      * counts it as a hole. */
     if (LK_HTTP_NOTE_IS_PARSE_ERR(m->len))
         p->st.parse_errors++;
-    if (LK_HTTP_NOTE_IS_BLIND(m->len))
+    if (LK_HTTP_NOTE_IS_BLIND(m->len)) {
+        /* Split by reason as well as totalled (М5): an h2 preface means a share
+         * of the traffic is invisible and always will be, a 101 means somebody
+         * is running websockets through this port, and a CONNECT means the
+         * server is a proxy. Three different conversations with the operator. */
         p->st.blind_conns++;
+        if (m->len == LK_HTTP_NOTE_BLIND_H2)
+            p->st.blind_h2++;
+        else if (m->len == LK_HTTP_NOTE_BLIND_UPGRADE)
+            p->st.blind_upgrade++;
+        else
+            p->st.blind_connect++;
+    }
     if (m->len == LK_HTTP_NOTE_BODY_UNSEEN && hc) {
         /* РH4: the head promised a body, not one byte of it came through the
          * socket, and the next response head closed the unit. The timings are

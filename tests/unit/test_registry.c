@@ -10,7 +10,12 @@
  *   - nothing is ever lost: sum of every series' count == total observations,
  *     across arbitrary eviction (the monotonicity invariant);
  *   - the (db,user) dimension limit spills to (other,other);
- *   - the dump is valid text format with stable, escaped labels. */
+ *   - the dump is valid text format with stable, escaped labels.
+ *
+ * Since М5 it also covers the second observation profile (РH10): the http
+ * families and their label keys, the fact that a PG-only registry prints none of
+ * them, that the two profiles share the dictionary and nothing else, and that
+ * the structured (OTLP) walk emits the same families the text dump does. */
 #include <stdio.h>
 #include <string.h>
 
@@ -251,10 +256,196 @@ static int test_proto_split(void)
     return 0;
 }
 
+/* --- the http profile (РH9/РH10, М5) -------------------------------------- */
+
+static void http_obs(struct lk_registry *r, uint64_t fp, const char *route, const char *method,
+                     const char *host, uint16_t status, uint64_t in, uint64_t out)
+{
+    char code[8];
+    struct lk_reg_obs o = {
+        .fp = fp,
+        .label = route,
+        .op = method,
+        .db = host,
+        .user = "-",
+        .proto = "http",
+        .profile = LK_PROF_HTTP,
+        .kind = LK_QK_REQUEST,
+        .sclass = (uint8_t)(LK_SCLASS_1XX + status / 100 - 1),
+        .qcode = status >= 500 ? LK_QCODE_ERROR : LK_QCODE_OK,
+        .has_duration = true,
+        .dcode = status >= 500 ? LK_CODE_ERROR : LK_CODE_OK,
+        .dur_seconds = 0.03,
+        .has_first_row = true,
+        .first_row_seconds = 0.01,
+        .has_upload = in > 0,
+        .upload_seconds = 0.5,
+        .has_size = true,
+        .bytes_in = in,
+        .bytes_out = out,
+    };
+
+    if (status >= 400) {
+        snprintf(code, sizeof(code), "%u", status);
+        o.err_code = code;
+    }
+    lk_reg_observe(r, &o);
+}
+
+/* The profile decides the family names and the label keys, and nothing else:
+ * one observation reaches every http family with the (route,method,host,user)
+ * identity, and none of the query ones. */
+static int test_http_profile(void)
+{
+    struct lk_registry *r = reg(8, 8);
+    char buf[65536];
+
+    CHECK(r);
+    http_obs(r, 1, "/orders/{id}", "GET", "shop.example", 200, 0, 1500);
+    http_obs(r, 1, "/orders/{id}", "GET", "shop.example", 200, 0, 1500);
+    http_obs(r, 1, "/orders/{id}", "GET", "shop.example", 404, 0, 40);
+    http_obs(r, 2, "/orders/{id}", "POST", "shop.example", 503, 900, 20);
+
+    dump(r, buf, sizeof(buf));
+    /* the identity, in every family, with the http label keys */
+#define ID(m)                                                                                      \
+    m "route=\"/orders/{id}\",method=\"GET\",host=\"shop.example\",user=\"-\",proto=\"http\""
+    CHECK(contains(buf, ID("latkit_http_requests_total{") ",status=\"2xx\"} 2\n"));
+    CHECK(contains(buf, ID("latkit_http_requests_total{") ",status=\"4xx\"} 1\n"));
+    CHECK(contains(buf, ID("latkit_http_request_duration_seconds_count{") ",code=\"ok\"} 3\n"));
+    CHECK(contains(buf, ID("latkit_http_ttfb_seconds_count{") "} 3\n"));
+    CHECK(contains(buf, ID("latkit_http_bytes_total{") ",direction=\"out\"} 3040\n"));
+    CHECK(contains(buf, ID("latkit_http_bytes_total{") ",direction=\"in\"} 0\n"));
+    CHECK(contains(buf, ID("latkit_http_response_size_bytes_count{") "} 3\n"));
+    CHECK(contains(buf, ID("latkit_http_response_size_bytes_bucket{") ",le=\"2048\"} 3\n"));
+#undef ID
+    /* the method is part of the identity (РH7): POST is its own slot, and its
+     * 5xx is the one thing that reads as an error */
+    CHECK(contains(buf, "method=\"POST\",host=\"shop.example\",user=\"-\",proto=\"http\",code="
+                        "\"error\"} 1\n"));
+    CHECK(contains(buf, "latkit_http_request_upload_seconds_count{route=\"/orders/{id}\",method="
+                        "\"POST\""));
+    /* the error counter is exact-code and route-free */
+    CHECK(contains(buf, "latkit_http_errors_total{code=\"404\",host=\"shop.example\",user=\"-\","
+                        "proto=\"http\"} 1\n"));
+    CHECK(contains(buf, "latkit_http_errors_total{code=\"503\","));
+    /* ... and no HTTP observation leaks into the database families */
+    CHECK(!contains(buf, "proto=\"http\",kind="));
+    CHECK(!contains(buf, "latkit_query_duration_seconds{query="));
+    CHECK(!contains(buf, "latkit_http_request_duration_seconds_count{query="));
+    lk_reg_free(r);
+    return 0;
+}
+
+/* A PG-only registry emits no http blocks at all — the property that keeps an
+ * existing exposition byte-identical (РH15). */
+static int test_http_absent_without_traffic(void)
+{
+    struct lk_registry *r = reg(8, 8);
+    char buf[16384];
+
+    CHECK(r);
+    obs(r, 1, "select ?", "app", "alice", LK_CODE_OK);
+    dump(r, buf, sizeof(buf));
+    CHECK(!contains(buf, "latkit_http_"));
+    CHECK(contains(buf, "# TYPE latkit_queries_total counter\n"));
+    lk_reg_free(r);
+    return 0;
+}
+
+/* One registry, both profiles: the dictionary is shared (an HTTP route and a
+ * SQL statement compete for the same K slots) but nothing else is — the two
+ * label spaces never merge, and each profile's `other` counter is its own. */
+static int test_profile_mix(void)
+{
+    struct lk_registry *r = reg(2, 8);
+    char buf[65536];
+
+    CHECK(r);
+    obs(r, 10, "select ?", "app", "alice", LK_CODE_OK);
+    http_obs(r, 20, "/health", "GET", "svc", 200, 0, 2);
+    CHECK(lk_reg_n_queries(r) == 2); /* both took a slot */
+
+    /* dictionary full: a third identity folds to the profile's own `other` */
+    http_obs(r, 30, "/items/{id}", "GET", "svc", 200, 0, 2);
+    dump(r, buf, sizeof(buf));
+    CHECK(contains(buf, "latkit_queries_other_total 0\n")); /* not the http fold */
+    CHECK(contains(buf, "route=\"other\",method=\"other\",host=\"svc\""));
+    CHECK(contains(buf, "query=\"select ?\",db=\"app\",user=\"alice\",proto=\"pg\""));
+    CHECK(lk_reg_other_obs(r) == 1); /* summed over profiles, for the invariant */
+    CHECK(lk_reg_series_count_sum(r) == lk_reg_total_obs(r));
+    lk_reg_free(r);
+    return 0;
+}
+
+/* The structured walk (Р31, what OTLP exports) and the text dump are two
+ * renderings of one registry, and they drift silently: a family added to the
+ * dump and forgotten in the iterator disappears from OTLP without any test
+ * going red. So: every view the iterator emits must be a family the dump also
+ * prints, and every http family must be among them. */
+struct iter_seen {
+    const char *names[64];
+    uint32_t n;
+    uint32_t max_labels;
+};
+
+static void iter_cb(void *ctx, const struct lk_metric_view *v)
+{
+    struct iter_seen *s = ctx;
+
+    if (v->nlabels > s->max_labels)
+        s->max_labels = v->nlabels;
+    for (uint32_t i = 0; i < s->n; i++)
+        if (!strcmp(s->names[i], v->name))
+            return;
+    if (s->n < 64)
+        s->names[s->n++] = v->name;
+}
+
+static int test_iter_matches_dump(void)
+{
+    struct lk_registry *r = reg(8, 8);
+    struct iter_seen seen = {{0}, 0, 0};
+    char buf[65536], want[128];
+    static const char *const http_families[] = {
+        "latkit_http_requests_total",      "latkit_http_request_duration_seconds",
+        "latkit_http_ttfb_seconds",        "latkit_http_request_upload_seconds",
+        "latkit_http_errors_total",        "latkit_http_bytes_total",
+        "latkit_http_response_size_bytes",
+    };
+
+    CHECK(r);
+    obs(r, 1, "select ?", "app", "alice", LK_CODE_OK);
+    lk_reg_observe_txn(r, "app", "alice", "pg", false, 0.4);
+    http_obs(r, 2, "/orders/{id}", "GET", "shop", 500, 10, 900);
+
+    lk_reg_iter(r, iter_cb, &seen);
+    dump(r, buf, sizeof(buf));
+    CHECK(seen.n > 0);
+    for (uint32_t i = 0; i < seen.n; i++) {
+        snprintf(want, sizeof(want), "# TYPE %s ", seen.names[i]);
+        CHECK(contains(buf, want));
+    }
+    for (uint32_t i = 0; i < sizeof(http_families) / sizeof(*http_families); i++) {
+        bool found = false;
+
+        for (uint32_t j = 0; j < seen.n && !found; j++)
+            found = !strcmp(seen.names[j], http_families[i]);
+        CHECK(found);
+    }
+    /* route,method,host,user,proto + one of code/status/direction: the widest
+     * label set any family has, and the bound the view's array must hold. */
+    CHECK(seen.max_labels == 6);
+    lk_reg_free(r);
+    return 0;
+}
+
 int main(void)
 {
     if (test_overflow_to_other() || test_evict_reset() || test_doorkeeper() ||
-        test_cardinality_ceiling() || test_dim_limit() || test_dump_format() || test_proto_split())
+        test_cardinality_ceiling() || test_dim_limit() || test_dump_format() ||
+        test_proto_split() || test_http_profile() || test_http_absent_without_traffic() ||
+        test_profile_mix() || test_iter_matches_dump())
         return 1;
     printf("test_registry: all passed\n");
     return 0;

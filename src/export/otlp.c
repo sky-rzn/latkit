@@ -8,9 +8,15 @@
  *   ExportMetricsServiceRequest { resource_metrics = 1 }   (== MetricsData wire)
  *   ResourceMetrics { resource = 1, scope_metrics = 2 }
  *   ScopeMetrics { scope = 1, metrics = 2 }
- *   Metric { name=1, description=2, gauge=5, sum=7, exponential_histogram=10 }
+ *   Metric { name=1, description=2, gauge=5, sum=7, histogram=9,
+ *     exponential_histogram=10 }
  *   Sum { data_points=1, aggregation_temporality=2, is_monotonic=3 }
  *   Gauge { data_points=1 }
+ *   Histogram { data_points=1, aggregation_temporality=2 }
+ *   HistogramDataPoint { start=2(fixed64), time=3(fixed64), count=4(fixed64),
+ *     sum=5(double), bucket_counts=6(packed fixed64),
+ *     explicit_bounds=7(packed double), attrs=9 }   (field 1 is reserved, so the
+ *     attributes are *not* where the exponential data point keeps them)
  *   ExponentialHistogram { data_points=1, aggregation_temporality=2 }
  *   NumberDataPoint { start=2(fixed64), time=3(fixed64), as_double=4, attrs=7 }
  *   ExponentialHistogramDataPoint { attrs=1, start=2(fixed64), time=3(fixed64),
@@ -164,6 +170,39 @@ static void enc_exp_hist_dp(struct pbuf *pb, const struct lk_metric_view *v,
     pb_submsg_end(pb, dp);
 }
 
+/* HistogramDataPoint from the РH9 octave size grid. An explicit-bucket
+ * Histogram rather than an ExponentialHistogram because that is what the grid
+ * *is* — 25 fixed powers of two — and mapping it onto a scale/offset pair would
+ * mean either lying about the zero bucket or inventing sub-buckets that hold
+ * nothing. The bounds go out with every export; they are 200 bytes on a payload
+ * that is already kilobytes. */
+static void enc_hist_dp(struct pbuf *pb, const struct lk_metric_view *v,
+                        const struct lk_timebase *tb, uint64_t now)
+{
+    const struct lk_bhist *h = v->bhist;
+    size_t dp = pb_submsg_begin(pb, 1); /* data_points */
+    size_t packed;
+
+    pb_field_fixed64(pb, 2, lk_wall_ns(tb, v->created_ns)); /* start_time_unix_nano */
+    pb_field_fixed64(pb, 3, now);                           /* time_unix_nano */
+    pb_field_fixed64(pb, 4, h->count);                      /* count */
+    pb_field_double(pb, 5, h->sum);                         /* sum */
+
+    packed = pb_submsg_begin(pb, 6); /* bucket_counts: nbounds + 1 entries */
+    for (int i = 0; i < LK_BHIST_NBUCKETS; i++)
+        pb_fixed64(pb, h->bucket[i]);
+    pb_fixed64(pb, h->overflow);
+    pb_submsg_end(pb, packed);
+
+    packed = pb_submsg_begin(pb, 7); /* explicit_bounds */
+    for (int i = 0; i < LK_BHIST_NBUCKETS; i++)
+        pb_double(pb, lk_bhist_bound(i));
+    pb_submsg_end(pb, packed);
+
+    enc_attrs(pb, 9, v);
+    pb_submsg_end(pb, dp);
+}
+
 void lk_otlp_encode_metric(struct pbuf *pb, const struct lk_metric_view *v,
                            const struct lk_timebase *tb, uint64_t now_wall_ns)
 {
@@ -190,6 +229,12 @@ void lk_otlp_encode_metric(struct pbuf *pb, const struct lk_metric_view *v,
     case LK_MT_HIST:
         data = pb_submsg_begin(pb, 10); /* ExponentialHistogram */
         enc_exp_hist_dp(pb, v, tb, now_wall_ns);
+        pb_field_varint(pb, 2, OTLP_TEMPORALITY_CUMULATIVE);
+        pb_submsg_end(pb, data);
+        break;
+    case LK_MT_HIST_BYTES:
+        data = pb_submsg_begin(pb, 9); /* Histogram (explicit buckets) */
+        enc_hist_dp(pb, v, tb, now_wall_ns);
         pb_field_varint(pb, 2, OTLP_TEMPORALITY_CUMULATIVE);
         pb_submsg_end(pb, data);
         break;

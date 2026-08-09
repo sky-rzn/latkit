@@ -76,7 +76,7 @@ services:
       GF_AUTH_ANONYMOUS_ENABLED: "false"
     volumes:
       # Reuse the postgres demo provisioning (datasource -> http://prometheus:9090)
-      # and the four dashboards straight from the repo — single source, read-only.
+      # and the bundled dashboards straight from the repo — single source, read-only.
       # The dashboards' $proto variable selects mysql.
       - ../demo/grafana/provisioning:/etc/grafana/provisioning:ro
       - ../../dashboards:/var/lib/grafana/dashboards:ro

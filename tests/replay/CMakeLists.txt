@@ -41,9 +41,11 @@ target_link_libraries(lkt_messages latkit_proto)
 
 # Dev tool: the --queries view — the real protocol handler over LKT1 traces
 # (МYSQL.md М3 acceptance; the expectation table is queries_traces.sh).
+# --metrics tees the observations into the real aggregator, so it links the
+# metrics lib as well (PLAN-HTTP.md М5 acceptance).
 add_executable(lkt_queries lkt_queries.c ${REPLAY_SRC})
-target_include_directories(lkt_queries PRIVATE ${REPLAY_INC})
-target_link_libraries(lkt_queries latkit_proto)
+target_include_directories(lkt_queries PRIVATE ${REPLAY_INC} ${CMAKE_SOURCE_DIR}/src/metrics)
+target_link_libraries(lkt_queries latkit_proto latkit_metrics)
 
 # М3 acceptance: expected observations per М0 trace scenario + parse_errors
 # == 0 on clean traces, asserted over the committed corpus.

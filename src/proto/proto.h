@@ -81,6 +81,11 @@ enum lk_query_kind {
  * separate flags rather than one status field so the DB protocols keep the
  * single "did this fail" bit they have always had. */
 #define LK_QO_CLIENT_ERR (1 << 8) /* HTTP status 4xx: counted apart from ERROR */
+/* РH5: the interval `ts_start … ts_req_done` contains a server round trip (the
+ * client asked `Expect: 100-continue` and waited for the answer before sending
+ * the body), so it is not the client's upload time and the upload family skips
+ * the unit. Duration and TTFB are unaffected — they start at ts_req_done. */
+#define LK_QO_EXPECT_CONT (1 << 10)
 #define LK_QO_BODY_UNSEEN                                                                          \
     (1 << 9) /* РH4: the response body was promised and did not                                   \
                 arrive in full — an old-kernel sendfile that                                     \
@@ -191,10 +196,15 @@ struct lk_proto_stats {
     __u64 compressed_conns;       /* CLIENT_COMPRESS/_ZSTD -> IGNORE connections (РМ7) */
     __u64 blind_conns;            /* protocol switched away from what we parse ->
                                      IGNORE connections (РH4: the HTTP/2 preface,
-                                     a 101 upgrade, a CONNECT tunnel). The reason
-                                     travels in the message stream (РH3) so the
-                                     per-reason split lands in М5 with the rest of
-                                     the http metric families. */
+                                     a 101 upgrade, a CONNECT tunnel). The total;
+                                     the three below split it by reason, because
+                                     "we cannot see h2" and "somebody opened a
+                                     websocket" are different facts about a
+                                     deployment and only one of them is a
+                                     surprise (М5). */
+    __u64 blind_h2;               /* ... an HTTP/2 preface: h2, hence gRPC */
+    __u64 blind_upgrade;          /* ... a 101: websocket, h2c, anything else */
+    __u64 blind_connect;          /* ... a CONNECT tunnel */
     __u64 by_type[2][256];        /* [enum lk_dir][type byte]; startup at [.][0] */
 };
 
@@ -257,6 +267,17 @@ enum lk_proto_role {
 enum lk_otel_kind {
     LK_OTEL_KIND_DB = 0, /* db.system.name / db.query.text / db.namespace */
     LK_OTEL_KIND_HTTP,   /* http.request.method / http.route / http.response.* */
+};
+
+/* Which metric families a protocol's observations are reported in (РH10, М5).
+ * Mirrors enum lk_profile (metrics.h) value for value — the metrics library
+ * stays free of the protocol headers, exactly as lk_qkind mirrors
+ * lk_query_kind. Kept apart from otel_kind on purpose: the S3 dialect
+ * (PLAN-MINIO.md) is an HTTP span with a metric profile of its own, so the two
+ * questions have two answers even though today they agree. */
+enum lk_proto_profile {
+    LK_PROTO_PROF_QUERY = 0, /* latkit_query_*{query,db,user} */
+    LK_PROTO_PROF_HTTP,      /* latkit_http_*{route,method,host,user} */
 };
 
 /* --- the HTTP dialect seam (РH8) ------------------------------------------ */
@@ -354,6 +375,7 @@ struct lk_proto_ops {
                                               "postgresql" / "mysql". Read only when
                                               otel_kind == LK_OTEL_KIND_DB. */
     enum lk_otel_kind otel_kind;           /* span shape the observations produce (РH11) */
+    enum lk_proto_profile profile;         /* metric families they are reported in (РH10) */
     enum lk_proto_role role;               /* which side the port filter puts us on (РH2) */
     __u16 flags;                           /* LK_PROTO_F_* */
     enum lk_sql_dialect sql_dialect;       /* normaliser dialect for this protocol's

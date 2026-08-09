@@ -132,9 +132,14 @@ static void prom_provide(void *ctx, struct lk_metrics *m)
         char code[8];
 
         snprintf(code, sizeof(code), "%d", p->reqs[i].code);
-        lk_metrics_set_counter_l2(m, "latkit_http_requests_total",
-                                  "HTTP responses served, by route and status code.", "path",
-                                  p->reqs[i].path, "code", code, (double)p->reqs[i].n);
+        /* latkit_exporter_*, not latkit_http_*: since the HTTP track the second
+         * prefix belongs to the traffic the agent *observes* (РH9), and a
+         * self-metric wearing an observation's name would have been the kind of
+         * collision nobody notices until a dashboard averages the two. */
+        lk_metrics_set_counter_l2(m, "latkit_exporter_requests_total",
+                                  "Responses served by the agent's own exporter, by route and "
+                                  "status code.",
+                                  "path", p->reqs[i].path, "code", code, (double)p->reqs[i].n);
     }
 }
 

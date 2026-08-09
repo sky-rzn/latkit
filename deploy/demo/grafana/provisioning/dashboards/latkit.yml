@@ -1,4 +1,4 @@
-# Provision the four dashboards straight from the repo's dashboards/ directory,
+# Provision the dashboards straight from the repo's dashboards/ directory,
 # mounted read-only at /var/lib/grafana/dashboards (Р43: that dir is the single
 # source — no copies). Non-JSON files there (lint.sh, README.md) are ignored.
 apiVersion: 1

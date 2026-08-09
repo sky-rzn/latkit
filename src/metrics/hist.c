@@ -147,3 +147,55 @@ void lk_hist_write(const struct lk_hist *h, FILE *f, const char *metric, const c
     fprintf(f, "%s_sum{%s} %.17g\n", metric, labelset, h->sum);
     fprintf(f, "%s_count{%s} %llu\n", metric, labelset, (unsigned long long)h->count);
 }
+
+/* --- size histogram (РH9) -------------------------------------------------- */
+
+double lk_bhist_bound(int i)
+{
+    return ldexp(1.0, LK_BHIST_MIN_LOG2 + i);
+}
+
+void lk_bhist_observe(struct lk_bhist *h, uint64_t bytes)
+{
+    int i = 0;
+
+    h->count++;
+    h->sum += (double)bytes;
+    /* Walking the 25 boundaries beats a bit-scan plus its edge cases: the
+     * observation happens once per completed response, not once per packet, and
+     * the loop is 25 comparisons on a hot cache line at the very worst. */
+    while (i < LK_BHIST_NBUCKETS && bytes > (1ull << (LK_BHIST_MIN_LOG2 + i)))
+        i++;
+    if (i == LK_BHIST_NBUCKETS)
+        h->overflow++;
+    else
+        h->bucket[i]++;
+}
+
+void lk_bhist_merge(struct lk_bhist *dst, const struct lk_bhist *src)
+{
+    for (int i = 0; i < LK_BHIST_NBUCKETS; i++)
+        dst->bucket[i] += src->bucket[i];
+    dst->overflow += src->overflow;
+    dst->sum += src->sum;
+    dst->count += src->count;
+}
+
+void lk_bhist_write(const struct lk_bhist *h, FILE *f, const char *metric, const char *labelset)
+{
+    const char *sep = labelset[0] ? "," : "";
+    uint64_t cum = 0;
+
+    for (int i = 0; i < LK_BHIST_NBUCKETS; i++) {
+        cum += h->bucket[i];
+        /* The bounds are exact powers of two below 2^53, so %.0f prints the
+         * integer Prometheus expects (64, 128, … 1073741824) with no exponent
+         * and no rounding. */
+        fprintf(f, "%s_bucket{%s%sle=\"%.0f\"} %llu\n", metric, labelset, sep, lk_bhist_bound(i),
+                (unsigned long long)cum);
+    }
+    fprintf(f, "%s_bucket{%s%sle=\"+Inf\"} %llu\n", metric, labelset, sep,
+            (unsigned long long)h->count);
+    fprintf(f, "%s_sum{%s} %.17g\n", metric, labelset, h->sum);
+    fprintf(f, "%s_count{%s} %llu\n", metric, labelset, (unsigned long long)h->count);
+}

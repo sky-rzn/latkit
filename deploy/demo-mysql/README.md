@@ -1,7 +1,7 @@
 # latkit MySQL demo stack
 
 The MySQL twin of [`../demo`](../demo): a MySQL server, a load generator, the
-agent, Prometheus and Grafana with the four dashboards provisioned — one
+agent, Prometheus and Grafana with the bundled dashboards provisioned — one
 `docker compose up` away, showing `proto="mysql"` data on every panel.
 
 ## Requirements
@@ -30,7 +30,7 @@ Then open:
 
 | what | where |
 |---|---|
-| **Grafana** — anonymous, four dashboards in the *latkit* folder | <http://localhost:3000/dashboards> |
+| **Grafana** — anonymous, the bundled dashboards in the *latkit* folder | <http://localhost:3000/dashboards> |
 | Prometheus | <http://localhost:19090> |
 | raw agent metrics | `curl http://localhost:9752/metrics` |
 

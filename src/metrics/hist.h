@@ -75,4 +75,45 @@ double lk_hist_bound(int k);
  * ""), so the histogram owns the le label but not the series identity. */
 void lk_hist_write(const struct lk_hist *h, FILE *f, const char *metric, const char *labelset);
 
+/* --- size histogram (РH9, PLAN-HTTP.md М5) --------------------------------
+ * A second, deliberately separate grid for *bytes*. The latency grid above
+ * covers 0.1 ms … 60 s, five orders of magnitude around one second; an HTTP
+ * response body is anywhere from an empty 204 to a gigabyte of video, nine
+ * orders of magnitude in the other direction, so reusing the latency grid would
+ * put every real response in the overflow cell. It is also a much coarser
+ * question: nobody reads a size distribution to ±9%, they read it to tell a
+ * page of JSON from a video file. Hence octaves — one bucket per power of two,
+ * 64 B … 1 GiB — which is 25 buckets against the latency grid's 77 and gives
+ * `le` values that are already the numbers an operator thinks in.
+ *
+ * bucket[i] holds the values in (2^(MIN+i-1), 2^(MIN+i)], so bucket[0] is
+ * "64 bytes or less" (empty bodies included — a size of zero is a fact about
+ * the response, not a bad observation, which is why there is no underflow cell
+ * and no nonpos guard here) and `overflow` is "larger than 1 GiB". */
+#define LK_BHIST_MIN_LOG2 6                                           /* first le = 64 B */
+#define LK_BHIST_MAX_LOG2 30                                          /* last le = 1 GiB */
+#define LK_BHIST_NBUCKETS (LK_BHIST_MAX_LOG2 - LK_BHIST_MIN_LOG2 + 1) /* 25 */
+
+struct lk_bhist {
+    uint64_t bucket[LK_BHIST_NBUCKETS]; /* bucket[i]: value <= 2^(MIN_LOG2 + i) */
+    uint64_t overflow;                  /* value > 2^MAX_LOG2 */
+    double sum;                         /* sum of the observed sizes */
+    uint64_t count;
+};
+
+/* Record one size (bytes). Total order, no clamping needed: the domain is
+ * unsigned and every value lands in a cell. */
+void lk_bhist_observe(struct lk_bhist *h, uint64_t bytes);
+
+/* dst += src, cell by cell (the other-fold of an evicted route, Р23/РH7). */
+void lk_bhist_merge(struct lk_bhist *dst, const struct lk_bhist *src);
+
+/* Upper boundary of bucket i, i.e. 2^(MIN_LOG2 + i) bytes — exact integers, so
+ * the text export prints them without a decimal point and the OTLP export hands
+ * the same numbers over as explicit bounds. */
+double lk_bhist_bound(int i);
+
+/* Text-format lines for one size series, in the shape lk_hist_write uses. */
+void lk_bhist_write(const struct lk_bhist *h, FILE *f, const char *metric, const char *labelset);
+
 #endif /* LATKIT_METRICS_HIST_H */

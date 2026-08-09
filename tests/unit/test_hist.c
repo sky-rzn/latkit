@@ -7,7 +7,9 @@
  *   - defensive clamping: 0 / negative / NaN -> underflow (+nonpos), +Inf ->
  *     overflow, below-range -> underflow, above-range -> overflow;
  *   - merge is cell-wise;
- *   - the classic text export: cumulative le buckets, +Inf == count, _sum. */
+ *   - the classic text export: cumulative le buckets, +Inf == count, _sum;
+ *   - and the same for the octave *size* grid (РH9): boundaries, the empty-body
+ *     edge, the 1 GiB overflow, merge, and integer le values in the export. */
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
@@ -138,10 +140,84 @@ static int test_classic_dump(void)
     return 0;
 }
 
+/* --- the octave size grid (РH9) ------------------------------------------- */
+
+/* Every observation lands in the bucket whose upper bound it is the first to
+ * fit under, boundaries included (the grid is upper-inclusive, the opposite of
+ * the latency one, because `le` is what Prometheus asks for). */
+static int test_bhist_buckets(void)
+{
+    struct lk_bhist h = {0};
+
+    CHECK(lk_bhist_bound(0) == 64.0);
+    CHECK(lk_bhist_bound(LK_BHIST_NBUCKETS - 1) == 1073741824.0); /* 1 GiB */
+
+    lk_bhist_observe(&h, 0);  /* a 204: no body at all */
+    lk_bhist_observe(&h, 64); /* exactly on the first boundary */
+    lk_bhist_observe(&h, 65); /* one byte over it */
+    lk_bhist_observe(&h, 1500);
+    lk_bhist_observe(&h, 2ull << 30); /* 2 GiB: past the top boundary */
+    CHECK(h.bucket[0] == 2);          /* 0 and 64 */
+    CHECK(h.bucket[1] == 1);          /* 65 -> (64, 128] */
+    CHECK(h.bucket[5] == 1);          /* 1500 -> (1024, 2048], le=2048 */
+    CHECK(h.overflow == 1);
+    CHECK(h.count == 5);
+    CHECK(h.sum == 0.0 + 64 + 65 + 1500 + (double)(2ull << 30));
+
+    uint64_t cells = h.overflow;
+
+    for (int i = 0; i < LK_BHIST_NBUCKETS; i++)
+        cells += h.bucket[i];
+    CHECK(cells == h.count);
+    return 0;
+}
+
+static int test_bhist_merge(void)
+{
+    struct lk_bhist a = {0}, b = {0};
+
+    lk_bhist_observe(&a, 100);
+    lk_bhist_observe(&b, 100);
+    lk_bhist_observe(&b, 1ull << 40);
+    lk_bhist_merge(&a, &b);
+    CHECK(a.count == 3);
+    CHECK(a.bucket[1] == 2);
+    CHECK(a.overflow == 1);
+    return 0;
+}
+
+static int test_bhist_dump(void)
+{
+    struct lk_bhist h = {0};
+    char buf[8192];
+    FILE *f = tmpfile();
+    size_t n;
+
+    CHECK(f != NULL);
+    lk_bhist_observe(&h, 0);
+    lk_bhist_observe(&h, 4096);
+    lk_bhist_observe(&h, 2ull << 30);
+
+    lk_bhist_write(&h, f, "latkit_http_response_size_bytes", "route=\"/x\"");
+    rewind(f);
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = '\0';
+    fclose(f);
+
+    /* le values print as plain integers, no exponent, no decimal point */
+    CHECK(contains(buf, "le=\"64\"} 1\n"));         /* the empty body */
+    CHECK(contains(buf, "le=\"2048\"} 1\n"));       /* 4096 is not in yet */
+    CHECK(contains(buf, "le=\"4096\"} 2\n"));       /* ... and is here */
+    CHECK(contains(buf, "le=\"1073741824\"} 2\n")); /* the 2 GiB body is not */
+    CHECK(contains(buf, "le=\"+Inf\"} 3\n"));
+    CHECK(contains(buf, "_count{route=\"/x\"} 3\n"));
+    return 0;
+}
+
 int main(void)
 {
     if (test_index_inverse() || test_observe() || test_clamp() || test_merge() ||
-        test_classic_dump())
+        test_classic_dump() || test_bhist_buckets() || test_bhist_merge() || test_bhist_dump())
         return 1;
     printf("test_hist: all passed\n");
     return 0;

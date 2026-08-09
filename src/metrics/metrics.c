@@ -36,6 +36,14 @@ static uint64_t mx_now_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+/* Seconds between two pipeline timestamps, zero when the interval is missing or
+ * inverted — a stamp that never arrived is 0, and "since the epoch" is a worse
+ * answer than "no time at all". */
+static double span_seconds(__u64 from, __u64 to)
+{
+    return to > from ? (double)(to - from) / LK_NS : 0.0;
+}
+
 /* on_txn (Р16) carries only the connection, and the query sink has no close
  * hook, so remember (db,user) per connection cookie in a fixed direct-mapped
  * cache refreshed on every session/query. A collision only mislabels a
@@ -124,6 +132,79 @@ static void mx_on_session(void *ctx, const struct lk_conn *c, const struct lk_se
     sess_store(ctx, c->cookie, s->database, s->user, lk_conn_proto(c)->name);
 }
 
+/* One HTTP exchange -> the http profile's families (РH9/РH10, М5). Everything
+ * that differs from the database path is here rather than in branches of
+ * mx_on_query below, because the two share almost nothing: the identity is a
+ * (method, route) pair instead of normalised SQL, the outcome is a status code
+ * whose 4xx half is the *client's* fault, and the timings are РH5's four rather
+ * than Р25's two.
+ *
+ * The labels (РH10): the route in the dictionary slot, the request's own Host in
+ * the db slot — not the connection's, since one keep-alive socket serves several
+ * virtual hosts — and the user slot empty ("-") unless `--http-user basic` was
+ * asked for. "-" rather than "": an empty label value means "absent" to
+ * Prometheus, and these are present and deliberately anonymous. */
+static void mx_http_obs(struct lk_metrics *m, const struct lk_proto_ops *ops,
+                        const struct lk_session *s, const struct lk_query_obs *o)
+{
+    struct lk_reg_obs ro = {0};
+    uint16_t fl = o->flags;
+    char code[8];
+
+    ro.profile = LK_PROF_HTTP;
+    ro.proto = ops->name;
+    ro.db = s->database[0] ? s->database : "-";
+    ro.user = s->user[0] ? s->user : "-";
+    ro.op = o->op;
+    ro.kind = o->kind;
+    ro.has_duration = true;
+    ro.sclass = o->err_code >= 100 && o->err_code < 600
+                    ? (uint8_t)(LK_SCLASS_1XX + o->err_code / 100 - 1)
+                    : LK_SCLASS_OTHER;
+    /* РH10: a 5xx is the server failing and belongs in code="error"; a 4xx is
+     * the client being told no, and folding it in would make every 404-heavy
+     * service look broken. Both land in the per-code error counter. */
+    ro.qcode = (fl & LK_QO_ERROR) ? LK_QCODE_ERROR : LK_QCODE_OK;
+    ro.dcode = (fl & LK_QO_ERROR) ? LK_CODE_ERROR : LK_CODE_OK;
+    if (o->err_code >= 400) {
+        snprintf(code, sizeof(code), "%u", o->err_code);
+        ro.err_code = code;
+    }
+
+    /* The four timings (РH5). The server's clock starts when the request body
+     * ends, so a gigabyte upload is not a slow response; the upload interval is
+     * its own family, and only for units where it means something — one with
+     * `Expect: 100-continue` contains a server round trip, and one whose body
+     * arrived in the same capture event as its head has no interval to report. */
+    ro.dur_seconds = span_seconds(o->ts_req_done_ns, o->ts_complete_ns);
+    if (o->ts_first_row_ns > o->ts_req_done_ns) {
+        ro.has_first_row = true;
+        ro.first_row_seconds = span_seconds(o->ts_req_done_ns, o->ts_first_row_ns);
+    }
+    if (!(fl & LK_QO_EXPECT_CONT) && o->ts_req_done_ns > o->ts_start_ns) {
+        ro.has_upload = true;
+        ro.upload_seconds = span_seconds(o->ts_start_ns, o->ts_req_done_ns);
+    }
+
+    ro.bytes_in = o->bytes_in;
+    ro.bytes_out = o->bytes_out;
+    /* A body the socket never carried (sendfile, or a connection that died
+     * mid-transfer, РH4) makes bytes_out a lower bound. The counters still take
+     * it — an undercount of a total is honest enough to graph — but the size
+     * *distribution* would be actively misleading, so that unit is left out. */
+    ro.has_size = !(fl & LK_QO_BODY_UNSEEN);
+
+    /* The route is the only thing here that may become a label, and it is
+     * already templated (РH7). No route — a CONNECT, or a head we never read —
+     * folds into route="other" rather than inventing one. */
+    if (o->route && o->route_len)
+        ro.label = o->route, ro.fp = o->route_fp;
+    else
+        ro.force_other = true;
+
+    lk_reg_observe(m->reg, &ro);
+}
+
 /* One observation -> the registry families. The flag mapping (Р23/Р25/Р28):
  *   - CANCEL         -> code=canceled, no latency, query="other";
  *   - ABORTED        -> code=aborted, no latency (killed by an earlier error);
@@ -139,6 +220,10 @@ static void mx_on_query(void *ctx, const struct lk_conn *c, const struct lk_sess
     uint16_t fl = o->flags;
 
     sess_store(m, c->cookie, s->database, s->user, ops->name);
+    if (ops->profile == LK_PROTO_PROF_HTTP) {
+        mx_http_obs(m, ops, s, o);
+        return;
+    }
 
     ro.db = s->database;
     ro.user = s->user;
@@ -153,7 +238,7 @@ static void mx_on_query(void *ctx, const struct lk_conn *c, const struct lk_sess
         ro.qcode = LK_QCODE_ERROR;
         ro.dcode = LK_CODE_ERROR;
         ro.has_duration = true;
-        ro.sqlstate = o->sqlstate[0] ? o->sqlstate : NULL;
+        ro.err_code = o->sqlstate[0] ? o->sqlstate : NULL;
     } else {
         ro.qcode = LK_QCODE_OK;
         ro.dcode = LK_CODE_OK;

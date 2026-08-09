@@ -105,22 +105,33 @@ void pb_field_bool(struct pbuf *p, uint32_t field, bool v)
     pb_varint(p, v ? 1 : 0);
 }
 
-void pb_field_fixed64(struct pbuf *p, uint32_t field, uint64_t v)
+void pb_fixed64(struct pbuf *p, uint64_t v)
 {
     uint8_t b[8];
 
     for (int i = 0; i < 8; i++)
         b[i] = (uint8_t)(v >> (8 * i)); /* little-endian */
-    pb_tag(p, field, PB_WIRE_I64);
     pb_raw(p, b, 8);
+}
+
+void pb_double(struct pbuf *p, double v)
+{
+    uint64_t bits;
+
+    memcpy(&bits, &v, sizeof(bits)); /* IEEE-754 binary64, host == little-endian */
+    pb_fixed64(p, bits);
+}
+
+void pb_field_fixed64(struct pbuf *p, uint32_t field, uint64_t v)
+{
+    pb_tag(p, field, PB_WIRE_I64);
+    pb_fixed64(p, v);
 }
 
 void pb_field_double(struct pbuf *p, uint32_t field, double v)
 {
-    uint64_t bits;
-
-    memcpy(&bits, &v, sizeof(bits));
-    pb_field_fixed64(p, field, bits);
+    pb_tag(p, field, PB_WIRE_I64);
+    pb_double(p, v);
 }
 
 void pb_field_bytes(struct pbuf *p, uint32_t field, const void *data, size_t n)

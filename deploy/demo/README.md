@@ -1,7 +1,7 @@
 # latkit demo stack
 
 Everything needed to *see* latkit work: a PostgreSQL server, a load generator,
-the agent itself, Prometheus and Grafana with the four dashboards provisioned —
+the agent itself, Prometheus and Grafana with the bundled dashboards provisioned —
 one `docker compose up` away.
 
 ## Requirements
@@ -30,7 +30,7 @@ Then open:
 
 | what | where |
 |---|---|
-| **Grafana** — anonymous, four dashboards in the *latkit* folder | <http://localhost:3000/dashboards> |
+| **Grafana** — anonymous, the bundled dashboards in the *latkit* folder | <http://localhost:3000/dashboards> |
 | Prometheus | <http://localhost:19090> |
 | raw agent metrics | `curl http://localhost:9752/metrics` |
 

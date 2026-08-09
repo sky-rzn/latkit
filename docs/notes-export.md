@@ -61,8 +61,10 @@ a load balancer.
 **Export self-metrics.** Counted by prom.c and poured into the very dump they
 describe via a facade provider (Р27):
 
-- `latkit_http_requests_total{path,code}` — responses by matched route
-  (`/metrics`, `/healthz`, or `other`) and status code;
+- `latkit_exporter_requests_total{path,code}` — responses served by the agent's
+  own exporter, by matched route (`/metrics`, `/healthz`, or `other`) and status
+  code. Named `latkit_http_requests_total` before the HTTP track (РH9): that name
+  now belongs to the traffic the agent *observes*, and the two must not collide;
 - `latkit_scrape_duration_seconds` — gauge, duration of the last `/metrics`
   serialisation.
 
@@ -107,6 +109,18 @@ acceptable, since the histogram's declared range tops out at 60 s. Grid index
 power boundaries (OTLP buckets are `(base^i, base^(i+1)]`, ours are lower-
 inclusive), which is noise next to the ~9% bucketing error the grid already
 carries.
+
+The **size** histogram (`latkit_http_response_size_bytes`, РH9) is the one
+exception: it is not an exponential grid but 25 explicit powers of two, so it
+goes out as a plain `Histogram{explicit_bounds}` (Metric field 9) rather than an
+`ExponentialHistogram` (field 10). Squeezing an octave grid into a scale/offset
+pair would mean either lying about the zero bucket or inventing sub-buckets that
+hold nothing. Note the data-point shapes differ in a way that is easy to get
+wrong and impossible to see afterwards: `HistogramDataPoint` keeps its
+attributes in **field 9** (field 1 is reserved), while
+`ExponentialHistogramDataPoint` keeps them in field 1 — encode it the other way
+and the Collector accepts the payload and silently drops every label, which is
+why `test_otlp_enc` asserts the field number.
 
 **Temporality — cumulative.** `time_unix_nano` is the export instant;
 `start_time_unix_nano` is the series' `created_ns` (added to the registry row in

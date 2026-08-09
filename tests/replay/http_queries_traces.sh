@@ -1,5 +1,5 @@
 #!/bin/sh
-# М3/М4 acceptance (PLAN-HTTP.md): the --queries view over the М0 trace corpus
+# М3/М4/М5 acceptance (PLAN-HTTP.md): the --queries view over the М0 trace corpus
 # must yield the expected observations per scenario — method, status, sizes, the
 # four timings and, since М4, the templated route (РH7) — with parse_errors == 0
 # on every clean trace. This is the plan's
@@ -277,9 +277,54 @@ for trace in "$DIR"/*/*.lkt; do
     esac
 done
 
+# --- М5 (РH9/РH10): the exposition the corpus produces ---------------------
+# The same replay, teed into the real aggregator, dumped once over every trace.
+# What is asserted here is what a metric consumer sees and the per-observation
+# view above cannot check: that the http families exist and are keyed by the
+# templated route, that the exposition is *valid* (no series printed twice — the
+# failure mode of a label set missing a key), and that none of this leaks into
+# the database families.
+trace="metrics"
+out=$("$LKT" --proto http --quiet --metrics "$DIR"/*/*.lkt 2>&1)
+
+for fam in requests_total request_duration_seconds_count ttfb_seconds_count \
+           request_upload_seconds_count errors_total bytes_total \
+           response_size_bytes_count; do
+    has "^latkit_http_$fam\{"
+done
+
+# The route label is the template, in the metric as on the observation line.
+bad=$(printf '%s\n' "$out" | grep -oE 'route="[^"]*"' | sort -u |
+      grep -E '\?|/[0-9]+(/|")' | head -1)
+[ -n "$bad" ] && fail "a metric label carries an id or a query string: '$bad'"
+
+# The method is part of the route identity (РH7): /hello is one path and two
+# routes, and their latencies must not be summed into one series.
+for m in GET HEAD; do
+    has "^latkit_http_requests_total\{route=\"/hello\",method=\"$m\""
+done
+
+# 5xx is the server failing and 4xx is not (РH10): both counted, one an error.
+has '^latkit_http_requests_total\{route="/boom".*status="5xx"'
+has '^latkit_http_request_duration_seconds_count\{route="/boom".*code="error"'
+has '^latkit_http_errors_total\{code="500"'
+
+# Nothing HTTP reaches the database families, and the PG-shaped counters stay at
+# zero — the profile split of РH10, seen from the outside.
+lacks '^latkit_quer(y|ies)_.*proto="http"'
+has '^latkit_queries_other_total 0$'
+has '^latkit_queries_truncated_total 0$'
+
+# A valid exposition prints every series exactly once. This is the check that
+# would catch an http family whose label set dropped a key that is part of its
+# identity — Prometheus rejects the whole scrape when that happens.
+dup=$(printf '%s\n' "$out" | grep -v '^#' | grep '^latkit_' |
+      sed 's/ [^ ]*$//' | sort | uniq -d | head -1)
+[ -n "$dup" ] && fail "duplicate series in the exposition: '$dup'"
+
 echo "---"
 if [ "$fails" -eq 0 ]; then
-    echo "http М3/М4: trace expectations met"
+    echo "http М3/М4/М5: trace expectations met"
     exit 0
 fi
 echo "$fails check(s) failed"

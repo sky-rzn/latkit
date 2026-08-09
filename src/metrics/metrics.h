@@ -58,10 +58,42 @@ enum lk_qkind {
     LK_QK_COPY_IN,
     LK_QK_COPY_OUT,
     LK_QK_CANCEL,
-    LK_QK_REQUEST, /* HTTP request/response exchange (РH6); the http profile of
-                      М5 gives it its own families, this keeps the shared
-                      latkit_queries_total honest until then */
+    LK_QK_REQUEST, /* HTTP request/response exchange (РH6). Since М5 an HTTP
+                      observation is reported by the `http` profile below and no
+                      longer touches latkit_queries_total, so this value is the
+                      mirror of enum lk_query_kind and nothing else */
     LK_N_QKINDS,
+};
+
+/* Observation profile (РH10, PLAN-HTTP.md М5): *which families* an observation
+ * is reported in, and under *which label keys*. One engine — the top-K
+ * dictionary, the doorkeeper, the dimension limit, the fold into `other`, the
+ * OTLP iterator — with the printing parameterised, because the alternative was
+ * reporting HTTP under latkit_query_* with `rows`, `sqlstate` and `txn` labels
+ * that mean nothing there, and burying the database dashboards in web traffic.
+ *
+ * A profile is a property of the wire protocol (lk_proto_ops.profile) and this
+ * enum mirrors that one value for value, exactly as lk_qkind mirrors
+ * lk_query_kind — so the pure metrics code needs no protocol header. */
+enum lk_profile {
+    LK_PROF_QUERY = 0, /* pg / mysql: latkit_query_* keyed by (query,db,user) */
+    LK_PROF_HTTP,      /* http: latkit_http_* keyed by (route,method,host,user) */
+    LK_N_PROFILES,
+};
+
+/* Status class of an HTTP observation (РH9): the `status` label of
+ * latkit_http_requests_total is the class, not the code — five values instead of
+ * sixty, and the per-code detail lives label-free-of-route in
+ * latkit_http_errors_total. LK_SCLASS_OTHER catches a status outside 100..599,
+ * which a well-formed response cannot carry and a degraded capture can. */
+enum lk_sclass {
+    LK_SCLASS_OTHER = 0,
+    LK_SCLASS_1XX,
+    LK_SCLASS_2XX,
+    LK_SCLASS_3XX,
+    LK_SCLASS_4XX,
+    LK_SCLASS_5XX,
+    LK_N_SCLASSES,
 };
 
 struct lk_metrics_cfg {
@@ -99,9 +131,9 @@ void lk_metrics_set_counter_l(struct lk_metrics *m, const char *name, const char
 void lk_metrics_set_gauge_l(struct lk_metrics *m, const char *name, const char *help,
                             const char *label_key, const char *label_val, double v);
 
-/* Two-label counter (Р29 self-metric latkit_http_requests_total{path,code}): the
- * only family in the flat-scalar set that needs a second dimension. Same keying
- * rules; series of one name print under one HELP/TYPE header. */
+/* Two-label counter (Р29 self-metric latkit_exporter_requests_total{path,code}):
+ * the only family in the flat-scalar set that needs a second dimension. Same
+ * keying rules; series of one name print under one HELP/TYPE header. */
 void lk_metrics_set_counter_l2(struct lk_metrics *m, const char *name, const char *help,
                                const char *label_key1, const char *label_val1,
                                const char *label_key2, const char *label_val2, double v);
@@ -134,10 +166,13 @@ struct lk_label {
     const char *value;
 };
 
+struct lk_bhist; /* metrics/hist.h — the octave size grid (РH9) */
+
 enum lk_metric_type {
-    LK_MT_COUNTER, /* monotonic cumulative Sum */
-    LK_MT_GAUGE,   /* Gauge */
-    LK_MT_HIST,    /* ExponentialHistogram (Р24 grid, scale=2) */
+    LK_MT_COUNTER,    /* monotonic cumulative Sum */
+    LK_MT_GAUGE,      /* Gauge */
+    LK_MT_HIST,       /* ExponentialHistogram (Р24 grid, scale=2) */
+    LK_MT_HIST_BYTES, /* explicit-bucket Histogram (РH9 octave size grid) */
 };
 
 struct lk_metric_view {
@@ -148,8 +183,9 @@ struct lk_metric_view {
     uint32_t nlabels;
     uint64_t created_ns; /* CLOCK_MONOTONIC; series/family creation -> OTLP start_time (Р31) */
     union {
-        double val;                 /* COUNTER / GAUGE */
-        const struct lk_hist *hist; /* HIST */
+        double val;                   /* COUNTER / GAUGE */
+        const struct lk_hist *hist;   /* HIST */
+        const struct lk_bhist *bhist; /* HIST_BYTES */
     };
 };
 

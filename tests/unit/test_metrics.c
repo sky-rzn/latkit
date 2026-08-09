@@ -5,7 +5,12 @@
  * standalone selection (Р25), normalisation into query="other", the error /
  * rows / truncated / txn / connection families, and the first-row histogram
  * flag. Durations are exact powers of two in seconds so their `_sum` prints
- * cleanly under %.17g. */
+ * cleanly under %.17g.
+ *
+ * Since М5 the same harness covers the second observation profile (РH10): an
+ * http connection's observations must land in latkit_http_* with the four
+ * timings of РH5 split into their three families, and in none of the database
+ * ones. */
 #include <stdio.h>
 #include <string.h>
 
@@ -414,6 +419,103 @@ static int test_mysql_proto_label(void)
     return 0;
 }
 
+/* An HTTP connection reports through the http profile (РH9/РH10, М5): the four
+ * timings become three families, the labels are the http ones, and none of it
+ * touches latkit_query_*. The stamps below are the shape a POST produces — the
+ * client spent 0.5 s uploading, the server answered 0.25 s after that. */
+static int test_http_profile(void)
+{
+    struct lk_metrics *m = lk_metrics_new(NULL);
+    struct lk_conn hconn = {.cookie = 0x8080, .ops = &lk_proto_http_ops};
+    char buf[65536];
+    struct lk_query_obs o = {
+        .ts_start_ns = 0,
+        .ts_req_done_ns = NS_500MS,
+        .ts_first_row_ns = NS_500MS + NS_125MS,
+        .ts_complete_ns = NS_500MS + NS_250MS,
+        .ts_ready_ns = NS_500MS + NS_250MS,
+        .text = "/orders/8123?token=secret",
+        .text_len = 25,
+        .bytes_in = 4096,
+        .bytes_out = 700,
+        .op = "POST",
+        .route = "/orders/{id}",
+        .route_len = 12,
+        .route_fp = 0x1234,
+        .err_code = 201,
+        .kind = LK_Q_REQUEST,
+    };
+
+    CHECK(m);
+    set_session("shop.example", ""); /* host -> the db slot; no --http-user */
+    g_sink = lk_metrics_query_sink(m);
+    g_sink->on_query(g_sink->ctx, &hconn, &g_sess, &o);
+    dump(m, buf, sizeof(buf));
+
+#define ID(m)                                                                                      \
+    m "route=\"/orders/{id}\",method=\"POST\",host=\"shop.example\",user=\"-\",proto=\"http\""
+    CHECK(has(buf, ID("latkit_http_requests_total{") ",status=\"2xx\"} 1\n"));
+    /* duration is measured from the *end of the request* (РH5): 0.25 s, not the
+     * 0.75 s the client experienced, and the upload is its own 0.5 s family. */
+    CHECK(has(buf, ID("latkit_http_request_duration_seconds_sum{") ",code=\"ok\"} 0.25\n"));
+    CHECK(has(buf, ID("latkit_http_ttfb_seconds_sum{") "} 0.125\n"));
+    CHECK(has(buf, ID("latkit_http_request_upload_seconds_sum{") "} 0.5\n"));
+    CHECK(has(buf, ID("latkit_http_bytes_total{") ",direction=\"in\"} 4096\n"));
+    CHECK(has(buf, ID("latkit_http_bytes_total{") ",direction=\"out\"} 700\n"));
+    CHECK(has(buf, ID("latkit_http_response_size_bytes_bucket{") ",le=\"1024\"} 1\n"));
+#undef ID
+    /* A 2xx is not an error, and nothing here is a query. */
+    CHECK(!has(buf, "latkit_http_errors_total{"));
+    CHECK(!has(buf, "proto=\"http\",kind=\"request\""));
+    /* The raw target never leaves the observation: only the template is a label
+     * (РH7/РH12), and the query string with it. */
+    CHECK(!has(buf, "8123"));
+    CHECK(!has(buf, "secret"));
+    lk_metrics_free(m);
+    return 0;
+}
+
+/* A 5xx is the server's error and a 4xx is the client's (РH10): both are in the
+ * exact-code counter, only the 5xx is code="error". */
+static int test_http_status_split(void)
+{
+    struct lk_metrics *m = lk_metrics_new(NULL);
+    struct lk_conn hconn = {.cookie = 0x8081, .ops = &lk_proto_http_ops};
+    char buf[65536];
+    struct lk_query_obs o = {
+        .ts_complete_ns = NS_250MS,
+        .ts_ready_ns = NS_250MS,
+        .op = "GET",
+        .route = "/health",
+        .route_len = 7,
+        .route_fp = 0x99,
+        .err_code = 404,
+        .kind = LK_Q_REQUEST,
+        .flags = LK_QO_CLIENT_ERR,
+    };
+
+    CHECK(m);
+    set_session("", ""); /* no Host header: the label is "-", never empty */
+    g_sink = lk_metrics_query_sink(m);
+    g_sink->on_query(g_sink->ctx, &hconn, &g_sess, &o);
+    o.err_code = 503;
+    o.flags = LK_QO_ERROR;
+    g_sink->on_query(g_sink->ctx, &hconn, &g_sess, &o);
+    dump(m, buf, sizeof(buf));
+
+    CHECK(has(buf, "latkit_http_requests_total{route=\"/health\",method=\"GET\",host=\"-\","
+                   "user=\"-\",proto=\"http\",status=\"4xx\"} 1\n"));
+    CHECK(has(buf, ",status=\"5xx\"} 1\n"));
+    CHECK(has(buf, "latkit_http_request_duration_seconds_count{route=\"/health\",method=\"GET\","
+                   "host=\"-\",user=\"-\",proto=\"http\",code=\"ok\"} 1\n")); /* the 404 */
+    CHECK(has(buf, ",proto=\"http\",code=\"error\"} 1\n"));                   /* the 503 */
+    CHECK(has(buf, "latkit_http_errors_total{code=\"404\",host=\"-\",user=\"-\",proto=\"http\"} "
+                   "1\n"));
+    CHECK(has(buf, "latkit_http_errors_total{code=\"503\","));
+    lk_metrics_free(m);
+    return 0;
+}
+
 /* The selfstats provider (task 4.4) emits the standard process_* series. */
 static int test_selfstats_provider(void)
 {
@@ -439,7 +541,7 @@ int main(void)
     if (test_ok_query() || test_error_query() || test_no_duration() || test_no_text_other() ||
         test_truncated() || test_pipelined_duration() || test_txn() || test_first_row_flag() ||
         test_scalars() || test_labeled_scalars() || test_providers() || test_selfstats_provider() ||
-        test_mysql_proto_label())
+        test_mysql_proto_label() || test_http_profile() || test_http_status_split())
         return 1;
     printf("test_metrics: all passed\n");
     return 0;

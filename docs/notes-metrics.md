@@ -47,6 +47,82 @@ one value while a mixed one never blurs the two `(db,user,query)` spaces. It is
 an orthogonal axis to the `(db,user)` cardinality limit — the per-`(db,user)`
 `other` spill stays split per protocol.
 
+### HTTP metrics (РH9/РH10)
+
+An HTTP port (`--port 8080=http`) reports through its own **profile**: the same
+registry, the same top-K dictionary and the same `other` fold, printed under
+different family names and different label keys. Reusing `latkit_query_*` with
+`proto="http"` would have been quicker and would have meant an HTTP request
+carrying `rows`, `sqlstate` and a transaction histogram that mean nothing, in
+the middle of the database dashboards.
+
+| Series | Type | Labels |
+|---|---|---|
+| `latkit_http_requests_total` | counter | `route, method, host, user, proto, status` — `status` is the **class** (`1xx…5xx`) |
+| `latkit_http_request_duration_seconds` | histogram | `route, method, host, user, proto, code` — `code`=`ok\|error` (error = 5xx) |
+| `latkit_http_ttfb_seconds` | histogram | `route, method, host, user, proto` |
+| `latkit_http_request_upload_seconds` | histogram | `route, method, host, user, proto` |
+| `latkit_http_errors_total` | counter | `code, host, user, proto` — the **exact** status ≥ 400, **no** `route` |
+| `latkit_http_bytes_total` | counter | `route, method, host, user, proto, direction` — `direction`=`in\|out` |
+| `latkit_http_response_size_bytes` | histogram | `route, method, host, user, proto` — the octave grid below |
+
+The label slots map onto the same interned dimensions the database profile uses:
+`route` takes the query slot, `host` the `db` slot, `user` the `user` slot. Two
+consequences worth knowing:
+
+- **`method` is part of the route's identity**, not a decoration: the
+  fingerprint is `XXH3(method NUL template)`, so `GET /orders/{id}` and
+  `DELETE /orders/{id}` hold two dictionary slots and never share a histogram.
+- **`user` is `-` unless `--http-user basic`.** HTTP usually has no user, but
+  the label is always printed: it is part of the series identity, and a family
+  that dropped it would emit two identical label sets the moment two users
+  shared a route — which is a scrape error, not a cosmetic one.
+
+`host` is the Host of *that request*, not of the connection: one keep-alive
+socket can serve several virtual hosts.
+
+**A 4xx is not an error.** `code="error"` on the duration histogram means 5xx —
+the server failing. A 404 is the server correctly saying no, and folding it in
+would make every 404-heavy service look broken. Both land in
+`latkit_http_errors_total`, which carries the exact code (a set bounded by HTTP
+itself, ~60 values) and no `route`, exactly as the SQLSTATE counter carries no
+`query`.
+
+**The four timings (РH5).** For a `GET` every latency model agrees and none of
+this matters. For an upload they do not, so the interval is split:
+
+```
+ts_start ──request head+body──▶ ts_req_done ──server──▶ ts_first_row ──▶ ts_complete
+```
+
+- `latkit_http_request_duration_seconds` = `ts_complete − ts_req_done` — the
+  server's time. A 1 GB POST over a slow link is not a slow server, and this is
+  the number that says so;
+- `latkit_http_ttfb_seconds` = `ts_first_row − ts_req_done`;
+- `latkit_http_request_upload_seconds` = `ts_req_done − ts_start`, recorded only
+  where it is the client's time alone: a request carrying `Expect:
+  100-continue` contains a server round trip and is excluded, and a body that
+  arrived in the same capture event as its head has no interval to report.
+
+Note this differs from nginx's `$request_time`, which covers the whole
+`ts_start … ts_complete` span. The two are reconciled — with numbers — in
+[docs/accuracy.md](accuracy.md).
+
+**Sizes** go into their own grid: one bucket per power of two, `le` = 64 B …
+1 GiB (25 buckets). The latency grid's ±9% resolution is pointless for body
+sizes and its range is wrong by twenty orders of magnitude; nobody reads a size
+distribution to better than an octave. A response whose body never reached the
+socket (`sendfile`, РH4 — `bytes_out` is then a lower bound) is left out of the
+histogram but still counted in `latkit_http_bytes_total`: an undercounted total
+is honest, an undercounted *distribution* is misleading.
+
+**Route cardinality is bounded by construction**, not by the templater being
+right. `route` goes through the same top-K dictionary as `query` (РH7 layer 3),
+so a heuristic that fails on some API costs accuracy, never series count: the
+overflow is reported as `route="other"`, and its share is a headline panel on
+the HTTP dashboard. A large or growing share is the signal to raise
+`--top-queries` or to pin the routes with `--http-routes`.
+
 ### Connection and self metrics (Р27)
 
 | Series | Type | Source |
@@ -60,7 +136,8 @@ an orthogonal axis to the `(db,user)` cardinality limit — the per-`(db,user)`
 | `latkit_parse_errors_total{proto}` | counter | protocol parser, split by `proto`=`pg\|mysql` (РМ6) |
 | `latkit_unknown_msgs_total{proto}` | counter | protocol parser, per `proto` |
 | `latkit_queries_dropped_total{reason, proto}` | counter | parser `units_dropped_*` — `reason`=`resync\|disconnect\|overflow` (Р19), per `proto` |
-| `latkit_ignored_conns_total{reason, proto}` | counter | deliberate blind zones — `reason`=`replication\|compressed` (РМ7/РМ8), per `proto` |
+| `latkit_ignored_conns_total{reason, proto}` | counter | deliberate blind zones — `reason`=`replication\|compressed` (РМ7/РМ8) or, on HTTP, `h2\|upgrade\|connect` (РH4), per `proto` |
+| `latkit_exporter_requests_total{path,code}` | counter | the agent's **own** `/metrics` server (renamed from `latkit_http_requests_total` in the HTTP track, РH9) |
 | `latkit_metric_series` | gauge | the registry itself — live count of cardinality-controlled series |
 | `process_cpu_seconds_total` | counter | `getrusage(2)` |
 | `process_resident_memory_bytes` | gauge | `/proc/self/statm` |
@@ -149,6 +226,26 @@ literal becomes `?` before it can reach a label, so the stored `query` label
 never carries user data. Raw SQL never enters the registry at all — the full
 text is available only to stage-5 OTel spans/exemplars, which read it from the
 live `lk_query_obs` during the `on_query` callback (it dangles afterwards).
+
+## Observation profiles (РH10)
+
+One registry, two vocabularies. The cardinality machinery — the top-K
+dictionary, the doorkeeper, the `(db,user)` limit, the fold into `other`, the
+OTLP iterator — is written once and is protocol-blind; what a profile supplies
+is a family-name set, a label-key set and a mask of which families an
+observation touches (`src/metrics/registry.c`, `struct reg_profile`). `pg` and
+`mysql` use the `query` profile, `http` the `http` one, and the S3 dialect
+(PLAN-MINIO.md) will add a third without touching the engine.
+
+Two properties fall out of that and are worth stating, because both are tested:
+
+- **a profile prints nothing until it has seen an observation.** A PostgreSQL-
+  only agent's exposition is byte-for-byte what it was before HTTP existed
+  (РH15) — no empty `latkit_http_*` blocks appear;
+- **the dictionary is shared, the label spaces are not.** An HTTP route and a
+  SQL statement compete for the same `K` slots (one knob, one memory bound), but
+  a route never lands in a `query` label and each profile's `other` counter is
+  its own.
 
 ## Cardinality control: top-K, doorkeeper, `other` (Р23)
 

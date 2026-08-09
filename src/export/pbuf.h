@@ -44,6 +44,11 @@ void pb_reset(struct pbuf *p); /* keep the allocation, drop the contents */
 void pb_raw(struct pbuf *p, const void *data, size_t n);
 void pb_varint(struct pbuf *p, uint64_t v);
 void pb_tag(struct pbuf *p, uint32_t field, uint32_t wire);
+/* Bare (untagged) fixed-width values: what a *packed* repeated field is made of
+ * — the tag and length come from the enclosing pb_submsg_begin/end, and the
+ * elements follow back to back (OTLP bucket_counts / explicit_bounds). */
+void pb_fixed64(struct pbuf *p, uint64_t v);
+void pb_double(struct pbuf *p, double v);
 
 /* --- scalar fields (tag + value) ------------------------------------------ */
 void pb_field_varint(struct pbuf *p, uint32_t field, uint64_t v);

@@ -258,11 +258,68 @@ static void test_hist(void)
     pb_free(&pb);
 }
 
+/* The size histogram (РH9) goes out as an explicit-bucket Histogram — a
+ * different Metric field, a different data-point shape, and attributes in field
+ * 9 rather than 1. Getting that last one wrong produces protobuf the Collector
+ * accepts and silently drops the labels from, so it is asserted here. */
+static void test_bhist(void)
+{
+    struct lk_bhist h = {0};
+    struct lk_label lbl[1] = {{"route", "/orders/{id}"}};
+    struct lk_metric_view v = {
+        .name = "latkit_http_response_size_bytes",
+        .type = LK_MT_HIST_BYTES,
+        .labels = lbl,
+        .nlabels = 1,
+        .created_ns = CREATED,
+    };
+    struct pbuf pb;
+    struct field metric, hi, dp, temp, cnt, sum, counts, bounds, attrs;
+
+    lk_bhist_observe(&h, 100);        /* -> bucket 1, le=128 */
+    lk_bhist_observe(&h, 3ull << 30); /* 3 GiB -> past the top boundary */
+
+    v.bhist = &h;
+    encode_one(&pb, &v);
+    EXPECT(find(pb.buf, pb.len, 2, &metric), "bhist: metric present");
+    EXPECT(find(metric.data, metric.len, 9, &hi), "bhist: Histogram (field 9) present");
+    EXPECT(!find(metric.data, metric.len, 10, &(struct field){0}),
+           "bhist: not an ExponentialHistogram");
+    EXPECT(find(hi.data, hi.len, 2, &temp) && temp.varint == 2, "bhist: temporality CUMULATIVE");
+    EXPECT(find(hi.data, hi.len, 1, &dp), "bhist: data point present");
+    EXPECT(find(dp.data, dp.len, 4, &cnt) && cnt.wire == 1 && cnt.i64 == 2,
+           "bhist: count=2 (fixed64)");
+    EXPECT(find(dp.data, dp.len, 5, &sum) && as_double(sum.i64) > 3e9, "bhist: sum>3 GiB");
+    EXPECT(find(dp.data, dp.len, 9, &attrs), "bhist: attributes in field 9");
+
+    EXPECT(find(dp.data, dp.len, 6, &counts), "bhist: bucket_counts present");
+    EXPECT(counts.len == 8 * (LK_BHIST_NBUCKETS + 1), "bhist: 26 packed fixed64 counts");
+    EXPECT(find(dp.data, dp.len, 7, &bounds), "bhist: explicit_bounds present");
+    EXPECT(bounds.len == 8 * LK_BHIST_NBUCKETS, "bhist: 25 packed bounds");
+    {
+        /* counts[1] is the 100-byte body, the last cell the 3 GiB overflow;
+         * bounds[0] is 64 and the last is 1 GiB. */
+        const uint8_t *c = counts.data, *b = bounds.data;
+        uint64_t c1 = 0, clast = 0, b0 = 0, blast = 0;
+
+        memcpy(&c1, c + 8, 8);
+        memcpy(&clast, c + 8 * LK_BHIST_NBUCKETS, 8);
+        memcpy(&b0, b, 8);
+        memcpy(&blast, b + 8 * (LK_BHIST_NBUCKETS - 1), 8);
+        EXPECT(c1 == 1, "bhist: bucket_counts[1]=1 (100 bytes)");
+        EXPECT(clast == 1, "bhist: overflow cell=1 (3 GiB)");
+        EXPECT(as_double(b0) == 64.0, "bhist: first bound = 64");
+        EXPECT(as_double(blast) == 1073741824.0, "bhist: last bound = 1 GiB");
+    }
+    pb_free(&pb);
+}
+
 int main(void)
 {
     test_counter();
     test_gauge();
     test_hist();
+    test_bhist();
     printf(failures ? "\n%d FAILURES\n" : "\nall otlp encoder tests passed\n", failures);
     return failures ? 1 : 0;
 }

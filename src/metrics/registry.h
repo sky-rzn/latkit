@@ -25,7 +25,13 @@
  * The family carried here is latkit_query_duration_seconds{query,db,user,proto,
  * code} (the cardinality-critical one); the flat self / connection counters
  * attach at the facade in tasks 4.3-4.4. Pure: no libbpf, I/O only via
- * lk_reg_dump's FILE. */
+ * lk_reg_dump's FILE.
+ *
+ * Since PLAN-HTTP.md М5 the same three defences serve a second *profile*
+ * (РH10): an HTTP observation keys the dictionary on (method, route) and prints
+ * under latkit_http_* with its own label names. The mechanism is untouched by
+ * that — one dictionary, one doorkeeper, one dimension limit, shared by both —
+ * and so is the PG/MySQL output, byte for byte. See struct lk_reg_obs. */
 #ifndef LATKIT_METRICS_REGISTRY_H
 #define LATKIT_METRICS_REGISTRY_H
 
@@ -41,40 +47,72 @@ struct lk_registry;
 struct lk_registry *lk_reg_new(const struct lk_metrics_cfg *cfg);
 void lk_reg_free(struct lk_registry *r);
 
-/* One completed query observation, already reduced from lk_query_obs by the
- * facade (metrics.c on_query): text normalised, duration selected (Р25), flags
+/* One completed observation, already reduced from lk_query_obs by the facade
+ * (metrics.c on_query): text normalised, duration selected (Р25/РH5), flags
  * mapped to codes. The registry owns cardinality control (top-K dictionary,
- * doorkeeper, (db,user) and sqlstate limits) and fans this out to every family
+ * doorkeeper, (db,user) and error-code limits) and fans this out to every family
  * that a single observation touches, so all of them share one dim interning and
- * one query-slot resolution:
+ * one query-slot resolution.
  *
+ * Which families those are is the `profile` (РH10). The engine is the same; the
+ * family names and the label keys are not:
+ *
+ *   LK_PROF_QUERY (pg / mysql)
  *   - latkit_queries_total{db,user,proto,kind,code}  (always; code = qcode)
  *   - latkit_query_duration_seconds{query,db,user,proto,code}  (if has_duration)
  *   - latkit_query_rows_total{query,db,user,proto}             (if has_duration)
  *   - latkit_query_first_row_seconds{query,db,user,proto}      (if enabled + has_first_row)
- *   - latkit_query_errors_total{sqlstate,db,user,proto}        (if sqlstate != NULL)
+ *   - latkit_query_errors_total{sqlstate,db,user,proto}        (if err_code != NULL)
  *   - latkit_queries_truncated_total                           (if truncated)
+ *   - latkit_queries_other_total, latkit_txn_duration_seconds
  *
- * `fp`/`label` come from the normaliser; `label` NULL or `force_other` routes
- * the query-keyed families to query="other" without consulting the dictionary
- * (NO_TEXT / CANCEL, Р28). db/user "" = unknown; proto NULL = "pg" (the
- * protocol default, РМ2 — bare unit-test observations stay PG-shaped). */
+ *   LK_PROF_HTTP (http, and later the s3 dialect)
+ *   - latkit_http_requests_total{route,method,host,user,proto,status}
+ *   - latkit_http_request_duration_seconds{route,method,host,user,proto,code}
+ *   - latkit_http_ttfb_seconds{route,method,host,user,proto}     (if has_first_row)
+ *   - latkit_http_request_upload_seconds{route,method,host,user,proto} (if has_upload)
+ *   - latkit_http_errors_total{code,host,user,proto}             (if err_code != NULL)
+ *   - latkit_http_bytes_total{route,method,host,user,proto,direction}
+ *   - latkit_http_response_size_bytes{route,method,host,user,proto} (if has_size)
+ *
+ * РH9 lists the http label sets without `user`; it is here because the series
+ * identity must stay unique whatever `--http-user basic` does — a family printed
+ * without a key that is part of its key would emit duplicate label sets the
+ * moment two users share a route, and a duplicate series is a scrape error, not
+ * a cosmetic issue. Without that flag it is the constant "-" and costs nothing.
+ *
+ * `fp`/`label` come from the normaliser (norm_sql for the query profile,
+ * norm_route for the http one); `label` NULL or `force_other` routes the
+ * slot-keyed families to query="other" / route="other" without consulting the
+ * dictionary (NO_TEXT / CANCEL, Р28; a request whose target never arrived, РH7).
+ * db/user "" = unknown; proto NULL = "pg" (the protocol default, РМ2 — bare
+ * unit-test observations stay PG-shaped). */
 struct lk_reg_obs {
     uint64_t fp;
-    const char *label; /* canonical text; NULL -> query="other" */
+    const char *label; /* canonical text; NULL -> query="other" / route="other" */
+    const char *op;    /* http: the method, part of the slot's identity (РH7) and
+                          printed as its own label; NULL for the query profile */
     const char *db, *user;
     const char *proto;        /* lk_proto_ops.name; NULL -> "pg" (РМ6) */
+    uint8_t profile;          /* enum lk_profile (== lk_proto_ops.profile) */
     uint8_t kind;             /* enum lk_qkind (== enum lk_query_kind) */
     uint8_t qcode;            /* enum lk_qcode: ok|error|aborted|canceled */
-    bool force_other;         /* skip the dictionary, record under query="other" */
+    uint8_t sclass;           /* enum lk_sclass, http only: the `status` label */
+    bool force_other;         /* skip the dictionary, record under `other` */
     bool has_duration;        /* observe duration + rows (+ first_row); else counter-only */
-    enum lk_code dcode;       /* duration series code: ok|error (Р23/Р25) */
-    double dur_seconds;       /* server-side latency (Р25) */
+    enum lk_code dcode;       /* duration series code: ok|error (Р23/Р25; http: 5xx) */
+    double dur_seconds;       /* server-side latency (Р25 / РH5) */
     uint64_t rows;            /* from CommandComplete */
     bool has_first_row;       /* ts_first_row was present */
-    double first_row_seconds; /* time to first DataRow */
+    double first_row_seconds; /* time to first DataRow / http TTFB (РH5) */
+    bool has_upload;          /* http: the request body took measurable time (РH5) */
+    double upload_seconds;    /* ... ts_req_done - ts_start */
+    bool has_size;            /* http: the response size is worth histogramming */
+    uint64_t bytes_in;        /* http: request body bytes */
+    uint64_t bytes_out;       /* http: response body bytes (also the size sample) */
     bool truncated;           /* text was a capture-budget/label prefix */
-    const char *sqlstate;     /* non-NULL -> latkit_query_errors_total */
+    const char *err_code;     /* SQLSTATE / HTTP status >= 400; non-NULL -> the
+                                 profile's error counter */
 };
 
 /* Fan one observation into all the families above, applying cardinality control. */
