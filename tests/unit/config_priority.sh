@@ -66,6 +66,29 @@ check "OTEL_SERVICE_NAME"        "$(get otlp_service_name OTEL_SERVICE_NAME=svc)
 # --- repeatable port via a comma-separated env list ---
 check "env port list count"   "$(env LATKIT_PORT=6000,6001,6002 "$LATKIT" --print-config | grep -c '^port=')" "3"
 
+# --- the per-port capture budget (РH14, PLAN-HTTP.md М7) ---
+# `port_cap=PORT:BYTES` is the *resolved* budget — what the kernel data path
+# will apply — so this is the one place the three-way precedence between the
+# explicit `:BYTES`, the protocol's default and --capture-limit is pinned.
+capof() { get_all="$("$LATKIT" --print-config "$@")"; printf '%s\n' "$get_all" | sed -n "s/^port_cap=$port://p"; }
+
+port=5432
+check "db port follows the global"  "$(capof -p 5432)"                        "8192"
+check "db port follows --capture-limit" "$(capof -p 5432 --capture-limit 4096)" "4096"
+port=8080
+check "http port defaults to 2048"  "$(capof -p 8080=http)"                   "2048"
+# A global budget is a ceiling: lowering it lowers the protocol default with it.
+check "global caps the http default" "$(capof -p 8080=http --capture-limit 1024)" "1024"
+# ... but a budget typed for this port was typed for a reason, and wins outright.
+check "explicit port budget wins"   "$(capof -p 8080=http:4096 --capture-limit 1024)" "4096"
+check "explicit budget over a db port" "$(capof -p 8080=pg:512)"              "512"
+
+# --- the Go TLS channel (РH13.3, М7) ---
+check "tls_go default"        "$(get tls_go)"                                       ""
+check "tls_go flag"           "$(get tls_go -- --tls-go /usr/bin/caddy)"            "/usr/bin/caddy"
+check "tls_go env list"       "$(get tls_go LATKIT_TLS_GO=/a/caddy,/b/traefik)"     "/a/caddy,/b/traefik"
+check "tls_go flag beats env" "$(get tls_go LATKIT_TLS_GO=/a/caddy -- --tls-go /b/x)" "/b/x"
+
 # --- the HTTP route knobs (РH7, PLAN-HTTP.md М4) ---
 # They have no LATKIT_* equivalent yet (the whole HTTP surface lands in the
 # README at М9), so what is checked here is defaulting, parsing and the one

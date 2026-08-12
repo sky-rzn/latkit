@@ -717,6 +717,33 @@ static bool http_no_state(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir
     return true;
 }
 
+/* HTTPS: a TLS record where a start line should be (М7, РH13). Unlike PG and
+ * MySQL, HTTP has no in-band negotiation to watch — TLS sits under it, so the
+ * very first bytes of the socket are already a handshake record and the framer
+ * would otherwise spend the connection scanning ciphertext for a method name.
+ *
+ * The test is deliberately narrow: only the first bytes of a direction, only a
+ * handshake record (0x16) of a TLS 1.x version, and only the message type that
+ * belongs on that side. A false positive would silence a real plaintext
+ * connection; these five bytes cannot occur at the head of an HTTP/1.x message,
+ * which must begin with a token or "HTTP/1.".
+ *
+ * Marking the connection LK_CONN_TLS is what puts it on the same footing as an
+ * encrypted PG or MySQL session: ciphertext socket events are dropped rather
+ * than framed, the plaintext channel (libssl or Go uprobes) feeds the framer
+ * instead, and if no uprobes are attached the connection is honestly counted as
+ * TLS-but-unread rather than parsed into garbage. */
+static bool tls_record_head(enum lk_dir dir, const struct http_dir *hd, const __u8 *p, __u32 n)
+{
+    if (hd->events != 1 || hd->st != HTTP_FR_HEAD || n < 3)
+        return false;
+    if (p[0] != 0x16 || p[1] != 0x03 || p[2] > 0x04)
+        return false; /* not a handshake record of SSL 3.0 / TLS 1.0..1.3 */
+    if (n >= 6 && p[5] != (dir == LK_DIR_RECV ? 0x01 : 0x02))
+        return false; /* handshake, but neither ClientHello nor ServerHello */
+    return true;
+}
+
 static void http_stream_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, const __u8 *p,
                               __u32 n, __u64 ts_ns)
 {
@@ -731,6 +758,12 @@ static void http_stream_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir
     hd->events++;
     hd->off += n;
     hd->last_ts = ts_ns;
+
+    if (tls_record_head(dir, hd, p, n)) {
+        note(r, c, dir, LK_HTTP_NOTE_TLS, ts_ns);
+        c->flags |= LK_CONN_TLS;
+        return; /* the rest of this chunk is ciphertext, and so is the stream */
+    }
 
     /* Loss dirties both directions before the bytes ever reach us (the conn
      * table's seq detector; a lazily created or synthetic entry starts that
@@ -957,6 +990,10 @@ const struct lk_proto_ops lk_proto_http_ops = {
      * (PLAN-MINIO.md РS1) is this same framer and handler with another dialect
      * hanging here — that is the whole of what "a dialect, not a fork" means. */
     .dialect = &lk_http_dialect_base,
+    /* РH14: heads are all this framer reads — the body is arithmetic — so an
+     * HTTP port defaults to a quarter of the DB budget. `--port 8080=http:N`
+     * overrides it; --capture-limit caps it. */
+    .cap_limit = LK_HTTP_CAPTURE_LIMIT,
     .proto_new = lk_proto_http_new,
     /* The message-framing hooks (hdr_size, parse_hdr, pre_emit, both
      * intercept_ and both resync_) stay NULL: in stream mode the two hooks

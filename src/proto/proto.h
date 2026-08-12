@@ -416,6 +416,14 @@ struct lk_proto_ops {
     const struct lk_http_dialect *dialect; /* HTTP flavour (РH8); NULL for the
                                               database protocols, which have no
                                               classification step at all */
+    __u32 cap_limit;                       /* default per-call capture budget of a port
+                                              speaking this protocol, bytes (РH14, М7);
+                                              0 = follow --capture-limit, which is what
+                                              the database protocols want. HTTP asks for
+                                              less: it needs heads, and a gigabyte of
+                                              response body copied into the ringbuf buys
+                                              nothing. An explicit `--port N=http:BYTES`
+                                              overrides it. */
 
     struct lk_proto *(*proto_new)(const struct lk_query_sink *out);
 

@@ -1,0 +1,87 @@
+# HTTPS e2e stand, Go half (PLAN-HTTP.md М7, РH13.3): a net/http server that
+# terminates TLS itself + curl + latkit + prometheus.
+#
+#   ./verify-http-go-tls.sh          # build agent + server, up, assert, down
+#   KEEP=1 ./verify-http-go-tls.sh   # leave it running
+#
+# This is the stand for the piece of М7 that is genuinely new code rather than a
+# wider scan: there is no libssl in a Go process, so every plaintext byte here
+# arrives through the uprobes tls_go.c placed on crypto/tls.(*Conn).Read/Write
+# and on the return instructions x86_len.c found inside them. If the symbol
+# lookup, the instruction decode, the Go register ABI or the per-goroutine
+# correlation were wrong, this stand shows zero observations rather than wrong
+# ones — which is why the verify script asserts a *count*, not just presence.
+#
+# The server binary is built on the host (verify-http-go-tls.sh, CGO_ENABLED=0)
+# and bind-mounted into both containers. Both mounts are the same host file,
+# hence the same inode — which is what a uprobe is registered against, so the
+# agent hooking `/srv/gotls` and the server executing `/srv/gotls` are provably
+# the same binary.
+
+services:
+  gosrv:
+    image: alpine:3.20
+    volumes:
+      - ../../build/gotls:/srv/gotls:ro
+    command: ["/srv/gotls"]
+    environment:
+      LISTEN: ":8443"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --no-check-certificate -O- https://127.0.0.1:8443/hello || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  load:
+    image: curlimages/curl:latest
+    depends_on:
+      gosrv:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        i=0
+        while true; do
+          i=$$((i + 1))
+          # One connection carrying several requests (keep-alive), then a fresh
+          # one: both halves of the correlation are exercised — the first call
+          # on a connection, whose bytes arrive with the handshake, and the
+          # later ones, which Go answers out of its own buffer.
+          curl -sk --http1.1 -o /dev/null https://gosrv:8443/hello \
+               --next -sk --http1.1 -o /dev/null https://gosrv:8443/json/$$i \
+               --next -sk --http1.1 -o /dev/null https://gosrv:8443/boom
+          sleep 0.2
+        done
+    restart: "no"
+
+  latkit:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.latkit
+    depends_on:
+      gosrv:
+        condition: service_healthy
+    privileged: true
+    pid: host
+    volumes:
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+      - ../../build/gotls:/srv/gotls:ro
+    command:
+      - "-p"
+      - "8443=http"
+      - "--tls-go"
+      - "/srv/gotls"
+      - "--prom-listen"
+      - "0.0.0.0:9752"
+    ports: ["9754:9752"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      - latkit
+    volumes:
+      - ./prometheus-http.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=1h"
+    ports: ["19092:9090"]

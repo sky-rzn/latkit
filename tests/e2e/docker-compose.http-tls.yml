@@ -1,0 +1,115 @@
+# HTTPS e2e stand, OpenSSL half (PLAN-HTTP.md М7, РH13.1): nginx over TLS +
+# curl + latkit + prometheus. Self-contained — it shares nothing with the
+# postgres stand but the agent image and the verify-script conventions.
+#
+#   ./verify-http-tls.sh          # build agent, up, assert, down
+#   KEEP=1 ./verify-http-tls.sh   # leave it running
+#
+# What it proves, and why each piece is here:
+#
+#   - **the existing channel covers web servers.** nginx links libssl
+#     dynamically, so no new BPF is involved: the only change М7 made for this
+#     stand is that `--tls auto` now scans for the *web* server comms when an
+#     http port is configured (РH13.1). The stand fails if that derivation is
+#     wrong, because nothing else would attach.
+#   - **the encrypted run equals the plaintext one.** The exit criterion of the
+#     stage is not "some metrics appeared" but that the observations are the
+#     ordinary ones — method, templated route, status class, timings — from a
+#     connection whose socket bytes are ciphertext from the first byte.
+#   - **HTTP/1.1 only.** h2 is a declared blind zone; the nginx config keeps it
+#     off and curl asks for 1.1, so the stand measures the TLS channel rather
+#     than the blind-zone counter.
+#
+# The traffic stays on the compose bridge (service name, no published port), for
+# the same reason the postgres stand does: a localhost hop goes through
+# docker-proxy, which splices the payload past the capture point.
+
+services:
+  # Throwaway self-signed cert into a shared volume. nginx reads both files as
+  # root, so no ownership dance is needed here (unlike the postgres stand).
+  cert-init:
+    image: alpine:3.20
+    volumes:
+      - httpcerts:/certs
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        apk add --no-cache openssl >/dev/null
+        openssl req -new -x509 -days 365 -nodes \
+          -out /certs/server.crt -keyout /certs/server.key -subj "/CN=latkit-stand"
+        chmod 644 /certs/server.crt /certs/server.key
+        echo "cert generated"
+    restart: "no"
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./nginx-tls.conf:/etc/nginx/nginx.conf:ro
+      - httpcerts:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --no-check-certificate -O- https://127.0.0.1:8443/hello || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Steady load: a fixed route, an id-bearing one (which must come back
+  # templated), a 404 and a 500 — one connection per curl, so the handshake path
+  # is exercised over and over rather than once.
+  load:
+    image: curlimages/curl:latest
+    depends_on:
+      nginx:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        i=0
+        while true; do
+          i=$$((i + 1))
+          curl -sk --http1.1 -o /dev/null https://nginx:8443/hello
+          curl -sk --http1.1 -o /dev/null https://nginx:8443/json/$$i
+          curl -sk --http1.1 -o /dev/null https://nginx:8443/nope
+          curl -sk --http1.1 -o /dev/null https://nginx:8443/boom
+          sleep 0.2
+        done
+    restart: "no"
+
+  # `--tls auto` with an http port: the scan set is derived from the port's
+  # protocol (РH13.1), which is what brings nginx into it.
+  latkit:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.latkit
+    depends_on:
+      nginx:
+        condition: service_healthy
+    privileged: true
+    pid: host
+    volumes:
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+    command:
+      - "-p"
+      - "8443=http"
+      - "--tls"
+      - "auto"
+      - "--prom-listen"
+      - "0.0.0.0:9752"
+    ports: ["9753:9752"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      - latkit
+    volumes:
+      - ./prometheus-http.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=1h"
+    ports: ["19091:9090"]
+
+volumes:
+  httpcerts:

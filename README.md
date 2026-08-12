@@ -159,7 +159,8 @@ binary is built differently (fully static musl, in a container):
 | Capture | Capabilities | Why |
 |---|---|---|
 | plaintext | `CAP_BPF` + `CAP_PERFMON` | BPF programs/maps; loading tracing programs |
-| TLS (`--tls auto`) | + `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` | reading `/proc/<pid>/(maps\|root)` of the DB server processes to find libssl; the kernel demands full `CAP_SYS_ADMIN` to create **u**probes |
+| TLS (`--tls auto`) | + `CAP_SYS_PTRACE` + `CAP_SYS_ADMIN` | reading `/proc/<pid>/(maps\|root)` of the server processes to find libssl; the kernel demands full `CAP_SYS_ADMIN` to create **u**probes |
+| TLS (`--tls-go PATH`) | + `CAP_SYS_ADMIN` | uprobes again; no `/proc` scan is involved — the binary is named, so `CAP_SYS_PTRACE` and `hostPID` are not needed for this channel |
 
 TLS capture in a container additionally needs **`hostPID`** (the libssl
 autodetect walks `/proc/<pid>` of the postgres processes). `hostNetwork` is
@@ -223,7 +224,8 @@ inherits the ambient config):
 |---|---|---|---|
 | `--tls auto\|off` | `LATKIT_TLS` | `off` | capture TLS plaintext via `libssl` uprobes; `auto` scans `/proc` for the matching processes' libssl and rescans every 30 s for new ones |
 | `--libssl PATH` | `LATKIT_LIBSSL` | off | attach the `SSL_*` uprobes to this exact libssl, skipping the scan (e.g. a container's copy); a missing file is fatal |
-| `--tls-comm NAME` | `LATKIT_TLS_COMM` | `postgres`, `mysqld`, `mariadbd` | with `--tls auto`, scan only processes with this exact comm |
+| `--tls-comm NAME` | `LATKIT_TLS_COMM` | derived from `--port` | with `--tls auto`, scan only processes with this exact comm. The default set follows the configured protocols: `postgres`, `mysqld`, `mariadbd` for a database port, `nginx`, `httpd`, `apache2`, `haproxy` for an HTTP one |
+| `--tls-go PATH` | `LATKIT_TLS_GO` | off | capture the TLS plaintext of a **Go** server (Caddy, Traefik, any `net/http`) by probing `crypto/tls` inside this binary — there is no libssl to scan for. Works on stripped binaries (the ones distributions ship) through Go's own function table. Repeatable, up to 4; x86-64; a binary that cannot be hooked is fatal at startup. [docs/notes-tls.md](docs/notes-tls.md) §4b |
 
 **Debug / diagnostics** (off by default; noisy, not for production):
 
@@ -304,12 +306,21 @@ method, tables and reproduction script - `tests/bench/run.sh`):
 
 ## Known limitations
 
-- **TLS: dynamically linked OpenSSL only.** Everything else is *detected*
-  and its ciphertext dropped-and-counted (`latkit_tls_*` metrics).
-  Statically linked OpenSSL, GnuTLS/NSS, and GSSENC (Kerberos encryption)
-  are out of scope. BoringSSL may work through the offset-independent
-  bridge but is untested.
-  [docs/notes-tls.md](docs/notes-tls.md) §6.
+- **TLS: dynamically linked OpenSSL, plus Go's `crypto/tls`.** OpenSSL servers
+  (postgres, mysqld/mariadbd, nginx, Apache, HAProxy) are read through libssl
+  uprobes; Go servers through `--tls-go`, stripped binaries included (x86-64 —
+  see [docs/notes-tls.md](docs/notes-tls.md) §4b). A statically linked OpenSSL
+  can be reached by pointing `--libssl` at the server binary itself. Everything
+  else — GnuTLS/NSS, GSSENC (Kerberos encryption), an arm64 Go binary — is
+  *detected* and its ciphertext dropped-and-counted (`latkit_tls_*` metrics),
+  never guessed at. BoringSSL may work through the offset-independent bridge but
+  is untested. [docs/notes-tls.md](docs/notes-tls.md) §6.
+- **UDP is counted, never parsed.** QUIC/HTTP-3 does not pass through the TCP
+  capture point at all, so an h3 server would look exactly like a broken agent.
+  Datagrams on the captured ports are therefore counted
+  (`latkit_udp_bytes_total{port,dir}`, `latkit_udp_packets_total`) and the agent
+  says so in its log — the number that distinguishes "nothing to see" from
+  "nothing we can see".
 - **MySQL scope: classic protocol only.** The **X Protocol** (port 33060,
   protobuf) is a different protocol, out of scope. The **compressed protocol**
   (`CLIENT_COMPRESS`, zstd) and **replication** streams (`COM_BINLOG_DUMP`) are

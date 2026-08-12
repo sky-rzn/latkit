@@ -69,6 +69,43 @@ label set is called out explicitly.
   `Proxy-Authorization`, `Cookie`, `Set-Cookie`) are additionally blanked in the
   `--messages --hexdump` view. `--http-redact off` restores the raw target.
 
+- **HTTPS: TLS capture for HTTP servers, OpenSSL and Go** (PLAN-HTTP.md М7,
+  РH13). An HTTPS port is observed exactly like a cleartext one — same routes,
+  statuses and timings — from two plaintext sources:
+  - **OpenSSL servers** (nginx, Apache, HAProxy) need no new machinery: with
+    `--tls auto` the `/proc` scan set is now derived from the protocols on
+    `--port`, so an HTTP port scans for `nginx`, `httpd`, `apache2`, `haproxy`
+    while a database port keeps scanning for `postgres`, `mysqld`, `mariadbd`.
+    `--libssl` also accepts a *server binary* with a statically linked OpenSSL.
+  - **Go servers** (Caddy, Traefik, any `net/http`) get a channel of their own:
+    `--tls-go PATH` probes `crypto/tls.(*Conn).Read/Write` inside the named
+    binary. Since a uretprobe cannot survive Go's goroutine-stack copying, the
+    agent decodes the function bodies and probes their `ret` instructions
+    instead; a body that does not decode cleanly is left unhooked and reported,
+    never probed at a guessed offset. Stripped binaries — which is how Caddy,
+    Traefik and MinIO are all shipped — are resolved through Go's own function
+    table (`.gopclntab`) when the ELF symbol table is gone.
+    `latkit_tls_attached{state}` gained the value **`go`**. x86-64; see
+    [docs/notes-tls.md](docs/notes-tls.md) §4b.
+
+  An HTTP connection that starts with a TLS handshake is now recognised as such
+  by the framer (HTTP, unlike PG/MySQL, negotiates nothing in band), so an
+  HTTPS port with no uprobes attached reads as "TLS, unread" instead of
+  producing parse errors from ciphertext.
+- **`latkit_udp_bytes_total{port,dir}` and `latkit_udp_packets_total{port,dir}`**
+  (РH16) — datagram volume on the captured ports, counted and never parsed. This
+  exists for one failure mode: HTTP/3 is QUIC over UDP and never passes the TCP
+  capture point, so an h3 server is indistinguishable from a broken agent. Now it
+  is not: the counters are non-zero and the agent says so once per port in its
+  log. The series appear only for ports that actually see datagrams.
+- **Per-port capture budget** (РH14): `--port 8080=http:4096` sets how many bytes
+  of each send/recv call are copied for that port. HTTP ports default to 2048 (a
+  head is all the framer reads, and a gigabyte of response body copied into the
+  ringbuf buys nothing), database ports keep the 8192 of `--capture-limit`; a
+  global `--capture-limit` still caps the protocol default, while an explicit
+  per-port value wins outright. `latkit --print-config` prints the resolved
+  budget per port as `port_cap=PORT:BYTES`.
+
 ### Changed
 
 - **Renamed self-metric: `latkit_http_requests_total` →
@@ -87,7 +124,12 @@ label set is called out explicitly.
   `proto`. Bundled dashboards and alerts are updated; a minor version, no major
   bump.
 - `--tls auto` default `/proc` scan set is now `{postgres, mysqld, mariadbd}`
-  (was `postgres`). `--tls-comm` still narrows it to a single comm.
+  (was `postgres`), widened by `{nginx, httpd, apache2, haproxy}` when an HTTP
+  port is configured (М7). `--tls-comm` still narrows it to a single comm. A
+  deployment with only database ports scans exactly what it scanned before.
+- Internal, no visible effect: the kernel-side `ports` map value grew from a
+  flag to a small struct (the per-port budget above), and the comm-filter
+  capacity from 4 to 8 entries.
 
 ### Notes
 

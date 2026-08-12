@@ -27,6 +27,7 @@
 #include "proto.h"
 #include "spans.h"
 #include "tls_attach.h"
+#include "tls_go.h"
 #include "version.h"
 
 #define LK_OTLP_MAX_KV            32 /* --otlp-header / --otlp-resource entries accepted */
@@ -49,11 +50,10 @@ static __u16 opt_ports[LK_MAX_PORTS];
  * a bare number is the default protocol (pg, the registry head). */
 static const struct lk_proto_ops *opt_port_ops[LK_MAX_PORTS];
 /* Per-port capture budget (РH14): the `:BYTES` suffix of `--port 8080=http:2048`,
- * 0 = follow --capture-limit. Parsed, validated and echoed by --print-config
- * here; the kernel-side `ports` map still holds a plain u8 flag, so the value
- * has no effect until М7 turns that map value into a struct. Deliberately
- * absent from --help until then — an advertised knob that does nothing is
- * worse than an undocumented one that will. */
+ * 0 = "no explicit value", which resolves to the protocol's own default (http:
+ * 2048, LK_HTTP_CAPTURE_LIMIT) capped by --capture-limit, or to --capture-limit
+ * itself for a protocol that asks for nothing special. port_cap_limit() below is
+ * the single place that precedence lives; the kernel only applies the result. */
 static __u32 opt_port_caps[LK_MAX_PORTS];
 /* `--http-user basic` (РH10): take the `user` label from the name half of an
  * `Authorization: Basic` header. Off by default — an identity is not something
@@ -106,6 +106,10 @@ static enum lk_tls_mode opt_tls_mode = LK_TLS_OFF; /* --tls; default off */
 static const char *opt_libssl;                     /* --libssl PATH: explicit uprobe target */
 static char opt_tls_comm[16];                      /* --tls-comm: the one comm to scan for (default:
                                                     * the lk_tls_default_comms DB-server set) */
+/* `--tls-go PATH` (РH13.3): Go servers link their TLS in, so there is no libssl
+ * to scan for — the binary itself is the attach target and has to be named. */
+static const char *opt_tls_go[LK_TLS_GO_MAX_PATHS];
+static int opt_ntls_go;
 /* Env-derived header/resource arrays (freed at exit for ASAN cleanliness). */
 static char **env_headers, **env_resource;
 static int env_nheaders, env_nresource;
@@ -200,7 +204,11 @@ static void usage(FILE *out, const char *argv0)
             "                        skipping the scan (e.g. a container's copy)\n"
             "      --tls-comm NAME   with --tls auto, scan only processes with\n"
             "                        this comm (default: postgres, mysqld,\n"
-            "                        mariadbd)\n"
+            "                        mariadbd; plus nginx, httpd, apache2,\n"
+            "                        haproxy when an http port is captured)\n"
+            "      --tls-go PATH     capture TLS plaintext of a Go server by\n"
+            "                        probing crypto/tls in this binary (x86-64,\n"
+            "                        not stripped); repeatable, up to %d\n"
             "      --print-config    resolve config (flag > LATKIT_* env > default)\n"
             "                        to stdout and exit; every flag has a LATKIT_*\n"
             "                        env equivalent (see README)\n"
@@ -211,7 +219,7 @@ static void usage(FILE *out, const char *argv0)
             LK_VERSION, argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT,
             LK_MAX_CHUNKS * LK_CHUNK_FULL, LK_CAP_HEADERS_LIMIT, LK_MAX_CONNS_DEFAULT,
             LK_CONN_IDLE_TIMEOUT_SEC, LK_TOP_QUERIES_DEFAULT, LK_QUERY_LABEL_LEN_DEFAULT,
-            LK_PROM_LISTEN_DEFAULT, LK_SPAN_TEXT_MAX_DEF);
+            LK_PROM_LISTEN_DEFAULT, LK_SPAN_TEXT_MAX_DEF, LK_TLS_GO_MAX_PATHS);
 }
 
 /* Strict decimal parse into [min, max]; -1 on any trailing garbage. */
@@ -264,6 +272,7 @@ enum {
     OPT_TLS,
     OPT_LIBSSL,
     OPT_TLS_COMM,
+    OPT_TLS_GO,
     OPT_PRINT_CONFIG,
     OPT_VERSION,
 };
@@ -603,6 +612,27 @@ static int set_option(int c, char *optarg)
     case OPT_LIBSSL:
         opt_libssl = optarg;
         break;
+    case OPT_TLS_GO: {
+        /* Repeatable and never merged with anything: the Go channel attaches to
+         * exactly the binaries it is pointed at (РH13.3). Copied rather than
+         * pointed into optarg, because the env layer hands this function a
+         * buffer it frees on the way out (the --cgroup rule). */
+        char *dup;
+
+        if (opt_ntls_go == LK_TLS_GO_MAX_PATHS) {
+            fprintf(stderr, "--tls-go: at most %d binaries\n", LK_TLS_GO_MAX_PATHS);
+            return -1;
+        }
+        if (!optarg[0]) {
+            fprintf(stderr, "--tls-go: empty path\n");
+            return -1;
+        }
+        dup = strdup(optarg);
+        if (!dup)
+            return -1;
+        opt_tls_go[opt_ntls_go++] = dup;
+        break;
+    }
     case OPT_TLS_COMM:
         if (strlen(optarg) >= sizeof(opt_tls_comm)) {
             fprintf(stderr, "--tls-comm: name longer than %zu chars\n", sizeof(opt_tls_comm) - 1);
@@ -676,6 +706,7 @@ static const struct env_opt env_opts[] = {
     {"LATKIT_TLS", OPT_TLS, true, false},
     {"LATKIT_LIBSSL", OPT_LIBSSL, true, false},
     {"LATKIT_TLS_COMM", OPT_TLS_COMM, true, false},
+    {"LATKIT_TLS_GO", OPT_TLS_GO, true, true},
 };
 
 /* Apply LATKIT_* env variables to flags not given on the CLI (Р34): flag > env
@@ -761,6 +792,7 @@ static int parse_args(int argc, char **argv)
         {"tls", required_argument, NULL, OPT_TLS},
         {"libssl", required_argument, NULL, OPT_LIBSSL},
         {"tls-comm", required_argument, NULL, OPT_TLS_COMM},
+        {"tls-go", required_argument, NULL, OPT_TLS_GO},
         {"print-config", no_argument, NULL, OPT_PRINT_CONFIG},
         {"version", no_argument, NULL, OPT_VERSION},
         {"hexdump", no_argument, NULL, 'x'},
@@ -920,6 +952,31 @@ static void configure_http(void)
     lk_proto_http_configure(&cfg);
 }
 
+/* Capture budget of one configured port, in bytes (РH14). The whole precedence
+ * of the three knobs lives here and nowhere else:
+ *
+ *   `--port 8080=http:4096`  an explicit per-port value wins outright — it was
+ *                            typed for this port, by someone who meant it;
+ *   protocol default         http asks for 2048 (heads are all it reads), the
+ *                            database protocols ask for nothing. Capped by
+ *                            --capture-limit: a global budget is a ceiling, so
+ *                            lowering it must lower every port with it;
+ *   0                        follow --capture-limit, the pre-РH14 behaviour and
+ *                            what every PG/MySQL deployment keeps getting.
+ *
+ * The kernel stores the result and applies it as-is (port_budget), so what
+ * --print-config prints is exactly what the data path will use. */
+static __u32 port_cap_limit(int i)
+{
+    __u32 proto_def = opt_port_ops[i] ? opt_port_ops[i]->cap_limit : 0;
+
+    if (opt_port_caps[i])
+        return opt_port_caps[i];
+    if (proto_def)
+        return proto_def < opt_capture_limit ? proto_def : opt_capture_limit;
+    return 0;
+}
+
 /* Print the effective configuration after CLI + env resolution and exit:
  * a no-BPF way to confirm flag > LATKIT_* > OTEL_* > default without a running
  * agent. The `0 = default` sentinels are resolved to their concrete values so
@@ -939,6 +996,14 @@ static void print_config(void)
             printf("port=%u\n", opt_ports[i]);
         else
             printf("port=%u=%s%s\n", opt_ports[i], opt_port_ops[i]->name, cap);
+    }
+    /* The resolved per-port budget (РH14), one line per port: the `port=` lines
+     * above echo what was typed, this is what the data path will actually
+     * apply — the protocol default and --capture-limit already folded in. */
+    for (int i = 0; i < opt_nports; i++) {
+        __u32 cap = port_cap_limit(i);
+
+        printf("port_cap=%u:%u\n", opt_ports[i], cap ? cap : opt_capture_limit);
     }
     printf("ringbuf_bytes=%llu\n", (unsigned long long)opt_ringbuf_bytes);
     printf("capture_limit=%u\n", opt_capture_limit);
@@ -986,6 +1051,10 @@ static void print_config(void)
     printf("tls=%s\n", opt_tls_mode == LK_TLS_AUTO ? "auto" : "off");
     printf("libssl=%s\n", opt_libssl ? opt_libssl : "");
     printf("tls_comm=%s\n", opt_tls_comm);
+    printf("tls_go=");
+    for (int i = 0; i < opt_ntls_go; i++)
+        printf("%s%s", i ? "," : "", opt_tls_go[i]);
+    printf("\n");
 }
 
 /* Argument count of this kernel's tcp_recvmsg, from its BTF; -1 when the
@@ -995,23 +1064,45 @@ static void print_config(void)
  * per shape and main() autoloads exactly one. On a probe failure or an arity
  * without a variant the 5-arg default is loaded and, if wrong for the kernel,
  * fails loudly at load rather than capturing half a stream. */
-static int recvmsg_arity(void)
+/* Everything main() needs to know about the running kernel before the load, in
+ * one pass over its BTF (loading vmlinux BTF is the expensive part, so it
+ * happens once): the arity above, and whether each optional attach target
+ * exists at all. A missing fentry target is a hard load/attach failure, so the
+ * UDP programs of РH16 — three functions that are ordinary kernel internals, not
+ * uapi — are autoloaded only where they are real. */
+struct lk_kernel_btf {
+    int recvmsg_args; /* -1 when the probe failed */
+    bool udp_sendmsg;
+    bool udpv6_sendmsg;
+    bool skb_consume_udp;
+};
+
+static bool btf_has_func(struct btf *btf, const char *name)
+{
+    return btf__find_by_name_kind(btf, name, BTF_KIND_FUNC) > 0;
+}
+
+static void probe_kernel_btf(struct lk_kernel_btf *k)
 {
     struct btf *btf = btf__load_vmlinux_btf();
     const struct btf_type *t;
-    int id, nargs = -1;
+    int id;
 
+    k->recvmsg_args = -1;
+    k->udp_sendmsg = k->udpv6_sendmsg = k->skb_consume_udp = false;
     if (!btf)
-        return -1;
+        return;
     id = btf__find_by_name_kind(btf, "tcp_recvmsg", BTF_KIND_FUNC);
     if (id > 0) {
         t = btf__type_by_id(btf, id);                 /* FUNC */
         t = t ? btf__type_by_id(btf, t->type) : NULL; /* -> FUNC_PROTO */
         if (t)
-            nargs = btf_vlen(t);
+            k->recvmsg_args = btf_vlen(t);
     }
+    k->udp_sendmsg = btf_has_func(btf, "udp_sendmsg");
+    k->udpv6_sendmsg = btf_has_func(btf, "udpv6_sendmsg");
+    k->skb_consume_udp = btf_has_func(btf, "skb_consume_udp");
     btf__free(btf);
-    return nargs;
 }
 
 /* The `ports` map exists only after load; attach happens after this, so the
@@ -1019,9 +1110,9 @@ static int recvmsg_arity(void)
 static int fill_ports(struct latkit_bpf *skel)
 {
     for (int i = 0; i < opt_nports; i++) {
-        __u8 one = 1;
-        int err = bpf_map__update_elem(skel->maps.ports, &opt_ports[i], sizeof(opt_ports[i]), &one,
-                                       sizeof(one), BPF_ANY);
+        struct lk_port_cfg cfg = {.cap_limit = port_cap_limit(i)};
+        int err = bpf_map__update_elem(skel->maps.ports, &opt_ports[i], sizeof(opt_ports[i]), &cfg,
+                                       sizeof(cfg), BPF_ANY);
 
         if (err) {
             fprintf(stderr, "failed to add port %u to filter: %d\n", opt_ports[i], err);
@@ -1051,13 +1142,60 @@ static void comm_filter_add(struct latkit_bpf *skel, const char *name)
     memcpy(flt[i], name, strnlen(name, LK_COMM_LEN - 1));
 }
 
+/* The comm set the kernel filter and the libssl scan work from, derived from
+ * what is actually being captured (РH13.1). Before М7 there was one list — the
+ * DB servers — because there was one kind of server; an HTTP port brings in the
+ * OpenSSL-linked web servers instead. Deriving the set from the configured
+ * protocols keeps a PG-only deployment byte-for-byte as it was (РH15) and keeps
+ * the filter inside LK_COMM_FILTER_MAX: the DB three plus the HTTP four plus
+ * `connection` is exactly the eight slots there are.
+ *
+ * Fills *out (NULL-terminated, at most `max` entries) and returns the count. */
+static int derive_scan_comms(const char **out, int max)
+{
+    int n = 0;
+    bool want_db = false, want_http = false;
+
+    for (int i = 0; i < opt_nports; i++) {
+        const struct lk_proto_ops *ops = opt_port_ops[i];
+
+        if (ops && ops->otel_kind == LK_OTEL_KIND_HTTP)
+            want_http = true;
+        else
+            want_db = true;
+    }
+    if (!want_db && !want_http)
+        want_db = true; /* no ports resolved yet: the historical default */
+
+    if (want_db)
+        for (const char *const *c = lk_tls_default_comms; *c && n < max - 1; c++)
+            out[n++] = *c;
+    if (want_http)
+        for (const char *const *c = lk_tls_http_comms; *c && n < max - 1; c++)
+            out[n++] = *c;
+    out[n] = NULL;
+    return n;
+}
+
+/* The comm a Go binary will show up as: its basename, truncated the way the
+ * kernel truncates a task comm. Used only to widen an *agent-derived* kernel
+ * filter — an explicit --comm stays the user's exact filter. */
+static const char *path_basename(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+
+    return slash ? slash + 1 : path;
+}
+
 int main(int argc, char **argv)
 {
     struct lk_events *events = NULL;
     struct lk_loop *loop = NULL;
     struct latkit_bpf *skel;
     struct lk_tls *tls = NULL;
+    struct lk_tls_go *tls_go = NULL;
     struct lk_cgroup *cgroup = NULL;
+    const char *scan_comms[LK_COMM_FILTER_MAX + 1];
     int err;
 
     if (parse_args(argc, argv))
@@ -1099,12 +1237,22 @@ int main(int argc, char **argv)
     bool tls_enabled = opt_tls_mode == LK_TLS_AUTO || opt_libssl;
     const char *tls_scan_comm = opt_tls_comm[0] ? opt_tls_comm : (opt_comm[0] ? opt_comm : NULL);
 
+    derive_scan_comms(scan_comms, LK_COMM_FILTER_MAX + 1);
+
     /* .rodata and map sizes are frozen at load time. */
     skel->rodata->cfg_capture_limit = opt_capture_limit;
     if (opt_comm[0]) {
         /* --comm: the user's exact kernel filter, with or without TLS. */
         comm_filter_add(skel, opt_comm);
     } else if (tls_enabled) {
+        /* Go binaries first (РH13.3): they were named explicitly, so if the
+         * eight slots run out it must be a default that falls off the end, not
+         * the target the operator asked for. Their comm matters because the
+         * Go channel correlates plaintext through the *socket* path, which this
+         * very filter gates — the uprobes themselves are attached per binary
+         * and need no comm at all. */
+        for (int i = 0; i < opt_ntls_go; i++)
+            comm_filter_add(skel, path_basename(opt_tls_go[i]));
         /* Attaching on pid=-1 hooks every process mapping a shared libssl —
          * including a psql/mysql client that maps the same file — so the
          * in-program comm filter is what keeps foreign SSL traffic out. It
@@ -1118,7 +1266,7 @@ int main(int argc, char **argv)
         if (tls_scan_comm)
             comm_filter_add(skel, tls_scan_comm);
         else
-            for (const char *const *c = lk_tls_default_comms; *c; c++)
+            for (const char **c = scan_comms; *c; c++)
                 comm_filter_add(skel, *c);
         comm_filter_add(skel, "connection");
     }
@@ -1134,6 +1282,7 @@ int main(int argc, char **argv)
         .mode = opt_tls_mode,
         .libssl_override = opt_libssl,
         .comm_filter = tls_scan_comm,
+        .comms = scan_comms,
         .rescan_sec = tls_enabled && !opt_libssl ? LK_TLS_RESCAN_SEC : 0,
     };
 
@@ -1143,14 +1292,38 @@ int main(int argc, char **argv)
         goto cleanup;
     }
 
-    /* Load the lk_tcp_recvmsg_exit variant matching this kernel's signature
-     * (see recvmsg_arity above); the other two stay out entirely. */
-    int recvmsg_args = recvmsg_arity();
+    /* The Go plaintext channel (РH13.3). Like the libssl one, its programs are
+     * dropped from the load when no binary was named — and with them the
+     * per-thread socket hint the correlation needs, so the DB path pays nothing
+     * for a channel it does not use. */
+    struct lk_tls_go_cfg gocfg = {
+        .paths = opt_tls_go,
+        .npaths = opt_ntls_go,
+        .rescan_sec = opt_ntls_go ? LK_TLS_RESCAN_SEC : 0,
+    };
 
-    bpf_program__set_autoload(skel->progs.lk_tcp_recvmsg_exit_a6, recvmsg_args == 6);
-    bpf_program__set_autoload(skel->progs.lk_tcp_recvmsg_exit_a4, recvmsg_args == 4);
+    tls_go = lk_tls_go_new(skel, &gocfg);
+    if (!tls_go) {
+        err = -1;
+        goto cleanup;
+    }
+
+    /* Load the lk_tcp_recvmsg_exit variant matching this kernel's signature
+     * (see probe_kernel_btf above); the other two stay out entirely. The UDP
+     * counters of РH16 follow the same rule for a different reason: their
+     * targets are kernel internals that a stripped-down or future kernel may
+     * not have, and an fentry on a function that does not exist fails the whole
+     * attach. */
+    struct lk_kernel_btf kbtf;
+
+    probe_kernel_btf(&kbtf);
+    bpf_program__set_autoload(skel->progs.lk_tcp_recvmsg_exit_a6, kbtf.recvmsg_args == 6);
+    bpf_program__set_autoload(skel->progs.lk_tcp_recvmsg_exit_a4, kbtf.recvmsg_args == 4);
     bpf_program__set_autoload(skel->progs.lk_tcp_recvmsg_exit,
-                              recvmsg_args != 6 && recvmsg_args != 4);
+                              kbtf.recvmsg_args != 6 && kbtf.recvmsg_args != 4);
+    bpf_program__set_autoload(skel->progs.lk_udp_sendmsg, kbtf.udp_sendmsg);
+    bpf_program__set_autoload(skel->progs.lk_udpv6_sendmsg, kbtf.udpv6_sendmsg);
+    bpf_program__set_autoload(skel->progs.lk_skb_consume_udp, kbtf.skb_consume_udp);
 
     err = latkit_bpf__load(skel);
     if (err) {
@@ -1187,8 +1360,12 @@ int main(int argc, char **argv)
     }
 
     /* Attach the TLS uprobes after the core programs; a missing libssl is a
-     * soft none, not a startup failure. */
+     * soft none, not a startup failure. A named Go binary is not: it was
+     * pointed at explicitly, so failing to hook it is a config error. */
     err = lk_tls_attach(tls);
+    if (err)
+        goto cleanup;
+    err = lk_tls_go_attach(tls_go);
     if (err)
         goto cleanup;
 
@@ -1198,8 +1375,10 @@ int main(int argc, char **argv)
         .capmode = skel->maps.capmode,
         .port_protos = opt_port_protos, /* port→protocol map (РМ2) */
         .n_port_protos = (unsigned)opt_nports,
-        .tls = tls,       /* attach-state gauge source (latkit_tls_attached) */
-        .cgroup = cgroup, /* latkit_cgroup_filter_paths gauge source */
+        .tls = tls,                        /* attach-state gauge source (latkit_tls_attached) */
+        .tls_go = tls_go,                  /* ... its Go half (РH13.3), same gauge */
+        .udp_stats = skel->maps.udp_stats, /* РH16: QUIC-on-a-watched-port counters */
+        .cgroup = cgroup,                  /* latkit_cgroup_filter_paths gauge source */
         .max_conns = opt_max_conns,
         .conn_idle_timeout_sec = opt_conn_idle_timeout,
         .record_path = opt_record,
@@ -1254,6 +1433,12 @@ int main(int argc, char **argv)
     if (err)
         goto cleanup;
 
+    /* Same idea for a Go binary replaced in place: uprobes stay on the inode
+     * they were created on, so the timer notices a new one and re-attaches. */
+    err = lk_tls_go_register(tls_go, loop);
+    if (err)
+        goto cleanup;
+
     /* Re-resolve the cgroup globs periodically so a recreated pod (new cgroup
      * id under the same glob) is re-picked up without a restart. */
     err = lk_cgroup_register(cgroup, loop);
@@ -1287,12 +1472,15 @@ cleanup:
     lk_events_free(events);
     lk_loop_free(loop);
     lk_tls_free(tls);
+    lk_tls_go_free(tls_go);
     lk_cgroup_free(cgroup);
     latkit_bpf__destroy(skel);
     for (int i = 0; i < opt_ncgroup; i++)
         free((char *)opt_cgroup[i]);
     for (int i = 0; i < opt_http_nquery_keys; i++)
         free((char *)opt_http_query_keys[i]);
+    for (int i = 0; i < opt_ntls_go; i++)
+        free((char *)opt_tls_go[i]);
     lk_route_map_free(opt_http_route_map);
     lk_free_pairs(env_headers, env_nheaders);
     lk_free_pairs(env_resource, env_nresource);

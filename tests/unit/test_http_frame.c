@@ -682,6 +682,42 @@ static int test_upgrade(void)
     return 0;
 }
 
+/* TLS on an HTTP port (М7, РH13): the connection opens with a handshake record
+ * instead of a request line. It must be recognised there and nowhere else — a
+ * connection already carrying HTTP/1.1 cannot suddenly become TLS, and a body
+ * byte that happens to be 0x16 is not a handshake. */
+static int test_tls_hello(void)
+{
+    /* A real ClientHello prefix: record header, handshake type, length, and the
+     * legacy version. It carries NULs, so it is fed by length, not by strlen. */
+    static const __u8 HELLO[] = {0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0xfc, 0x03, 0x03};
+
+    reset();
+    feed(LK_DIR_RECV, sizeof(HELLO), 0, HELLO, sizeof(HELLO), 10);
+    CHECK(nrecs == 1 && note_is(0, LK_DIR_RECV, LK_HTTP_NOTE_TLS));
+    /* TLS, not IGNORE: the plaintext arrives on the uprobe channel, and the
+     * generic layer drops the ciphertext for us. A blind zone would have thrown
+     * the connection away instead. */
+    CHECK((conn.flags & LK_CONN_TLS) && !(conn.flags & LK_CONN_IGNORE));
+
+    /* Not the first bytes of the direction: an ordinary request has been framed
+     * already, so a record-shaped body is just a body. */
+    reset();
+    call(LK_DIR_RECV, "POST /u HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\n", 10);
+    feed(LK_DIR_RECV, 5, 0, HELLO, 5, 20);
+    CHECK(!(conn.flags & LK_CONN_TLS));
+    CHECK(is(nrecs - 1, LK_DIR_RECV, LK_HTTP_MSG_END, 5));
+
+    /* A handshake record whose message type belongs to the other direction is
+     * not one: the narrow test is what keeps a plaintext connection safe. */
+    reset();
+    static const __u8 SRVHELLO[] = {0x16, 0x03, 0x01, 0x02, 0x00, 0x02, 0x00, 0x00, 0x50};
+
+    feed(LK_DIR_RECV, sizeof(SRVHELLO), 0, SRVHELLO, sizeof(SRVHELLO), 10);
+    CHECK(!(conn.flags & LK_CONN_TLS));
+    return 0;
+}
+
 /* CONNECT answered 2xx: everything after the response head is tunnel payload.
  * A refused CONNECT leaves an ordinary connection behind. */
 static int test_connect(void)
@@ -1052,11 +1088,11 @@ int main(void)
         test_hole_in_head() || test_hole_at_boundary() || test_hole_in_chunked() ||
         test_head_too_big() || test_cl_te() || test_content_length_dups() || test_bad_fields() ||
         test_bad_start_lines() || test_lf_only() || test_leading_crlf() || test_h2_preface() ||
-        test_upgrade() || test_connect() || test_until_close() || test_request_without_length() ||
-        test_body_unseen() || test_resync_torn_anchor() || test_false_anchor() ||
-        test_anchor_across_hole() || test_off_anomaly() || test_pipeline_overflow() ||
-        test_response_without_request() || test_pg_unaffected_alongside() || test_display_mask() ||
-        test_wire())
+        test_upgrade() || test_tls_hello() || test_connect() || test_until_close() ||
+        test_request_without_length() || test_body_unseen() || test_resync_torn_anchor() ||
+        test_false_anchor() || test_anchor_across_hole() || test_off_anomaly() ||
+        test_pipeline_overflow() || test_response_without_request() ||
+        test_pg_unaffected_alongside() || test_display_mask() || test_wire())
         return 1;
     free(conn.frame[0].buf);
     free(conn.frame[1].buf);

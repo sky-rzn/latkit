@@ -18,6 +18,7 @@
 struct bpf_map;
 struct lk_loop;
 struct lk_tls;
+struct lk_tls_go;
 struct lk_cgroup;
 struct lk_port_proto;
 
@@ -25,12 +26,19 @@ struct lk_events_cfg {
     struct bpf_map *ringbuf; /* `events` map */
     struct bpf_map *stats;   /* `stats` per-CPU counters */
     struct bpf_map *capmode; /* per-conn capture-budget override (Р21) */
+    /* UDP packet/byte counters on the watched ports (РH16), NULL when the
+     * programs were not loaded. Nothing is parsed here — the map exists so that
+     * "the dashboard is empty" can be answered with "because this port speaks
+     * QUIC" instead of a shrug. */
+    struct bpf_map *udp_stats;
     /* port→protocol map (РМ2): borrowed, alive for the agent's lifetime; the
      * conn table assigns lk_conn.ops from it at entry creation. */
     const struct lk_port_proto *port_protos;
     unsigned n_port_protos;
     struct lk_tls *tls;          /* TLS uprobe manager: source of the attach-state
                                     gauge (latkit_tls_attached), NULL when off */
+    struct lk_tls_go *tls_go;    /* its Go counterpart (РH13.3): feeds the same
+                                    gauge, including its state="go" value */
     struct lk_cgroup *cgroup;    /* cgroup filter: source of latkit_cgroup_filter_paths,
                                     NULL / disabled when --cgroup was not given */
     __u32 max_conns;             /* userspace conn table ceiling (LRU past it) */

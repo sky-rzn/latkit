@@ -23,7 +23,24 @@ KEEP=1 ./verify.sh   # same, but leave the stand running to poke at it
 ./verify-tls.sh        # TLS variant: ssl=on + sslmode=require + --tls auto (stage 6)
 ./verify-mysql-tls.sh  # MySQL TLS stand: mysqld require_secure_transport=ON,
                        #   -p 3306=mysql --tls auto (MYSQL.md этап М5)
+
+./verify-http-tls.sh     # HTTPS via nginx + libssl uprobes (PLAN-HTTP.md М7)
+./verify-http-go-tls.sh  # HTTPS via a Go net/http server + --tls-go (М7, РH13.3)
 ```
+
+The two HTTPS stands are self-contained (their own compose file, their own
+Prometheus, no postgres): each brings up a TLS server, a curl load loop and the
+agent, and asserts that an encrypted run produces the *ordinary* HTTP
+observations — templated routes, the 4xx/5xx split, plausible timings — plus the
+proof that the TLS path is the source. The Go one additionally asserts that the
+three routes it drives arrive in comparable numbers: a correlation that only
+caught the later requests of a connection would light every counter and still be
+wrong. `STRIP=1 ./verify-http-go-tls.sh` rebuilds the server with
+`-ldflags "-s -w"` — the shape every Go server in the wild is actually shipped
+in — and runs the same assertions against the agent's other resolution path,
+Go's own function table. It builds `tests/e2e/gotls` on the host (a Go toolchain
+is required) and bind-mounts the binary into both the server and the agent, so
+the uprobe and the running process provably share an inode.
 
 `verify.sh` builds `build/latkit` on the host first (the image just wraps that
 binary — the BPF skeleton toolchain is not reproduced in a container), brings the
@@ -63,12 +80,14 @@ Prometheus on 9090), <http://localhost:9752/metrics> (the agent),
   `rate()` window under steady load. That is real captured latency, not a
   histogram error.
 
-## Not here yet: the HTTP stand
+## Not here yet: the plaintext HTTP stand
 
-The HTTP track's e2e stand (`docker-compose.http.yml` + `verify-http.sh`: nginx,
-a Go backend, a load generator) belongs to PLAN-HTTP.md М8 and does not exist
-yet, so the М6 claim "the agent's span shows up in a trace backend as a child of
-the client's span" is verified **offline** rather than in a live Jaeger:
+The HTTP track's *plaintext* e2e stand (`docker-compose.http.yml` +
+`verify-http.sh`: nginx, a Go backend, a load generator) belongs to PLAN-HTTP.md
+М8 and does not exist yet — the two HTTPS stands above arrived with М7 because
+they are what that stage had to prove. So the М6 claim "the agent's span shows
+up in a trace backend as a child of the client's span" is verified **offline**
+rather than in a live Jaeger:
 
 - `tests/replay/http_queries_traces.sh` replays the recorded `*/traceparent.lkt`
   corpus traces (four servers, a real W3C context on the wire) through the

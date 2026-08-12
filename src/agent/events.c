@@ -33,6 +33,7 @@
 #include "record.h"
 #include "selfstats.h"
 #include "tls_attach.h"
+#include "tls_go.h"
 
 #define LK_STATS_INTERVAL_SEC 10
 #define LK_SWEEP_INTERVAL_SEC 60
@@ -57,8 +58,12 @@ struct lk_events {
     struct lk_prom *prom;           /* Prometheus /metrics server (task 5.1), NULL if off */
     struct lk_otlp *otlp;           /* OTLP/HTTP push exporter (task 5.2), NULL if off */
     bool tls_logged;                /* one-shot: "TLS capture active" logged once (see below) */
-    __u64 proc_ns;                  /* cumulative time spent draining/processing the ringbuf,
-                                       nanoseconds; the self-overhead counter's source (Р27). */
+    /* Ports already named in the "this is UDP" notice (РH16), so the answer is
+     * given once per port rather than every stats interval. */
+    __u16 udp_noted[LK_MAX_PORTS];
+    int n_udp_noted;
+    __u64 proc_ns; /* cumulative time spent draining/processing the ringbuf,
+                      nanoseconds; the self-overhead counter's source (Р27). */
 };
 
 /* Monotonic clock for the self-overhead timer. CLOCK_MONOTONIC is a vDSO read
@@ -256,16 +261,39 @@ static bool sum_kernel_stats(struct lk_events *e, __u64 sum[LK_ST_MAX])
  * {fn}/{dir} label: the kernel counts them without that split (the same
  * documented Р27 deviation as latkit_events_total), so the label the spec
  * sketches would always be a single value — omitted rather than faked. */
+/* The single value of latkit_tls_attached{state} over both plaintext channels
+ * (РH13.3). The libssl status answers for its own, and the Go one is folded in
+ * here because an operator wants one answer to "is TLS being read", not two:
+ *
+ *   - no Go binary configured  -> the libssl status, unchanged (РH15);
+ *   - Go asked for and complete, no libssl attached -> "go": the Go channel is
+ *     the live one, which is exactly what a Caddy/Traefik host looks like;
+ *   - Go complete *and* libssl complete -> "ok": both are, nothing is missing;
+ *   - anything asked for and only partly delivered -> "partial".
+ */
+static enum lk_tls_state tls_attach_state(const struct lk_events *e)
+{
+    enum lk_tls_state ssl = e->cfg.tls ? lk_tls_status(e->cfg.tls) : LK_TLS_STATE_NONE;
+
+    if (!lk_tls_go_enabled(e->cfg.tls_go))
+        return ssl;
+    if (lk_tls_go_files(e->cfg.tls_go) == 0 || lk_tls_go_partial(e->cfg.tls_go) ||
+        ssl == LK_TLS_STATE_PARTIAL)
+        return LK_TLS_STATE_PARTIAL;
+    return ssl == LK_TLS_STATE_NONE ? LK_TLS_STATE_GO : LK_TLS_STATE_OK;
+}
+
 static void ev_provide_tls_stats(struct lk_events *e, struct lk_metrics *m, const __u64 *sum,
                                  const struct lk_conn_table_stats *cs)
 {
-    static const char *const states[] = {"none", "partial", "ok"};
-    enum lk_tls_state st = e->cfg.tls ? lk_tls_status(e->cfg.tls) : LK_TLS_STATE_NONE;
+    static const char *const states[] = {"none", "partial", "ok", "go"};
+    enum lk_tls_state st = tls_attach_state(e);
 
     /* One series per state, 1 on the live one — a Prometheus enum gauge. */
-    for (unsigned i = 0; i < 3; i++)
+    for (unsigned i = 0; i < LK_TLS_STATE_MAX; i++)
         lk_metrics_set_gauge_l(m, "latkit_tls_attached",
-                               i == 0 ? "libssl uprobe attach state (1 on the active state)."
+                               i == 0 ? "TLS uprobe attach state (1 on the active state); "
+                                        "\"go\" means the Go crypto/tls channel."
                                       : NULL,
                                "state", states[i], (unsigned)st == i ? 1.0 : 0.0);
 
@@ -288,6 +316,80 @@ static void ev_provide_tls_stats(struct lk_events *e, struct lk_metrics *m, cons
                                "Decrypted events dropped for a missing SSL-to-cookie link.",
                                (double)sum[LK_ST_TLS_CORR_MISS]);
     }
+}
+
+/* --- UDP volume on the watched ports (РH16) --------------------------------
+ * Read the per-CPU `udp_stats` map, sum it, and hand each {port,dir} pair to
+ * `fn`. There is no parsing behind these numbers and there never will be: they
+ * exist so that an HTTP/3 server — invisible to a TCP-based agent by
+ * construction (docs/notes-httpproto.md §8) — reads as "this port speaks a
+ * protocol we do not parse" instead of as a broken installation. The one-shot
+ * log line below is the other half of that answer. */
+typedef void (*lk_udp_fn)(void *ctx, __u16 port, __u8 dir, const struct lk_udp_stat *s);
+
+static void walk_udp_stats(struct lk_events *e, lk_udp_fn fn, void *ctx)
+{
+    struct lk_udp_key key, next;
+    struct lk_udp_stat *vals;
+    int ncpus = libbpf_num_possible_cpus();
+    bool have_key = false;
+
+    if (!e->cfg.udp_stats || ncpus < 1)
+        return;
+    vals = calloc(ncpus, sizeof(*vals));
+    if (!vals)
+        return;
+    while (!bpf_map__get_next_key(e->cfg.udp_stats, have_key ? &key : NULL, &next, sizeof(next))) {
+        struct lk_udp_stat sum = {0};
+
+        key = next;
+        have_key = true;
+        if (bpf_map__lookup_elem(e->cfg.udp_stats, &key, sizeof(key), vals,
+                                 (size_t)ncpus * sizeof(*vals), 0))
+            continue;
+        for (int cpu = 0; cpu < ncpus; cpu++) {
+            sum.packets += vals[cpu].packets;
+            sum.bytes += vals[cpu].bytes;
+        }
+        if (sum.packets)
+            fn(ctx, key.port, key.dir, &sum);
+    }
+    free(vals);
+}
+
+static void udp_metric(void *ctx, __u16 port, __u8 dir, const struct lk_udp_stat *s)
+{
+    struct lk_metrics *m = ctx;
+    char portbuf[8];
+
+    snprintf(portbuf, sizeof(portbuf), "%u", port);
+    lk_metrics_set_counter_l2(m, "latkit_udp_bytes_total",
+                              "UDP bytes on a captured port. Not parsed: UDP here means "
+                              "QUIC/HTTP-3 or another datagram protocol.",
+                              "port", portbuf, "dir", dir == LK_DIR_SEND ? "out" : "in",
+                              (double)s->bytes);
+    lk_metrics_set_counter_l2(m, "latkit_udp_packets_total", NULL, "port", portbuf, "dir",
+                              dir == LK_DIR_SEND ? "out" : "in", (double)s->packets);
+}
+
+/* One line per port, once: enough to end the investigation, not enough to spam
+ * a log for the lifetime of the process. */
+static void udp_notice(void *ctx, __u16 port, __u8 dir, const struct lk_udp_stat *s)
+{
+    struct lk_events *e = ctx;
+
+    (void)dir;
+    for (int i = 0; i < e->n_udp_noted; i++)
+        if (e->udp_noted[i] == port)
+            return;
+    if (e->n_udp_noted == (int)(sizeof(e->udp_noted) / sizeof(e->udp_noted[0])))
+        return;
+    e->udp_noted[e->n_udp_noted++] = port;
+    fprintf(stderr,
+            "latkit: UDP traffic on captured port %u (%llu packets so far): most likely "
+            "QUIC/HTTP-3, which this agent does not parse — its observations will be "
+            "missing from the metrics (see README, \"Known limitations\")\n",
+            port, (unsigned long long)s->packets);
 }
 
 /* --- self-metric provider (task 4.4, Р27) ---------------------------------
@@ -392,6 +494,11 @@ static void ev_provide_stats(void *ctx, struct lk_metrics *m)
         lk_metrics_set_gauge(m, "latkit_cgroup_filter_paths",
                              "cgroupfs paths currently matched by the --cgroup filter.",
                              (double)lk_cgroup_paths(e->cfg.cgroup));
+
+    /* Datagram traffic on the very ports being captured (РH16): absent from the
+     * exposition until a port actually sees some, so a TCP-only deployment
+     * carries no extra series. */
+    walk_udp_stats(e, udp_metric, m);
 }
 
 /* /healthz liveness source (task 5.1): the Prometheus server lives in src/export
@@ -456,6 +563,8 @@ void lk_events_print_stats(struct lk_events *e)
             (unsigned long long)rs->bad_len, (unsigned long long)rs->hdr_holes,
             (unsigned long long)rs->off_anomalies, (unsigned long long)rs->resyncs,
             (unsigned long long)rs->tls_conns);
+
+    walk_udp_stats(e, udp_notice, e);
 
     for (unsigned i = 0; i < lk_proto_nregistry; i++)
         print_proto_stats(lk_proto_registry[i]->name, lk_proto_stats(e->protos[i]));
@@ -652,7 +761,11 @@ static int handle_event(void *ctx, void *data, size_t size)
              * framer has been reset to startup — the plaintext source is now the
              * stage-6 uprobe channel (Р38). */
             e->tls_logged = true;
-            fprintf(stderr, "latkit: TLS capture active (decrypted channel via libssl uprobes)\n");
+            fprintf(stderr, "latkit: TLS capture active (decrypted channel via %s uprobes)\n",
+                    lk_tls_go_files(e->cfg.tls_go) > 0 &&
+                            lk_tls_status(e->cfg.tls) == LK_TLS_STATE_NONE
+                        ? "Go crypto/tls"
+                        : "libssl");
         }
         if (ev.decrypted_early)
             /* Р38 says 'S' precedes any decrypted byte; if this fires the

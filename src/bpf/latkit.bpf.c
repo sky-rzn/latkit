@@ -190,13 +190,24 @@ static __always_inline __u16 gap_take(struct lk_conn_state *st)
 }
 
 /* Port filter, filled by the agent from --port after load, before attach.
- * Keys are host-order local ports. */
+ * Keys are host-order local ports; the value carries the port's capture budget
+ * (РH14) — presence in the map is still the whole filter, the value only tunes
+ * how much of each call is copied. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, LK_MAX_PORTS);
     __type(key, __u16);
-    __type(value, __u8);
+    __type(value, struct lk_port_cfg);
 } ports SEC(".maps");
+
+/* UDP volume counters (РH16), key = {port, dir}. Per-CPU so the QUIC fast path
+ * costs one uncontended add; userspace sums across CPUs. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_HASH);
+    __uint(max_entries, LK_MAX_UDP_KEYS);
+    __type(key, struct lk_udp_key);
+    __type(value, struct lk_udp_stat);
+} udp_stats SEC(".maps");
 
 /* cgroup filter (task 7.1, Р48): keys are cgroup ids
  * (bpf_get_current_cgroup_id), value unused. Filled and diffed by the agent's
@@ -226,11 +237,34 @@ struct {
  * (client SEND + server RECV of the same payload) for free and pins direction
  * semantics: RECV = frontend->backend, SEND = backend->frontend. skc_num is
  * already host order. */
-static __always_inline int sk_port_match(struct sock *sk)
+static __always_inline struct lk_port_cfg *sk_port_cfg(struct sock *sk)
 {
     __u16 lport = BPF_CORE_READ(sk, __sk_common.skc_num);
 
-    return bpf_map_lookup_elem(&ports, &lport) != NULL;
+    return bpf_map_lookup_elem(&ports, &lport);
+}
+
+static __always_inline int sk_port_match(struct sock *sk)
+{
+    return sk_port_cfg(sk) != NULL;
+}
+
+/* Capture budget for this call (Р6 + РH14): the port's own limit when it has
+ * one, otherwise the global --capture-limit. Nothing else about the value is
+ * interpreted here — the precedence between the flag, the protocol default and
+ * the explicit `:BYTES` was resolved in userspace. */
+static __always_inline __u32 port_budget(const struct lk_port_cfg *pc)
+{
+    __u32 cap = pc ? pc->cap_limit : 0;
+
+    return cap ? cap : cfg_capture_limit;
+}
+
+/* Same, by port number: the uprobe channels have no struct sock, only the tuple
+ * snapshot taken when the connection was correlated. */
+static __always_inline __u32 port_cfg_budget(__u16 lport)
+{
+    return port_budget(bpf_map_lookup_elem(&ports, &lport));
 }
 
 /* cgroup filter (task 7.1, Р48): the calling task's cgroup id must be in the
@@ -570,9 +604,13 @@ static __always_inline int emit_chunk(__u64 cookie, struct lk_conn_state *st, __
  * chunks; segments shorter than that each cost a chunk of their own, so a
  * heavily fragmented iovec can exhaust the LK_MAX_CHUNKS slots before the
  * byte budget — those calls under-capture without a TRUNC flag, which stage
- * 2 still detects from off/cap_len against total_len. */
+ * 2 still detects from off/cap_len against total_len.
+ *
+ * cap_budget is this port's byte budget (port_budget, РH14): the caller has
+ * already resolved --capture-limit against the port's own limit. */
 static __always_inline void emit_data_chunks(__u64 cookie, struct lk_conn_state *st, __u8 dir,
-                                             __u32 total_len, const struct lk_segs *segs)
+                                             __u32 total_len, const struct lk_segs *segs,
+                                             __u32 cap_budget)
 {
     __u64 avail_total = 0;
     __u32 budget;
@@ -593,7 +631,7 @@ static __always_inline void emit_data_chunks(__u64 cookie, struct lk_conn_state 
      * budget < total_len means the chain is truncated (by --capture-limit,
      * the HEADERS mode, an unsupported iterator, or segments beyond
      * LK_MAX_SEGS), and every chunk of the chain carries LK_F_TRUNC. */
-    budget = cfg_capture_limit;
+    budget = cap_budget;
     /* The per-connection override lives in `capmode`, written by userspace (Р21),
      * so it can flip mid-connection; each call reads the current value. A miss
      * means FULL. Whatever the mode, only cap_len is affected — total_len stays
@@ -804,13 +842,52 @@ static __always_inline void ssl_nested_link(void *active_map, __u64 id, struct s
     ssl_conn_set(c->ssl, bpf_get_socket_cookie(sk), sk);
 }
 
+/* ------------------------------------------------------------------------- *
+ * Go crypto/tls -> socket-cookie bridge (РH13.3). A Go server has no libssl:
+ * TLS lives inside the binary, and the only place plaintext is visible is the
+ * boundary of crypto/tls.(*Conn).Read/Write. Those uprobes see a *tls.Conn and
+ * a slice, never a struct sock, and walking *tls.Conn -> net.Conn -> fd by
+ * offset breaks with every Go release — so the correlation is built from what
+ * the kernel already knows.
+ *
+ * The note below is one half of it: every socket call on a watched port records
+ * "thread T talked to connection C at time X". A Go call that issued a syscall
+ * during its lifetime therefore finds a hint newer than its own start, which
+ * identifies its connection beyond doubt; the RET probe then remembers the
+ * answer per *tls.Conn (go_conn, further down), so the next call on that same
+ * connection is correlated even when it is served entirely out of Go's own
+ * buffer and touches no syscall at all.
+ *
+ * cfg_go_tls gates the write: with no Go binary attached the DB/HTTP socket
+ * path must not pay a map update per call. It is .rodata, so the branch is
+ * folded away at load time. */
+const volatile bool cfg_go_tls;
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, __u64); /* pid_tgid: the *thread* that made the socket call */
+    __type(value, struct lk_sock_hint);
+} sock_hint SEC(".maps");
+
+static __always_inline void go_sock_hint(__u64 cookie)
+{
+    struct lk_sock_hint h = {.cookie = cookie, .ts_ns = bpf_ktime_get_ns()};
+    __u64 id = bpf_get_current_pid_tgid();
+
+    if (!cfg_go_tls)
+        return;
+    bpf_map_update_elem(&sock_hint, &id, &h, BPF_ANY);
+}
+
 SEC("fentry/tcp_sendmsg")
 int BPF_PROG(lk_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
 {
     struct lk_conn_state *st;
     struct lk_segs segs = {};
+    struct lk_port_cfg *pc = sk_port_cfg(sk);
 
-    if (!sk_port_match(sk) || !comm_allowed() || !cgroup_allowed())
+    if (!pc || !comm_allowed() || !cgroup_allowed())
         return 0;
 
     __u64 cookie = bpf_get_socket_cookie(sk);
@@ -822,6 +899,10 @@ int BPF_PROG(lk_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
     /* Fallback SSL*->cookie bridge (Р37): if this send is the nested syscall of
      * a live SSL_write on this thread, bind that SSL* to this connection. */
     ssl_nested_link(&active_ssl_wr, bpf_get_current_pid_tgid(), sk);
+    /* The Go channel's equivalent (РH13.3), a plain "this thread just wrote to
+     * this connection" note. Off unless a Go binary was attached, so the DB
+     * path never pays for it. */
+    go_sock_hint(cookie);
 
     /* Data is still in the caller's buffer on entry to tcp_sendmsg; snapshot
      * msg->msg_iter and read straight from userspace. On an unsupported
@@ -829,7 +910,7 @@ int BPF_PROG(lk_tcp_sendmsg, struct sock *sk, struct msghdr *msg, size_t size)
      * total_len must stay honest. */
     if (iter_snapshot(msg, &segs))
         stat_add(LK_ST_ITER_UNSUPPORTED, 1);
-    emit_data_chunks(cookie, st, LK_DIR_SEND, size, &segs);
+    emit_data_chunks(cookie, st, LK_DIR_SEND, size, &segs, port_budget(pc));
     return 0;
 }
 
@@ -890,11 +971,13 @@ static __always_inline int recvmsg_exit(struct sock *sk, long ret)
         __u64 cookie = bpf_get_socket_cookie(sk);
 
         cs = conn_get(sk, cookie);
-        if (cs)
+        if (cs) {
             /* ret bytes were copied, in order, into the segments snapshot
              * taken on entry; the emit loop stops after ret bytes, so the
              * tail of a partially filled segment list is never read. */
-            emit_data_chunks(cookie, cs, LK_DIR_RECV, ret, segs);
+            emit_data_chunks(cookie, cs, LK_DIR_RECV, ret, segs, port_budget(sk_port_cfg(sk)));
+            go_sock_hint(cookie); /* РH13.3, see the send path */
+        }
     }
 
     /* Always drop the entry, including the ret <= 0 path, or the map leaks. */
@@ -1021,11 +1104,15 @@ static __always_inline int emit_ssl_chunk(__u64 cookie, __u8 dir, __u32 total_le
 /* Emit the decrypted buffer of one SSL_read/SSL_write call as a chain of data
  * events sharing total_len, with increasing off and consecutive seq — the
  * decrypted twin of emit_data_chunks. The buffer is contiguous, so the chain is
- * a straight walk by offset; the --capture-limit budget is applied (never the
- * HEADERS capmode — that governs the ciphertext socket path, the plaintext must
- * stay full for the parser, Р40). The per-CPU cursor holds the loop-carried
- * state exactly as emit_data_chunks needs it for the verifier. */
-static __always_inline void emit_ssl_data(__u64 cookie, __u8 dir, __u32 total_len, __u64 buf)
+ * a straight walk by offset; the byte budget is applied (never the HEADERS
+ * capmode — that governs the ciphertext socket path, the plaintext must stay
+ * full for the parser, Р40). cap_budget is the port's budget resolved by the
+ * caller from the connection's local port (РH14): an HTTPS port needs the head
+ * of each message and no more, exactly like its plaintext twin. The per-CPU
+ * cursor holds the loop-carried state exactly as emit_data_chunks needs it for
+ * the verifier. */
+static __always_inline void emit_ssl_data(__u64 cookie, __u8 dir, __u32 total_len, __u64 buf,
+                                          __u32 cap_budget)
 {
     __u32 budget;
     struct lk_cursor *cur;
@@ -1033,7 +1120,7 @@ static __always_inline void emit_ssl_data(__u64 cookie, __u8 dir, __u32 total_le
 
     stat_add(LK_ST_BYTES_TOTAL, total_len);
 
-    budget = cfg_capture_limit;
+    budget = cap_budget;
     if (budget > total_len)
         budget = total_len;
     if (budget < total_len)
@@ -1133,7 +1220,10 @@ static __always_inline int ssl_ret(void *active_map, __u8 dir, long ret, int is_
         struct lk_ssl_conn *c = bpf_map_lookup_elem(&ssl_to_conn, &k);
 
         if (c)
-            emit_ssl_data(c->cookie, dir, (__u32)len, call->buf);
+            /* The tuple snapshot carries the local port, so the plaintext of an
+             * HTTPS connection gets the same per-port budget as its ciphertext
+             * (РH14); a cookie without a tuple falls back to the global limit. */
+            emit_ssl_data(c->cookie, dir, (__u32)len, call->buf, port_cfg_budget(c->tuple.sport));
         else
             stat_add(LK_ST_TLS_CORR_MISS, 1);
     }
@@ -1282,5 +1372,290 @@ int BPF_UPROBE(lk_ssl_free, void *ssl)
     struct lk_ssl_key key = {.ssl = (__u64)ssl, .tgid = bpf_get_current_pid_tgid() >> 32};
 
     bpf_map_delete_elem(&ssl_to_conn, &key);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- *
+ * Go crypto/tls plaintext channel (РH13.3, PLAN-HTTP.md М7). Same shape as the
+ * OpenSSL channel above — entry probe saves the arguments, return probe emits
+ * the buffer as LK_F_DECRYPTED data events — with three differences forced by
+ * the runtime:
+ *
+ *   - **no uretprobe.** A uretprobe replaces the return address on the stack,
+ *     and a goroutine stack can be copied and moved (growth, shrink), which
+ *     rewrites that address behind the kernel's back: the trampoline is then
+ *     never reached, or worse, reached with the wrong stack. So userspace
+ *     (tls_go.c) decodes the function body, finds every RET instruction and
+ *     attaches these programs as ordinary uprobes at those offsets. Several
+ *     links share one program; each of them is a real return site.
+ *   - **the Go register ABI (1.17+).** Arguments are not on the stack:
+ *     `func (c *Conn) Write(b []byte) (int, error)` passes the receiver in RAX,
+ *     b.ptr in RBX, b.len in RCX, b.cap in RDI, and returns n in RAX. The
+ *     macros below name exactly those, and nothing outside this comment depends
+ *     on Go's calling convention.
+ *   - **correlation without struct offsets.** See go_sock_hint above: the
+ *     thread's last socket call answers "which connection", and the answer is
+ *     memoised per *tls.Conn so buffered calls stay correlated.
+ *
+ * x86-64 only in v1 (arm64 is a separate task, РH13.3): on other targets the
+ * bodies compile to a bare `return 0` and userspace refuses to attach — the
+ * skeleton keeps the same programs either way, so nothing else is arch-aware. */
+
+#if defined(__TARGET_ARCH_x86)
+#define GO_RECV(ctx)        ((__u64)BPF_CORE_READ((ctx), ax)) /* receiver / return n */
+#define GO_ARG_PTR(ctx)     ((__u64)BPF_CORE_READ((ctx), bx))
+#define GO_ARG_LEN(ctx)     ((__u64)BPF_CORE_READ((ctx), cx))
+#define GO_CURG(ctx)        ((__u64)BPF_CORE_READ((ctx), r14)) /* the running goroutine */
+#define LK_GO_TLS_SUPPORTED 1
+#else
+#define GO_RECV(ctx)        0ULL
+#define GO_ARG_PTR(ctx)     0ULL
+#define GO_ARG_LEN(ctx)     0ULL
+#define GO_CURG(ctx)        0ULL
+#define LK_GO_TLS_SUPPORTED 0
+#endif
+
+/* Key of both Go maps: a userspace pointer plus the process it belongs to — a
+ * goroutine pointer for the in-flight calls, a *tls.Conn for the learned
+ * connections. The tgid is there for the reason the SSL bridge needs it too:
+ * two processes can hold their objects at the same address. */
+struct lk_go_key {
+    __u64 ptr;
+    __u64 tgid;
+};
+
+/* In-flight crypto/tls.(*Conn).Write / .Read arguments, keyed like
+ * their OpenSSL twins — except that the key is the *goroutine*, not the thread.
+ * That difference is not a refinement, it is what makes the channel work: a
+ * server's Read blocks in the netpoller, and the goroutine that resumes when
+ * the bytes arrive routinely resumes on another M. Keyed by thread, the return
+ * probe would find no entry and the request would be lost — measured, on the
+ * first connection of the first test. The goroutine pointer lives in R14 for
+ * the whole call by the same ABI that puts the arguments in RAX/RBX/RCX, so it
+ * costs one register read and survives every migration.
+ *
+ * LRU rather than plain HASH (their SSL twins are HASH) so that an entry whose
+ * return probe never runs — a panic unwinding past it — ages out on its own. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, struct lk_go_key);
+    __type(value, struct lk_go_call);
+} active_go_wr SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 10240);
+    __type(key, struct lk_go_key);
+    __type(value, struct lk_go_call);
+} active_go_rd SEC(".maps");
+
+/* Learned *tls.Conn -> socket cookie, the Go twin of ssl_to_conn. Only ever
+ * written from a hint that provably belongs to the call in progress, so a stale
+ * entry cannot outlive a reused address — the first call on a fresh connection
+ * always performs the handshake syscalls and overwrites it. LRU is the
+ * backstop; Go frees no Conn we could hook. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct lk_go_key);
+    __type(value, __u64); /* socket cookie */
+} go_conn SEC(".maps");
+
+static __always_inline int go_entry(void *active_map, __u64 g, __u64 conn, __u64 buf, __u64 len)
+{
+    struct lk_go_key k = {.ptr = g, .tgid = bpf_get_current_pid_tgid() >> 32};
+    struct lk_go_call call = {.conn = conn, .buf = buf, .len = len, .ts_ns = bpf_ktime_get_ns()};
+
+    /* Same gate as the socket path: a Go binary is attached by path, but its
+     * comm may still be in an explicit --comm/--cgroup filter. */
+    if (!g || !comm_allowed() || !cgroup_allowed())
+        return 0;
+    bpf_map_update_elem(active_map, &k, &call, BPF_ANY);
+    return 0;
+}
+
+/* Which connection does the finished call belong to? Three answers, strongest
+ * first — and the order is the whole correlation design:
+ *
+ *   1. the thread made a socket call while this one ran (the hint is newer than
+ *      the call's own start): that socket is this connection, beyond doubt.
+ *      Remembered against the *tls.Conn for next time;
+ *   2. nothing happened on the socket during the call — a Read served out of
+ *      Go's own buffered record, which is routine — so the answer remembered
+ *      for this *tls.Conn stands;
+ *   3. neither, which in practice means the first call on a connection whose
+ *      handshake did the reading: the request bytes arrived in the same segment
+ *      as the client's last handshake flight, so the Read that returns them
+ *      makes no syscall at all and there is nothing learned yet. The thread's
+ *      most recent socket activity is that same handshake — the goroutine
+ *      serving a connection stays with it — so the older hint is used, and
+ *      learned, rather than throwing the request away.
+ *
+ * Rule 3 is the one assumption in the chain (a thread whose last socket call
+ * belonged to another connection would misattribute a *first* call on a Conn),
+ * and it is bounded by rules 1 and 2 taking precedence everywhere after that
+ * first call. Without it, measured: the first request of every keep-alive
+ * connection is lost. */
+static __always_inline __u64 go_cookie(const struct lk_go_call *call, __u64 tgid)
+{
+    struct lk_go_key k = {.ptr = call->conn, .tgid = tgid};
+    __u64 id = bpf_get_current_pid_tgid();
+    struct lk_sock_hint *h = bpf_map_lookup_elem(&sock_hint, &id);
+    __u64 *learned;
+
+    if (h && h->cookie && h->ts_ns >= call->ts_ns) {
+        if (call->conn)
+            bpf_map_update_elem(&go_conn, &k, &h->cookie, BPF_ANY);
+        return h->cookie; /* rule 1 */
+    }
+    learned = call->conn ? bpf_map_lookup_elem(&go_conn, &k) : NULL;
+    if (learned)
+        return *learned; /* rule 2 */
+    if (h && h->cookie) {
+        if (call->conn)
+            bpf_map_update_elem(&go_conn, &k, &h->cookie, BPF_ANY);
+        return h->cookie; /* rule 3 */
+    }
+    return 0;
+}
+
+/* Return site of a Go TLS call: `n` bytes of the saved buffer are plaintext.
+ * n <= 0 (error, EOF, a Write that wrote nothing) yields nothing, exactly like
+ * the SSL_* path. The entry is always dropped so the map cannot leak. */
+static __always_inline int go_ret(void *active_map, __u64 g, __u8 dir, __s64 n)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    struct lk_go_key k = {.ptr = g, .tgid = id >> 32};
+    struct lk_go_call *call = g ? bpf_map_lookup_elem(active_map, &k) : NULL;
+
+    if (!call) {
+        /* No entry for this goroutine: the call started before the probes were
+         * attached, or it was filtered out at entry (not a miss), or the entry
+         * was evicted. Counted only when this call would have been captured. */
+        if (comm_allowed() && cgroup_allowed())
+            stat_add(LK_ST_TLS_CORR_MISS, 1);
+        return 0;
+    }
+
+    if (n > 0) {
+        __u64 len = (__u64)n;
+        __u64 cookie;
+
+        if (len > call->len)
+            len = call->len; /* a return larger than the buffer is not ours to trust */
+        cookie = go_cookie(call, id >> 32);
+        if (cookie) {
+            /* The socket path registered this cookie, so its tuple names the
+             * local port and with it the port's capture budget (РH14). */
+            struct lk_conn_state *cs = bpf_map_lookup_elem(&conns, &cookie);
+
+            emit_ssl_data(cookie, dir, (__u32)len, call->buf,
+                          port_cfg_budget(cs ? cs->tuple.sport : 0));
+        } else {
+            stat_add(LK_ST_TLS_CORR_MISS, 1);
+        }
+    }
+    bpf_map_delete_elem(active_map, &k);
+    return 0;
+}
+
+/* crypto/tls.(*Conn).Write(b []byte): application plaintext on its way out —
+ * backend->frontend (SEND). The slice belongs to the caller and stays valid
+ * across the call, so the copy happens at the return site, where the count
+ * written is known and the socket write has already happened (which is what
+ * makes the hint above land). */
+SEC("uprobe")
+int lk_go_tls_write(struct pt_regs *ctx)
+{
+    if (!LK_GO_TLS_SUPPORTED)
+        return 0;
+    return go_entry(&active_go_wr, GO_CURG(ctx), GO_RECV(ctx), GO_ARG_PTR(ctx), GO_ARG_LEN(ctx));
+}
+
+SEC("uprobe")
+int lk_go_tls_write_ret(struct pt_regs *ctx)
+{
+    if (!LK_GO_TLS_SUPPORTED)
+        return 0;
+    return go_ret(&active_go_wr, GO_CURG(ctx), LK_DIR_SEND, (__s64)GO_RECV(ctx));
+}
+
+/* crypto/tls.(*Conn).Read(b []byte): decrypted plaintext on its way in —
+ * frontend->backend (RECV). The buffer holds nothing at entry; only the return
+ * site sees the bytes. */
+SEC("uprobe")
+int lk_go_tls_read(struct pt_regs *ctx)
+{
+    if (!LK_GO_TLS_SUPPORTED)
+        return 0;
+    return go_entry(&active_go_rd, GO_CURG(ctx), GO_RECV(ctx), GO_ARG_PTR(ctx), GO_ARG_LEN(ctx));
+}
+
+SEC("uprobe")
+int lk_go_tls_read_ret(struct pt_regs *ctx)
+{
+    if (!LK_GO_TLS_SUPPORTED)
+        return 0;
+    return go_ret(&active_go_rd, GO_CURG(ctx), LK_DIR_RECV, (__s64)GO_RECV(ctx));
+}
+
+/* ------------------------------------------------------------------------- *
+ * UDP volume counters (РH16). HTTP/3 is QUIC over UDP and is not parsed — it
+ * does not even reach this agent's capture point (docs/notes-httpproto.md §8).
+ * The failure mode that costs an operator an afternoon is the *silent* one: a
+ * dashboard with no data and no reason. So the watched ports are counted on the
+ * UDP path too — packets and bytes, nothing else. No payload is read, no
+ * connection is registered, no ringbuf record is written; a non-zero
+ * latkit_udp_bytes_total on port 443 with no HTTP observations is the
+ * diagnosis, printed as such by the agent.
+ *
+ * Send is hooked per family (udp_sendmsg / udpv6_sendmsg — same signature,
+ * different call sites); receive is hooked once, at skb_consume_udp, which both
+ * families funnel through with the byte count already known. That avoids a
+ * third fexit-arity dance on udp_recvmsg for what is, in the end, a diagnostic
+ * counter. Each program is autoloaded only if its function exists in the
+ * running kernel's BTF (main.c). */
+static __always_inline void udp_count(struct sock *sk, __u8 dir, __s64 bytes)
+{
+    struct lk_udp_key k = {};
+    struct lk_udp_stat *s, init = {};
+    __u16 lport = BPF_CORE_READ(sk, __sk_common.skc_num);
+
+    if (bytes <= 0 || !bpf_map_lookup_elem(&ports, &lport))
+        return;
+    k.port = lport;
+    k.dir = dir;
+    s = bpf_map_lookup_elem(&udp_stats, &k);
+    if (!s) {
+        bpf_map_update_elem(&udp_stats, &k, &init, BPF_NOEXIST);
+        s = bpf_map_lookup_elem(&udp_stats, &k);
+        if (!s)
+            return;
+    }
+    s->packets += 1; /* per-CPU value: a plain add is enough */
+    s->bytes += (__u64)bytes;
+}
+
+SEC("fentry/udp_sendmsg")
+int BPF_PROG(lk_udp_sendmsg, struct sock *sk, struct msghdr *msg, size_t len)
+{
+    udp_count(sk, LK_DIR_SEND, (__s64)len);
+    return 0;
+}
+
+SEC("fentry/udpv6_sendmsg")
+int BPF_PROG(lk_udpv6_sendmsg, struct sock *sk, struct msghdr *msg, size_t len)
+{
+    udp_count(sk, LK_DIR_SEND, (__s64)len);
+    return 0;
+}
+
+/* skb_consume_udp(sk, skb, len): the single point both udp_recvmsg and
+ * udpv6_recvmsg reach once a datagram has been handed to userspace. */
+SEC("fentry/skb_consume_udp")
+int BPF_PROG(lk_skb_consume_udp, struct sock *sk, struct sk_buff *skb, int len)
+{
+    udp_count(sk, LK_DIR_RECV, len);
     return 0;
 }

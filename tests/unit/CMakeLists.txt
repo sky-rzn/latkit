@@ -32,6 +32,27 @@ target_include_directories(test_tls_route PRIVATE
 target_link_libraries(test_tls_route latkit_proto)
 add_test(NAME tls_route COMMAND test_tls_route)
 
+# x86-64 length decoder and return-site search (PLAN-HTTP.md М7, РH13.3): the
+# module the Go TLS channel places its probes with, so its refusals matter as
+# much as its answers. Pure — no libbpf, no ELF, no privileges.
+add_executable(test_x86_len test_x86_len.c ${CMAKE_SOURCE_DIR}/src/agent/x86_len.c)
+target_include_directories(test_x86_len PRIVATE ${CMAKE_SOURCE_DIR}/src/agent)
+add_test(NAME x86_len COMMAND test_x86_len)
+
+# ELF symbol reader (М7): looks its own function up in its own binary and
+# compares the bytes at the file offset it computed with the mapped ones — the
+# address arithmetic a Go uprobe depends on, checked against reality.
+add_executable(test_elf_syms test_elf_syms.c ${CMAKE_SOURCE_DIR}/src/agent/elf_syms.c)
+target_include_directories(test_elf_syms PRIVATE ${CMAKE_SOURCE_DIR}/src/agent)
+add_test(NAME elf_syms COMMAND test_elf_syms)
+
+# Go function-table reader (М7): the path that resolves crypto/tls in the
+# stripped binaries every Go server actually ships (М0 recon item 3). Driven
+# over a synthetic table, so no Go toolchain is needed to test the parser.
+add_executable(test_go_pclntab test_go_pclntab.c ${CMAKE_SOURCE_DIR}/src/agent/go_pclntab.c)
+target_include_directories(test_go_pclntab PRIVATE ${CMAKE_SOURCE_DIR}/src/agent)
+add_test(NAME go_pclntab COMMAND test_go_pclntab)
+
 # cgroup filter core (task 7.1, Р48): glob matcher, id-set diff and the cgroupfs
 # resolver over a synthetic tree. Libbpf-free — links only the pure cgroup_match.c.
 add_executable(test_cgroup test_cgroup.c ${CMAKE_SOURCE_DIR}/src/agent/cgroup_match.c)

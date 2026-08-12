@@ -81,10 +81,11 @@ for trace in "$DIR"/*/*.lkt; do
     esac
 
     case "$srv/$base" in
-    # The scenarios built to be rejected, and the two TLS traces where
-    # ciphertext is framed as plaintext until М7 — the exact set М2 documented
-    # in notes-httpproto.md. Everything else must be clean.
-    */bad-request | */cl-te | go/huge-head | gunicorn/huge-head | nginx/tls-decrypted*)
+    # The scenarios built to be rejected — the exact set М2 documented in
+    # notes-httpproto.md. Everything else must be clean, the TLS traces
+    # included: until М7 their ciphertext was framed as plaintext and produced
+    # parse errors, and recognising the handshake is what removed them.
+    */bad-request | */cl-te | go/huge-head | gunicorn/huge-head)
         has " parse_errors=[1-9]" ;;
     *)
         has " parse_errors=0 " ;;
@@ -248,6 +249,33 @@ for trace in "$DIR"/*/*.lkt; do
         # is an ordinary 200 and must *not* be a blind zone.
         nobs 1
         has ' blind=0 '
+        ;;
+    # --- TLS (М7, РH13) ---------------------------------------------------
+    nginx/tls)
+        # Ciphertext and nothing else: the handshake record is recognised where
+        # a request line belongs, the connection is marked TLS, and not one
+        # observation is invented out of encrypted bytes. Before М7 this trace
+        # produced parse errors instead — the whole point of the stage.
+        nobs 0
+        has ' parse_errors=0 '
+        ;;
+    nginx/tls-decrypted)
+        # The same load with the uprobe channel live — and curl's ALPN made it
+        # h2 inside TLS, so the *decrypted* stream is an HTTP/2 preface. Both
+        # halves have to hold at once: the socket side recognised TLS, and the
+        # plaintext side recognised h2 and went blind rather than guessing.
+        nobs 0
+        has ' blind=1 '
+        ;;
+    nginx/tls-decrypted-h1)
+        # The acceptance criterion of М7 in one line: plaintext HTTP/1.1
+        # recovered from a TLS connection through the uprobe channel yields the
+        # ordinary observations — method, status, route, timings — exactly as
+        # the cleartext traces do.
+        nobs 2
+        has '^http .* method=GET status=200 .* route=/hello target=/hello$'
+        has '^http .* route=/json/\{id\} '
+        gt dur 0
         ;;
     # --- trace context and the credential header --------------------------
     gunicorn/traceparent)

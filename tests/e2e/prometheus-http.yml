@@ -1,0 +1,11 @@
+# Prometheus config for the two HTTPS stands (PLAN-HTTP.md М7). Just the agent —
+# these stands assert the capture path, not the export fan-out, which the
+# postgres stand already covers with its collector leg.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: latkit
+    static_configs:
+      - targets: ["latkit:9752"]

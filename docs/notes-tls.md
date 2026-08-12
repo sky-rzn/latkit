@@ -204,13 +204,143 @@ are in the process model and in naming, not in the probes:
   `--tls-comm` — proving the default scan set and the widened kernel filter on
   a live 8.x server.
 
+## 4b. HTTP servers, and the Go delta (РH13, PLAN-HTTP.md М7)
+
+HTTPS splits cleanly into two cases, and only one of them needed new code.
+
+### nginx / Apache / HAProxy: the same channel, a wider scan
+
+They link OpenSSL dynamically and call `SSL_read`/`SSL_write` like a database
+server does, so §1–§4 apply unchanged — no new probe, no new correlation, no new
+BPF. The only thing М7 changed for them is *which processes the scan looks at*:
+the comm set is now derived from the protocols on `--port` (РH13.1), so
+
+| configured ports | AUTO scan set (process comm) | kernel filter (thread comm) |
+|---|---|---|
+| `-p 5432` (pg), `-p 3306=mysql` | `postgres`, `mysqld`, `mariadbd` | + `connection` |
+| `-p 8443=http` | `nginx`, `httpd`, `apache2`, `haproxy` | the same |
+| both | all seven | + `connection` |
+
+Both Apache spellings are there because both are in the field (`httpd` on
+RHEL-family, `apache2` on Debian-family). The DB-only case is byte-for-byte what
+it was before М7 (РH15), which is the point of deriving rather than widening:
+a postgres deployment does not start scanning web servers because HTTP exists.
+
+`LK_COMM_FILTER_MAX` went from 4 to 8 for this — seven comms plus `connection`
+is exactly eight, and the DB four had already filled the old ceiling.
+
+Two operational notes:
+
+- **`--libssl PATH` also serves a statically linked OpenSSL**, because the
+  attach is by *file*: point it at the server binary itself (node, envoy) and
+  the same symbol lookup runs against that ELF. It works when the symbols are
+  present; a stripped static build has nothing to attach to and reports
+  `state="none"` rather than pretending.
+- **HTTP has no in-band TLS negotiation to observe.** PG and MySQL announce the
+  switch on the wire (`SSLRequest` → `'S'`), and the framer flips there. HTTPS
+  is TLS from the first byte, so the HTTP framer recognises the handshake record
+  itself — a `0x16 0x03 0x0x` record carrying a ClientHello where a request line
+  belongs — and marks the connection `LK_CONN_TLS` (`http_frame.c`,
+  `tls_record_head`). That is what stops ciphertext being scanned for method
+  names, and it is why an HTTPS port with no uprobes attached reads as
+  "TLS, unread" instead of as a stream of parse errors.
+
+### Go servers (Caddy, Traefik, MinIO, any `net/http`): a second channel
+
+A Go binary has no libssl: TLS is `crypto/tls`, compiled in. The plaintext
+boundary is therefore inside the application binary, at
+`crypto/tls.(*Conn).Read` / `.Write`, and hooking it needs three things the
+OpenSSL path gets for free (`src/agent/tls_go.c`, `--tls-go PATH`):
+
+1. **The address, from whichever table the binary still has.** First the ELF
+   symbol table (`elf_syms.c`); failing that, Go's own function table
+   (`go_pclntab.c`, `.gopclntab`). The second one is not a fallback in
+   practice — it is the main path. The М0 reconnaissance measured the three Go
+   servers this track names, Caddy, Traefik and MinIO, and **all three ship
+   `-ldflags "-s -w"` binaries with no symbol table**; only a plain `go build`
+   keeps one. What `-s -w` cannot remove is the table the runtime needs for
+   panics and profiles, which carries the entry address and name of every
+   function.
+
+   Either way the *virtual address* is then translated to a *file offset*
+   through the PT_LOAD segment containing it, because that is what a uprobe is
+   registered by. One wrinkle worth knowing: the pclntab header's own
+   `textStart` field is **zero in the file image** — the runtime fills it at
+   load time — so the `.text` section's address stands in. Read literally, the
+   field would place every probe about 4 MB too low, inside a running server.
+   The rule is pinned by a test, and checked against a binary that carries both
+   tables: the address the function table yields is the address its symbol table
+   gives, to the byte.
+
+   Supported: Go 1.18+ pclntab layouts (magic `0xFFFFFFF0`/`0xFFFFFFF1`), a
+   statically linked binary with a `.gopclntab` section. A cgo/externally-linked
+   Go binary keeps the table inside `.data.rel.ro` with no section of its own —
+   finding it there means scanning for the header, which no server in scope
+   needs today. A binary with neither table is dark, and says so.
+2. **Return sites, because uretprobes are unusable here.** The kernel implements
+   a uretprobe by overwriting the return address on the stack; the Go runtime
+   *copies goroutine stacks* when they grow, which rewrites that address behind
+   the kernel's back. So latkit decodes the function body with a minimal x86-64
+   length decoder (`x86_len.c`) and puts ordinary uprobes on its `ret`
+   instructions — the approach Pixie and eCapture take. The decoder **fails
+   closed**: an opcode outside its table, an AVX prefix, or a walk that does not
+   end exactly on the function's last byte means the function is left unhooked
+   and said so in the log. A probe on a byte that is not an instruction boundary
+   would corrupt the observed process, and that is not a trade worth making for
+   coverage. Table-driven, table-tested (`tests/unit/test_x86_len.c`).
+3. **A connection identity that survives Go's scheduler.** Walking
+   `*tls.Conn → net.Conn → fd` by struct offset breaks with Go releases, so
+   latkit does not: the kernel side records, per thread, the last socket cookie
+   that thread talked to (`sock_hint`, written by the existing
+   `tcp_sendmsg`/`tcp_recvmsg` hooks and only when a Go binary is attached), and
+   the return probe resolves its call against it. Three rules, strongest first:
+   a socket call made *during* this Go call names the connection outright and is
+   memoised against the `*tls.Conn` pointer; otherwise the memoised answer
+   stands (a `Read` served out of Go's own buffered record makes no syscall at
+   all); otherwise the thread's most recent socket activity is used, which is
+   what correlates the *first* request on a connection — its bytes arrive with
+   the client's last handshake flight, so the `Read` that returns them makes no
+   syscall of its own. `latkit_tls_correlation_misses_total` counts what none of
+   the three could place.
+
+   The in-flight call itself is keyed by the **goroutine** (R14 under Go's
+   register ABI), not by the thread: a server's `Read` blocks in the netpoller
+   and the goroutine that resumes routinely resumes on another M. Keyed by
+   thread, the return probe finds no entry and the request is lost — measured,
+   on the first connection of the first stand run.
+
+Arguments come from the Go 1.17+ register ABI (receiver `RAX`, `b.ptr` `RBX`,
+`b.len` `RCX`, `n` back in `RAX`). Everything version-specific about Go is in
+that one sentence and in the two symbol names — deliberately, since it is the
+part that moves.
+
+**Scope:** x86-64 only in v1 (arm64 wants its own decoder; an arm64 binary is
+refused with a message rather than probed wrongly). `--tls-go` is repeatable,
+and a named binary that cannot be hooked
+is a startup error, like a bad `--libssl`: it was named explicitly. A binary
+replaced in place (an image update) gets a new inode while uprobes stay on the
+old one, so the same 30 s timer that rescans for libssl re-attaches it.
+
+`latkit_tls_attached{state="go"}` means the Go channel is the live one. When a
+deployment runs both (an nginx front and a Go backend on one host), the gauge
+reports `ok` if everything requested attached and `partial` if anything did not.
+
+### Capture budget on the decrypted channel (РH14)
+
+The per-port budget applies to plaintext too: the uprobe path resolves the
+connection's local port and uses that port's `cap_limit`, so an HTTPS port
+copies ~2 KiB per call (heads, which is all the HTTP framer reads) exactly as
+its cleartext twin does, while a database port keeps the 8 KiB default. The
+HEADERS capture mode still never applies to plaintext (Р40) — that one governs
+ciphertext, which nothing parses.
+
 ## 5. Self-metrics (Р41)
 
 Exposed by both exporters, poured by the `events.c` provider from three sources
 — the kernel per-CPU counters, the conn table, and the attach manager:
 
 ```
-latkit_tls_attached{state}                gauge     state=ok|partial|none (1 on the live one)
+latkit_tls_attached{state}                gauge     state=ok|partial|none|go (1 on the live one)
 latkit_tls_connections                    gauge     TLS connections currently tracked
 latkit_tls_connections_total              counter   TLS connections since start
 latkit_tls_uprobe_events_total            counter   decrypted events submitted
@@ -242,6 +372,16 @@ dropped and counted, so data is never silently corrupted, only absent:
   too) and **drops** its data as a known gap; libgssapi uprobes are v1.1.
 - **SSLKEYLOGFILE / TLS-record decryption** — not needed and not done: the
   uprobe already hands back decrypted application-layer buffers.
+- **Go: arm64, and binaries with no function table at all** (М7, §4b) — the
+  return-site decoder is x86-64 only, and a cgo-linked Go binary whose pclntab
+  has no section of its own is not searched for. Both are refused with a
+  message; neither is guessed at. A *stripped* Go binary is supported (that is
+  what `.gopclntab` is for).
+- **HTTP/3 (QUIC)** — not a TLS gap but a transport one: it never reaches
+  `tcp_sendmsg`, so there is nothing to decrypt or to drop. The watched ports
+  are counted on the UDP path instead (`latkit_udp_bytes_total`, РH16) so an
+  h3-only server reads as "a protocol we do not parse" rather than as a broken
+  agent.
 
 ## 7. Security
 
@@ -267,5 +407,21 @@ also applies to formerly opaque encrypted sessions.
   plaintext stand plus `latkit_tls_connections > 0`,
   `latkit_tls_attached{state="ok"} == 1`, uprobe events flowing, and ~zero
   correlation misses.
-</content>
-</invoke>
+- **HTTPS e2e, two stands** (М7). `verify-http-tls.sh`: nginx over TLS with
+  `--tls auto`, asserting the ordinary HTTP observations — templated routes,
+  4xx/5xx split, plausible p95 — from a fully encrypted run, plus zero blind
+  zones (an accidental h2 negotiation would show up there rather than as a
+  quiet gap). `verify-http-go-tls.sh`: a `net/http` server with `--tls-go`,
+  where the load generator sends three requests per connection in a fixed ratio
+  and the stand asserts the *per-route counts are comparable* — a correlation
+  that only caught the later requests of a connection would light every counter
+  and still be wrong.
+- **Go probe internals, unit** (М7): `test_x86_len.c` (instruction lengths from
+  real assembler output, the return search over a body whose immediates contain
+  fourteen `0xC3` bytes and two actual returns, and every refusal path) and
+  `test_elf_syms.c` (a self-lookup that compares the bytes at the computed file
+  offset with the mapped function — the address arithmetic a uprobe depends on,
+  checked against reality).
+- **Kernel matrix** (`tests/kernel/smoke.sh`): the UDP counters of РH16 get a
+  phase of their own, since their attach targets are ordinary kernel internals
+  that a kernel change can remove silently.

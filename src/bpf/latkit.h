@@ -12,8 +12,11 @@
 /* Capacity and entry size of the comm filter (РМ10). The filter matches the
  * *thread* comm (bpf_get_current_comm), so the list must fit the default
  * DB-server set {postgres, mysqld, mariadbd} plus `connection` — MySQL 8.x
- * renames its per-session threads. LK_COMM_LEN mirrors TASK_COMM_LEN. */
-#define LK_COMM_FILTER_MAX 4
+ * renames its per-session threads. Raised to 8 by РH13.1: an HTTP deployment
+ * scans for {nginx, httpd, apache2, haproxy} instead, a mixed one for both
+ * sets, and the DB four already filled the old ceiling exactly.
+ * LK_COMM_LEN mirrors TASK_COMM_LEN. */
+#define LK_COMM_FILTER_MAX 8
 #define LK_COMM_LEN        16
 
 /* Capacity of the `cgroups` filter map (task 7.1, Р48): a handful of postgres
@@ -25,6 +28,26 @@
  * LK_MAX_CHUNKS): total_len always reports the real call size — budgets cut
  * cap_len only, so the stage-2 reassembler knows the exact size of the hole. */
 #define LK_CAPTURE_LIMIT 8192
+
+/* Per-port capture budget (РH14) — the value of the `ports` map, which used to
+ * be a bare "this port is watched" flag. An HTTP server needs the head of every
+ * message and nothing else, so on a multi-gigabit response the default 8 KiB
+ * per call is pure ringbuf pressure; a DB port keeps the old budget. The
+ * resolution order lives entirely in userspace (main.c fill_ports): an explicit
+ * `--port 8080=http:4096` wins, else the protocol's own default capped by
+ * --capture-limit, else 0 = "follow --capture-limit". The kernel only applies
+ * what it is given, so there is one place to reason about the precedence.
+ * Configuration is static — written before attach, read on the data path — so
+ * there is nothing to race with. */
+struct lk_port_cfg {
+    __u32 cap_limit; /* bytes per send/recv call; 0 = cfg_capture_limit */
+};
+
+/* Default per-call budget of an HTTP port (РH14): a head plus a generous
+ * allowance for cookies. A header block larger than this is normal and honest —
+ * the start line and the first fields arrive first, and the observation is
+ * flagged truncated. */
+#define LK_HTTP_CAPTURE_LIMIT 2048
 
 /* Data-event payload size classes (design decision Р4): the reserve size is
  * picked per chunk from the actual capture size, so small control messages do
@@ -59,6 +82,54 @@ enum lk_stat_id {
     LK_ST_TLS_DECRYPTED_BYTES, /* sum of cap_len over decrypted events */
     LK_ST_TLS_RESERVE_FAIL,    /* bpf_ringbuf_reserve failures on the decrypted path */
     LK_ST_MAX,
+};
+
+/* UDP volume counters (РH16), map `udp_stats`. HTTP/3 is QUIC over UDP: it
+ * never passes through tcp_sendmsg, so to the agent an h3-only server looks
+ * exactly like a broken agent — an empty dashboard and no explanation. These
+ * two counters are the explanation. They count packets and bytes on the watched
+ * local ports and nothing else: no payload is read, no connection is created,
+ * no event is emitted. Per-CPU values, summed by userspace.
+ *
+ * The key packs the local port and the direction so the exposition can carry
+ * {port,dir} without a second map; `dir` is enum lk_dir. */
+struct lk_udp_key {
+    __u16 port;
+    __u8 dir;
+    __u8 _pad;
+};
+
+struct lk_udp_stat {
+    __u64 packets;
+    __u64 bytes;
+};
+
+#define LK_MAX_UDP_KEYS (LK_MAX_PORTS * 2)
+
+/* Go crypto/tls uprobe channel (РH13.3). Two shared shapes:
+ *
+ * lk_go_call — the in-flight arguments of crypto/tls.(*Conn).Read/Write, saved
+ * by the entry probe and consumed by the RET probes (Go 1.17+ register ABI:
+ * receiver in RAX, slice pointer in RBX, length in RCX; the return count comes
+ * back in RAX). `conn` is the *tls.Conn receiver, used purely as an opaque
+ * identity — the twin of SSL* in the OpenSSL channel — never dereferenced, so
+ * no Go struct layout is baked in.
+ *
+ * lk_sock_hint — "the last socket call this thread made", written by the
+ * fentry/fexit socket path and read by the RET probes to answer "which
+ * connection did this Go call belong to". ts_ns is what makes it safe: a hint
+ * older than the Go call's own start proves nothing about it, so it is refused
+ * (and the learned per-Conn mapping is used instead). */
+struct lk_go_call {
+    __u64 conn; /* *tls.Conn receiver: identity only */
+    __u64 buf;  /* b.ptr of the []byte argument */
+    __u64 len;  /* b.len (capacity of the call, not the result) */
+    __u64 ts_ns;
+};
+
+struct lk_sock_hint {
+    __u64 cookie;
+    __u64 ts_ns;
 };
 
 enum lk_ev_type { LK_EV_DATA = 0, LK_EV_CONN_OPEN = 1, LK_EV_CONN_CLOSE = 2 };

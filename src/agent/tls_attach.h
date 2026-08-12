@@ -27,21 +27,43 @@ struct lk_tls;
 enum lk_tls_mode { LK_TLS_OFF = 0, LK_TLS_AUTO };
 
 /* latkit_tls_attached{state}: none = no uprobes live, partial = some symbols
- * attached (e.g. an OpenSSL without the _ex calls), ok = the full set. */
-enum lk_tls_state { LK_TLS_STATE_NONE = 0, LK_TLS_STATE_PARTIAL, LK_TLS_STATE_OK };
+ * attached (e.g. an OpenSSL without the _ex calls), ok = the full set.
+ *
+ * `go` is the one value this module never returns on its own (РH13.3): it means
+ * "the live plaintext channel is the Go one, and it is complete", which is a
+ * statement about both channels together — events.c combines the libssl status
+ * below with the Go one (tls_go.h) into the single value the gauge carries. */
+enum lk_tls_state {
+    LK_TLS_STATE_NONE = 0,
+    LK_TLS_STATE_PARTIAL,
+    LK_TLS_STATE_OK,
+    LK_TLS_STATE_GO,
+    LK_TLS_STATE_MAX
+};
 
 struct lk_tls_cfg {
     enum lk_tls_mode mode;       /* --tls: OFF (default) or AUTO (scan /proc) */
     const char *libssl_override; /* --libssl PATH: attach here, skip the scan */
     const char *comm_filter;     /* --tls-comm: the one process comm to scan for;
-                                  * NULL => the lk_tls_default_comms set */
+                                  * NULL => the `comms` list below */
+    const char *const *comms;    /* NULL-terminated scan set, derived by main.c from
+                                  * the configured port protocols (РH13.1): the DB
+                                  * servers, the OpenSSL web servers, or both. NULL
+                                  * => lk_tls_default_comms, the DB-only default */
     unsigned rescan_sec;         /* AUTO rescan period for new libssl paths (0 => no rescan) */
 };
 
-/* The default AUTO-scan process-comm set, NULL-terminated: every server latkit
- * speaks the protocol of. main.c derives the kernel-side thread-comm filter
- * from the same list (plus `connection`, the MySQL 8.x session-thread name). */
-extern const char *const lk_tls_default_comms[];
+/* The AUTO-scan process-comm sets, NULL-terminated, one per family of server
+ * latkit speaks the protocol of. main.c picks the ones the configured ports
+ * call for (РH13.1) and derives the kernel-side thread-comm filter from the same
+ * lists (plus `connection`, the MySQL 8.x session-thread name).
+ *
+ * The HTTP set covers the servers that reach OpenSSL through a shared libssl.
+ * The Go-based ones (Caddy, Traefik, MinIO) are not here and never will be:
+ * they have no libssl to find, and their plaintext comes from the separate Go
+ * channel (tls_go.h), attached to the binary by name. */
+extern const char *const lk_tls_default_comms[]; /* postgres, mysqld, mariadbd */
+extern const char *const lk_tls_http_comms[];    /* nginx, httpd, apache2, haproxy */
 
 /* Create the handle and decide autoload of the SSL_* programs. MUST be called
  * after latkit_bpf__open() and BEFORE latkit_bpf__load(): when no uprobes will

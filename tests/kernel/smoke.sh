@@ -15,7 +15,12 @@
 #   - TLS: uprobe events flowed, correlation misses == 0, tls conns == conns;
 #     plus (with bpftool) the SSL_set_fd walk check — ssl_to_conn must be
 #     populated during tlspipe's post-handshake pause, before any data call
-#     could have triggered the nested-syscall fallback (Р37).
+#     could have triggered the nested-syscall fallback (Р37);
+#   - UDP (РH16): datagrams on the captured port are counted and TCP capture is
+#     untouched by them. These are the М7 fentries on udp_sendmsg / udpv6_sendmsg
+#     / skb_consume_udp, whose targets are ordinary kernel internals — exactly
+#     the kind of attach that a kernel change breaks silently, which is why the
+#     matrix runs them.
 #
 #   sudo tests/kernel/smoke.sh [--port N] [--repeat N] [--no-tls] [--mysql] [--build DIR]
 set -u
@@ -152,6 +157,53 @@ if start_agent plain; then
         fail "pgstream failed"
         tail -5 "$TMP/pgstream.log" | sed 's/^/  | /'
         stop_agent plain || true
+    fi
+fi
+
+# --- UDP counters (РH16) -------------------------------------------------------
+# HTTP/3 is QUIC over UDP and never reaches the TCP capture point; the counters
+# below are what turns "the dashboard is empty" into "this port speaks a protocol
+# we do not parse". Here they are driven with a plain datagram echo: one send and
+# one receive on the captured port, in both directions.
+log "UDP counters (РH16)"
+if start_agent udp; then
+    if python3 - "$PORT" <<'EOF' >"$TMP/udp.out" 2>&1
+import socket, sys, time
+port = int(sys.argv[1])
+srv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+srv.bind(("127.0.0.1", port))
+cli = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for _ in range(5):
+    cli.sendto(b"x" * 100, ("127.0.0.1", port))
+    data, addr = srv.recvfrom(2048)
+    srv.sendto(b"y" * 50, addr)
+    cli.recv(2048)
+    time.sleep(0.01)
+print("udp: done packets=5 in_bytes=500 out_bytes=250")
+EOF
+    then
+        note "$(tail -1 "$TMP/udp.out")"
+        if stop_agent udp; then
+            prom=$TMP/udp.prom
+            assert_eq "udp: packets in" \
+                "$(metric "$prom" 'latkit_udp_packets_total{port="'"$PORT"'",dir="in"}')" 5
+            assert_eq "udp: bytes in" \
+                "$(metric "$prom" 'latkit_udp_bytes_total{port="'"$PORT"'",dir="in"}')" 500
+            assert_eq "udp: packets out" \
+                "$(metric "$prom" 'latkit_udp_packets_total{port="'"$PORT"'",dir="out"}')" 5
+            # Datagrams are counted and nothing else: no connection, no event, no
+            # parse. A UDP packet that reached the TCP pipeline would show here.
+            assert_eq "udp: connections_opened_total" \
+                "$(metric "$prom" latkit_connections_opened_total)" 0
+            assert_eq "udp: parse_errors_total" "$(metric "$prom" latkit_parse_errors_total)" 0
+        else
+            fail "agent exited non-zero after UDP phase"
+            tail -5 "$TMP/udp.log" | sed 's/^/  | /'
+        fi
+    else
+        fail "udp driver failed"
+        tail -5 "$TMP/udp.out" | sed 's/^/  | /'
+        stop_agent udp || true
     fi
 fi
 

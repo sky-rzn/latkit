@@ -86,6 +86,7 @@ enum lk_http_note {
     LK_HTTP_NOTE_PIPELINE_OVER, /* more in-flight requests than the ring holds */
     LK_HTTP_NOTE_BODY_UNSEEN,   /* body promised, none on the socket (РH4) */
     LK_HTTP_NOTE_NO_MEM,        /* framer state allocation failed */
+    LK_HTTP_NOTE_TLS,           /* a TLS record where a request line belongs (М7) */
     LK_HTTP_NOTE_BLIND_H2,      /* HTTP/2 preface: h2, hence gRPC, is out of scope */
     LK_HTTP_NOTE_BLIND_UPGRADE, /* 101 Switching Protocols: websocket, h2c, ... */
     LK_HTTP_NOTE_BLIND_CONNECT, /* CONNECT answered 2xx: the rest is a tunnel */

@@ -54,10 +54,20 @@ Two MySQL-specific operator traps:
   scopes the capture — leave comm unset. This is distinct from `--tls-comm`,
   which matches the *process* comm for the libssl `/proc` scan and is fine as
   `mysqld` (MYSQL.md М5).
-- **TLS scan set.** `--tls auto` scans `{postgres, mysqld, mariadbd}` by
-  default; `--tls-comm` narrows it. MariaDB linking bundled wolfSSL/GnuTLS has
-  no `libssl.so` to attach to — TLS is then detected and dropped-and-counted,
-  visible as `latkit_tls_attached{state!="ok"}`.
+- **TLS scan set.** `--tls auto` scans the comms its ports imply (М7):
+  `{postgres, mysqld, mariadbd}` for a database port, `{nginx, httpd, apache2,
+  haproxy}` for an HTTP one, both for a mixed deployment; `--tls-comm` narrows
+  it to one name. MariaDB linking bundled wolfSSL/GnuTLS has no `libssl.so` to
+  attach to — TLS is then detected and dropped-and-counted, visible as
+  `latkit_tls_attached{state!="ok"}`.
+- **Go servers** (Caddy, Traefik, any `net/http`) have no libssl to find:
+  name the binary with `--tls-go /usr/bin/caddy` and latkit probes `crypto/tls`
+  inside it, stripped binaries included. This channel needs no `/proc` scan, so
+  it needs neither `CAP_SYS_PTRACE` nor `hostPID` — only the `CAP_SYS_ADMIN`
+  every uprobe needs, and the binary readable at the same path (a bind mount of
+  the host's file in a container: the uprobe binds to the inode, so both sides
+  must see the same file). x86-64 only; see
+  [notes-tls.md](notes-tls.md) §4b.
 
 ## The release binary
 

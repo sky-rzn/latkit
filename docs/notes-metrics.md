@@ -138,6 +138,8 @@ the HTTP dashboard. A large or growing share is the signal to raise
 | `latkit_queries_dropped_total{reason, proto}` | counter | parser `units_dropped_*` — `reason`=`resync\|disconnect\|overflow` (Р19), per `proto` |
 | `latkit_ignored_conns_total{reason, proto}` | counter | deliberate blind zones — `reason`=`replication\|compressed` (РМ7/РМ8) or, on HTTP, `h2\|upgrade\|connect` (РH4), per `proto` |
 | `latkit_exporter_requests_total{path,code}` | counter | the agent's **own** `/metrics` server (renamed from `latkit_http_requests_total` in the HTTP track, РH9) |
+| `latkit_udp_bytes_total{port,dir}` | counter | kernel `udp_stats` map — datagram volume on a captured port, **counted and never parsed** (РH16, М7). Present only once a port sees UDP. Its reason for existing: HTTP/3 is QUIC over UDP and never reaches the TCP capture point, so without these an h3 server is indistinguishable from a broken agent |
+| `latkit_udp_packets_total{port,dir}` | counter | the same map, packet count |
 | `latkit_metric_series` | gauge | the registry itself — live count of cardinality-controlled series |
 | `process_cpu_seconds_total` | counter | `getrusage(2)` |
 | `process_resident_memory_bytes` | gauge | `/proc/self/statm` |

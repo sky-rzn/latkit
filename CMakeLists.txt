@@ -245,9 +245,14 @@ target_include_directories(latkit_export PRIVATE
 target_link_libraries(latkit_export PUBLIC latkit_metrics latkit_norm)
 
 # --- agent -----------------------------------------------------------------
+# tls_go.c is the Go half of the TLS channel (РH13.3); elf_syms.c and x86_len.c
+# are its two pure dependencies — an ELF symbol reader and an instruction-length
+# decoder — kept libbpf-free so the unit tests can link them on their own.
 add_executable(latkit src/agent/main.c src/agent/loop.c src/agent/events.c
                src/agent/decode.c src/agent/conn_table.c
                src/agent/pipeline.c src/agent/record.c src/agent/tls_attach.c
+               src/agent/tls_go.c src/agent/elf_syms.c src/agent/x86_len.c
+               src/agent/go_pclntab.c
                src/agent/cgroup_filter.c src/agent/cgroup_match.c
                src/common/otel_env.c)
 add_dependencies(latkit latkit_skel)

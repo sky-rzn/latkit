@@ -297,8 +297,31 @@ each has a trace in the corpus so М2 can prove it detects them:
 | **h2c upgrade** | `Upgrade: h2c` + `HTTP2-Settings` in a request; **only a `101` response makes it real** | whole connection past the `101`. Measured: none of nginx 1.29, Go, node or gunicorn accepts the upgrade — all four answer an ordinary HTTP/1.1 `200`, so the request alone must not be treated as a blind zone |
 | **WebSocket** | `Upgrade: websocket` + a `101` response | connection after the `101`; the handshake unit itself is observed |
 | **CONNECT tunnel** | `CONNECT` + a `2xx` response | connection after the response head |
-| **TLS without an attached uprobe** | existing TLS detection | whole connection, existing counter |
+| **TLS without an attached uprobe** | the handshake record itself (see below) | whole connection, counted as a TLS connection rather than as parse errors |
 | **HTTP/3 / QUIC** | *not detectable* — UDP never reaches `tcp_sendmsg` | invisible; РH16's UDP byte counter exists so this looks like QUIC rather than like a broken agent |
+
+### TLS: recognised, not negotiated (М7)
+
+PG and MySQL announce their switch to TLS on the wire — `SSLRequest`, a one-byte
+`'S'` — and the framer flips there. HTTP announces nothing: HTTPS is TLS
+underneath, so the very first byte of the socket is already a handshake record
+and there is no request line to wait for.
+
+So the framer looks for the record itself, and only where it could not be
+anything else: the first bytes of a direction, `0x16` (handshake) with a
+`0x03 0x0x` version, and the message type that belongs on that side —
+ClientHello from the client, ServerHello from the server. A byte sequence like
+that cannot begin an HTTP/1.x message, which must start with a method token or
+`HTTP/1.`. On a match the connection is marked `LK_CONN_TLS`, which is the same
+state a PG connection reaches after its `'S'`: ciphertext socket events are
+dropped instead of framed, and the plaintext — if a uprobe channel is attached
+(docs/notes-tls.md §4b) — arrives from there and is framed normally.
+
+Without that recognition the framer would scan ciphertext for method names for
+the life of the connection. That was measurable, not theoretical: before М7 the
+two TLS traces in the corpus were the only "clean" traces that produced parse
+errors, and the acceptance test carried an exception for them. It no longer
+does.
 
 ### `sendfile`, and a measurement that changes the story
 

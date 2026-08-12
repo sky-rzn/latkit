@@ -64,9 +64,9 @@ the corpus needs both. File name = `<scenario>.lkt`.
 | `nosendfile-static` (nginx) | the same 8 MB through the socket — the control |
 | `proxy-both-legs` (nginx) | front (8080) **and** upstream (8082) legs in one trace |
 | `h2c-prior` (nginx) | cleartext h2 by prior knowledge, `http2 on` |
-| `tls` (nginx) | TLS on the socket: ciphertext only |
-| `tls-decrypted` (nginx) | the same load with libssl uprobes — plaintext, and curl's ALPN makes it **h2 inside TLS** |
-| `tls-decrypted-h1` (nginx) | `--http1.1`: plaintext HTTP/1.1 through the uprobe channel |
+| `tls` (nginx) | TLS on the socket: ciphertext only. Since М7 the framer recognises the handshake record and marks the connection TLS, so this trace yields no observations *and* no parse errors |
+| `tls-decrypted` (nginx) | the same load with libssl uprobes — plaintext, and curl's ALPN makes it **h2 inside TLS**, i.e. a blind zone inside a TLS connection |
+| `tls-decrypted-h1` (nginx) | `--http1.1`: plaintext HTTP/1.1 through the uprobe channel — the М7 acceptance case, two ordinary observations |
 
 113 traces total (nginx 33, go 28, node 26, gunicorn 26); 5.4 MB.
 
@@ -203,6 +203,15 @@ not a fallback; `nm` covers only self-built services. `go tool nm` does not
 help — it reads the same ELF symtab and returns nothing on these binaries. This
 is a real scope increase for М7 and an argument for keeping М7 deferrable, as
 the plan already allows.
+
+**Resolved in М7:** `src/agent/go_pclntab.c` reads the function table, so
+`--tls-go` resolves `crypto/tls.(*Conn).Read/Write` in exactly these stripped
+binaries — verified against this Caddy image, whose two functions decode into 8
+and 7 return sites. The symbol table is still tried first (it is what a
+self-built server has) and gives byte-identical addresses on a binary carrying
+both. The cgo-linked binaries in the table above (containerd, runc, ctr), whose
+pclntab has no section of its own, remain out of scope — none of them is a
+server this track observes.
 
 ### 4. HTTP/2 over TLS — 4 of 10 client shapes, and every browser
 

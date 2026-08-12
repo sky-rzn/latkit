@@ -91,6 +91,12 @@ static const struct lk_tls_probe tls_probes[] = {
  * from the same set. */
 const char *const lk_tls_default_comms[] = {"postgres", "mysqld", "mariadbd", NULL};
 
+/* The HTTP half of the same idea (РH13.1, М7): the web servers whose TLS goes
+ * through a shared libssl, so the existing channel covers them with nothing but
+ * a wider scan. Both Apache spellings are here because both are in the field —
+ * `httpd` on RHEL-family distributions, `apache2` on Debian ones. */
+const char *const lk_tls_http_comms[] = {"nginx", "httpd", "apache2", "haproxy", NULL};
+
 /* An attached libssl, identified by its file so a rescan never double-attaches
  * the same binary (many backends map it; its /proc/<pid>/root path differs per
  * pid but the device+inode do not). */
@@ -330,7 +336,7 @@ struct lk_tls *lk_tls_new(struct latkit_bpf *skel, const struct lk_tls_cfg *cfg)
         t->single_comm[0] = cfg->comm_filter;
         t->comms = t->single_comm;
     } else {
-        t->comms = lk_tls_default_comms;
+        t->comms = cfg->comms && cfg->comms[0] ? cfg->comms : lk_tls_default_comms;
     }
     /* Enabled when there is anything to attach to: an explicit path always, or
      * AUTO which will scan. OFF with no --libssl loads none of the SSL_* programs
