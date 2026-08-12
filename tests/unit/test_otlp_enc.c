@@ -10,6 +10,8 @@
 #include "metrics.h"
 #include "otlp.h"
 #include "pbuf.h"
+#include "proto.h" /* enum lk_otel_kind (РH11) */
+#include "spans.h"
 #include "timebase.h"
 
 #include <stdio.h>
@@ -314,12 +316,181 @@ static void test_bhist(void)
     pb_free(&pb);
 }
 
+/* --- span encoder (task 5.3, and the HTTP shape РH11 / М6) ---------------- */
+
+/* Decode one Span out of a freshly encoded pbuf. */
+static bool encode_span(struct pbuf *pb, const struct lk_span *sp, struct field *span)
+{
+    struct lk_timebase tb = {.offset_ns = 0};
+
+    pb_init(pb);
+    lk_otlp_encode_span(pb, sp, &tb);
+    EXPECT(!pb->oom, "span: encode did not OOM");
+    return find(pb->buf, pb->len, 2, span);
+}
+
+/* The attribute (field 9) with this key, as a string; NULL when absent. `out`
+ * receives a NUL-terminated copy. */
+static bool attr_str(const struct field *span, const char *key, char *out, size_t cap)
+{
+    struct rd r = {span->data, span->data + span->len};
+    struct field f, k, av, sv;
+
+    while (next_field(&r, &f)) {
+        if (f.num != 9)
+            continue;
+        if (!find(f.data, f.len, 1, &k) || k.len != strlen(key) || memcmp(k.data, key, k.len))
+            continue;
+        if (!find(f.data, f.len, 2, &av) || !find(av.data, av.len, 1, &sv))
+            return false;
+        if (sv.len >= cap)
+            return false;
+        memcpy(out, sv.data, sv.len);
+        out[sv.len] = '\0';
+        return true;
+    }
+    return false;
+}
+
+/* The same, for an int_value attribute. */
+static bool attr_int(const struct field *span, const char *key, uint64_t *out)
+{
+    struct rd r = {span->data, span->data + span->len};
+    struct field f, k, av, iv;
+
+    while (next_field(&r, &f)) {
+        if (f.num != 9)
+            continue;
+        if (!find(f.data, f.len, 1, &k) || k.len != strlen(key) || memcmp(k.data, key, k.len))
+            continue;
+        if (!find(f.data, f.len, 2, &av) || !find(av.data, av.len, 3, &iv))
+            return false;
+        *out = iv.varint;
+        return true;
+    }
+    return false;
+}
+
+/* A database span keeps the shape it has had since task 5.3: a *client* span
+ * with db.* attributes and no parent. Pinned here because М6 put a branch in
+ * front of it (РH15: nothing about PG/MySQL may move). */
+static void test_span_db(void)
+{
+    struct lk_span sp = {
+        .start_ns = CREATED,
+        .end_ns = NOW,
+        .db_system = "postgresql",
+        .rows = 3,
+        .have_rows = true,
+    };
+    struct pbuf pb;
+    struct field span, kind;
+    char buf[128];
+
+    snprintf(sp.name, sizeof(sp.name), "select ?");
+    snprintf(sp.db, sizeof(sp.db), "appdb");
+    snprintf(sp.user, sizeof(sp.user), "alice");
+    EXPECT(encode_span(&pb, &sp, &span), "db span: encoded");
+    EXPECT(find(span.data, span.len, 6, &kind) && kind.varint == 3, "db span: kind CLIENT");
+    EXPECT(!find(span.data, span.len, 4, &(struct field){0}), "db span: no parent_span_id");
+    EXPECT(attr_str(&span, "db.system.name", buf, sizeof(buf)) && !strcmp(buf, "postgresql"),
+           "db span: db.system.name");
+    EXPECT(attr_str(&span, "db.namespace", buf, sizeof(buf)) && !strcmp(buf, "appdb"),
+           "db span: db.namespace");
+    EXPECT(!attr_str(&span, "http.route", buf, sizeof(buf)), "db span: no http attributes");
+    pb_free(&pb);
+}
+
+/* The HTTP shape (РH11): a *server* span, a parent from the caller's
+ * `traceparent`, the semconv attribute set — and not one db.* key. */
+static void test_span_http(void)
+{
+    struct lk_span_http h = {
+        .bytes_in = 11,
+        .bytes_out = 4096,
+        .status = 200,
+        .client_port = 51000,
+        .server_port = 8080,
+        .version = 1,
+    };
+    struct lk_span sp = {
+        .start_ns = CREATED,
+        .end_ns = NOW,
+        .otel_kind = LK_OTEL_KIND_HTTP,
+        .http = &h,
+        .have_parent = true,
+        .text = "/orders/42?token=***",
+        .text_len = 20,
+    };
+    struct pbuf pb;
+    struct field span, kind, parent, tstate;
+    uint64_t iv;
+    char buf[128];
+
+    snprintf(sp.name, sizeof(sp.name), "GET /orders/{id}");
+    memset(sp.parent_id, 0xab, sizeof(sp.parent_id));
+    snprintf(h.route, sizeof(h.route), "/orders/{id}");
+    snprintf(h.method, sizeof(h.method), "GET");
+    snprintf(h.host, sizeof(h.host), "shop.example");
+    snprintf(h.ua, sizeof(h.ua), "curl/8.5.0");
+    snprintf(h.client, sizeof(h.client), "10.0.0.7");
+    snprintf(h.ctype, sizeof(h.ctype), "application/json");
+    snprintf(h.req_id, sizeof(h.req_id), "8f14e45f");
+    snprintf(h.tstate, sizeof(h.tstate), "rojo=00f067aa0ba902b7");
+
+    EXPECT(encode_span(&pb, &sp, &span), "http span: encoded");
+    /* The three fields that make it a *child server* span rather than a
+     * standalone client one — the whole point of М6. */
+    EXPECT(find(span.data, span.len, 6, &kind) && kind.varint == 2, "http span: kind SERVER");
+    EXPECT(find(span.data, span.len, 4, &parent) && parent.len == 8, "http span: parent_span_id");
+    EXPECT(find(span.data, span.len, 3, &tstate) && tstate.len == strlen(h.tstate),
+           "http span: trace_state carried");
+
+    EXPECT(attr_str(&span, "http.request.method", buf, sizeof(buf)) && !strcmp(buf, "GET"),
+           "http span: http.request.method");
+    EXPECT(attr_str(&span, "http.route", buf, sizeof(buf)) && !strcmp(buf, "/orders/{id}"),
+           "http span: http.route");
+    EXPECT(attr_int(&span, "http.response.status_code", &iv) && iv == 200,
+           "http span: status_code as an int");
+    EXPECT(attr_str(&span, "server.address", buf, sizeof(buf)) && !strcmp(buf, "shop.example"),
+           "http span: server.address");
+    EXPECT(attr_str(&span, "url.scheme", buf, sizeof(buf)) && !strcmp(buf, "http"),
+           "http span: url.scheme");
+    EXPECT(attr_str(&span, "url.path", buf, sizeof(buf)) && !strcmp(buf, "/orders/42?token=***"),
+           "http span: url.path, redacted");
+    EXPECT(attr_str(&span, "network.protocol.version", buf, sizeof(buf)) && !strcmp(buf, "1.1"),
+           "http span: protocol version");
+    EXPECT(attr_str(&span, "user_agent.original", buf, sizeof(buf)) && !strcmp(buf, "curl/8.5.0"),
+           "http span: user_agent.original");
+    EXPECT(attr_str(&span, "client.address", buf, sizeof(buf)) && !strcmp(buf, "10.0.0.7"),
+           "http span: client.address");
+    EXPECT(attr_int(&span, "http.response.body.size", &iv) && iv == 4096,
+           "http span: response body size");
+    EXPECT(!attr_str(&span, "db.system.name", buf, sizeof(buf)), "http span: no db.system.name");
+    EXPECT(!attr_str(&span, "db.query.text", buf, sizeof(buf)), "http span: no db.query.text");
+    EXPECT(!find(span.data, span.len, 15, &(struct field){0}), "http span: 200 sets no Status");
+
+    /* https when the bytes arrived through the TLS path, and a 5xx — the only
+     * status that is the *server's* failure — sets the span status (РH10). */
+    h.tls = true;
+    h.status = 503;
+    sp.error = true;
+    pb_free(&pb);
+    EXPECT(encode_span(&pb, &sp, &span), "http span: re-encoded");
+    EXPECT(attr_str(&span, "url.scheme", buf, sizeof(buf)) && !strcmp(buf, "https"),
+           "http span: url.scheme https on TLS");
+    EXPECT(find(span.data, span.len, 15, &(struct field){0}), "http span: 5xx sets Status");
+    pb_free(&pb);
+}
+
 int main(void)
 {
     test_counter();
     test_gauge();
     test_hist();
     test_bhist();
+    test_span_db();
+    test_span_http();
     printf(failures ? "\n%d FAILURES\n" : "\nall otlp encoder tests passed\n", failures);
     return failures ? 1 : 0;
 }

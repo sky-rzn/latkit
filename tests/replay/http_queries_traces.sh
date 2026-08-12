@@ -254,16 +254,19 @@ for trace in "$DIR"/*/*.lkt; do
         # gunicorn does not pipeline: the second request lands on a connection
         # it never answers, so it is dropped and counted rather than observed.
         nobs 1
-        has '^http .* target=/json/[^ ]*token=s3cr3t'
+        has '^http .* target=/json/[^ ]*token=\*\*\*'
         has '^http .* route=/json/\{id\} '
         ;;
     */traceparent)
         nobs 2
-        # The raw target reaches the sink unredacted — the span redactor is
-        # М6's job — while the *route* beside it is the template, with the id
-        # collapsed and the query gone: the two identities of РH7, side by side
-        # on one line.
-        has '^http .* target=/json/[^ ]*token=s3cr3t'
+        # Two identities side by side (РH7): the *route* is the template, with
+        # the id collapsed and the query gone, and the target beside it is the
+        # path as it arrived — except for the credential-shaped query value,
+        # which РH12's redactor replaced at the handler, before any consumer
+        # (М6). The raw value appears nowhere in this output; http_privacy.sh
+        # asserts that across every surface at once.
+        has '^http .* target=/json/[^ ]*token=\*\*\*'
+        lacks 's3cr3t'
         has '^http .* route=/json/\{id\} '
         # Without --http-user the credential header is not read at all.
         has '^http .* user=- '
@@ -273,6 +276,28 @@ for trace in "$DIR"/*/*.lkt; do
         # ... and never the password half, whatever the flag says (РH12).
         printf '%s\n' "$with_user" | grep -Eq 'hunter2|s3cr3tpass' &&
             fail "a password reached the output"
+
+        # --- М6 (РH11): the span joins the caller's trace -------------------
+        # Ratio 0, so *nothing* is sampled by chance: every span below exists
+        # because an inbound `traceparent` said this trace is being recorded.
+        # The corpus request carries the W3C example context with sampled=1;
+        # the second one on the same connection carries sampled=0 and must
+        # produce no span at all — parent-based sampling, on real recorded
+        # traffic rather than on a synthetic observation.
+        spans=$("$LKT" --proto http --quiet --spans 0 "$trace" 2>&1)
+        printf '%s\n' "$spans" |
+            grep -Eq '^span trace=4bf92f3577b34da6a3ce929d0e0e4736 parent=00f067aa0ba902b7 ' ||
+            fail "the span did not join the caller's trace as its child"
+        printf '%s\n' "$spans" | grep -Eq '^span .* kind=server ' ||
+            fail "the agent's span is not a server span"
+        printf '%s\n' "$spans" | grep -Eq '^span .* route=/json/\{id\} ' ||
+            fail "the span carries no http.route"
+        printf '%s\n' "$spans" | grep -Eq '^span .* tstate="rojo=00f067aa0ba902b7,' ||
+            fail "tracestate did not survive verbatim"
+        printf '%s\n' "$spans" | grep -Eq '^spans: sampled=1 ' ||
+            fail "expected exactly one sampled span (sampled=0 must not be sampled)"
+        printf '%s\n' "$spans" | grep -Eq 's3cr3t|YWRtaW46aHVudGVyMg|deadbeefcafe' &&
+            fail "a secret reached the span"
         ;;
     esac
 done

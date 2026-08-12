@@ -63,6 +63,28 @@ Prometheus on 9090), <http://localhost:9752/metrics> (the agent),
   `rate()` window under steady load. That is real captured latency, not a
   histogram error.
 
+## Not here yet: the HTTP stand
+
+The HTTP track's e2e stand (`docker-compose.http.yml` + `verify-http.sh`: nginx,
+a Go backend, a load generator) belongs to PLAN-HTTP.md М8 and does not exist
+yet, so the М6 claim "the agent's span shows up in a trace backend as a child of
+the client's span" is verified **offline** rather than in a live Jaeger:
+
+- `tests/replay/http_queries_traces.sh` replays the recorded `*/traceparent.lkt`
+  corpus traces (four servers, a real W3C context on the wire) through the
+  production handler and the real span collector, and asserts that the resulting
+  span carries the caller's `trace_id`, the caller's span id as its parent, kind
+  `server`, and the caller's `tracestate` — and that the second request on the
+  same connection, whose `traceparent` says `sampled=0`, produces no span at all;
+- `tests/unit/test_otlp_enc.c` asserts the same span on the wire, decoding the
+  encoder's protobuf: `SPAN_KIND_SERVER`, `parent_span_id`, `trace_state`, and
+  the HTTP semconv attributes with no `db.*` among them.
+
+What that pair does not cover is a real collector accepting the payload, which is
+exactly what the live stand adds — the base stand already validates the traces
+pipeline for database spans (the collector 400s malformed OTLP), and the HTTP one
+extends it to this span shape in М8.
+
 ## Files
 
 | File | Role |

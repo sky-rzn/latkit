@@ -30,6 +30,7 @@ struct pbuf;
 struct lk_metric_view;
 struct lk_timebase;
 struct lk_query_sink;
+struct lk_span;
 
 struct lk_otlp_cfg {
     const char *endpoint;              /* http://host:port[/path]; enables the exporter */
@@ -70,5 +71,12 @@ const struct lk_query_sink *lk_otlp_span_sink(struct lk_otlp *o);
  * is converted to the data point's start_time through tb. */
 void lk_otlp_encode_metric(struct pbuf *pb, const struct lk_metric_view *v,
                            const struct lk_timebase *tb, uint64_t now_wall_ns);
+
+/* Encode one collected span as a ScopeSpans.spans (field 2) Span into an open
+ * pbuf. Exposed for the same reason as the metric encoder: the two span shapes
+ * (db client, HTTP server — РH11) differ in their kind, their parent and every
+ * attribute, and a test that asserts on the bytes is the only way to keep that
+ * from drifting silently. The exporter calls it from the ring drain. */
+void lk_otlp_encode_span(struct pbuf *pb, const struct lk_span *sp, const struct lk_timebase *tb);
 
 #endif /* LATKIT_OTLP_H */

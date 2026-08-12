@@ -45,6 +45,14 @@ struct h_obs {
     char route[LK_ROUTE_TEXT_MAX]; /* the template (РH7); "" = none reported */
     __u64 route_fp;
     char host[64], user[64], app[64], ver[16];
+    /* The span material of РH11 (М6): the trace context the request arrived
+     * under and the head fields that are attributes rather than labels. Copied
+     * like everything else — lk_query_obs.http points into the handler's state
+     * and is gone the moment the callback returns. */
+    bool have_http, have_trace;
+    __u8 trace_id[16], parent_id[8], trace_flags, version;
+    __u64 ts_interim;
+    char tracestate[LK_HTTP_TSTATE_MAX + 1], req_id[64], ctype[64];
 };
 
 struct h_sess {
@@ -94,6 +102,21 @@ static inline void h_on_query(void *ctx, const struct lk_conn *c, const struct l
     snprintf(r->user, sizeof(r->user), "%s", s->user);
     snprintf(r->app, sizeof(r->app), "%s", s->app);
     snprintf(r->ver, sizeof(r->ver), "%s", s->server_version);
+    if (o->http) {
+        r->have_http = true;
+        r->have_trace = o->http->trace_id != NULL;
+        if (r->have_trace) {
+            memcpy(r->trace_id, o->http->trace_id, sizeof(r->trace_id));
+            memcpy(r->parent_id, o->http->parent_id, sizeof(r->parent_id));
+        }
+        r->trace_flags = o->http->trace_flags;
+        r->version = o->http->version;
+        r->ts_interim = o->http->ts_interim_ns;
+        if (o->http->tracestate && o->http->tracestate_len < sizeof(r->tracestate))
+            memcpy(r->tracestate, o->http->tracestate, o->http->tracestate_len);
+        snprintf(r->req_id, sizeof(r->req_id), "%s", o->http->req_id ? o->http->req_id : "");
+        snprintf(r->ctype, sizeof(r->ctype), "%s", o->http->ctype ? o->http->ctype : "");
+    }
 }
 
 static inline void h_on_session(void *ctx, const struct lk_conn *c, const struct lk_session *s)

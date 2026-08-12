@@ -50,6 +50,7 @@
 #include <string.h>
 
 #include "http.h"
+#include "norm_redact.h"
 
 /* Framer state (РH1), lazily allocated: the connection table frees it on every
  * removal path. NULL means we cannot frame this connection at all — say so and
@@ -862,6 +863,87 @@ static void http_stream_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir 
     }
 }
 
+/* --- masking the shown head (РH3/РH12, М6) --------------------------------- */
+
+/* The four headers that carry a credential rather than a description of one.
+ * `Cookie` is on the list for the same reason as `Authorization`: a session
+ * cookie *is* the session, and anyone holding the bytes holds the account. */
+static bool header_is_secret(struct http_span name)
+{
+    return http_span_eq_ci(name, "authorization") || http_span_eq_ci(name, "cookie") ||
+           http_span_eq_ci(name, "set-cookie") || http_span_eq_ci(name, "proxy-authorization");
+}
+
+/* The offset of a span inside the caller's copy, or n when it is not in it —
+ * which cannot happen, since every span here came out of this very buffer. */
+static size_t span_off(const __u8 *base, __u32 n, struct http_span s)
+{
+    size_t off = (size_t)(s.p - (const char *)base);
+
+    return (!s.p || off > n || s.n > n - off) ? n : off;
+}
+
+/* Blank a span of the caller's copy. Same length, so every offset in the
+ * hexdump beside it still points where it did on the wire. */
+static void blank(__u8 *base, __u32 n, struct http_span s)
+{
+    size_t off = span_off(base, n, s);
+
+    if (off < n)
+        memset(base + off, '*', s.n);
+}
+
+/* РH12's query redaction, applied to a span of the copy. */
+static void blank_query(__u8 *base, __u32 n, struct http_span s)
+{
+    size_t off = span_off(base, n, s);
+
+    if (off < n)
+        lk_url_redact_inplace((char *)base + off, s.n);
+}
+
+/* Hide the two kinds of secret a head carries before it is *displayed*
+ * (`--messages --hexdump`, lkt_messages): the credential headers, and the query
+ * values РH12 redacts everywhere else. Only heads are touched — a 'D'/'E'/'!'
+ * message has no bytes at all (РH3), bodies are never captured, and there is
+ * nothing else in the dictionary.
+ *
+ * Deliberately *not* done at framing time. The framer publishes the head as it
+ * arrived because the handler above it still has to read `Authorization` when
+ * `--http-user basic` asks for the name half; masking there would make the flag
+ * silently do nothing. So this runs on the viewer's own copy, at the point where
+ * bytes turn into output, which is also the only place where the question "who
+ * will read this" has an answer. */
+static void http_mask_body(const struct lk_msg *m, __u8 *p, __u32 n)
+{
+    struct http_head h;
+    struct http_span line, name, val;
+
+    if (!p || !n)
+        return;
+    if (m->type != LK_HTTP_MSG_REQ && m->type != LK_HTTP_MSG_RESP && m->type != LK_HTTP_MSG_INTER)
+        return;
+    http_head_init(&h, p, n);
+    if (!http_head_line(&h, &line))
+        return;
+    /* The start line of a request holds the target, and a target holds
+     * `?token=…` as often as a header holds a bearer. Only the target span is
+     * handed to the redactor, not the whole line: everything after it is
+     * ` HTTP/1.1`, and a redactor told to treat that as the tail of a query
+     * value would blank the version — a masked head that no longer shows its own
+     * framing is a poor trade for hiding one more byte. */
+    if (m->type == LK_HTTP_MSG_REQ) {
+        struct http_span method, target;
+        __u8 minor;
+
+        if (http_parse_req_line(line, &method, &target, &minor) && target.n)
+            blank_query(p, n, target);
+    }
+    while (http_head_field(&h, &name, &val))
+        if (header_is_secret(name))
+            blank(p, n, val);
+}
+
 const struct lk_proto_ops lk_proto_http_ops = {
     .name = "http",
     /* db_system stays NULL: HTTP is not a database, and otel_kind is what
@@ -881,4 +963,5 @@ const struct lk_proto_ops lk_proto_http_ops = {
      * above are the machine. */
     .stream_bytes = http_stream_bytes,
     .stream_hole = http_stream_hole,
+    .mask_body = http_mask_body,
 };

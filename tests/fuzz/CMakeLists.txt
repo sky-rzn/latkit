@@ -43,10 +43,12 @@ set(FUZZ_PROTO_SRC
     ${CMAKE_SOURCE_DIR}/src/proto/http/http_route.c)
 set(FUZZ_CORE_SRC
     ${CMAKE_SOURCE_DIR}/src/agent/conn_table.c ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
-# Since М4 the HTTP handler classifies through the route templater, so every
-# target that compiles the proto sources needs the normaliser sources too.
+# Since М4 the HTTP handler classifies through the route templater, and since М6
+# it redacts through norm_redact.c, so every target that compiles the proto
+# sources needs the normaliser sources too.
 set(FUZZ_NORM_SRC ${CMAKE_SOURCE_DIR}/src/norm/norm_sql.c
-                  ${CMAKE_SOURCE_DIR}/src/norm/norm_route.c)
+                  ${CMAKE_SOURCE_DIR}/src/norm/norm_route.c
+                  ${CMAKE_SOURCE_DIR}/src/norm/norm_redact.c)
 
 function(latkit_fuzzer name)
     add_executable(${name} ${ARGN})

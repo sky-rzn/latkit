@@ -24,6 +24,23 @@ const struct lk_proto_ops *lk_proto_find(const char *name, size_t name_len)
     return NULL;
 }
 
+__u32 lk_msg_body_for_display(const struct lk_proto_ops *ops, const struct lk_msg *m, __u8 *out,
+                              __u32 outcap)
+{
+    __u32 n = m->body_cap < outcap ? m->body_cap : outcap;
+
+    if (!m->body || !n)
+        return 0;
+    memcpy(out, m->body, n);
+    /* A protocol with nothing to hide leaves the copy alone; the copy still
+     * happens, because the alternative is two code paths in every viewer and one
+     * of them getting it wrong. A memcpy of a few hundred bytes on a debug flag
+     * is not a cost worth reasoning about. */
+    if (ops && ops->mask_body)
+        ops->mask_body(m, out, n);
+    return n;
+}
+
 /* --- shared handler-base accessors (Р15) ----------------------------------
  * A handler's own state lives in lk_conn.proto_state; the object itself is the
  * protocol-independent base (proto.h), so these need no per-protocol code. */

@@ -353,9 +353,43 @@ trusting the local kernel.
   span attached to a made-up trace.
 - `flags & 0x01` is `sampled`. A non-sampled request still may be exported by
   the slow-query threshold; that asymmetry is deliberate and documented.
-- `tracestate` is carried through verbatim, unparsed, size-capped.
+- `tracestate` is carried through verbatim and unparsed; one longer than 256
+  bytes is **dropped rather than clipped** — half a comma-separated list is not a
+  shorter list, it is a malformed one.
 - Without a valid `traceparent` the span keeps today's behaviour: its own trace
   id, no parent.
+
+Since М6 this is wired: the observation carries the context (`struct
+lk_http_obs`), the span adopts it, and the OTLP encoder emits a `SPAN_KIND_SERVER`
+span with `parent_span_id` and `trace_state` set. The full attribute list and the
+sampling rules live in docs/notes-export.md §"The HTTP span".
+
+## What never leaves the agent (РH12)
+
+Three rules, each enforced in one place rather than in every consumer:
+
+1. **Labels carry only the template.** The raw path never becomes a metric label
+   — that is the route templater's guarantee (РH7), not a policy applied at the
+   sink.
+2. **Credential-shaped query values are redacted where the target leaves the
+   handler.** A key containing `token`, `sig`, `password`, `passwd`, `secret`,
+   `key`, `code` or `auth` (case-insensitive substring, so `access_token` and
+   `X-Amz-Signature` are covered) has its value replaced by `***` before the
+   observation is published, so `--queries`, the span's `url.path` and anything
+   added later all see the redacted form. `--http-redact off` turns it off.
+   Over-redaction is the deliberate error direction: an unreadable value in one
+   span costs a debugging session, a leaked credential costs an incident.
+3. **Credential headers are never copied and never shown.** `Authorization`,
+   `Proxy-Authorization`, `Cookie` and `Set-Cookie` travel past the parser
+   untouched (the exception is `--http-user basic`, which extracts the name half
+   and stops the base64 decode at the colon), and the `--messages --hexdump`
+   view blanks their values — same length, so the framing stays readable.
+
+`tests/replay/http_privacy.sh` is the test that makes this a property rather than
+a comment: the corpus `*/traceparent.lkt` traces were recorded with a
+`?token=s3cr3t`, a `Basic YWRtaW46aHVudGVyMg==` and a session cookie, and the
+script greps every surface — `--queries`, `/metrics`, spans, hexdump — for all
+three, asserting also that each surface produced output at all.
 
 ## Sizes: what the capture budget actually meets
 

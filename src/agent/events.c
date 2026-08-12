@@ -547,8 +547,15 @@ static void on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const struct l
            dir == LK_DIR_RECV ? "fe>" : "<be", (unsigned long long)c->cookie, type, m->len,
            m->body_cap, m->flags & LK_MSG_BODY_TRUNC ? " trunc" : "",
            m->flags & LK_MSG_AFTER_RESYNC ? " resync" : "");
-    if (e->cfg.hexdump && m->body_cap)
-        hexdump(m->body, m->body_cap);
+    if (e->cfg.hexdump && m->body_cap) {
+        /* Through the protocol's display mask (РH3/РH12, М6): a head published
+         * verbatim to the handler is not the same bytes as a head printed to a
+         * terminal or a log file, and the difference is a bearer token. */
+        __u8 shown[LK_MSG_BODY_MAX];
+        __u32 n = lk_msg_body_for_display(lk_conn_proto(c), m, shown, sizeof(shown));
+
+        hexdump(shown, n);
+    }
 }
 
 /* Resync log pairs with the gap/dirty messages on stderr: "gap -> resync" in

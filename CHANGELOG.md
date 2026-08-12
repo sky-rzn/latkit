@@ -47,6 +47,28 @@ label set is called out explicitly.
   the HTTP blind zones, split by what the connection switched to (they replace
   the single `blind` reason introduced during the HTTP track's development).
 
+- **HTTP spans that join the caller's trace** (PLAN-HTTP.md М6, РH11). A sampled
+  observation from an HTTP port is exported as an OTel `SPAN_KIND_SERVER` span
+  with the current HTTP semantic conventions (`http.request.method`,
+  `http.route`, `http.response.status_code`, `server.address`, `url.scheme`,
+  `url.path`, `network.protocol.version`, `user_agent.original`,
+  `client.address`, request/response body sizes). If the request carries a W3C
+  `traceparent`, the span takes **that** trace id and the caller's span id as its
+  parent, and passes `tracestate` through — so the agent's view of a request
+  appears inside an existing distributed trace with no instrumentation in the
+  application. Sampling becomes parent-based for such requests: a sampled trace
+  is always exported, an unsampled one is skipped by the ratio predicate but can
+  still be picked up by `--otlp-spans-slow-ms` (the asymmetry is deliberate and
+  documented). Database spans are unchanged, `SPAN_KIND_CLIENT` and `db.*` as
+  before.
+- **`--http-redact` (default on)** — query-string values whose key names a
+  credential (`token`, `sig`, `password`, `secret`, `key`, `code`, `auth`,
+  matched as case-insensitive substrings) are replaced by `***` where the request
+  target leaves the handler, so every output path — spans, `--queries`, anything
+  later — carries the redacted form. Credential headers (`Authorization`,
+  `Proxy-Authorization`, `Cookie`, `Set-Cookie`) are additionally blanked in the
+  `--messages --hexdump` view. `--http-redact off` restores the raw target.
+
 ### Changed
 
 - **Renamed self-metric: `latkit_http_requests_total` →

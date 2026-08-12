@@ -29,6 +29,7 @@
 #include <string.h>
 
 #include "fuzz_invariants.h"
+#include "norm_redact.h"
 #include "norm_route.h"
 #include "norm_sql.h"
 
@@ -48,6 +49,7 @@ static void route_input(const uint8_t *data, size_t size)
     nl = size ? memchr(s, '\n', size) : NULL;
     if (!nl) {
         fz_check_route_stable("GET", 3, s, size, NULL);
+        fz_check_redact_stable(s, size);
         return;
     }
     mlen = (size_t)(nl - s);
@@ -63,6 +65,9 @@ static void route_input(const uint8_t *data, size_t size)
      * different code paths and both owe the same invariants. */
     fz_check_route_stable(s, mlen, nl + 1, tlen, &cfg);
     fz_check_route_stable(s, mlen, nl + 1, tlen, NULL);
+    /* The same target through the redactor (РH12, М6): it sees exactly these
+     * bytes in production, and its growth bound is what sizes a heap buffer. */
+    fz_check_redact_stable(nl + 1, tlen);
     lk_route_map_free((struct lk_route_map *)cfg.map);
 }
 

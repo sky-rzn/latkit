@@ -297,6 +297,16 @@ struct http_conn {
     __u64 open_seq; /* next seq to hand out; live units are [head_seq, open_seq) */
     __u64 req_seq;  /* unit currently receiving a request body; ~0 = none */
 
+    /* Scratch for the redacted target (РH12, М6), owned and reused like the
+     * unit's own buffers: `lk_query_obs.text` must stay valid for the callback,
+     * and the redacted form is a different string from the one the unit holds —
+     * the unit keeps the raw target because the route templater classifies that.
+     * Allocated on the first request that actually carries a credential-shaped
+     * query key, so a connection that never sees one never pays for it, which is
+     * nearly all of them. */
+    char *redacted;
+    __u32 redacted_cap;
+
     __u32 owed;       /* responses still owed for requests the ring could not hold.
                          Responses arrive in request order, so the untracked ones
                          are the newest and their responses come last — which is

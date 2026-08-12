@@ -100,6 +100,32 @@ struct lk_session {
     bool complete; /* startup seen in full */
 };
 
+/* What an HTTP exchange carries that a database query has no equivalent of
+ * (РH11, PLAN-HTTP.md М6): the W3C trace context it arrived under, and the
+ * handful of head fields that are span attributes rather than labels. Hung off
+ * lk_query_obs by pointer and NULL for PG/MySQL, so the database path keeps the
+ * struct — and the cache lines — it had.
+ *
+ * All of it is *borrowed for the duration of the callback*, like `text`: the
+ * pointers reach into the handler's per-connection state, which is reused by the
+ * next unit on that connection. A sink that keeps any of it copies it (spans.c
+ * does).
+ *
+ * Not here on purpose: the host, the user agent and the user, which are session
+ * labels and already travel in lk_session (РH10), and the status, which reuses
+ * err_code because *every* HTTP observation has one. */
+struct lk_http_obs {
+    const __u8 *trace_id;  /* 16 bytes; NULL = no usable `traceparent` */
+    const __u8 *parent_id; /* 8 bytes, valid with trace_id */
+    const char *tracestate;
+    __u32 tracestate_len; /* verbatim, unparsed, may be 0 */
+    const char *req_id;   /* X-Request-Id / X-Amzn-Trace-Id; NULL = none */
+    const char *ctype;    /* response Content-Type, first token; NULL = none */
+    __u64 ts_interim_ns;  /* first 1xx head (100-continue / early hints); 0 = none */
+    __u8 trace_flags;     /* W3C trace-flags; bit 0 = the caller sampled this trace */
+    __u8 version;         /* HTTP/1.<version> of the response, else of the request */
+};
+
 /* One completed unit of work, whatever the protocol calls it: a query, a COPY,
  * or an HTTP request/response exchange. The four timestamps are the reason the
  * struct exists — everything else is labels.
@@ -122,9 +148,14 @@ struct lk_query_obs {
     __u64 ts_complete_ns;  /* backend message that closed the unit / last body byte */
     __u64 ts_ready_ns;     /* nearest following Z; 0 = not yet (ABORTED/CANCEL).
                               HTTP has no separate ready point: == ts_complete */
-    const char *text;      /* raw SQL prefix / raw request target (path+query),
+    const char *text;      /* raw SQL prefix / the request target (path+query),
                               NOT normalised; NULL on NO_TEXT; valid only for the
-                              duration of on_query */
+                              duration of on_query. The one thing done to it is
+                              РH12's redaction: with `--http-redact` (the default)
+                              the values of credential-shaped query keys arrive
+                              already replaced by `***`, at the handler rather
+                              than in each sink, so no consumer can leak one by
+                              forgetting to ask */
     __u32 text_len;
     __u64 rows;        /* from the CommandComplete tag; summed on MULTI_STMT */
     __u64 bytes;       /* COPY: summed len of CopyData */
@@ -142,20 +173,22 @@ struct lk_query_obs {
                           become a label. NULL for the DB protocols, and for
                           an HTTP unit whose target never arrived */
     __u32 route_len;
-    __u64 route_fp;       /* XXH3-64 of `method NUL route`: the identity the М5
-                             top-K keys on. The method is in it because two
-                             methods on one path are two routes (РH7) */
-    const char *err_name; /* symbolic error name, borrowed for the callback; the
-                             S3 dialect's error code (РH8). NULL everywhere in
-                             v1 — HTTP's error identity is err_code */
-    char sqlstate[6];     /* on LK_QO_ERROR, C-string */
-    __u16 err_code;       /* vendor error code (MySQL errno) on LK_QO_ERROR; 0 =
-                             none/unknown (PG has no numeric code) — М6 span attr.
-                             HTTP reuses it for the status code, which is set on
-                             *every* observation, not only failing ones (РH10) */
-    __u8 kind;            /* enum lk_query_kind */
-    char txn_status;      /* I/T/E from the closing Z; 0 = unknown (HTTP: none) */
-    __u16 flags;          /* LK_QO_* */
+    __u64 route_fp;                 /* XXH3-64 of `method NUL route`: the identity the М5
+                                       top-K keys on. The method is in it because two
+                                       methods on one path are two routes (РH7) */
+    const char *err_name;           /* symbolic error name, borrowed for the callback; the
+                                       S3 dialect's error code (РH8). NULL everywhere in
+                                       v1 — HTTP's error identity is err_code */
+    const struct lk_http_obs *http; /* HTTP span material (РH11, М6), borrowed for
+                                       the callback; NULL for the DB protocols */
+    char sqlstate[6];               /* on LK_QO_ERROR, C-string */
+    __u16 err_code;                 /* vendor error code (MySQL errno) on LK_QO_ERROR; 0 =
+                                       none/unknown (PG has no numeric code) — М6 span attr.
+                                       HTTP reuses it for the status code, which is set on
+                                       *every* observation, not only failing ones (РH10) */
+    __u8 kind;                      /* enum lk_query_kind */
+    char txn_status;                /* I/T/E from the closing Z; 0 = unknown (HTTP: none) */
+    __u16 flags;                    /* LK_QO_* */
 };
 
 struct lk_query_sink {
@@ -399,6 +432,14 @@ struct lk_proto_ops {
     void (*stream_bytes)(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, const __u8 *p,
                          __u32 n, __u64 ts_ns);
     void (*stream_hole)(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64 n);
+    /* Redact a message body that is about to be *shown* — `--messages --hexdump`
+     * and the lkt_messages harness (РH3, М6). It runs on the viewer's own copy,
+     * in place, and never on the framer's buffer: the handler downstream must
+     * still see the head as it arrived, because `--http-user basic` reads the
+     * very header this hides. NULL means "nothing here needs hiding", which is
+     * the honest answer for PG and MySQL — their credentials travel in an
+     * authentication exchange the framer never republishes. */
+    void (*mask_body)(const struct lk_msg *m, __u8 *p, __u32 n);
 };
 
 /* PG v3 framing behind the vtable (src/proto/pg/pg_frame.c). Also the
@@ -437,6 +478,13 @@ struct lk_proto *lk_proto_http_new(const struct lk_query_sink *out);
  * Everything the route config points at is borrowed and must outlive the agent's
  * event loop: in main.c that is argv and the map parsed at startup. */
 struct lk_http_cfg {
+    /* --http-redact (РH12), and the one setting here whose default is *on*: the
+     * values of credential-shaped query keys are replaced by `***` before the
+     * target leaves the handler, so no export path can carry one. Off restores
+     * the byte-exact target — a debugging choice, and one an operator has to
+     * make deliberately. A zeroed lk_http_cfg therefore means "redact", which is
+     * why the field is spelled as an opt-out. */
+    bool no_redact;
     bool user_basic;           /* --http-user basic: take the `user` label from the name
                                   half of `Authorization: Basic`. Off by default — it is
                                   an identity, and the plan's rule is that nothing leaves
@@ -464,5 +512,17 @@ extern const unsigned lk_proto_nregistry;
 
 /* Name lookup for the CLI (`--port 3306=mysql`); NULL when unknown. */
 const struct lk_proto_ops *lk_proto_find(const char *name, size_t name_len);
+
+/* Copy a message body for *display* — `--messages --hexdump` and lkt_messages —
+ * through the protocol's mask_body hook (РH3/РH12, М6). Returns the number of
+ * bytes written to out (min(m->body_cap, outcap)).
+ *
+ * A copy rather than a mask in place, and that is the whole point: the framer's
+ * buffer belongs to the parser, which still has to read the header this hides
+ * (`--http-user basic`). One helper rather than the same six lines in every
+ * viewer, so a new consumer of lk_msg cannot print a credential by not knowing
+ * it had to ask. */
+__u32 lk_msg_body_for_display(const struct lk_proto_ops *ops, const struct lk_msg *m, __u8 *out,
+                              __u32 outcap);
 
 #endif /* LATKIT_PROTO_H */

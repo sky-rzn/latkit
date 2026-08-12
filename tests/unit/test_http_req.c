@@ -196,10 +196,14 @@ static int test_long_target(void)
     return 0;
 }
 
-/* --- trace context and the request id ------------------------------------- */
+/* --- trace context and the request id (РH11, М6) --------------------------- */
 
 static int test_trace_headers(void)
 {
+    static const __u8 want_trace[16] = {0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6,
+                                        0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36};
+    static const __u8 want_parent[8] = {0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7};
+
     h_reset();
     h_call(LK_DIR_RECV,
            "GET /a HTTP/1.1\r\n"
@@ -210,12 +214,20 @@ static int test_trace_headers(void)
            1000);
     answer(2000);
     CHECK(h_nobs == 1);
+    /* Since М6 the context reaches the observation, which is what lets a span
+     * join the caller's trace instead of starting its own. */
+    CHECK(h_obs[0].have_http && h_obs[0].have_trace);
+    CHECK(!memcmp(h_obs[0].trace_id, want_trace, sizeof(want_trace)));
+    CHECK(!memcmp(h_obs[0].parent_id, want_parent, sizeof(want_parent)));
+    CHECK(h_obs[0].trace_flags & 0x01); /* the caller is sampling this trace */
+    CHECK(!strcmp(h_obs[0].tracestate, "rojo=00f067aa0ba902b7"));
+    CHECK(!strcmp(h_obs[0].req_id, "7f3a2b1c-0000-4000-8000-000000000001"));
+    CHECK(h_obs[0].version == 1); /* the response's HTTP/1.1 */
 
-    /* The parsed context lives on the unit until М6 threads it into a span; the
-     * unit is gone by now, so what this test can assert is that a well-formed
-     * header costs nothing and a malformed one is refused. Both are checked
-     * exhaustively in test_http_wire.c; here the point is that the handler runs
-     * them at all and survives the shapes. */
+    /* A malformed header produces *no* context rather than a patched-up one: a
+     * span hung off a made-up trace id is worse than a standalone span, because
+     * it silently corrupts somebody else's trace. The shapes themselves are
+     * covered exhaustively in test_http_wire.c. */
     h_reset();
     h_call(
         LK_DIR_RECV,
@@ -223,6 +235,76 @@ static int test_trace_headers(void)
         1000);
     answer(2000);
     CHECK(h_nobs == 1 && h_stats()->parse_errors == 0);
+    CHECK(h_obs[0].have_http && !h_obs[0].have_trace);
+    /* X-Amzn-Trace-Id fills the same slot as X-Request-Id: whichever arrives. */
+    CHECK(!strcmp(h_obs[0].req_id, "Root=1-x"));
+
+    /* An oversized tracestate is dropped, not clipped (РH11): half a
+     * comma-separated list is not a shorter list, it is a malformed one, and
+     * passing it on would corrupt the trace for whoever does parse it. */
+    {
+        char big[64 + LK_HTTP_TSTATE_MAX + 32];
+        int off = snprintf(big, sizeof(big), "GET /a HTTP/1.1\r\nHost: h\r\ntracestate: ");
+
+        for (int i = 0; i < LK_HTTP_TSTATE_MAX + 8; i++)
+            big[off++] = 'x';
+        snprintf(big + off, sizeof(big) - (size_t)off, "\r\n\r\n");
+        h_reset();
+        h_call(LK_DIR_RECV, big, 1000);
+        answer(2000);
+        CHECK(h_nobs == 1 && h_obs[0].tracestate[0] == '\0');
+    }
+    return 0;
+}
+
+/* --- РH12: the query-string redactor -------------------------------------- */
+
+/* The rules of the redactor live in test_norm_redact.c; what is asserted here
+ * is that the *handler* applies them — once, at the one point where a target
+ * leaves it — and that the route beside it is unaffected, because the templater
+ * still classifies the bytes that arrived. */
+static int test_redaction(void)
+{
+    struct lk_http_cfg cfg = {0};
+
+    lk_proto_http_configure(NULL); /* the default is on (РH12) */
+    h_reset();
+    h_call(LK_DIR_RECV, "GET /orders/42?token=s3cr3t&page=2 HTTP/1.1\r\nHost: h\r\n\r\n", 1000);
+    answer(2000);
+    CHECK(h_nobs == 1);
+    CHECK(h_target_is(0, "/orders/42?token=***&page=2"));
+    CHECK(!strcmp(h_obs[0].route, "/orders/{id}"));
+
+    /* Nothing to redact: the observation points straight at the unit's own copy,
+     * no scratch buffer and no rewrite. Asserted through the output, which is
+     * all a test can see — and all that matters. */
+    h_reset();
+    h_call(LK_DIR_RECV, "GET /orders/42?page=2 HTTP/1.1\r\nHost: h\r\n\r\n", 1000);
+    answer(2000);
+    CHECK(h_target_is(0, "/orders/42?page=2"));
+
+    /* A key promoted into the route by --http-query-keys is the operator saying
+     * "this value is a route": the templater keeps it, and the redactor — which
+     * runs on the target, not on the template — leaves the template alone. */
+    cfg.route.query_keys[0] = "action";
+    cfg.route.nquery_keys = 1;
+    lk_proto_http_configure(&cfg);
+    h_reset();
+    h_call(LK_DIR_RECV, "GET /api?action=List&sig=abcdef HTTP/1.1\r\nHost: h\r\n\r\n", 1000);
+    answer(2000);
+    CHECK(h_nobs == 1 && !strcmp(h_obs[0].route, "/api?action=List"));
+    CHECK(h_target_is(0, "/api?action=List&sig=***"));
+
+    /* --http-redact off is the escape hatch, and the only way to see the raw
+     * bytes anywhere in the agent. */
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.no_redact = true;
+    lk_proto_http_configure(&cfg);
+    h_reset();
+    h_call(LK_DIR_RECV, "GET /orders/42?token=s3cr3t HTTP/1.1\r\nHost: h\r\n\r\n", 1000);
+    answer(2000);
+    CHECK(h_target_is(0, "/orders/42?token=s3cr3t"));
+    lk_proto_http_configure(NULL);
     return 0;
 }
 
@@ -288,7 +370,9 @@ static int test_route(void)
     answer(2000);
     CHECK(h_nobs == 1);
     CHECK(!strcmp(h_obs[0].route, "/orders/{id}"));
-    CHECK(h_target_is(0, "/orders/42?token=secret")); /* the raw one is untouched */
+    /* The target travels beside the template, uncollapsed — the two identities
+     * of РH7 — with only РH12's redaction applied to it (test_redaction). */
+    CHECK(h_target_is(0, "/orders/42?token=***"));
     CHECK(h_obs[0].route_fp != 0);
 
     /* Two ids, one route: the whole point of the label. And two methods on one
@@ -350,7 +434,8 @@ int main(void)
 {
     int rc = test_basic_fields() || test_session_once() || test_target_forms() ||
              test_missing_headers() || test_torn_head() || test_truncated_head() ||
-             test_long_target() || test_trace_headers() || test_authorization() || test_route();
+             test_long_target() || test_trace_headers() || test_redaction() ||
+             test_authorization() || test_route();
 
     h_free();
     if (rc)

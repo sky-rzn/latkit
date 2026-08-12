@@ -69,6 +69,12 @@ static __u32 opt_http_route_depth;              /* 0 = LK_ROUTE_DEPTH_DEF */
 static const char *opt_http_query_keys[LK_ROUTE_QUERY_KEYS_MAX];
 static int opt_http_nquery_keys;
 static char opt_http_route_header[32]; /* --http-route-header, folded lowercase */
+/* `--http-redact off` (РH12, М6): the one HTTP knob whose default is *on*. With
+ * it on, the values of credential-shaped query keys are replaced by `***` where
+ * the target leaves the handler, so no export path can carry one; off restores
+ * the byte-exact target everywhere, which is a debugging choice and has to be
+ * made deliberately. Stored as the opt-out so a zeroed config redacts. */
+static bool opt_http_no_redact;
 static struct lk_port_proto opt_port_protos[LK_MAX_PORTS];
 static int opt_nports;
 static __u64 opt_ringbuf_bytes = LK_RINGBUF_SZ;
@@ -254,6 +260,7 @@ enum {
     OPT_HTTP_ROUTE_DEPTH,
     OPT_HTTP_QUERY_KEYS,
     OPT_HTTP_ROUTE_HEADER,
+    OPT_HTTP_REDACT,
     OPT_TLS,
     OPT_LIBSSL,
     OPT_TLS_COMM,
@@ -503,6 +510,20 @@ static int set_option(int c, char *optarg)
             return -1;
         }
         break;
+    case OPT_HTTP_REDACT:
+        /* РH12: on by default, so this flag exists to turn the redactor *off*.
+         * Spelled as a value rather than a bare --no-http-redact because the
+         * former reads the same way in a systemd unit as on a command line, and
+         * this is a setting an operator has to be able to find and justify. */
+        if (!strcmp(optarg, "on")) {
+            opt_http_no_redact = false;
+        } else if (!strcmp(optarg, "off")) {
+            opt_http_no_redact = true;
+        } else {
+            fprintf(stderr, "--http-redact: expected 'on' or 'off', got '%s'\n", optarg);
+            return -1;
+        }
+        break;
     case OPT_HTTP_ROUTES:
         /* The file is read after parsing, not here: an option handler that does
          * I/O runs from the env layer too, and "the config was rejected" should
@@ -736,6 +757,7 @@ static int parse_args(int argc, char **argv)
         {"http-route-depth", required_argument, NULL, OPT_HTTP_ROUTE_DEPTH},
         {"http-query-keys", required_argument, NULL, OPT_HTTP_QUERY_KEYS},
         {"http-route-header", required_argument, NULL, OPT_HTTP_ROUTE_HEADER},
+        {"http-redact", required_argument, NULL, OPT_HTTP_REDACT},
         {"tls", required_argument, NULL, OPT_TLS},
         {"libssl", required_argument, NULL, OPT_LIBSSL},
         {"tls-comm", required_argument, NULL, OPT_TLS_COMM},
@@ -886,6 +908,7 @@ static int load_route_map(void)
 static void configure_http(void)
 {
     struct lk_http_cfg cfg = {
+        .no_redact = opt_http_no_redact,
         .user_basic = opt_http_user_basic,
         .route = {.map = opt_http_route_map, .depth = (uint8_t)opt_http_route_depth},
     };
@@ -940,6 +963,7 @@ static void print_config(void)
         printf("%s%s", i ? "," : "", opt_http_query_keys[i]);
     printf("\n");
     printf("http_route_header=%s\n", opt_http_route_header);
+    printf("http_redact=%s\n", opt_http_no_redact ? "off" : "on");
     printf("top_queries=%u\n", opt_top_queries ? opt_top_queries : LK_TOP_QUERIES_DEFAULT);
     printf("query_label_len=%u\n",
            opt_query_label_len ? opt_query_label_len : LK_QUERY_LABEL_LEN_DEFAULT);

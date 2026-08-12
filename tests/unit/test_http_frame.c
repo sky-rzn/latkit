@@ -915,6 +915,62 @@ static int test_pg_unaffected_alongside(void)
 /* The bounded cursor and the shape rules the framer stands on. Every helper
  * takes an explicit length; none of them may read past it, which is what the
  * fuzz target exercises at scale and what these cases pin by construction. */
+/* --- the display mask (РH3/РH12, М6) -------------------------------------- */
+
+/* What `--messages --hexdump` and lkt_messages show is not what the handler
+ * parses: the credential headers are blanked and the credential-shaped query
+ * values overwritten, on the viewer's own copy, before a byte reaches a
+ * terminal. Driven through lk_msg_body_for_display, which is the function both
+ * viewers call — testing lk_proto_http_ops.mask_body directly would test a hook
+ * nobody is obliged to route through. */
+static int test_display_mask(void)
+{
+    static const char req[] = "GET /a?page=1&token=s3cr3t HTTP/1.1\r\n"
+                              "Host: h\r\n"
+                              "Authorization: Basic YWRtaW46aHVudGVyMg==\r\n"
+                              "Cookie: session=deadbeefcafe\r\n"
+                              "User-Agent: curl/8.5.0\r\n\r\n";
+    struct lk_msg m = {.type = LK_HTTP_MSG_REQ,
+                       .len = sizeof(req) - 1,
+                       .body_cap = sizeof(req) - 1,
+                       .body = (const __u8 *)req};
+    __u8 out[512];
+    __u32 n = lk_msg_body_for_display(&lk_proto_http_ops, &m, out, sizeof(out));
+
+    CHECK(n == sizeof(req) - 1); /* same length: the hexdump's offsets still hold */
+    out[n] = '\0';
+    CHECK(!strstr((char *)out, "s3cr3t"));
+    CHECK(!strstr((char *)out, "YWRtaW46aHVudGVyMg"));
+    CHECK(!strstr((char *)out, "deadbeefcafe"));
+    /* Masked, not deleted, and only where it had to be: the framing of the head
+     * — start line, version, field names, the harmless header — is exactly what
+     * came off the wire, or the view stops being useful for debugging framing. */
+    CHECK(strstr((char *)out, "GET /a?page=1&token=****** HTTP/1.1"));
+    CHECK(strstr((char *)out, "Authorization: ***"));
+    CHECK(strstr((char *)out, "Cookie: ***"));
+    CHECK(strstr((char *)out, "User-Agent: curl/8.5.0"));
+    /* The source is untouched — the handler above still needs `Authorization`
+     * when `--http-user basic` asks for the name half (РH10). */
+    CHECK(strstr(req, "YWRtaW46aHVudGVyMg") != NULL);
+
+    /* A message with no body of its own carries nothing to mask, and PG has
+     * nothing to hide in a republished message at all: both paths must still
+     * produce the bytes the viewer asked for. */
+    {
+        struct lk_msg d = {.type = LK_HTTP_MSG_DATA, .len = 4096};
+
+        CHECK(lk_msg_body_for_display(&lk_proto_http_ops, &d, out, sizeof(out)) == 0);
+    }
+    {
+        static const char q[] = "select 1";
+        struct lk_msg pgm = {.type = 'Q', .len = 13, .body_cap = 8, .body = (const __u8 *)q};
+
+        CHECK(lk_msg_body_for_display(&lk_proto_pg_ops, &pgm, out, sizeof(out)) == 8);
+        CHECK(!memcmp(out, q, 8));
+    }
+    return 0;
+}
+
 static int test_wire(void)
 {
     struct http_span m, t, v;
@@ -999,7 +1055,8 @@ int main(void)
         test_upgrade() || test_connect() || test_until_close() || test_request_without_length() ||
         test_body_unseen() || test_resync_torn_anchor() || test_false_anchor() ||
         test_anchor_across_hole() || test_off_anomaly() || test_pipeline_overflow() ||
-        test_response_without_request() || test_pg_unaffected_alongside() || test_wire())
+        test_response_without_request() || test_pg_unaffected_alongside() || test_display_mask() ||
+        test_wire())
         return 1;
     free(conn.frame[0].buf);
     free(conn.frame[1].buf);

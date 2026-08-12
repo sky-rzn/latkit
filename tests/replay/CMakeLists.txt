@@ -44,8 +44,9 @@ target_link_libraries(lkt_messages latkit_proto)
 # --metrics tees the observations into the real aggregator, so it links the
 # metrics lib as well (PLAN-HTTP.md М5 acceptance).
 add_executable(lkt_queries lkt_queries.c ${REPLAY_SRC})
-target_include_directories(lkt_queries PRIVATE ${REPLAY_INC} ${CMAKE_SOURCE_DIR}/src/metrics)
-target_link_libraries(lkt_queries latkit_proto latkit_metrics)
+target_include_directories(lkt_queries PRIVATE ${REPLAY_INC} ${CMAKE_SOURCE_DIR}/src/metrics
+                           ${CMAKE_SOURCE_DIR}/src/export)
+target_link_libraries(lkt_queries latkit_proto latkit_metrics latkit_export)
 
 # М3 acceptance: expected observations per М0 trace scenario + parse_errors
 # == 0 on clean traces, asserted over the committed corpus.
@@ -59,3 +60,12 @@ add_test(NAME my_queries_traces
 add_test(NAME http_queries_traces
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/http_queries_traces.sh
                  $<TARGET_FILE:lkt_queries> ${CMAKE_SOURCE_DIR}/tests/traces/http)
+
+# М6 acceptance (РH12): the corpus traces recorded with deliberately secret URLs
+# and headers, greped across every surface the agent has — observations,
+# exposition, spans and the raw --hexdump view. Without this test the privacy
+# rule is a comment; with it, it is a property.
+add_test(NAME http_privacy
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/http_privacy.sh
+                 $<TARGET_FILE:lkt_queries> $<TARGET_FILE:lkt_messages>
+                 ${CMAKE_SOURCE_DIR}/tests/traces/http)

@@ -199,10 +199,12 @@ target_link_libraries(latkit_proto PUBLIC latkit_norm)
 # src/norm/** is pure like src/proto/**: no libbpf, no I/O beyond the caller's
 # buffer, so it links into the agent and the offline harnesses alike. It depends
 # on nothing but libc and the vendored xxhash (XXH3-64, header-only, BSD) — kept
-# as a SYSTEM include so -Werror does not police third-party code. Two members:
-# the SQL normaliser (Р22) and the HTTP route templater (РH7), which share the
-# "collapse the volatile part, hash the whole input" contract and nothing else.
-add_library(latkit_norm STATIC src/norm/norm_sql.c src/norm/norm_route.c)
+# as a SYSTEM include so -Werror does not police third-party code. Three members:
+# the SQL normaliser (Р22), the HTTP route templater (РH7) and the query-string
+# redactor (РH12, М6) — the first two share the "collapse the volatile part, hash
+# the whole input" contract, the third is the privacy rule of the HTTP track in
+# one function so that every path through the agent obeys the same one.
+add_library(latkit_norm STATIC src/norm/norm_sql.c src/norm/norm_route.c src/norm/norm_redact.c)
 target_include_directories(latkit_norm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/norm)
 target_include_directories(latkit_norm SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xxhash)

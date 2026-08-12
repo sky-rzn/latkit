@@ -182,8 +182,12 @@ void http_req_head(struct lk_proto *p, struct lk_conn *c, struct http_conn *hc,
     http_copy_label(u->host, sizeof(u->host), authority.n ? authority : host);
     /* tracestate is carried through verbatim and unparsed (РH11): it is a
      * vendor's opaque state and reading into it would be someone else's schema.
-     * Failure to allocate loses the field and nothing else. */
-    if (tstate.n)
+     * Which is also why an oversized one is *dropped* rather than clipped:
+     * truncating a comma-separated list produces a value that is not merely
+     * shorter but malformed, and passing that on would corrupt a trace for
+     * whoever does parse it. Failure to allocate loses the field and nothing
+     * else. */
+    if (tstate.n && tstate.n <= LK_HTTP_TSTATE_MAX)
         copy_owned(&u->tracestate, &u->tracestate_len, &u->tracestate_cap, tstate,
                    LK_HTTP_TSTATE_MAX);
 

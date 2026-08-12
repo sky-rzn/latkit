@@ -50,6 +50,7 @@
 #include "loop.h"
 #include "metrics.h"
 #include "pbuf.h"
+#include "proto.h" /* enum lk_otel_kind: which semconv a span speaks (РH11) */
 #include "spans.h"
 #include "timebase.h"
 #include "version.h"
@@ -60,6 +61,7 @@
 #define OTLP_TEMPORALITY_CUMULATIVE 2
 #define OTLP_MAX_RES_ATTRS          32
 
+#define OTLP_SPAN_KIND_SERVER 2 /* SpanKind.SPAN_KIND_SERVER (РH11: the HTTP shape) */
 #define OTLP_SPAN_KIND_CLIENT 3 /* SpanKind.SPAN_KIND_CLIENT */
 #define OTLP_STATUS_ERROR     2 /* StatusCode.STATUS_CODE_ERROR */
 
@@ -242,21 +244,11 @@ void lk_otlp_encode_metric(struct pbuf *pb, const struct lk_metric_view *v,
     pb_submsg_end(pb, metric);
 }
 
-/* --- span encoder (task 5.3, Р32) ----------------------------------------- */
+/* --- span encoder (task 5.3, Р32; the HTTP shape РH11) --------------------- */
 
-/* One Span into an open ScopeSpans (field 2). Attributes follow OTel database
- * semconv; the raw SQL leaves the agent only here (or its masked form). */
-static void enc_span(struct pbuf *pb, const struct lk_span *sp, const struct lk_timebase *tb)
+/* The db.* attribute set (Р32): what a database span says about itself. */
+static void enc_span_db_attrs(struct pbuf *pb, const struct lk_span *sp)
 {
-    size_t span = pb_submsg_begin(pb, 2); /* ScopeSpans.spans */
-
-    pb_field_bytes(pb, 1, sp->trace_id, sizeof(sp->trace_id));
-    pb_field_bytes(pb, 2, sp->span_id, sizeof(sp->span_id));
-    pb_field_string(pb, 5, sp->name);
-    pb_field_varint(pb, 6, OTLP_SPAN_KIND_CLIENT);
-    pb_field_fixed64(pb, 7, lk_wall_ns(tb, sp->start_ns));
-    pb_field_fixed64(pb, 8, lk_wall_ns(tb, sp->end_ns));
-
     enc_str_kv(pb, 9, "db.system.name", sp->db_system ? sp->db_system : "postgresql");
     if (sp->db[0])
         enc_str_kv(pb, 9, "db.namespace", sp->db);
@@ -267,15 +259,115 @@ static void enc_span(struct pbuf *pb, const struct lk_span *sp, const struct lk_
     if (sp->have_rows)
         enc_int_kv(pb, 9, "db.response.returned_rows", sp->rows);
     if (sp->error) {
-        size_t st;
-
         if (sp->sqlstate[0])
             enc_str_kv(pb, 9, "db.response.status_code", sp->sqlstate);
         /* MySQL vendor error number, when the parser captured one (М6): SQLSTATE
          * carries the class, errno the specific code. PG has no numeric code. */
         if (sp->err_code)
             enc_int_kv(pb, 9, "db.mysql.error_code", sp->err_code);
-        st = pb_submsg_begin(pb, 15); /* Status */
+    }
+}
+
+/* The HTTP server attribute set (РH11), spelled in current OTel semantic
+ * conventions so a backend recognises it without a mapping rule of ours:
+ * `http.request.method`, `http.route`, `http.response.status_code`,
+ * `server.address`, `url.scheme`, `network.protocol.version`,
+ * `user_agent.original`, `client.address`.
+ *
+ * Two of them are not from the semconv catalogue and are here on purpose:
+ * `http.request.header.x-request-id` is the join key the accuracy bench uses
+ * against an access log (М8), and the two РH5 instants are what make the four
+ * timings readable inside a span that covers the whole exchange — a trace
+ * viewer draws one bar, and without these there is no way to see that three
+ * quarters of it was the client uploading. */
+static void enc_span_http_attrs(struct pbuf *pb, const struct lk_span *sp,
+                                const struct lk_timebase *tb)
+{
+    const struct lk_span_http *h = sp->http;
+    char ver[8];
+
+    if (h->method[0])
+        enc_str_kv(pb, 9, "http.request.method", h->method);
+    if (h->route[0])
+        enc_str_kv(pb, 9, "http.route", h->route);
+    if (h->status)
+        enc_int_kv(pb, 9, "http.response.status_code", h->status);
+    if (h->host[0])
+        enc_str_kv(pb, 9, "server.address", h->host);
+    if (h->server_port)
+        enc_int_kv(pb, 9, "server.port", h->server_port);
+    enc_str_kv(pb, 9, "url.scheme", h->tls ? "https" : "http");
+    /* The redacted target (РH12). Absent under --otlp-span-masked, which for an
+     * HTTP span means "the route and nothing else". */
+    if (sp->text)
+        enc_str_kv_n(pb, 9, "url.path", sp->text, sp->text_len);
+    snprintf(ver, sizeof(ver), "1.%u", h->version & 1);
+    enc_str_kv(pb, 9, "network.protocol.version", ver);
+    if (h->ua[0])
+        enc_str_kv(pb, 9, "user_agent.original", h->ua);
+    if (h->client[0]) {
+        enc_str_kv(pb, 9, "client.address", h->client);
+        if (h->client_port)
+            enc_int_kv(pb, 9, "client.port", h->client_port);
+    }
+    if (sp->user[0])
+        enc_str_kv(pb, 9, "user.name", sp->user);
+    if (h->ctype[0])
+        enc_str_kv(pb, 9, "http.response.header.content-type", h->ctype);
+    if (h->req_id[0])
+        enc_str_kv(pb, 9, "http.request.header.x-request-id", h->req_id);
+    if (h->bytes_in)
+        enc_int_kv(pb, 9, "http.request.body.size", h->bytes_in);
+    if (h->bytes_out)
+        enc_int_kv(pb, 9, "http.response.body.size", h->bytes_out);
+    /* РH5 inside the bar: when the request body ended (the server's clock
+     * starts) and when the first response byte left. Wall clock, like the span's
+     * own bounds, so a viewer can place them on the same axis. */
+    if (h->req_done_ns > sp->start_ns)
+        enc_int_kv(pb, 9, "latkit.http.request_end_unix_nano", lk_wall_ns(tb, h->req_done_ns));
+    if (h->first_byte_ns)
+        enc_int_kv(pb, 9, "latkit.http.first_byte_unix_nano", lk_wall_ns(tb, h->first_byte_ns));
+}
+
+/* One Span into an open ScopeSpans (field 2). Two shapes behind one encoder: a
+ * database client span (Р32) and an HTTP *server* span (РH11) — the kind field
+ * differs because the fact differs. The agent stands beside the server and sees
+ * a request being served, which is the definition of SPAN_KIND_SERVER; calling
+ * it a client span would put the arrow the wrong way round in every trace view
+ * and, worse, make it a sibling of the caller's span instead of its child.
+ *
+ * The raw SQL — or the redacted URL — leaves the agent only here. */
+void lk_otlp_encode_span(struct pbuf *pb, const struct lk_span *sp, const struct lk_timebase *tb)
+{
+    size_t span = pb_submsg_begin(pb, 2); /* ScopeSpans.spans */
+    bool http = sp->otel_kind == LK_OTEL_KIND_HTTP && sp->http;
+
+    pb_field_bytes(pb, 1, sp->trace_id, sizeof(sp->trace_id));
+    pb_field_bytes(pb, 2, sp->span_id, sizeof(sp->span_id));
+    /* The caller's trace context (РH11): its state verbatim, its span id as our
+     * parent. Both absent — and the span standalone — when no `traceparent`
+     * arrived, which is every database observation and any request that carried
+     * none. */
+    if (http && sp->http->tstate[0])
+        pb_field_string(pb, 3, sp->http->tstate);
+    if (sp->have_parent)
+        pb_field_bytes(pb, 4, sp->parent_id, sizeof(sp->parent_id));
+    pb_field_string(pb, 5, sp->name);
+    pb_field_varint(pb, 6, http ? OTLP_SPAN_KIND_SERVER : OTLP_SPAN_KIND_CLIENT);
+    pb_field_fixed64(pb, 7, lk_wall_ns(tb, sp->start_ns));
+    pb_field_fixed64(pb, 8, lk_wall_ns(tb, sp->end_ns));
+
+    if (http)
+        enc_span_http_attrs(pb, sp, tb);
+    else
+        enc_span_db_attrs(pb, sp);
+
+    /* Span status is the *server's* verdict, so a 4xx is not one: the request
+     * was answered correctly, with "no". Only LK_QO_ERROR — a 5xx, or a database
+     * error — sets it (РH10). */
+    if (sp->error) {
+        size_t st = pb_submsg_begin(pb, 15); /* Status */
+
         pb_field_varint(pb, 3, OTLP_STATUS_ERROR);
         pb_submsg_end(pb, st);
     }
@@ -486,7 +578,7 @@ static void enc_span_cb(void *ctx, const struct lk_span *sp)
 {
     struct enc_ctx *e = ctx;
 
-    enc_span(e->pb, sp, e->tb);
+    lk_otlp_encode_span(e->pb, sp, e->tb);
 }
 
 static void otlp_enc_resource(struct lk_otlp *o, struct pbuf *pb)

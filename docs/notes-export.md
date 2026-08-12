@@ -192,11 +192,11 @@ sampled if either fires. Off by default.
 client (Р31), alongside a metrics tick or when the ring hits 3/4.
 
 **Ids & timings.** `trace_id` (16 B) and `span_id` (8 B) come from a
-`getrandom(2)` seed; the trace is standalone (no parent — the client's context is
-invisible; parsing a `traceparent` from a sqlcommenter SQL comment is a v1.1
-candidate). `start = ts_start_ns`, `end = ts_complete_ns` (the precise
-per-request model — spans need no averaging compromise, cf. Р25), converted to
-wall clock by `timebase.c` (Р33).
+`getrandom(2)` seed; a database span is standalone (no parent — the client's
+context is invisible in SQL; parsing a `traceparent` from a sqlcommenter comment
+is a v1.1 candidate). An HTTP span is not, see below. `start = ts_start_ns`,
+`end = ts_complete_ns` (the precise per-request model — spans need no averaging
+compromise, cf. Р25), converted to wall clock by `timebase.c` (Р33).
 
 **Attributes** (OTel semconv for databases): `db.system.name` (`postgresql` or
 `mysql`, from the connection's protocol, РМ6/М6), `db.query.text` (raw SQL;
@@ -206,6 +206,78 @@ omitted under `NO_TEXT`), `db.namespace` (database), `db.user`,
 An error sets `otel.status = ERROR` and `db.response.status_code = SQLSTATE`,
 plus `db.mysql.error_code` = the MySQL vendor errno when one was captured (PG has
 no numeric code).
+
+### The HTTP span (РH11, PLAN-HTTP.md М6)
+
+One collector, two shapes. Which one an observation produces is read off the
+connection's protocol (`lk_proto_ops.otel_kind`), never guessed from the port or
+from the contents — the same rule as the metric profile (РH10).
+
+**Kind: `SERVER`, not `CLIENT`.** The agent stands beside the server and watches
+a request being *served*. Getting this wrong is not cosmetic: a client span would
+sit as a sibling of the caller's span rather than as its child, and every trace
+view would draw the arrow the wrong way round.
+
+**The caller's trace is adopted.** A request carrying a well-formed W3C
+`traceparent` produces a span with **that** `trace_id` and with the caller's span
+id as `parent_span_id`; `tracestate` is passed through verbatim (whole or not at
+all — a clipped list is malformed, not short). This is the thing the database
+track could not do in principle: the agent's observation becomes a hop inside an
+existing distributed trace, with no instrumentation in the application. A
+malformed header yields *no* context rather than a patched-up one — a span hung
+off a made-up trace id silently corrupts somebody else's trace.
+
+**Sampling is parent-based.** If the caller says the trace is sampled, it is
+sampled here, whatever `--otlp-spans` says; if the caller says it is not, the
+ratio draw is skipped. The **asymmetry is deliberate**: `--otlp-spans-slow-ms`
+still fires on an unsampled trace, because an upstream sampler throwing dice
+before the request was served could not have known this one would take four
+seconds. Such a span joins a trace whose other spans were dropped — a real cost,
+and the alternative (losing every slow outlier that happened to be unsampled) is
+worse. Consequence worth planning for: **once spans are enabled at all**, a
+caller sampling at 100 % makes the agent export a span per request whatever
+ratio was configured; the ring bound and `latkit_spans_dropped_total` are what
+keep that bounded. Enabling remains the operator's switch — with neither
+`--otlp-spans` nor `--otlp-spans-slow-ms` set, the collector is never built and
+no inbound header can turn it on.
+
+**Timings.** The span covers `ts_start … ts_complete` — the whole exchange,
+including the client's upload — and the two РH5 instants inside it travel as
+attributes (`latkit.http.request_end_unix_nano`, `latkit.http.first_byte_unix_nano`),
+so a trace viewer can show that three quarters of the bar was an upload. The
+*slow* predicate, unlike the span, measures only the server's part
+(`ts_complete − ts_req_done`): a gigabyte POST over a slow link is not a slow
+request.
+
+**Attributes** (current OTel HTTP semconv): `http.request.method`, `http.route`
+(the template, РH7 — never the path), `http.response.status_code`,
+`server.address` (the request's own `Host`), `server.port`, `url.scheme`
+(`https` when the bytes came through the TLS path), `url.path` (the redacted
+target, see below), `network.protocol.version`, `user_agent.original`,
+`client.address`/`client.port` (from the connection tuple — the capture is
+server-side, so the peer is the client), `user.name` when `--http-user basic`
+asked for one, `http.request.body.size` / `http.response.body.size`,
+`http.response.header.content-type`, and `http.request.header.x-request-id` —
+the last is not from the semconv catalogue and is there because it is the join
+key the accuracy bench uses against an access log. The span name is
+`{method} {route}`, low-cardinality by construction. **`otel.status = ERROR`
+only for 5xx**: a 4xx is the server correctly saying no (РH10).
+
+**`--otlp-span-masked` on an HTTP span means "the route and nothing else"** —
+`url.path` is dropped entirely. A URL has no literals to collapse the way SQL
+does, so there is no masked *form* of one; the template is the masked identity.
+
+**Privacy (РH12).** Query values whose key names a credential (`token`, `sig`,
+`password`, `key`, `code`, `secret`, `auth`, matched case-insensitively as
+substrings, so `access_token` and `X-Amz-Signature` are covered) are replaced by
+`***` — at the handler, where the target leaves it, so *every* consumer gets the
+redacted form and no sink can leak one by forgetting to ask. `--http-redact off`
+restores the raw target everywhere. Independently, the four credential-bearing
+headers (`Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`) are
+blanked in the `--messages --hexdump` view (РH3), which is the only path that
+ever prints header bytes. `tests/replay/http_privacy.sh` replays the corpus
+traces recorded with deliberately secret URLs and headers and greps *every*
+surface — observations, exposition, spans, hexdump — for the planted literals.
 
 **Exemplars** (optional tail of 5.3, **deferred** — not an M3 criterion): the
 last sampled `{trace_id, span_id, value}` per histogram row, emitted in the
@@ -256,6 +328,12 @@ lives comfortably on flags + env; revisit on real demand.
   normalised (literal-free) text as `db.query.text` for environments that need
   spans without leaking literals; `--otlp-span-text-max` caps the text.
   Exemplars carry only ids, never text.
+- **A URL is the most talkative data the agent sees**, and the HTTP track treats
+  it as such (РH12): metric labels carry only the route template, `url.path`
+  reaches a span only for a sampled one and only after the credential redactor,
+  and credential headers are never copied anywhere — `Authorization` is read at
+  all only when `--http-user basic` asks for the *name* half, whose decode stops
+  at the colon. See "The HTTP span" above.
 - **Untrusted network input.** The HTTP server is a microscopic GET-only subset
   with per-connection size/time limits (Р29); the protobuf path is write-only.
 
@@ -274,5 +352,6 @@ lives comfortably on flags + env; revisit on real demand.
   it — our OTLP path already emits a lossless `ExponentialHistogram`, which
   Prometheus stores as a native histogram. Revisit a protobuf exposition only if
   real demand appears (stage 8+).
-- **No `traceparent` from SQL comments** (sqlcommenter) — spans are standalone;
-  correlating with an upstream trace is a v1.1 candidate.
+- **No `traceparent` from SQL comments** (sqlcommenter) — a *database* span is
+  standalone; correlating one with an upstream trace is a v1.1 candidate. HTTP
+  spans do join the caller's trace, from the request header (РH11, above).

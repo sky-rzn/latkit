@@ -34,6 +34,18 @@ struct lk_query_sink;
 #define LK_SPAN_TEXT_MAX_DEF 4096
 #define LK_SPAN_NAME_MAX     64 /* span name = normalised text, truncated (Р32) */
 
+/* Bounds on the HTTP half (РH11, PLAN-HTTP.md М6). Each is what an *attribute*
+ * may usefully be, not what HTTP permits — a route longer than this is not a
+ * route, and a client address is an address. tracestate is the exception: it is
+ * carried whole or not at all, because a clipped list is malformed rather than
+ * merely short, so its bound matches the handler's (LK_HTTP_TSTATE_MAX). */
+#define LK_SPAN_ROUTE_MAX  128
+#define LK_SPAN_METHOD_MAX 16
+#define LK_SPAN_REQID_MAX  48
+#define LK_SPAN_CTYPE_MAX  32
+#define LK_SPAN_ADDR_MAX   46 /* INET6_ADDRSTRLEN */
+#define LK_SPAN_TSTATE_MAX 256
+
 struct lk_spans_cfg {
     double sample_ratio;             /* (0,1]; <= 0 disables the probabilistic predicate */
     uint64_t slow_ns;                /* > 0: also sample any query with duration >= slow_ns */
@@ -44,27 +56,59 @@ struct lk_spans_cfg {
     void *watermark_ctx;
 };
 
+/* The HTTP half of a span (РH11, PLAN-HTTP.md М6), hung off lk_span by pointer
+ * and NULL for the database protocols — which is what keeps a PG span exactly
+ * the size and shape it was. It lives in an arena beside the text one, for the
+ * same reason: 2048 slots of it is a megabyte of address space and only the
+ * pages a real HTTP span writes ever become resident.
+ *
+ * Everything here is a copy: the observation's pointers dangle the moment the
+ * callback returns (Р16), and a span sits in the ring until the next export. */
+struct lk_span_http {
+    char route[LK_SPAN_ROUTE_MAX];   /* http.route — the template, never the path */
+    char method[LK_SPAN_METHOD_MAX]; /* http.request.method */
+    char host[64];                   /* server.address (the request's own Host) */
+    char req_id[LK_SPAN_REQID_MAX];  /* X-Request-Id: the accuracy bench's join key */
+    char ctype[LK_SPAN_CTYPE_MAX];   /* response Content-Type, first token */
+    char client[LK_SPAN_ADDR_MAX];   /* client.address, from the connection tuple */
+    char ua[64];                     /* user_agent.original (session app slot) */
+    char tstate[LK_SPAN_TSTATE_MAX]; /* W3C tracestate, verbatim or absent */
+    uint64_t bytes_in, bytes_out;    /* http.request/response.body.size */
+    uint64_t req_done_ns;            /* РH5's inner points, as span attributes: the */
+    uint64_t first_byte_ns;          /* ... upload end and the TTFB instant */
+    uint16_t status;                 /* http.response.status_code */
+    uint16_t client_port, server_port;
+    uint8_t version;   /* HTTP/1.<version> */
+    bool tls;          /* url.scheme: https when the bytes came through the TLS path */
+    bool client_error; /* 4xx: not an error of the server's, and not a span error */
+};
+
 /* One collected span, drained by the OTLP traces encoder. Timings are still
  * CLOCK_MONOTONIC — the encoder converts them to Unix-epoch ns via the timebase
  * at export (Р33). text is a bounded copy of the raw (or, when masked, the
- * normalised) SQL, pointing into the collector's text arena (not owned by the
- * span, not freed per-drain); NULL on a NO_TEXT observation. */
+ * normalised) SQL — for an HTTP span, of the request target, already redacted by
+ * the handler (РH12) — pointing into the collector's text arena (not owned by
+ * the span, not freed per-drain); NULL on a NO_TEXT observation. */
 struct lk_span {
     uint8_t trace_id[16];
     uint8_t span_id[8];
+    uint8_t parent_id[8];      /* the caller's span id, from `traceparent` (РH11) */
     uint64_t start_ns, end_ns; /* mono (bpf_ktime_get_ns domain) */
     uint64_t rows;
-    char name[LK_SPAN_NAME_MAX]; /* normalised text prefix, NUL-terminated */
+    char name[LK_SPAN_NAME_MAX]; /* normalised text prefix / `METHOD /route` */
     char db[64], user[64];       /* db.namespace, db.user */
     const char *db_system;       /* OTel db.system.name; borrowed static string
                                     from lk_proto_ops.db_system (М6) */
-    char *text;                  /* db.query.text bytes; NULL if none */
+    char *text;                  /* db.query.text / url.path bytes; NULL if none */
     uint32_t text_len;
-    char sqlstate[6];  /* on error, C-string */
-    uint16_t err_code; /* vendor error code (MySQL errno); 0 = none (М6) */
-    uint8_t kind;      /* enum lk_query_kind */
+    struct lk_span_http *http; /* the HTTP half; NULL for a database span */
+    char sqlstate[6];          /* on error, C-string */
+    uint16_t err_code;         /* vendor error code (MySQL errno); 0 = none (М6) */
+    uint8_t kind;              /* enum lk_query_kind */
+    uint8_t otel_kind;         /* enum lk_otel_kind: which semconv this span speaks */
     bool error;
     bool have_rows;
+    bool have_parent; /* the request arrived inside somebody else's trace */
 };
 
 /* cfg is copied; NULL is not allowed (the exporter only builds this when spans

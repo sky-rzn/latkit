@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "http.h" /* the HTTP framer's synthetic dictionary (РH3) */
+#include "norm_redact.h"
 #include "norm_sql.h"
 #include "proto.h"
 
@@ -159,6 +160,27 @@ static inline void fz_check_obs(const struct lk_query_obs *o)
         fz_read_bytes(o->op, strlen(o->op));
     if (o->err_name)
         fz_read_bytes(o->err_name, strlen(o->err_name));
+    /* The same rule for the РH11 span material (М6), which is the largest bundle
+     * of borrowed pointers the contract has: a trace context is offered whole or
+     * not at all — a trace id without a parent id would send the span builder
+     * reading eight bytes that were never there. */
+    if (o->http) {
+        const struct lk_http_obs *h = o->http;
+
+        FZ_ASSERT((h->trace_id != NULL) == (h->parent_id != NULL));
+        if (h->trace_id) {
+            fz_read_bytes(h->trace_id, 16);
+            fz_read_bytes(h->parent_id, 8);
+        }
+        if (h->tracestate)
+            fz_read_bytes(h->tracestate, h->tracestate_len);
+        else
+            FZ_ASSERT(h->tracestate_len == 0);
+        if (h->req_id)
+            fz_read_bytes(h->req_id, strlen(h->req_id));
+        if (h->ctype)
+            fz_read_bytes(h->ctype, strlen(h->ctype));
+    }
     /* РH5's ordering: the request cannot finish before it started. The other
      * three stamps are deliberately *not* ordered against each other — a
      * response head can precede the end of the request body (an early 413), and
@@ -216,6 +238,39 @@ static inline void fz_check_route_stable(const char *method, size_t mlen, const 
             FZ_ASSERT(c != '?');
     }
     fz_read_bytes(a.text, a.text_len);
+}
+
+/* The query-string redactor (РH12, М6) over the same untrusted target. Three
+ * contracts, and the middle one is load-bearing: http.c sizes its scratch buffer
+ * at 2n + 3 on the strength of it, so a shape that made the redacted form grow
+ * faster than that would be a heap overflow rather than a wrong label.
+ *
+ * What is deliberately *not* asserted here is "no secret survives": that is a
+ * statement about which keys are sensitive, it is table-driven, and it belongs
+ * in test_norm_redact.c where the table is. The fuzzer's job is the memory
+ * safety and the bounds. */
+static inline void fz_check_redact_stable(const char *target, size_t tlen)
+{
+    char a[2 * 4096 + 8], b[sizeof(a)], inplace[4096];
+    uint32_t na, nb;
+
+    if (tlen > sizeof(inplace))
+        tlen = sizeof(inplace);
+    na = lk_url_redact(target, (uint32_t)tlen, a, sizeof(a));
+    nb = lk_url_redact(target, (uint32_t)tlen, b, sizeof(b));
+    FZ_ASSERT(na == nb && memcmp(a, b, na) == 0);
+    FZ_ASSERT(na <= 2 * tlen + LK_REDACT_MARK_LEN);
+    /* needed() and redact() must agree: a target the scan calls clean has to
+     * come through byte for byte, or a caller that trusts the scan keeps the
+     * original while the redactor would have changed it. */
+    if (!lk_url_redact_needed(target, (uint32_t)tlen))
+        FZ_ASSERT(na == tlen && memcmp(a, target, na) == 0);
+    if (tlen) {
+        memcpy(inplace, target, tlen);
+        lk_url_redact_inplace(inplace, (uint32_t)tlen);
+        fz_read_bytes(inplace, tlen); /* same length, always: it overwrites */
+    }
+    fz_read_bytes(a, na);
 }
 
 #endif /* LATKIT_FUZZ_INVARIANTS_H */

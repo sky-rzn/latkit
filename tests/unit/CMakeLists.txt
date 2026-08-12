@@ -163,6 +163,12 @@ add_executable(test_norm_route test_norm_route.c)
 target_link_libraries(test_norm_route latkit_norm)
 add_test(NAME norm_route COMMAND test_norm_route)
 
+# Query-string redactor (PLAN-HTTP.md М6, РH12): the key table, the bounds, and
+# the invariant the whole privacy claim rests on — no secret survives the copy.
+add_executable(test_norm_redact test_norm_redact.c)
+target_link_libraries(test_norm_redact latkit_norm)
+add_test(NAME norm_redact COMMAND test_norm_redact)
+
 # Exponential histogram (task 4.2): grid boundaries vs the ldexp reference,
 # clamping, merge, classic-bucket text export. Links the pure metrics lib.
 add_executable(test_hist test_hist.c)

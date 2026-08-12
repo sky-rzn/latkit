@@ -44,6 +44,7 @@
 #include <string.h>
 
 #include "http.h"
+#include "norm_redact.h"
 
 /* --- handler-wide configuration (РH10) ------------------------------------ */
 
@@ -142,10 +143,73 @@ struct http_unit *http_unit_open(struct lk_proto *p, struct http_conn *hc, __u64
 
 /* --- emitting -------------------------------------------------------------- */
 
+/* The target as it may leave the handler (РH12). The unit keeps the raw bytes —
+ * the route templater classifies those, and a `***` in the middle of a path it
+ * was about to collapse would be a second, invisible rule — so the redacted form
+ * is built here, into the connection's own scratch, and only when a
+ * credential-shaped query key is actually present. Everything else keeps
+ * pointing straight at the unit's copy: no allocation, no copy, no cost on the
+ * overwhelming majority of requests that carry no query string at all.
+ *
+ * On an allocation failure the observation goes out with *no* text rather than
+ * the raw one: a missing url.path is a gap in a debugging aid, a leaked one is
+ * permanent. */
+static void obs_text(struct http_conn *hc, const struct http_unit *u, struct lk_query_obs *o)
+{
+    __u32 cap;
+
+    if (u->flags & LK_QO_NO_TEXT || !u->target_len) {
+        o->flags |= LK_QO_NO_TEXT;
+        return;
+    }
+    if (http_cfg()->no_redact || !lk_url_redact_needed(u->target, u->target_len)) {
+        o->text = u->target;
+        o->text_len = u->target_len;
+        return;
+    }
+    /* `***` is longer than a one- or two-character value, so the redacted form
+     * can *grow*: `sig=&sig=&…` is the worst shape at 1.6×. Twice the input plus
+     * a mark covers it with room to spare, over a target already bounded by
+     * LK_HTTP_TARGET_MAX — and a clip would be safe anyway, since the redactor
+     * writes a value only after deciding to keep it. */
+    cap = u->target_len * 2 + LK_REDACT_MARK_LEN;
+    if (hc->redacted_cap < cap) {
+        char *nb = realloc(hc->redacted, cap);
+
+        if (!nb) {
+            o->flags |= LK_QO_NO_TEXT;
+            return;
+        }
+        hc->redacted = nb;
+        hc->redacted_cap = cap;
+    }
+    o->text = hc->redacted;
+    o->text_len = lk_url_redact(u->target, u->target_len, hc->redacted, hc->redacted_cap);
+}
+
 static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct http_conn *hc,
                       struct http_unit *u)
 {
     struct lk_route_out route;
+    /* The span material (РH11): pointers into the unit, valid exactly as long as
+     * the callback. Filled unconditionally — a request with no trace context
+     * still has a version and possibly a request id, and a span builder reading
+     * `trace_id == NULL` is how it learns to mint its own. */
+    struct lk_http_obs http = {
+        .trace_id = u->tp.valid ? u->tp.trace_id : NULL,
+        .parent_id = u->tp.valid ? u->tp.parent_id : NULL,
+        .tracestate = u->tracestate_len ? u->tracestate : NULL,
+        .tracestate_len = u->tracestate_len,
+        .req_id = u->req_id[0] ? u->req_id : NULL,
+        .ctype = u->ctype[0] ? u->ctype : NULL,
+        .ts_interim_ns = u->ts_interim_ns,
+        .trace_flags = u->tp.valid ? u->tp.flags : 0,
+        /* The response's version when there is one: what a span reports as
+         * `network.protocol.version` is what the server spoke. A unit only gets
+         * here with a response head, so the request's minor is the fallback for
+         * the degenerate case, not the normal answer. */
+        .version = u->have_resp ? u->resp_minor : u->minor,
+    };
     struct lk_query_obs o = {
         .ts_start_ns = u->ts_start_ns,
         .ts_req_done_ns = u->ts_req_done_ns ? u->ts_req_done_ns : u->ts_start_ns,
@@ -155,6 +219,7 @@ static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct http_conn *h
         .bytes_in = u->bytes_in,
         .bytes_out = u->bytes_out,
         .op = u->method[0] ? u->method : NULL,
+        .http = &http,
         .err_code = u->status,
         .kind = LK_Q_REQUEST,
         .flags = u->flags,
@@ -172,12 +237,7 @@ static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct http_conn *h
      * reporting a number that means two different things. */
     if (u->expect_cont)
         o.flags |= LK_QO_EXPECT_CONT;
-    if (!(u->flags & LK_QO_NO_TEXT) && u->target_len) {
-        o.text = u->target;
-        o.text_len = u->target_len;
-    } else {
-        o.flags |= LK_QO_NO_TEXT;
-    }
+    obs_text(hc, u, &o);
     /* The two identities of an HTTP observation travel side by side and neither
      * replaces the other (РH7): `text` is the raw target, for the span that М6
      * will redact and sample, and `route` is the template, the only one of the
@@ -468,6 +528,7 @@ static void http_on_conn_close(void *ctx, struct lk_conn *c)
         free(hc->ring[i].target);
         free(hc->ring[i].tracestate);
     }
+    free(hc->redacted);
     free(hc);
     c->proto_state = NULL;
 }
