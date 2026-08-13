@@ -1,6 +1,6 @@
-# latkit DaemonSet (Р47) — one agent per node, capturing every postgres on the
-# node kernel-side. Single file, no Helm (v1 scope); configuration is the
-# LATKIT_* env layer (Р34) right in this manifest.
+# latkit DaemonSet (Р47) — one agent per node, capturing every postgres (or
+# MySQL, or HTTP/1.x server) on the node kernel-side. Single file, no Helm (v1
+# scope); configuration is the LATKIT_* env layer (Р34) right in this manifest.
 #
 #   kubectl apply -f latkit-daemonset.yaml
 #
@@ -56,11 +56,25 @@ spec:
               value: "0.0.0.0:9752"
             - name: LATKIT_PORT
               value: "5432"
-            # MySQL/MariaDB instead of (or alongside) postgres: name the port's
-            # wire protocol, e.g. "3306=mysql" or "5432,3306=mysql". Do NOT add
+            # MySQL/MariaDB or HTTP instead of (or alongside) postgres: name the
+            # port's wire protocol, e.g. "3306=mysql", "5432,3306=mysql" or
+            # "8080=http,8443=http" (a bare number defaults to pg). Do NOT add
             # LATKIT_COMM=mysqld — that per-thread kernel filter drops every
             # event on MySQL 8.x, whose session threads are named `connection`
-            # (MYSQL.md М5). The default TLS scan set already includes mysqld.
+            # (MYSQL.md М5); web-server threads are not named after their binary
+            # either. The default TLS scan set already follows the protocols
+            # configured here.
+            #
+            # An http port observes ingress/ingress-controller and sidecar
+            # traffic without touching either. Two caveats worth knowing before
+            # you point it at a service mesh (README "Known limitations"):
+            # HTTP/2 — hence gRPC — is a declared blind zone, counted as
+            # latkit_ignored_conns_total{reason="h2"}, and a body sent with
+            # sendfile(2) may not cross the capture point at all. Both are
+            # counters on the "latkit — HTTP" dashboard, never silence.
+            # Route templating needs no configuration; if it mis-reads your API
+            # (watch the route="other" share), mount a route map and set
+            # LATKIT_HTTP_ROUTES — see deploy/demo-http/routes.map.
             # TLS capture of postgres running with ssl=on (stage 6). Needs the
             # SYS_PTRACE + SYS_ADMIN capabilities below.
             - name: LATKIT_TLS

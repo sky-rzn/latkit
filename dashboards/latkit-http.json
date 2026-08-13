@@ -264,7 +264,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(latkit_http_requests_total{proto=~\"$proto\",route=\"other\"}[$__rate_interval])) / clamp_min(sum(rate(latkit_http_requests_total{proto=~\"$proto\"}[$__rate_interval])), 0.001)",
+          "expr": "(sum(rate(latkit_http_requests_total{proto=~\"$proto\",route=\"other\"}[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(latkit_http_requests_total{proto=~\"$proto\"}[$__rate_interval])), 0.001)",
           "refId": "A",
           "range": true,
           "instant": false,

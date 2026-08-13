@@ -28,6 +28,31 @@ label set is called out explicitly.
   `performance_schema.events_statements_summary_by_digest`
   ([docs/accuracy.md](docs/accuracy.md)).
 
+- **HTTP/1.x support.** latkit now observes an HTTP server the way it observes a
+  database: `--port 8080=http` (a bare port number still means `pg`) and every
+  request-response on that port becomes an observation — method, **templated
+  route**, Host, status, body sizes and four separate timings — from a server
+  with no access log, no status module and no instrumentation. Keep-alive,
+  pipelining, `Transfer-Encoding: chunked`, `Expect: 100-continue`, 1xx,
+  absolute-form targets and all methods are parsed; HTTP/2 (hence gRPC),
+  WebSocket/`Upgrade`, `CONNECT` tunnels and `sendfile` bodies are recognised
+  and counted as blind rather than guessed at. Plaintext and TLS, OpenSSL and Go
+  servers alike. See [docs/notes-httpproto.md](docs/notes-httpproto.md) and the
+  design plan in `PLAN-HTTP.md`.
+- **Route templating** (`route` label): a URL is unbounded by construction, so
+  the label is a template built in three layers — an explicit map
+  (`--http-routes FILE`), a segment classifier (numbers, UUIDs, ULIDs, hex
+  digests, dates, digit-dense and over-long segments become `{id}`; the query
+  string is dropped unless named in `--http-query-keys`), and the same top-K
+  dictionary that bounds the `query` label. The heuristic decides *which*
+  routes you get, never *how many*: the overflow is `route="other"` and its
+  share is a panel. Knobs: `--http-routes`, `--http-route-depth`,
+  `--http-query-keys`, `--http-route-header`, `--http-user`, `--http-redact`,
+  each with a `LATKIT_HTTP_*` environment equivalent.
+- HTTP deploy stacks: [`deploy/demo-http`](deploy/demo-http) (the two-minute
+  demo — nginx + a Go backend + load, with `tls` and `trace` profiles) and
+  [`deploy/existing-http`](deploy/existing-http) (monitoring-only, for a web
+  server you already run).
 - **HTTP metric families and the `latkit-http` dashboard** (PLAN-HTTP.md М5).
   Observations from an `--port 8080=http` port are reported under their own
   family set rather than borrowed database ones:
@@ -133,6 +158,46 @@ label set is called out explicitly.
 
 ### Notes
 
+- **HTTP blind zones** (recognised and counted, never guessed at):
+  **HTTP/2 — and therefore gRPC** (`latkit_ignored_conns_total{reason="h2"}`;
+  a TLS port facing browsers negotiates h2 through ALPN almost always, so
+  capture the origin leg behind the terminator, which is HTTP/1.1 by default),
+  WebSocket and any `Upgrade` (`reason="upgrade"`), `CONNECT` tunnels
+  (`reason="connect"`), **HTTP/3** (QUIC over UDP never reaches the TCP capture
+  point — hence the UDP counters above), and `sendfile` response bodies on
+  kernels that do not route them through `sendmsg` (`bytes_out` becomes a
+  declared lower bound). Request bodies and headers beyond a small list of
+  interest are never parsed. Outgoing (client-side) requests are out of scope in
+  v1. Reasoning: README "Known limitations", PLAN-HTTP.md §8.
+- **`--tls auto` also narrows the kernel capture filter** (documented here for
+  the first time — behaviour unchanged since stage 6, but harmless for
+  databases and consequential for HTTP). The comm set latkit scans for libssl is
+  installed as the kernel filter on the thread comm, so that a shared-`libssl`
+  uprobe does not pull in every process mapping the library. On an HTTP host
+  that means an application server of another comm (Go, Node, Python) on a
+  second captured port reports **nothing** while the nginx port reports
+  normally. Ways out and the reasoning: [docs/deploy.md](docs/deploy.md) "Wire
+  protocols", [`deploy/existing-http`](deploy/existing-http/README.md); the
+  demo's `tls` profile demonstrates it on purpose.
+- **HTTPS: one parse error per ~70 client connections** (newly documented, see
+  [docs/notes-tls.md](docs/notes-tls.md) §6). An HTTPS connection is recognised
+  as TLS from the first event of a direction; nginx's OpenSSL reads the client's
+  record header in two pieces, so the client side is recognised late — from the
+  server's ServerHello — and the ciphertext framed in between is counted as one
+  parse error. The observations (route, status, timings) are unaffected: they
+  come from the uprobe channel. Measured at 1.4 % of connections on a stand that
+  opens one connection per request; a keep-alive client sees it far less often.
+- **A `tcp_sendmsg` the kernel refuses is still counted** (capture layer, all
+  protocols, newly documented — see
+  [docs/notes-iov.md](docs/notes-iov.md) "Known limitations"). SEND is hooked on
+  entry, before a return value exists, so a call rejected with `-EAGAIN` on a
+  full socket buffer is counted at its requested length and the application's
+  re-send is counted again. It takes a large response and a saturated socket:
+  measured at ~0.07 % of observations on the HTTP demo's 8 MB routes, where it
+  inflates `bytes_out` and produces one `parse_errors` + a resync per
+  occurrence. Loud, not silent — but not fixed in this release: the correction
+  is a capture-layer redesign (SEND moving to the `fexit` shape RECV already
+  uses).
 - **MySQL blind zones** (recognised and honestly counted, not parsed): the X
   Protocol (port 33060), the compressed protocol (`CLIENT_COMPRESS`), and
   replication streams (`COM_BINLOG_DUMP`). MariaDB builds linking bundled

@@ -1,0 +1,220 @@
+# latkit HTTP demo stack (PLAN-HTTP.md М9): nginx + a Go backend + load +
+# latkit + prometheus + grafana — the HTTP twin of ../demo (postgres) and
+# ../demo-mysql, wired so `docker compose up` on a Linux host gives live
+# Grafana with the bundled dashboards in about a minute after the images are
+# there. See README.md for the requirements and a tour.
+#
+#   docker compose up --build -d
+#   LATKIT_TLS=auto docker compose --profile tls up --build -d   # + HTTPS (РH13)
+#   docker compose --profile tls --profile trace down -v    # tear down anything
+#
+# Two ports are observed rather than one, because a reverse proxy is the
+# ordinary shape of a real deployment: 8080 is the front leg (client → nginx)
+# and 8081 the upstream leg (nginx → backend). Each has its own latencies, and
+# the point of a per-port observation is that they never merge.
+#
+# Capture hygiene (README "Known limitations"): the load talks to nginx over
+# the compose network by service name — nginx publishes NO port, so nothing
+# crosses docker-proxy on localhost, which would splice() the payload past the
+# capture point. latkit filters the server ports kernel-wide, which covers the
+# HTTPS nginx of the tls profile too.
+
+services:
+  # The application server: Go net/http, built by the stack itself so the demo
+  # needs nothing but Docker. Its responses are the shapes the agent has to get
+  # right — see backend/main.go for what each route is for.
+  backend:
+    build: ./backend
+    environment:
+      LISTEN: ":8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8081/healthz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # The front: static files with `sendfile on` (nginx's default, and the reason
+  # РH4 exists) plus a reverse-proxy leg to the backend. The 8 MB file is
+  # generated at startup — a binary blob does not belong in a git tree.
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        mkdir -p /www/static
+        head -c 8388608 /dev/urandom > /www/static/big.bin
+        printf 'small\n' > /www/static/small.txt
+        exec nginx -g 'daemon off;'
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Steady, varied load so every panel is alive: fresh random identifiers of
+  # five different shapes on every pass (the templater's real test), junk query
+  # strings, two virtual hosts, both upload shapes of РH5, keep-alive bursts,
+  # a chunked response, static files and a spread of failures. Details and
+  # rationale: load/load.sh.
+  load:
+    image: curlimages/curl:latest
+    depends_on:
+      nginx:
+        condition: service_healthy
+    volumes:
+      - ./load/load.sh:/load.sh:ro
+    entrypoint: ["sh", "/load.sh"]
+    restart: unless-stopped
+
+  # The agent — the release scratch image (musl static), built from the repo
+  # root so the version stamp sees .git. Configured through the LATKIT_* env
+  # layer, nothing else.
+  latkit:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    depends_on:
+      nginx:
+        condition: service_healthy
+    # Demo simplicity. The measured minimal set instead (docs/deploy.md):
+    #   cap_add: [BPF, PERFMON, SYS_PTRACE, SYS_ADMIN]
+    # (SYS_PTRACE + SYS_ADMIN only for TLS uprobes; + SYS_RESOURCE on < 5.11)
+    privileged: true
+    pid: host               # uprobes / /proc access need the host PID namespace
+    environment:
+      # The port form carries the wire protocol; a bare number would default to
+      # the postgres parser. 8443 is only used by the tls profile — a port with
+      # no traffic costs nothing.
+      LATKIT_PORT: "8080=http,8081=http,8443=http"
+      LATKIT_PROM_LISTEN: "0.0.0.0:9752"  # default is loopback (Р29); a container must listen out
+      # TLS capture is OFF here and opt-in with the tls profile:
+      #   LATKIT_TLS=auto docker compose --profile tls up --build -d
+      # Not because it costs anything to attach, but because `--tls auto` also
+      # installs a *kernel comm filter* — the scan set {nginx, httpd, apache2,
+      # haproxy} for an http port — and the Go backend's comm is not in it, so
+      # the 8081 upstream leg would go dark. That is the trade, it is real, and
+      # the README explains it rather than hiding it behind a default.
+      LATKIT_TLS: "${LATKIT_TLS:-off}"
+      # Route templating is on by default and needs no configuration; these are
+      # the knobs, at their defaults, so the demo shows where they live:
+      #LATKIT_HTTP_ROUTE_DEPTH: "8"       # segments kept before the tail folds to /...
+      #LATKIT_HTTP_QUERY_KEYS: "action"   # query keys that are part of the route
+      #LATKIT_HTTP_USER: "basic"          # `user` label from Authorization: Basic
+      # Pin the routes instead of guessing them (РH7 layer 1) — uncomment both
+      # this and the volume below:
+      #LATKIT_HTTP_ROUTES: /etc/latkit/routes.map
+      #
+      # OTLP spans (РH11): off unless you pass an endpoint. With the trace
+      # profile below:
+      #   LATKIT_OTLP_ENDPOINT=http://jaeger:4318 LATKIT_OTLP_SPANS=1 \
+      #     docker compose --profile trace up --build -d
+      LATKIT_OTLP_ENDPOINT: "${LATKIT_OTLP_ENDPOINT:-}"
+      LATKIT_OTLP_SPANS: "${LATKIT_OTLP_SPANS:-}"
+      LATKIT_OTLP_SERVICE_NAME: latkit-demo-http
+    #volumes:
+    #  - ./routes.map:/etc/latkit/routes.map:ro
+    ports: ["9752:9752"]    # convenience: curl http://localhost:9752/metrics
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on:
+      - latkit
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=2h"
+    ports: ["19090:9090"]   # 19090 to avoid clashing with a host Prometheus
+
+  grafana:
+    image: grafana/grafana:11.4.0    # pinned major 11.x (Р42)
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: "dark"
+    volumes:
+      # Reuse the postgres demo's provisioning (datasource -> prometheus:9090,
+      # dashboard provider) — same Prometheus service name. All five bundled
+      # dashboards are provisioned; latkit — HTTP is the one with data here.
+      - ../demo/grafana/provisioning:/etc/grafana/provisioning:ro
+      # The dashboards repo dir is the single source (Р43) — mounted read-only.
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+
+  # --- profile tls (additive): a second nginx serving HTTPS, and a client that
+  # --- only speaks to it. The plaintext pair keeps running, so the dashboards
+  # --- show both kinds of traffic side by side and the TLS ones are not
+  # --- distinguishable by their observations — which is the claim of РH13.
+
+  cert-init:
+    image: alpine:3.20
+    profiles: ["tls"]
+    volumes:
+      - httpcerts:/certs
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        [ -s /certs/server.crt ] && exit 0
+        apk add --no-cache openssl >/dev/null
+        openssl req -new -x509 -days 365 -nodes \
+          -out /certs/server.crt -keyout /certs/server.key -subj "/CN=latkit-demo"
+        chmod 644 /certs/server.crt /certs/server.key
+    restart: "no"
+
+  nginx-tls:
+    image: nginx:1.27-alpine
+    profiles: ["tls"]
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./nginx-tls.conf:/etc/nginx/nginx.conf:ro
+      - httpcerts:/certs:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --no-check-certificate -O- https://127.0.0.1:8443/healthz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # The same load script against the HTTPS front: every byte on that socket is
+  # ciphertext, and the plaintext on the dashboards comes from the libssl
+  # uprobes. `-k` because the certificate is self-signed; `--http1.1` because
+  # h2 is a declared blind zone and ALPN would otherwise pick it.
+  load-tls:
+    image: curlimages/curl:latest
+    profiles: ["tls"]
+    depends_on:
+      nginx-tls:
+        condition: service_healthy
+    environment:
+      FRONT: https://nginx-tls:8443
+      CURL_EXTRA: "-k --http1.1"
+    volumes:
+      - ./load/load.sh:/load.sh:ro
+    entrypoint: ["sh", "/load.sh"]
+    restart: unless-stopped
+
+  # --- profile trace (additive): somewhere for the spans to go. Start it with
+  # --- LATKIT_OTLP_ENDPOINT / LATKIT_OTLP_SPANS set (see the latkit service).
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    profiles: ["trace"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"     # the UI
+    restart: unless-stopped
+
+volumes:
+  httpcerts:

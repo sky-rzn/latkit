@@ -1,0 +1,107 @@
+# latkit next to an EXISTING web server (nginx / Apache / HAProxy / a Go
+# service) — monitoring only. Unlike deploy/demo-http this brings NO server and
+# NO load generator: the agent captures the real traffic of the host. Capture is
+# kernel-wide fentry on tcp_sendmsg/tcp_recvmsg, so `pid: host` is all it needs
+# to see it — no link to the web server, no change to its configuration, no
+# access log required.
+#
+#   cd deploy/existing-http
+#   GF_ADMIN_PASSWORD=change-me docker compose up --build -d
+#
+# Prereqs: Linux kernel >= 5.15 with BTF (/sys/kernel/btf/vmlinux), Docker +
+# compose plugin. The traffic must be HTTP/1.x over TCP — HTTP/2 is a declared
+# blind zone and HTTP/3 (QUIC/UDP) never reaches the capture point at all
+# (README "Known limitations"); both are visible as counters, see the README
+# here.
+#
+# Grafana + Prometheus bind to 127.0.0.1 only: /metrics and this Grafana have no
+# auth. Reach them over an SSH tunnel (ssh -L 3000:127.0.0.1:3000 vps) or your
+# own TLS reverse proxy — do not publish these ports to the internet.
+
+services:
+  latkit:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    pid: host                 # uprobes / /proc scan need the host PID namespace
+    # Measured minimal set (docs/deploy.md). BPF+PERFMON = plaintext capture;
+    # SYS_PTRACE+SYS_ADMIN are only for the TLS uprobes. Drop the last two (and
+    # set LATKIT_TLS=off) if you capture a plaintext port — an origin behind a
+    # TLS-terminating balancer usually is one. On kernels < 5.11 add
+    # SYS_RESOURCE. `privileged: true` is the documented fallback.
+    cap_add: [BPF, PERFMON, SYS_PTRACE, SYS_ADMIN]
+    # The TLS auto-scan reads /proc/<host-pid>/root/.../libssl.so of the web
+    # server process to attach the SSL_* uprobes. The docker-default AppArmor
+    # profile mediates that cross-process /proc access and makes the scan come
+    # back empty EVEN WITH CAP_SYS_PTRACE. seccomp + caps stay in force. Needed
+    # ONLY for TLS capture in a container; for plaintext, drop it.
+    security_opt:
+      - apparmor=unconfined
+    environment:
+      # The ports your server listens on, each with its wire protocol. A bare
+      # number would default to the postgres parser. Both legs of a reverse
+      # proxy are worth capturing — they have different latencies:
+      #   LATKIT_PORT: "443=http,8080=http"
+      LATKIT_PORT: "80=http"
+      LATKIT_PROM_LISTEN: "0.0.0.0:9752"  # a container must listen off-loopback
+      # HTTPS: the /proc scan set follows the ports' protocols, so an http port
+      # already scans for nginx, httpd, apache2 and haproxy. Set to "off" for a
+      # plaintext port — it saves a /proc walk and two capabilities.
+      LATKIT_TLS: auto
+      # A Go server (Caddy, Traefik, any net/http) has no libssl to scan for:
+      # name the binary instead. The path must be visible to this container at
+      # the same inode — bind-mount it (see volumes below).
+      # LATKIT_TLS_GO: /host/usr/bin/caddy
+      #
+      # Route templating (РH7) is on by default and needs no configuration. The
+      # knobs, at their defaults:
+      # LATKIT_HTTP_ROUTE_DEPTH: "8"       # path segments kept before /...
+      # LATKIT_HTTP_QUERY_KEYS: "action"   # query keys that are part of a route
+      # LATKIT_HTTP_ROUTE_HEADER: X-Route  # trust the app's own route header
+      # LATKIT_HTTP_USER: basic            # `user` label from Authorization: Basic
+      # If the templater mis-reads your API (watch the route="other" share on
+      # the dashboard), pin the routes instead — one `METHOD /a/{id}/b` per
+      # line, see deploy/demo-http/routes.map:
+      # LATKIT_HTTP_ROUTES: /etc/latkit/routes.map
+      #
+      # Do NOT set LATKIT_COMM unless you know the server's per-THREAD comm:
+      # that is the kernel capture filter, and a wrong value drops every event
+      # silently. The port filter already scopes the capture.
+    #volumes:
+    #  - ./routes.map:/etc/latkit/routes.map:ro
+    #  - /usr/bin/caddy:/host/usr/bin/caddy:ro      # for LATKIT_TLS_GO
+    # No published port: Prometheus scrapes latkit:9752 over the compose network.
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on: [latkit]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+    ports: ["127.0.0.1:9090:9090"]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0     # pinned major 11.x (Р42)
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GF_ADMIN_PASSWORD:?set GF_ADMIN_PASSWORD}"
+      GF_USERS_DEFAULT_THEME: "dark"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      # Reuse the postgres demo provisioning (datasource -> http://prometheus:9090)
+      # and the bundled dashboards straight from the repo — single source,
+      # read-only. "latkit — HTTP" is the one to open.
+      - ../demo/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["127.0.0.1:3000:3000"]
+    restart: unless-stopped
+
+volumes:
+  prom-data:
+  grafana-data:

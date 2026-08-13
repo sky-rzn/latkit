@@ -382,6 +382,25 @@ dropped and counted, so data is never silently corrupted, only absent:
   are counted on the UDP path instead (`latkit_udp_bytes_total`, РH16) so an
   h3-only server reads as "a protocol we do not parse" rather than as a broken
   agent.
+- **HTTPS: a split client record header costs one parse error per connection**
+  (found on the demo stand, PLAN-HTTP.md М9 — *open, not fixed*). `tls_record_
+  head()` in http_frame.c inspects **the first event of a direction** and needs
+  three bytes of it. On the client→server side that assumption does not always
+  hold: nginx's OpenSSL reads the record header in pieces, so the first captured
+  RECV event of an HTTPS connection can be a **single byte** (`0x16`), with the
+  rest of the header in the next event — and the detector, looking at event
+  two, declines. The connection is still recognised as TLS from the *server's*
+  ServerHello a moment later (that direction is written in one call), so nothing
+  is mis-parsed for long: what the peer sent in between is framed as HTTP,
+  fails, and is counted as one `parse_errors` before the connection goes to the
+  decrypted channel. Measured on the demo's `tls` profile — one connection per
+  request, i.e. the worst case for a per-connection artefact: **18 of ~1300
+  connections, 1.4 %**; the observations themselves (route, status, timings) are
+  unaffected, since they come from the uprobe channel. The fix is to test the
+  first *bytes* of a direction rather than its first *event* (concatenating the
+  head buffer with the incoming chunk, and dropping that buffer when the test
+  fires) — framer surgery with its own unit and fuzz round, not a release-notes
+  edit.
 
 ## 7. Security
 

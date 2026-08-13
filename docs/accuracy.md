@@ -371,6 +371,22 @@ zero `latkit_ringbuf_dropped_total` and zero `latkit_resync_total`.
   The bench reports the count of affected requests on every run (`# NOTE:`),
   and the e2e stand drives both shapes deliberately.
 
+- **A large response can be over-counted, and then mis-framed, when the
+  server's socket fills.** This one is not an HTTP property but a capture-layer
+  one, surfaced by HTTP because HTTP is the first protocol here to write
+  megabytes into one connection: SEND is hooked on `fentry`, so a
+  `tcp_sendmsg` the kernel refuses outright (`-EAGAIN`, full send buffer,
+  non-blocking socket) is counted at its *requested* length, and the
+  application then re-sends the same bytes in another call. `bytes_out` is
+  high by that call, the arithmetic body skip finishes early, and the leftover
+  body bytes are rejected as a start line — one `parse_errors` and a resync,
+  loudly rather than silently. Measured on the demo stand (8 MB responses,
+  load generator and agent on one host): 11 in 15 548 observations, ~0.07 %,
+  all on the big-file routes. The accuracy bench does not reproduce it (1 MB
+  responses, one request at a time), which is itself informative about when it
+  happens. Full signature and the fix it would take:
+  [notes-iov.md](notes-iov.md) "Known limitations".
+
 ## Reproduction
 
 ```sh

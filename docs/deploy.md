@@ -35,15 +35,28 @@ CO-RE handles the version drift internally (`src/bpf/latkit.bpf.c`,
 resolved at load time — the event format never changes. **arm64** is a v1.1
 target (CO-RE does not stand in the way; it is untested hardware).
 
-## Wire protocols (PostgreSQL and MySQL)
+## Wire protocols (PostgreSQL, MySQL and HTTP)
 
 A capture port carries its wire protocol: `--port 5432` (or `5432=pg`) is
-PostgreSQL, `--port 3306=mysql` is MySQL/MariaDB, and one agent can watch both
-(`--port 5432,3306=mysql`, `LATKIT_PORT=5432,3306=mysql`). Every query-family
-metric is labelled `proto="pg"|"mysql"` so the two never collide. MySQL support
-covers the classic protocol (5.7 / 8.x, MariaDB 10.6+); the X Protocol, the
-compressed protocol and replication streams are recognised and counted as blind
-(README "Known limitations", [notes-myproto.md](notes-myproto.md)).
+PostgreSQL, `--port 3306=mysql` is MySQL/MariaDB, `--port 8080=http` is
+HTTP/1.x, and one agent can watch all of them at once (`--port
+5432,3306=mysql,8080=http`, same spelling in `LATKIT_PORT`). Every metric
+carries `proto` so the protocols never collide — and HTTP reports through
+families of its own (`latkit_http_*{route,method,host,…}`) rather than
+borrowing the database ones, because an HTTP request has no rows, no SQLSTATE
+and no transaction ([notes-metrics.md](notes-metrics.md) §"HTTP metrics").
+
+MySQL support covers the classic protocol (5.7 / 8.x, MariaDB 10.6+); the X
+Protocol, the compressed protocol and replication streams are recognised and
+counted as blind (README "Known limitations",
+[notes-myproto.md](notes-myproto.md)).
+
+A port may also carry a capture budget: `--port 8080=http:4096` sets how many
+bytes of each send/recv call are copied for that port. The default is 2048 for
+an `http` port (a head is all the framer reads, and copying gigabytes of
+response body into the ringbuf buys nothing) and `--capture-limit` (8192) for a
+database one. `latkit --print-config` prints the resolved value per port as
+`port_cap=PORT:BYTES`.
 
 Two MySQL-specific operator traps:
 
@@ -68,6 +81,51 @@ Two MySQL-specific operator traps:
   the host's file in a container: the uprobe binds to the inode, so both sides
   must see the same file). x86-64 only; see
   [notes-tls.md](notes-tls.md) §4b.
+
+And four HTTP-specific ones, all of which are **counters rather than silence**
+— the point of each is that the dashboard tells you which case you are in:
+
+- **HTTP/2 is a blind zone, and so is gRPC.** A browser-facing TLS port
+  negotiates h2 through ALPN almost always; latkit recognises the preface and
+  drops the connection as a whole into
+  `latkit_ignored_conns_total{reason="h2"}`. Internal service-to-service and
+  origin legs are still mostly HTTP/1.1 — capturing the **origin** leg behind a
+  TLS terminator (nginx speaks 1.1 upstream by default) is usually the answer.
+  The reasoning, and why this is a separate track rather than a to-do, is in
+  PLAN-HTTP.md §8.
+- **HTTP/3 does not pass the capture point at all.** QUIC is UDP; there is no
+  `tcp_sendmsg` to hook and no plaintext boundary to read. So that an h3 server
+  cannot be mistaken for a broken agent, datagrams on captured ports are
+  counted (`latkit_udp_bytes_total{port,dir}`,
+  `latkit_udp_packets_total`) and the agent says so in its log (РH16).
+- **`sendfile` bodies.** nginx serves static files with `sendfile on` by
+  default, and such a body does not reach the socket as a copyable buffer. On
+  kernels since ~6.5 it is routed through `sendmsg` and the bytes are still
+  accounted; where it is not, `bytes_out` becomes a lower bound, the unit is
+  flagged `BODY_UNSEEN` and the response is left out of the size histogram
+  (an undercounted total is honest, an undercounted distribution is
+  misleading). Both cases are visible on the HTTP dashboard.
+- **`--tls auto` narrows the *capture* filter, not just the scan.** The derived
+  comm set is installed as the kernel filter on the thread comm — necessary,
+  because a shared-`libssl` uprobe fires for every process mapping the library
+  and something must keep foreign SSL traffic out of the channel. On a database
+  host this is invisible: the process being captured is the process being
+  scanned. On an HTTP host it is not, because a deployment routinely has nginx
+  *and* an application server of another comm: with `--tls auto` and no
+  `--comm`, an `--port 8081=http` leg served by a **Go / Node / Python** process
+  reports **nothing at all**, while the nginx port reports normally. Ways out:
+  leave TLS capture off when the port is plaintext; name a Go server with
+  `--tls-go` (which adds its comm to the filter); or run a second agent for the
+  application port with `--tls off` — disjoint ports, so nothing is
+  double-counted. `--comm` is not a way out: it narrows the filter to one name.
+  Demonstrated deliberately by the `tls` profile of
+  [`deploy/demo-http`](../deploy/demo-http/README.md).
+- **Route cardinality is bounded, accuracy is not.** `route` is a template and
+  the top-K dictionary caps it whatever the templater decides, so a heuristic
+  that fails on your API costs accuracy, never series count. The two panels to
+  read are the `route="other"` share and the top-routes list; the fix, when
+  needed, is `--http-routes FILE` (an explicit `METHOD /path/{id}` map, first
+  match wins, unmatched paths still fall through to the heuristic).
 
 ## The release binary
 

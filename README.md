@@ -1,16 +1,25 @@
 # latkit
 
-**Per-query PostgreSQL and MySQL latency without extension, config change, and database restart.**
+**Per-query PostgreSQL and MySQL latency, and per-route HTTP latency, without an extension, a config change, or a restart.**
 
-Latkit is an eBPF agent that watches the PostgreSQL and MySQL/MariaDB wire
-protocols at the socket layer and turns them into per-query latency histograms:
-normalised query text, database/user labels, row counts, SQLSTATE errors,
-transaction timings. It exports to Prometheus and OpenTelemetry, ships with
-four ready-made Grafana dashboards, runs beside the database, and the database
-never knows it's there.
+Latkit is an eBPF agent that watches the PostgreSQL, MySQL/MariaDB and HTTP/1.x
+wire protocols at the socket layer and turns them into latency histograms:
+normalised query text, database/user labels, row counts, SQLSTATE errors and
+transaction timings for the databases; templated routes, methods, hosts, status
+codes and four separate timings for HTTP. It exports to Prometheus and
+OpenTelemetry, ships with five ready-made Grafana dashboards, runs beside the
+server, and the server never knows it's there.
 
-Every query series carries a `proto="pg"|"mysql"` label; one agent can watch a
-5432 and a 3306 at once (`--port 5432,3306=mysql`).
+Every series carries a `proto="pg"|"mysql"|"http"` label; one agent can watch a
+5432, a 3306 and an 8080 at once
+(`--port 5432,3306=mysql,8080=http`).
+
+For HTTP that means p99 per route from a web server with no access log, no
+status module and no instrumentation — and, when the caller sends a W3C
+`traceparent`, a server span **inside the caller's existing trace**. The
+declared blind zones (HTTP/2 and therefore gRPC, HTTP/3, WebSocket, CONNECT)
+are counted rather than guessed at: see [Known
+limitations](#known-limitations).
 
 
 ![latkit Overview dashboard](docs/img/latkit-overview.png)
@@ -32,24 +41,39 @@ Open <http://localhost:3000/dashboards> and start with **latkit - Overview**;
 live query latency shows up within a minute. TLS profile and troubleshooting:
 [deploy/demo/README.md](deploy/demo/README.md). For MySQL, the same stack with
 `mysql:8.4` and `proto="mysql"` dashboards lives in
-[deploy/demo-mysql](deploy/demo-mysql/README.md).
+[deploy/demo-mysql](deploy/demo-mysql/README.md); for **HTTP** — nginx in front
+of a Go backend, the **latkit — HTTP** dashboard, plus optional HTTPS and
+`traceparent`-into-Jaeger profiles — in
+[deploy/demo-http](deploy/demo-http/README.md).
 
 ## Why latkit
 
-- **Zero-touch.** You don't need PostgreSQL extension, `shared_preload_libraries`
-  or restart. Point the agent at a running database and metrics start flowing.
-  Nothing runs inside PostgreSQL. The database doesn't know the agent exists.
-- **Server-side truth.** Latency is measured network-to-network on the DB
-  host. It's what the server actually took, per query, including everything
+- **Zero-touch.** You don't need a PostgreSQL extension,
+  `shared_preload_libraries` or a restart — nor, for a web server, an access
+  log, a status module or a line of instrumentation. Point the agent at a
+  running server and metrics start flowing. Nothing runs inside it; it doesn't
+  know the agent exists.
+- **Server-side truth.** Latency is measured network-to-network on the server's
+  own host. It's what the server actually took, per query, including everything
   `pg_stat_statements` never sees (parse, protocol round-trips, result
-  streaming). See [the measurement model](#what-the-numbers-mean).
+  streaming) — and, for HTTP, including the time an application never sees at
+  all: reading the request body off the socket and draining the response into
+  it. See [the measurement model](#what-the-numbers-mean).
 - **Bounded cardinality by construction.** SQL is normalised to a fingerprint
   (literals → `?`), a top-K LRU caps the distinct `query` labels, and the rest
-  folds into `query="other"`.
+  folds into `query="other"`. A URL is unbounded by construction, so the same
+  machinery caps the HTTP `route` label — and the templater that turns
+  `/users/8213/orders` into `/users/{id}/orders` only decides *which* routes you
+  get, never *how many*. See [Routes](#http-routes-a-url-is-not-a-label).
 - **Honest under loss.** Ringbuf drops and parser resyncs are counted and
   dashboarded.
 - **TLS without decryption keys.** Encrypted sessions ride the same pipeline
-  via `libssl` uprobes. You don't need to pass private keys.
+  via `libssl` uprobes — and Go servers (Caddy, Traefik, any `net/http`)
+  through `crypto/tls` probes, stripped binaries included. You don't need to
+  pass private keys.
+- **Part of the trace you already have.** An HTTP request carrying a W3C
+  `traceparent` becomes a server span inside *that* trace
+  ([details](#traceparent-inside-somebody-elses-trace)).
 - **Drops in anywhere.** One static binary (musl, ~4 MB), Docker image,
   systemd unit or k8s DaemonSet.
 
@@ -148,11 +172,12 @@ binary is built differently (fully static musl, in a container):
   [docs/deploy.md](docs/deploy.md#kernel-support).
 - **x86_64** arm64 is untested.
 - **cgroup v2** if you use `--cgroup`.
-- **Dynamically linked OpenSSL** in the DB server processes for TLS capture
-  (`--tls auto`). MariaDB builds that link a bundled **wolfSSL/GnuTLS** instead
-  of OpenSSL have no `libssl.so` to attach to — their TLS is detected and
+- **Dynamically linked OpenSSL** in the observed server processes for TLS
+  capture (`--tls auto`) — or, for a **Go** server, the binary named with
+  `--tls-go`. MariaDB builds that link a bundled **wolfSSL/GnuTLS** instead of
+  OpenSSL have no `libssl.so` to attach to — their TLS is detected and
   dropped-and-counted, not decrypted. Everything else is detected and counted
-  without decryption. See [Known limitations](#known-limitations-v1).
+  without decryption. See [Known limitations](#known-limitations).
 - **Privileges** - root, or the capability set below (kernel/LSM caveats and
   failure signatures in [docs/deploy.md](docs/deploy.md)):
 
@@ -163,8 +188,8 @@ binary is built differently (fully static musl, in a container):
 | TLS (`--tls-go PATH`) | + `CAP_SYS_ADMIN` | uprobes again; no `/proc` scan is involved — the binary is named, so `CAP_SYS_PTRACE` and `hostPID` are not needed for this channel |
 
 TLS capture in a container additionally needs **`hostPID`** (the libssl
-autodetect walks `/proc/<pid>` of the postgres processes). `hostNetwork` is
-never needed: fentry capture sees every netns of the host by construction.
+autodetect walks `/proc/<pid>` of the observed server's processes). `hostNetwork`
+is never needed: fentry capture sees every netns of the host by construction.
 
 ## Configuration
 
@@ -180,7 +205,7 @@ Use it to verify a deployment's env layer.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `-p, --port PORT[=pg\|mysql]` | `LATKIT_PORT` | `5432` | local (server) port to capture, optionally with its wire protocol (default: `pg`); repeatable, up to 16 (e.g. `5432,3306=mysql`) |
+| `-p, --port PORT[=pg\|mysql\|http[:BYTES]]` | `LATKIT_PORT` | `5432` | local (server) port to capture, optionally with its wire protocol (default: `pg`) and a per-port capture budget; repeatable, up to 16 (e.g. `5432,3306=mysql,8080=http`, `443=http:4096`). The budget defaults to `--capture-limit` for a database port and **2048 for an `http` one** — only heads are parsed, so a gigabyte of response body is never copied |
 | `--comm NAME` | `LATKIT_COMM` | off | only capture send/recv of processes with this exact comm. **MySQL 8.x names its per-session threads `connection`, not `mysqld`** — don't filter on `mysqld` there; the port filter already scopes it |
 | `--cgroup PATTERN` | `LATKIT_CGROUP` | off | only capture cgroups whose path under `/sys/fs/cgroup` matches this glob (`*` stays within a path segment, `**` spans); repeatable, re-resolved every 30 s; requires cgroup v2 |
 
@@ -200,6 +225,18 @@ Use it to verify a deployment's env layer.
 | `--top-queries N` | `LATKIT_TOP_QUERIES` | `500` | distinct normalised queries tracked before the rest fold into `query="other"` - the main cardinality knob |
 | `--query-label-len N` | `LATKIT_QUERY_LABEL_LEN` | `256` | max chars of the normalised text kept as the `query` label |
 | `--first-row-hist` | `LATKIT_FIRST_ROW_HIST` | off | also record `latkit_query_first_row_seconds` (doubles the query-labelled series) |
+
+**HTTP observation** (only meaningful with an `=http` port; all optional — route
+templating works with no configuration at all):
+
+| Flag | Env | Default | Meaning |
+|---|---|---|---|
+| `--http-routes FILE` | `LATKIT_HTTP_ROUTES` | off | explicit route map, one `METHOD /users/{id}/orders` per line, first match wins; unmatched paths still fall through to the templater. [Format](deploy/demo-http/routes.map) |
+| `--http-route-depth N` | `LATKIT_HTTP_ROUTE_DEPTH` | `8` | path segments kept in a route label; deeper paths end in `/…` |
+| `--http-query-keys K[,K…]` | `LATKIT_HTTP_QUERY_KEYS` | none | query keys whose *value* belongs to the route (`?action=…` APIs). Every other key and value is dropped before the label |
+| `--http-route-header NAME` | `LATKIT_HTTP_ROUTE_HEADER` | off | trust a route the application sends in this header. Off by default: it is client-controllable input, and only top-K bounds it |
+| `--http-user basic\|none` | `LATKIT_HTTP_USER` | `none` | derive the `user` label from the name half of `Authorization: Basic`; the password is never decoded, Bearer tokens never touched |
+| `--http-redact on\|off` | `LATKIT_HTTP_REDACT` | **on** | replace credential-looking query values (`token`, `sig`, `password`, `key`, `code`, …) with `***` wherever a request target leaves the handler — spans included |
 
 **Exporters** (both run independently; the OTLP group falls back to the
 standard `OTEL_*` variables, so an agent deployed beside other OTel tooling
@@ -222,7 +259,7 @@ inherits the ambient config):
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--tls auto\|off` | `LATKIT_TLS` | `off` | capture TLS plaintext via `libssl` uprobes; `auto` scans `/proc` for the matching processes' libssl and rescans every 30 s for new ones |
+| `--tls auto\|off` | `LATKIT_TLS` | `off` | capture TLS plaintext via `libssl` uprobes; `auto` scans `/proc` for the matching processes' libssl and rescans every 30 s for new ones. **It also installs that comm set as the kernel capture filter** (a shared-libssl uprobe fires for every process mapping the library), so a captured port served by a process outside the set — a Go/Node/Python app server behind nginx — reports nothing while TLS capture is on: see [docs/deploy.md](docs/deploy.md) |
 | `--libssl PATH` | `LATKIT_LIBSSL` | off | attach the `SSL_*` uprobes to this exact libssl, skipping the scan (e.g. a container's copy); a missing file is fatal |
 | `--tls-comm NAME` | `LATKIT_TLS_COMM` | derived from `--port` | with `--tls auto`, scan only processes with this exact comm. The default set follows the configured protocols: `postgres`, `mysqld`, `mariadbd` for a database port, `nginx`, `httpd`, `apache2`, `haproxy` for an HTTP one |
 | `--tls-go PATH` | `LATKIT_TLS_GO` | off | capture the TLS plaintext of a **Go** server (Caddy, Traefik, any `net/http`) by probing `crypto/tls` inside this binary — there is no libssl to scan for. Works on stripped binaries (the ones distributions ship) through Go's own function table. Repeatable, up to 4; x86-64; a binary that cannot be hooked is fatal at startup. [docs/notes-tls.md](docs/notes-tls.md) §4b |
@@ -266,6 +303,67 @@ per-connection), a query observation that spans a loss is discarded and counted
 the Overview dashboard pins a "capture degraded" annotation to any window
 with non-zero drops.
 
+**For HTTP the one interval becomes four**, because a `POST` of a gigabyte over
+a slow link is not a slow server:
+
+```
+ts_start ──request head + body──▶ ts_req_done ──server──▶ first byte ──▶ ts_complete
+          └ latkit_http_request_upload_seconds ┘└ ttfb ┘
+                                               └────── duration ───────┘
+```
+
+`latkit_http_request_duration_seconds` starts at the **end of the request**, so
+the client's upload time is reported as its own family instead of being charged
+to the server; `latkit_http_ttfb_seconds` splits "thinking" from "streaming".
+This differs from nginx's `$request_time`, which covers the whole span — the two
+are reconciled, with numbers, in [docs/accuracy.md](docs/accuracy.md). A 5xx is
+an error; a **4xx is not** (the server correctly saying no), though both are
+counted by exact code in `latkit_http_errors_total`.
+
+## HTTP routes: a URL is not a label
+
+A `query` label is bounded because SQL normalises to a fingerprint. A URL has no
+such property — `/users/8213/orders` is a different string for every user — so
+the `route` label is built in three layers, and the guarantee comes from the
+third, not from the heuristic:
+
+1. **an explicit map** — `--http-routes FILE`, one `GET /users/{id}/orders` per
+   line, first match wins. For the teams who already know their OTel
+   `http.route`;
+2. **templating** (the default, no configuration): each path segment is
+   classified — plain number, UUID, ULID, hex digest ≥ 8, `YYYY-MM-DD`, longer
+   than 24 characters, over 40 % digits, base64-ish — and anything that looks
+   like a value becomes `{id}`. A file extension is kept (`{file}.js`), depth is
+   capped (`--http-route-depth`), and the **query string is dropped entirely**
+   unless you name keys with `--http-query-keys`;
+3. **a hard bound**: the same top-K dictionary the `query` label uses. Whatever
+   the first two layers decide, a route that does not fit folds into
+   `route="other"` — so a heuristic that fails on your API costs accuracy, never
+   cardinality, and the `route="other"` share is a headline panel telling you
+   exactly that.
+
+The route's identity includes the method: `GET /orders/{id}` and
+`DELETE /orders/{id}` are two routes, never one histogram.
+
+## `traceparent`: inside somebody else's trace
+
+If a request carries a W3C `traceparent`, the sampled span latkit exports takes
+**that** trace id and the caller's span id as its parent (and passes
+`tracestate` through). The agent's view of the request then appears inside your
+existing distributed trace — a `SPAN_KIND_SERVER` span with the OTel HTTP
+semantic conventions (`http.request.method`, `http.route`,
+`http.response.status_code`, `server.address`, `url.scheme`, `url.path`,
+`network.protocol.version`, `user_agent.original`, `client.address`) — with
+nothing instrumented inside the server. Requests without a `traceparent` get a
+trace of their own, as before.
+
+Sampling becomes parent-based for such requests: a sampled trace is always
+exported, an unsampled one is skipped by `--otlp-spans` but can still be picked
+up by `--otlp-spans-slow-ms` (deliberate: a slow request is worth a span even
+when its trace was not sampled). Spans are off until you set `--otlp-endpoint`,
+and a span is the only path by which a `url.path` — redacted — leaves the host.
+Try it: the `trace` profile of [deploy/demo-http](deploy/demo-http/README.md).
+
 ## Overhead
 
 Measured with paired ABAB runs against a no-agent baseline at ~50k
@@ -294,6 +392,15 @@ method, tables and reproduction script - `tests/bench/run.sh`):
 - **Raw SQL leaves the agent only in OTel spans, which are off by default**
   (`--otlp-spans`). Enable them deliberately. `--otlp-span-masked`
   substitutes the normalised text where literals must not leave the host.
+- **The agent sees whole HTTP requests; only the route template survives.**
+  Raw paths, query strings, headers and bodies never enter the metrics
+  registry — the label is the template, and that is structural, not a setting.
+  Credential-looking query values (`token`, `sig`, `password`, `key`, `code`,
+  …) are replaced by `***` wherever a target leaves the handler
+  (`--http-redact`, on by default), credential headers are blanked even in the
+  debug dump, and `Authorization` is decoded no further than a user name — and
+  only if you ask for it (`--http-user basic`). A sampled span is the only
+  thing that carries a `url.path` (redacted) off the host.
 - **Own endpoints bind loopback by default** (`--prom-listen
   127.0.0.1:9752`) and speak plain HTTP with no auth. Exposing them
   (`0.0.0.0`) is an explicit choice. Front with a reverse proxy outside a
@@ -315,6 +422,28 @@ method, tables and reproduction script - `tests/bench/run.sh`):
   *detected* and its ciphertext dropped-and-counted (`latkit_tls_*` metrics),
   never guessed at. BoringSSL may work through the offset-independent bridge but
   is untested. [docs/notes-tls.md](docs/notes-tls.md) §6.
+- **HTTP scope: HTTP/1.0 and HTTP/1.1, server side.** Keep-alive, pipelining,
+  `chunked`, `Expect: 100-continue`, 1xx, absolute-form targets and every method
+  are parsed. Out of scope, each *recognised and counted* rather than guessed
+  at (`latkit_ignored_conns_total{reason}`):
+  - **HTTP/2 — and therefore gRPC.** HPACK's header table cannot survive a
+    capture hole and per-stream state cannot be bounded the way this agent
+    bounds everything else; the preface is detected and the connection is
+    dropped whole (`reason="h2"`). On a browser-facing TLS port ALPN picks h2
+    almost always — capture the origin leg behind the terminator, which is
+    still HTTP/1.1 by default. Reasoning in full: PLAN-HTTP.md §8;
+  - **WebSocket and any `Upgrade`** (`reason="upgrade"`), **`CONNECT` tunnels**
+    (`reason="connect"`) — after the switch the bytes are not HTTP;
+  - **`sendfile` response bodies** may not cross the capture point: `bytes_out`
+    is then a declared lower bound (the unit is flagged, and left out of the
+    size histogram rather than skewing it). Since ~6.5 the kernel routes them
+    through `sendmsg` and they are accounted normally;
+  - **request bodies** are never parsed (JSON, forms, multipart), and neither
+    are headers beyond the small list of interest.
+
+  Outgoing requests (your app calling someone else's API) are not observed in
+  v1: the capture filter is on the local port, and a client's local port is
+  ephemeral.
 - **UDP is counted, never parsed.** QUIC/HTTP-3 does not pass through the TCP
   capture point at all, so an h3 server would look exactly like a broken agent.
   Datagrams on the captured ports are therefore counted
@@ -350,12 +479,14 @@ method, tables and reproduction script - `tests/bench/run.sh`):
 
 ```
         kernel                             userspace (one process, one epoll loop)
-┌───────────────────────────┐            ┌────────────────────────────────────────┐
-│ fentry tcp_sendmsg        │  ringbuf   │ conn table → framer → PG/MySQL parser  │
-│ fentry/fexit tcp_recvmsg  │ ─────────▶ │  → SQL normaliser → top-K registry     │
-│ tp_btf inet_sock_set_state│  events    │  → /metrics (pull) + OTLP push + spans │
-│ uprobes SSL_read/SSL_write│            │                                        │
-└───────────────────────────┘            └────────────────────────────────────────┘
+┌───────────────────────────┐            ┌──────────────────────────────────────────┐
+│ fentry tcp_sendmsg        │  ringbuf   │ conn table → framer → PG/MySQL/HTTP      │
+│ fentry/fexit tcp_recvmsg  │ ─────────▶ │   parser → SQL normaliser / route        │
+│ tp_btf inet_sock_set_state│  events    │   templater → top-K registry             │
+│ uprobes SSL_read/SSL_write│            │   → /metrics (pull) + OTLP push + spans  │
+│ uprobes Go crypto/tls     │            │                                          │
+│ fentry udp_sendmsg/recvmsg│            │ (UDP: counted only — see limitations)    │
+└───────────────────────────┘            └──────────────────────────────────────────┘
 ```
 
 The kernel side does the minimum: filter (port AND comm AND cgroup), stamp,
@@ -367,7 +498,8 @@ connection identity, and the socket-layer copy is dropped and counted. The
 layer-by-layer write-ups: [docs/notes-iov.md](docs/notes-iov.md) (payload
 capture), [docs/notes-reassembly.md](docs/notes-reassembly.md) (framing),
 [docs/notes-pgproto.md](docs/notes-pgproto.md) /
-[docs/notes-myproto.md](docs/notes-myproto.md) (parsers),
+[docs/notes-myproto.md](docs/notes-myproto.md) /
+[docs/notes-httpproto.md](docs/notes-httpproto.md) (parsers),
 [docs/notes-metrics.md](docs/notes-metrics.md) (normalisation, nomenclature,
 cardinality), [docs/notes-export.md](docs/notes-export.md) (exporters),
 [docs/notes-tls.md](docs/notes-tls.md) (TLS).
@@ -378,6 +510,13 @@ The metric nomenclature is a public API:
 `latkit_query_rows_total`, connection/transaction series, and the agent
 self-metrics (`latkit_ringbuf_dropped_total`, `latkit_resync_total`,
 `latkit_metric_series`, …) that feed the **Agent health** dashboard.
+HTTP reports through families of its own rather than borrowing the database
+ones — `latkit_http_request_duration_seconds{route,method,host,user,proto,code}`,
+`latkit_http_ttfb_seconds`, `latkit_http_request_upload_seconds`,
+`latkit_http_requests_total{…,status}`, `latkit_http_errors_total{code,…}`,
+`latkit_http_bytes_total{…,direction}`, `latkit_http_response_size_bytes` —
+because a request has no rows, no SQLSTATE and no transaction. One registry, two
+label profiles ([docs/notes-metrics.md](docs/notes-metrics.md)).
 For a valid exposition use `latkit --dump-metrics` + `kill -USR1`.
 
 ## Development

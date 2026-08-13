@@ -132,9 +132,12 @@ static void usage(FILE *out, const char *argv0)
     fprintf(out,
             "latkit %s\n"
             "usage: %s [options]\n"
-            "  -p, --port PORT[=PROTO]\n"
+            "  -p, --port PORT[=PROTO[:BYTES]]\n"
             "                        local (server) port to capture, optionally with\n"
-            "                        its wire protocol (default: pg);\n"
+            "                        its wire protocol (pg | mysql | http; default:\n"
+            "                        pg) and a per-port capture budget in bytes\n"
+            "                        (default: 8192 for a database port, 2048 for\n"
+            "                        http, where only heads are read);\n"
             "                        repeatable, up to %d ports (default: %d)\n"
             "      --ringbuf-bytes N ringbuf size, power-of-two bytes (default: %d)\n"
             "      --capture-limit N capture budget per send/recv call, bytes\n"
@@ -209,6 +212,30 @@ static void usage(FILE *out, const char *argv0)
             "      --tls-go PATH     capture TLS plaintext of a Go server by\n"
             "                        probing crypto/tls in this binary (x86-64,\n"
             "                        not stripped); repeatable, up to %d\n"
+            "      --http-routes FILE\n"
+            "                        route map, one `METHOD /users/{id}/orders`\n"
+            "                        per line; a matching pattern wins over the\n"
+            "                        templater below (default: off)\n"
+            "      --http-route-depth N\n"
+            "                        keep at most N path segments in a route\n"
+            "                        label; deeper paths end in /... (default: %d)\n"
+            "      --http-query-keys K[,K...]\n"
+            "                        query-string keys whose value is part of the\n"
+            "                        route (?action=... APIs); every other key and\n"
+            "                        value is dropped before the label (default: none)\n"
+            "      --http-route-header NAME\n"
+            "                        take the route from this request header when\n"
+            "                        present. UNTRUSTED input — only top-K bounds\n"
+            "                        the cardinality (default: off)\n"
+            "      --http-user basic|none\n"
+            "                        derive the `user` label from the name half of\n"
+            "                        Authorization: Basic; the password is never\n"
+            "                        decoded (default: none, i.e. user=\"-\")\n"
+            "      --http-redact on|off\n"
+            "                        replace credential-looking query values with\n"
+            "                        *** wherever a request target leaves the\n"
+            "                        handler, and blank credential headers in the\n"
+            "                        --messages dump (default: on)\n"
             "      --print-config    resolve config (flag > LATKIT_* env > default)\n"
             "                        to stdout and exit; every flag has a LATKIT_*\n"
             "                        env equivalent (see README)\n"
@@ -219,7 +246,7 @@ static void usage(FILE *out, const char *argv0)
             LK_VERSION, argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT,
             LK_MAX_CHUNKS * LK_CHUNK_FULL, LK_CAP_HEADERS_LIMIT, LK_MAX_CONNS_DEFAULT,
             LK_CONN_IDLE_TIMEOUT_SEC, LK_TOP_QUERIES_DEFAULT, LK_QUERY_LABEL_LEN_DEFAULT,
-            LK_PROM_LISTEN_DEFAULT, LK_SPAN_TEXT_MAX_DEF, LK_TLS_GO_MAX_PATHS);
+            LK_PROM_LISTEN_DEFAULT, LK_SPAN_TEXT_MAX_DEF, LK_TLS_GO_MAX_PATHS, LK_ROUTE_DEPTH_DEF);
 }
 
 /* Strict decimal parse into [min, max]; -1 on any trailing garbage. */
@@ -507,9 +534,8 @@ static int set_option(int c, char *optarg)
         break;
     case OPT_HTTP_USER:
         /* РH10: `--http-user basic` takes the `user` label from the name half of
-         * `Authorization: Basic`. Off by default, and deliberately absent from
-         * --help until М9 documents the HTTP surface as a whole — the same
-         * treatment the per-port capture budget gets (РH14). */
+         * `Authorization: Basic`. Off by default — a `user` label is a
+         * cardinality multiplier, and most HTTP has no user at all. */
         if (!strcmp(optarg, "basic")) {
             opt_http_user_basic = true;
         } else if (!strcmp(optarg, "none")) {
@@ -707,6 +733,17 @@ static const struct env_opt env_opts[] = {
     {"LATKIT_LIBSSL", OPT_LIBSSL, true, false},
     {"LATKIT_TLS_COMM", OPT_TLS_COMM, true, false},
     {"LATKIT_TLS_GO", OPT_TLS_GO, true, true},
+    {"LATKIT_HTTP_ROUTES", OPT_HTTP_ROUTES, true, false},
+    {"LATKIT_HTTP_ROUTE_DEPTH", OPT_HTTP_ROUTE_DEPTH, true, false},
+    /* Not `repeat`: the flag itself takes the comma-separated list and each
+     * spelling of it *replaces* the previous one, so splitting the variable here
+     * would leave only its last key. */
+    {"LATKIT_HTTP_QUERY_KEYS", OPT_HTTP_QUERY_KEYS, true, false},
+    {"LATKIT_HTTP_ROUTE_HEADER", OPT_HTTP_ROUTE_HEADER, true, false},
+    {"LATKIT_HTTP_USER", OPT_HTTP_USER, true, false},
+    /* Value-carrying rather than boolean (`on`/`off`) because its default is on:
+     * a truthy-word variable could only ever turn on what is already on. */
+    {"LATKIT_HTTP_REDACT", OPT_HTTP_REDACT, true, false},
 };
 
 /* Apply LATKIT_* env variables to flags not given on the CLI (Р34): flag > env

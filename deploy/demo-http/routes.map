@@ -1,0 +1,42 @@
+# Example route map for `--http-routes` / `LATKIT_HTTP_ROUTES` (РH7 layer 1).
+#
+# The demo runs WITHOUT this file by default, so that what you see on the
+# dashboard is the heuristic templater doing its job on URLs it has never seen.
+# Mount and enable it (both lines are in docker-compose.yml, commented) to pin
+# the routes instead:
+#
+#   volumes:     [ ./routes.map:/etc/latkit/routes.map:ro ]
+#   environment: LATKIT_HTTP_ROUTES: /etc/latkit/routes.map
+#
+# Format: one `METHOD /path/template` per line; `{name}` is a wildcard segment
+# and its spelling is yours (the label is printed verbatim). `*` as the method
+# matches any. First match wins, so order from specific to general. Blank lines
+# and `#` comments are ignored; a line that cannot be a path template (no
+# leading `/`, a `?` or `#` inside it) is rejected and counted at startup.
+#
+# What a map buys over the heuristic: the label is exactly the one your team
+# already uses in OTel `http.route`, and a segment the heuristic cannot know is
+# an id (a slug, a filename, an e-mail) stops splitting your histogram. What it
+# costs: it has to be kept in step with the application's routing table.
+# Anything not matched here still falls through to the heuristic — a map is a
+# correction, not a whitelist.
+
+GET    /api/users/{id}/orders
+GET    /api/users/{id}
+GET    /api/orders/{order_id}
+DELETE /api/orders/{order_id}
+GET    /api/sessions/{session}
+GET    /api/blobs/{digest}
+GET    /api/reports/{day}
+GET    /api/search
+GET    /api/events
+GET    /api/slow
+GET    /api/flaky
+GET    /api/boom
+GET    /api/legacy
+POST   /api/orders
+PUT    /api/uploads/{id}
+*      /static/{file}
+*      /nosendfile/{file}
+GET    /hello
+GET    /healthz

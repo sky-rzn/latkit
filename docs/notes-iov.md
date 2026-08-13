@@ -220,6 +220,29 @@ unless noted; `dmesg` stayed empty across all loads.
   the slots before the byte budget; such calls under-capture without
   `LK_F_TRUNC`, which stage 2 still detects from `off`/`cap_len` vs
   `total_len`.
+- **A refused `tcp_sendmsg` is counted anyway** (found on the HTTP demo stand,
+  PLAN-HTTP.md М9 — *open, not resolved*). SEND is hooked on `fentry` only, so
+  the record is written before the return value exists: `total_len` is what the
+  application **asked** to send. On a non-blocking socket whose send buffer is
+  full the kernel can accept **nothing** (`-EAGAIN`), and the application
+  re-sends the same bytes in the next call — which the agent counts a second
+  time. Signature, from a recorded trace: two consecutive SEND events on one
+  connection with **byte-identical captured payload** and different
+  `total_len` (observed: 32768 then 65536 — nginx retrying with more data
+  queued behind it).
+  Consequences, in the order they bite: `bytes_out` is over-reported by the
+  refused call; a body skipped arithmetically therefore ends early, and the
+  leftover body bytes are read as the next head — one `parse_errors`, then a
+  resync. Measured on the HTTP demo (8 MB static responses, a load generator
+  and an agent competing for one host): **11 parse errors in 15 548
+  observations, ~0.07 %**, all on the two big-file routes. It takes a large
+  response and a socket that fills, which is why the database stands have never
+  shown it — a `Content-Length`-framed reply of a few KB is accepted whole.
+  The fix is not a patch to the framer, which cannot know: SEND would have to
+  move to the RECV shape (snapshot the segments on `fentry`, emit on `fexit`
+  with the real `ret`), at the cost of a map write per send and a timestamp
+  that moves from entry to exit. That is a capture-layer design change with its
+  own kernel-matrix round, not an М9 edit.
 - **splice() traffic is invisible or empty** (observed via docker-proxy,
   which relays with splice): the send side arrives at `tcp_sendmsg` with an
   `ITER_BVEC` iterator (kernel pages, not the application buffer) and
