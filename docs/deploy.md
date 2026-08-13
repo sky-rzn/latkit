@@ -105,21 +105,18 @@ And four HTTP-specific ones, all of which are **counters rather than silence**
   flagged `BODY_UNSEEN` and the response is left out of the size histogram
   (an undercounted total is honest, an undercounted distribution is
   misleading). Both cases are visible on the HTTP dashboard.
-- **`--tls auto` narrows the *capture* filter, not just the scan.** The derived
-  comm set is installed as the kernel filter on the thread comm — necessary,
-  because a shared-`libssl` uprobe fires for every process mapping the library
-  and something must keep foreign SSL traffic out of the channel. On a database
-  host this is invisible: the process being captured is the process being
-  scanned. On an HTTP host it is not, because a deployment routinely has nginx
-  *and* an application server of another comm: with `--tls auto` and no
-  `--comm`, an `--port 8081=http` leg served by a **Go / Node / Python** process
-  reports **nothing at all**, while the nginx port reports normally. Ways out:
-  leave TLS capture off when the port is plaintext; name a Go server with
-  `--tls-go` (which adds its comm to the filter); or run a second agent for the
-  application port with `--tls off` — disjoint ports, so nothing is
-  double-counted. `--comm` is not a way out: it narrows the filter to one name.
-  Demonstrated deliberately by the `tls` profile of
-  [`deploy/demo-http`](../deploy/demo-http/README.md).
+- **`--tls auto` does not narrow what is captured** (since М9 — read this if you
+  run an older build). The derived comm set gates the **uprobe channels** only:
+  a shared-`libssl` uprobe fires for every process mapping the library, so
+  something must say which of them is the server. The socket path is scoped by
+  the port filter instead, and takes its comm gate from an explicit `--comm`
+  alone. Before М9 both shared one list, and the consequence was silent
+  wherever the captured process was not the scanned one — the ordinary HTTP
+  shape: with `--tls auto`, a plaintext `--port 8081=http` served by a Go, Node
+  or Python process reported **nothing at all** while the nginx port beside it
+  looked healthy. If you see a port with connections and no observations on an
+  older agent, that is the cause; the workaround there was `--tls off` or a
+  second agent for the application port.
 - **Route cardinality is bounded, accuracy is not.** `route` is a template and
   the top-K dictionary caps it whatever the templater decides, so a heuristic
   that fails on your API costs accuracy, never series count. The two panels to

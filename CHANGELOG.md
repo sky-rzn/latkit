@@ -156,6 +156,24 @@ label set is called out explicitly.
   flag to a small struct (the per-port budget above), and the comm-filter
   capacity from 4 to 8 entries.
 
+### Fixed
+
+- **`--tls auto` no longer narrows plaintext capture.** The comm set latkit
+  derives for TLS (the libssl scan set, `--tls-comm`, the basenames of
+  `--tls-go` binaries, `connection`) was installed as *the* kernel capture
+  filter, gating the socket path as well as the uprobes. On a database host that
+  was invisible — the captured process is the scanned one — but on any host
+  where it is not, capture went silently missing: with TLS on, a plaintext
+  `--port 8081=http` served by a Go, Node or Python application produced **no
+  observations at all**, while the nginx port beside it looked healthy. The
+  symptom was a port with connections and zero queries.
+  The derived set now gates only the uprobe channels, which is what it was for
+  (a shared-`libssl` uprobe attaches at pid=-1 and fires for every process
+  mapping the file). `--comm` is unchanged: an explicit filter still applies to
+  every path. Nothing changes for a database-only deployment. Regression: the
+  `comm-filter scope` phase of `tests/kernel/smoke.sh`, on the whole kernel
+  matrix.
+
 ### Notes
 
 - **HTTP blind zones** (recognised and counted, never guessed at):
@@ -169,16 +187,6 @@ label set is called out explicitly.
   declared lower bound). Request bodies and headers beyond a small list of
   interest are never parsed. Outgoing (client-side) requests are out of scope in
   v1. Reasoning: README "Known limitations", PLAN-HTTP.md §8.
-- **`--tls auto` also narrows the kernel capture filter** (documented here for
-  the first time — behaviour unchanged since stage 6, but harmless for
-  databases and consequential for HTTP). The comm set latkit scans for libssl is
-  installed as the kernel filter on the thread comm, so that a shared-`libssl`
-  uprobe does not pull in every process mapping the library. On an HTTP host
-  that means an application server of another comm (Go, Node, Python) on a
-  second captured port reports **nothing** while the nginx port reports
-  normally. Ways out and the reasoning: [docs/deploy.md](docs/deploy.md) "Wire
-  protocols", [`deploy/existing-http`](deploy/existing-http/README.md); the
-  demo's `tls` profile demonstrates it on purpose.
 - **HTTPS: one parse error per ~70 client connections** (newly documented, see
   [docs/notes-tls.md](docs/notes-tls.md) §6). An HTTPS connection is recognised
   as TLS from the first event of a direction; nginx's OpenSSL reads the client's

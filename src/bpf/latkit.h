@@ -9,13 +9,14 @@
 #define LK_MAX_PORTS    16   /* capacity of the `ports` filter map */
 #define LK_DEFAULT_PORT 5432 /* used when no --port is given */
 
-/* Capacity and entry size of the comm filter (РМ10). The filter matches the
- * *thread* comm (bpf_get_current_comm), so the list must fit the default
- * DB-server set {postgres, mysqld, mariadbd} plus `connection` — MySQL 8.x
- * renames its per-session threads. Raised to 8 by РH13.1: an HTTP deployment
- * scans for {nginx, httpd, apache2, haproxy} instead, a mixed one for both
- * sets, and the DB four already filled the old ceiling exactly.
- * LK_COMM_LEN mirrors TASK_COMM_LEN. */
+/* Capacity and entry size of the comm filters (РМ10). Both match the *thread*
+ * comm (bpf_get_current_comm) and share this shape: `cfg_comm_filter` — the
+ * user's `--comm`, gating every path — and `cfg_tls_comm_filter`, gating the
+ * uprobe channels only. The latter is what needs the room: it must fit the
+ * default DB-server set {postgres, mysqld, mariadbd} plus `connection` (MySQL
+ * 8.x renames its per-session threads), and РH13.1 added the HTTP set
+ * {nginx, httpd, apache2, haproxy} for an http port — a mixed deployment holds
+ * both. LK_COMM_LEN mirrors TASK_COMM_LEN. */
 #define LK_COMM_FILTER_MAX 8
 #define LK_COMM_LEN        16
 

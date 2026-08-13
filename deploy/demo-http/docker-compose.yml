@@ -5,7 +5,7 @@
 # there. See README.md for the requirements and a tour.
 #
 #   docker compose up --build -d
-#   LATKIT_TLS=auto docker compose --profile tls up --build -d   # + HTTPS (РH13)
+#   docker compose --profile tls up --build -d     # + an HTTPS nginx (РH13)
 #   docker compose --profile tls --profile trace down -v    # tear down anything
 #
 # Two ports are observed rather than one, because a reverse proxy is the
@@ -92,14 +92,13 @@ services:
       # no traffic costs nothing.
       LATKIT_PORT: "8080=http,8081=http,8443=http"
       LATKIT_PROM_LISTEN: "0.0.0.0:9752"  # default is loopback (Р29); a container must listen out
-      # TLS capture is OFF here and opt-in with the tls profile:
-      #   LATKIT_TLS=auto docker compose --profile tls up --build -d
-      # Not because it costs anything to attach, but because `--tls auto` also
-      # installs a *kernel comm filter* — the scan set {nginx, httpd, apache2,
-      # haproxy} for an http port — and the Go backend's comm is not in it, so
-      # the 8081 upstream leg would go dark. That is the trade, it is real, and
-      # the README explains it rather than hiding it behind a default.
-      LATKIT_TLS: "${LATKIT_TLS:-off}"
+      # Safe on a plaintext stack: the uprobes attach and simply see no TLS
+      # traffic. With --profile tls they decrypt the HTTPS nginx (РH13.1) — the
+      # /proc scan set follows the ports' protocols, so an http port scans for
+      # nginx/httpd/apache2/haproxy. That set gates the uprobe channel only, so
+      # the Go backend on 8081 — whose comm is in nobody's scan set — keeps
+      # being observed in plaintext either way.
+      LATKIT_TLS: auto
       # Route templating is on by default and needs no configuration; these are
       # the knobs, at their defaults, so the demo shows where they live:
       #LATKIT_HTTP_ROUTE_DEPTH: "8"       # segments kept before the tail folds to /...

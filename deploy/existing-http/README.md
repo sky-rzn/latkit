@@ -103,35 +103,25 @@ at HPACK state would be worse than counting.
 - **A statically linked OpenSSL** (node, envoy): point `--libssl` /
   `LATKIT_LIBSSL` at the server binary itself.
 
-> ### The trap: `LATKIT_TLS=auto` narrows what is captured at all
+> ### `LATKIT_TLS=auto` does not narrow what is captured
 >
-> With TLS capture on, the scan set is not only where latkit *looks for libssl*
-> — it is also installed as the **kernel capture filter on the thread comm**.
-> The reason is sound: a shared `libssl` uprobe fires for every process that
-> maps the library, so something has to keep a `curl` or a `psql` on the same
-> host out of the channel. The consequence is not obvious: with
-> `LATKIT_TLS=auto` and no explicit `LATKIT_COMM`, **send/recv from a process
-> whose comm is not in the set is dropped** — and the set is
-> `{nginx, httpd, apache2, haproxy}` for an http port (plus the database three
-> if you also capture a database port, plus `connection`).
+> Worth stating because it was not always true. The scan set — where latkit
+> looks for `libssl` — also gates the **uprobe channel**: a shared-`libssl`
+> uprobe fires for every process that maps the library, so something has to keep
+> a `curl` or a `psql` on the same host out of it. That gate stops there. Your
+> plaintext ports are captured by the port filter regardless of which process
+> serves them, so an nginx on 443 and a Go application on 8080 are both observed
+> by one agent with TLS capture on.
 >
-> So an agent capturing `443=http,8080=http` with TLS on will report the nginx
-> port and **silently see nothing on the 8080 leg** if that leg is served by a
-> Go, Node, Python or Java process. The symptom is a port with connections but
-> no observations, and it looks exactly like "the protocol is not HTTP".
+> **On agents older than this one** the two shared a single filter, and a
+> plaintext port served by a Go / Node / Python / Java process reported nothing
+> at all whenever `LATKIT_TLS=auto` was set — a port with connections and no
+> observations, looking exactly like "the protocol is not HTTP". The workarounds
+> there were `LATKIT_TLS=off`, or a second agent for the application port. On a
+> current build neither is needed.
 >
-> Three ways out, in order of preference:
-> 1. **Is the port plaintext?** Then `LATKIT_TLS=off`. No filter is installed at
->    all, and every process on the captured ports is observed. An origin behind
->    a TLS-terminating balancer is this case.
-> 2. **Name the Go binary** — `LATKIT_TLS_GO=/usr/bin/caddy` adds its comm to
->    the filter along with attaching its probes.
-> 3. **One agent per role.** A second latkit with `LATKIT_PORT=8080=http` and
->    `LATKIT_TLS=off` next to the TLS one; the two capture disjoint ports, so
->    Prometheus scrapes both and nothing is counted twice.
->
-> `LATKIT_COMM` is *not* a way out: it replaces the filter with exactly one
-> comm, which is narrower still.
+> `LATKIT_COMM` is still a real filter and still applies everywhere: set it and
+> you capture that one comm and nothing else.
 
 Verify TLS capture is live:
 
@@ -203,9 +193,9 @@ Isolate top-down; each step says which layer is at fault.
    - `events_total` grows, `http_requests_total` empty → the bytes are not
      readable HTTP/1.x: check `ignored_conns_total{reason}` (h2 / upgrade /
      connect) and, on an HTTPS port, whether the uprobes attached;
-   - **one captured port reports and another does not** → almost always the
-     comm-filter trap above: turn `LATKIT_TLS=off` and see whether the silent
-     port comes to life;
+   - **one captured port reports and another does not** → check `LATKIT_COMM`
+     (it filters every path) and, on an agent older than this one, the
+     comm-filter note above: `LATKIT_TLS=off` was the workaround;
    - everything flat, `udp_bytes_total` growing → HTTP/3;
    - everything flat and no UDP either → the port filter does not match (wrong
      `LATKIT_PORT`), the traffic is on a unix socket, or `pid: host` is missing.

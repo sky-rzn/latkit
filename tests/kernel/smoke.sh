@@ -289,6 +289,39 @@ else
     log "TLS smoke skipped ($([ "$DO_TLS" = 1 ] && echo 'tlspipe not built' || echo '--no-tls'))"
 fi
 
+# --- comm-filter scope: plaintext traffic while TLS capture is on --------------
+# The regression for PLAN-HTTP.md М9. Enabling TLS gives the agent a derived comm
+# list (here `--tls-comm tlspipe`, in production the libssl scan set), and that
+# list is the uprobe gate: a uprobe on a shared libssl fires for every process
+# mapping it, so something must say which one is the server.
+#
+# It must NOT gate the socket path, which is already scoped to the configured
+# port. Until М9 one list did both, and the cost was silent: with TLS on, a
+# captured port served by any other process — a Go/Node/Python app behind nginx
+# — produced no observations at all. Here pgstream plays that process: its comm
+# is `pgstream`, the filter says `tlspipe`, and every query must still be seen.
+if [ "$DO_TLS" = 1 ] && [ -x "$TLSPIPE" ]; then
+    log "comm-filter scope (plaintext under --tls)"
+    LIBSSL=$(ldd "$TLSPIPE" | awk '/libssl/ { print $3; exit }')
+    if [ -z "$LIBSSL" ]; then
+        fail "cannot resolve tlspipe's libssl (ldd)"
+    elif start_agent scope --libssl "$LIBSSL" --tls-comm tlspipe; then
+        if summary=$("$PGSTREAM" -p "$PORT" -r "$REPEAT" $PGSTREAM_PROTO 2>"$TMP/pgstream2.log"); then
+            note "$summary (driver comm: pgstream, TLS comm filter: tlspipe)"
+            if stop_agent scope; then
+                assert_phase scope "$summary"
+            else
+                fail "agent exited non-zero after comm-scope phase"
+                tail -5 "$TMP/scope.log" | sed 's/^/  | /'
+            fi
+        else
+            fail "pgstream failed"
+            tail -5 "$TMP/pgstream2.log" | sed 's/^/  | /'
+            stop_agent scope || true
+        fi
+    fi
+fi
+
 # --- verdict -------------------------------------------------------------------
 log "verdict"
 if [ "$fails" -eq 0 ]; then

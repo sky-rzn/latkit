@@ -188,9 +188,24 @@ are in the process model and in naming, not in the probes:
   matches the **thread** comm (`bpf_get_current_comm`). A single shared name —
   the pre-М5 behaviour of adopting `--tls-comm` as the kernel filter — silently
   dropped *every* socket and uprobe event of an 8.x server (находка М0). Since
-  М5 the two diverge: with `--tls` and no explicit `--comm`, the kernel filter
-  is the scan set widened by `connection`; an explicit `--comm` still overrides
-  the kernel filter exactly.
+  М5 the two diverge: with `--tls` and no explicit `--comm`, the uprobe filter
+  is the scan set widened by `connection`; an explicit `--comm` applies on top,
+  and on every path.
+- **Two comm filters, and which path each one gates** (М9). The derived TLS set
+  above is `cfg_tls_comm_filter` and it gates **the uprobe channels only**: a
+  uprobe on a shared libssl attaches at pid=-1, so it fires for every process
+  mapping that file — a `psql`, a `curl` — and a comm is what tells them apart.
+  The socket path is gated by `cfg_comm_filter`, which holds **`--comm` and
+  nothing else**, because that path is already scoped to the configured local
+  ports (Р7).
+  Until М9 there was one list for both, and the cost was invisible on a
+  database host — where the captured process *is* the scanned one — and
+  expensive anywhere else: with `--tls auto`, a plaintext `--port 8081=http`
+  served by a Go, Node or Python process produced no observations at all, while
+  the nginx port beside it looked perfectly healthy. The symptom was a port
+  with connections and zero queries. Regression: the `comm-filter scope` phase
+  of `tests/kernel/smoke.sh` drives plaintext traffic from `pgstream` while the
+  agent runs `--tls-comm tlspipe`, and asserts the full plaintext expectations.
 - **MariaDB bundled TLS is a blind spot.** MariaDB builds linked against
   bundled wolfSSL (the upstream default in some packagings) or GnuTLS map no
   `libssl.so`, so there is nothing to hook: the scan finds the process but no
@@ -201,7 +216,7 @@ are in the process model and in naming, not in the probes:
 - **e2e.** `tests/e2e/verify-mysql-tls.sh` is the MySQL twin of
   `verify-tls.sh`: mysqld with `require_secure_transport=ON`, a CLI load loop
   on `--ssl-mode=REQUIRED`, latkit with `-p 3306=mysql --tls auto` and **no**
-  `--tls-comm` — proving the default scan set and the widened kernel filter on
+  `--tls-comm` — proving the default scan set and the widened uprobe filter on
   a live 8.x server.
 
 ## 4b. HTTP servers, and the Go delta (РH13, PLAN-HTTP.md М7)
@@ -215,11 +230,16 @@ server does, so §1–§4 apply unchanged — no new probe, no new correlation, 
 BPF. The only thing М7 changed for them is *which processes the scan looks at*:
 the comm set is now derived from the protocols on `--port` (РH13.1), so
 
-| configured ports | AUTO scan set (process comm) | kernel filter (thread comm) |
+| configured ports | AUTO scan set (process comm) | uprobe filter (thread comm) |
 |---|---|---|
 | `-p 5432` (pg), `-p 3306=mysql` | `postgres`, `mysqld`, `mariadbd` | + `connection` |
 | `-p 8443=http` | `nginx`, `httpd`, `apache2`, `haproxy` | the same |
 | both | all seven | + `connection` |
+
+The third column gates the **uprobe channels only** (М9): the socket path takes
+its filter from `--comm` alone, so a plaintext port served by some other process
+— which is what an HTTP deployment looks like — is observed whether or not TLS
+capture is on. See §4a, "Two comm filters".
 
 Both Apache spellings are there because both are in the field (`httpd` on
 RHEL-family, `apache2` on Debian-family). The DB-only case is byte-for-byte what

@@ -47,10 +47,32 @@ const volatile __u32 cfg_capture_limit = LK_CAPTURE_LIMIT;
  * are packed from index 0. A short list, not a single name (РМ10): the match is
  * against the *thread* comm, and one server may need several — MySQL 8.x names
  * its per-session threads `connection` while the process stays `mysqld`.
- * Checked on the send/recv path only: fentry/fexit of tcp_sendmsg/tcp_recvmsg
- * run in the calling task's context, while the lifecycle tracepoint may fire in
- * softirq where comm is garbage. */
+ * Checked on the send/recv path and in the uprobe channels — everywhere the
+ * program runs in the calling task's context. Never from the lifecycle
+ * tracepoint, which may fire in softirq where comm is garbage.
+ *
+ * This one carries **only what the operator asked for** (`--comm`): it is a
+ * capture filter, and its whole meaning is "capture nothing else". */
 const volatile char cfg_comm_filter[LK_COMM_FILTER_MAX][LK_COMM_LEN];
+
+/* The second filter, and the reason there are two: the comm set the agent
+ * *derives* for TLS (the libssl scan set, a `--tls-comm`, the basenames of
+ * `--tls-go` binaries, plus `connection`) gates the **uprobe channels only**.
+ *
+ * A uprobe on a shared libssl attaches at pid=-1, so it fires for every process
+ * on the host that maps that file — a psql or a curl included. Something has to
+ * say which of them is the server we mean, and a comm is what we have.
+ *
+ * The socket path needs no such gate: it is already scoped to the configured
+ * local ports (Р7), i.e. to the server side of exactly the traffic that was
+ * asked for. Gating it on the same derived set (as v1 did until PLAN-HTTP.md
+ * М9) silently narrowed *plaintext* capture to the servers the TLS scanner
+ * happens to know: with `--tls auto`, a `--port 8081=http` served by a Go, Node
+ * or Python process — the ordinary shape of an application behind nginx —
+ * produced no observations at all, while the nginx port looked fine. Harmless
+ * where the captured process is the scanned one (a database host), a silent
+ * blind spot anywhere else. */
+const volatile char cfg_tls_comm_filter[LK_COMM_FILTER_MAX][LK_COMM_LEN];
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -285,24 +307,24 @@ static __always_inline int cgroup_allowed(void)
     return bpf_map_lookup_elem(&cgroups, &id) != NULL;
 }
 
-/* Exact-match comm filter: the current thread's comm must equal one of the
- * configured entries; a no-op unless cfg_comm_filter is set. Send/recv path
- * only, see cfg_comm_filter above. */
-static __always_inline int comm_allowed(void)
+/* Exact-match against one comm list: the current thread's comm must equal one of
+ * the configured entries; a no-op (allow) unless the list is set. Both callers
+ * run in the calling task's context — see the two cfg_*_comm_filter comments. */
+static __always_inline int comm_match(const volatile char (*flt)[LK_COMM_LEN])
 {
     char comm[LK_COMM_LEN];
 
-    if (!cfg_comm_filter[0][0])
+    if (!flt[0][0])
         return 1;
     if (bpf_get_current_comm(comm, sizeof(comm)))
         return 0;
     for (unsigned f = 0; f < LK_COMM_FILTER_MAX; f++) {
         unsigned i;
 
-        if (!cfg_comm_filter[f][0])
+        if (!flt[f][0])
             break; /* packed from 0: first empty entry ends the list */
         for (i = 0; i < LK_COMM_LEN; i++) {
-            if (comm[i] != cfg_comm_filter[f][i])
+            if (comm[i] != flt[f][i])
                 break;
             if (!comm[i])
                 return 1; /* equal up to and including the NUL */
@@ -311,6 +333,20 @@ static __always_inline int comm_allowed(void)
             return 1; /* both unterminated at 16 bytes: full-buffer match */
     }
     return 0;
+}
+
+/* The operator's `--comm`: every path, socket and uprobe alike. */
+static __always_inline int comm_allowed(void)
+{
+    return comm_match(cfg_comm_filter);
+}
+
+/* The uprobe gate: `--comm` (if any) *and* the agent-derived TLS set. Both, not
+ * either — the derived set says which server the uprobes are for, `--comm` says
+ * what the operator wants captured at all, and neither implies the other. */
+static __always_inline int tls_comm_allowed(void)
+{
+    return comm_match(cfg_comm_filter) && comm_match(cfg_tls_comm_filter);
 }
 
 /* Fill *t (must be zeroed by the caller) from the socket. tcp_sendmsg and
@@ -1171,17 +1207,17 @@ static __always_inline void emit_ssl_data(__u64 cookie, __u8 dir, __u32 total_le
 }
 
 /* Entry: stash the call arguments for the matching return probe. comm-filtered
- * (same cfg_comm_filter as the socket path) so attaching on pid=-1 does not turn
- * every libssl user on the host into events. */
+ * (cfg_tls_comm_filter) so attaching on pid=-1 does not turn every libssl user
+ * on the host into events. */
 static __always_inline int ssl_entry(void *active_map, __u64 ssl, __u64 buf, __u64 written_ptr)
 {
     __u64 id = bpf_get_current_pid_tgid();
     struct lk_ssl_call call = {.ssl = ssl, .buf = buf, .written_ptr = written_ptr};
 
-    /* Same filters as the socket path: a uprobe runs in the backend's task
-     * context, so the cgroup id is valid here too (Р48). Keeps a TLS backend in
-     * a non-target cgroup out, mirroring the plaintext send/recv gate. */
-    if (!comm_allowed() || !cgroup_allowed())
+    /* A uprobe runs in the backend's task context, so the cgroup id is valid
+     * here too (Р48): a TLS backend in a non-target cgroup stays out, mirroring
+     * the plaintext send/recv gate. */
+    if (!tls_comm_allowed() || !cgroup_allowed())
         return 0;
     bpf_map_update_elem(active_map, &id, &call, BPF_ANY);
     return 0;
@@ -1331,7 +1367,7 @@ static __always_inline int ssl_set_fd_link(void *ssl, int fd)
     __u64 cookie = 0;
     __u16 family;
 
-    if (!comm_allowed())
+    if (!tls_comm_allowed())
         return 0;
     sk = fd_to_sock(fd);
     if (!sk)
@@ -1467,9 +1503,11 @@ static __always_inline int go_entry(void *active_map, __u64 g, __u64 conn, __u64
     struct lk_go_key k = {.ptr = g, .tgid = bpf_get_current_pid_tgid() >> 32};
     struct lk_go_call call = {.conn = conn, .buf = buf, .len = len, .ts_ns = bpf_ktime_get_ns()};
 
-    /* Same gate as the socket path: a Go binary is attached by path, but its
-     * comm may still be in an explicit --comm/--cgroup filter. */
-    if (!g || !comm_allowed() || !cgroup_allowed())
+    /* A Go binary is attached by path, so the comm gate is not what selects it —
+     * but an explicit --comm/--cgroup still applies, and the derived set carries
+     * this binary's own basename (main.c) so a probe cannot fire for a namesake
+     * the operator did not name. */
+    if (!g || !tls_comm_allowed() || !cgroup_allowed())
         return 0;
     bpf_map_update_elem(active_map, &k, &call, BPF_ANY);
     return 0;
@@ -1533,7 +1571,7 @@ static __always_inline int go_ret(void *active_map, __u64 g, __u8 dir, __s64 n)
         /* No entry for this goroutine: the call started before the probes were
          * attached, or it was filtered out at entry (not a miss), or the entry
          * was evicted. Counted only when this call would have been captured. */
-        if (comm_allowed() && cgroup_allowed())
+        if (tls_comm_allowed() && cgroup_allowed())
             stat_add(LK_ST_TLS_CORR_MISS, 1);
         return 0;
     }

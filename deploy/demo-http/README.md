@@ -132,7 +132,7 @@ header or body ever reaches a metric label at all (РH12).
 ## TLS profile
 
 ```sh
-LATKIT_TLS=auto docker compose --profile tls up --build -d
+docker compose --profile tls up --build -d
 ```
 
 adds a **second** nginx serving HTTPS on 8443 with a self-signed certificate,
@@ -153,20 +153,13 @@ configured, the `--tls auto` scan set includes `nginx`, `httpd`, `apache2` and
 libssl to find and is named instead: `LATKIT_TLS_GO=/usr/bin/caddy`, see
 [docs/notes-tls.md](../../docs/notes-tls.md) §4b.
 
-> **`LATKIT_TLS=auto` is opt-in here, and this is why.** That same scan set is
-> also installed as the **kernel capture comm filter** — with TLS on, latkit
-> captures send/recv only from processes whose comm is in it. That is what keeps
-> a `psql` or a browser mapping the same shared `libssl` out of the uprobe
-> channel, and on a database host it changes nothing, because the process you
-> capture *is* the one being scanned. An HTTP deployment is not like that: the
-> upstream leg of this stack is served by a **Go** process whose comm is
-> `backend`, so with `--tls auto` the 8081 series stop and the "two legs" story
-> above quietly becomes one. Turn the profile on and watch it happen — it is a
-> deliberate demonstration. The ways out, in a real deployment: leave TLS
-> capture off if the port you care about is plaintext, or give the app server
-> its own agent (a second latkit with `--port 8081=http` and no `--tls`), or
-> name it with `--tls-go` (which adds its comm to the filter). Same trap,
-> in operator form: [`../existing-http/README.md`](../existing-http/README.md).
+The scan set gates **the uprobe channel only**: the plaintext upstream leg on
+8081 is served by a Go process whose comm is in nobody's scan set, and it keeps
+being observed with TLS capture on. (It did not, before М9 — one comm list gated
+both the uprobes and the socket path, which made a plaintext port served by any
+other process silently invisible whenever `--tls auto` was set. If you are
+running an older build, that is the explanation for a port that reports
+nothing.)
 
 The HTTPS front is HTTP/1.1 only, on purpose: h2 is a declared blind zone
 (README "Known limitations"), and a demo that quietly negotiated h2 would be

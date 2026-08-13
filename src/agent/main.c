@@ -1163,20 +1163,35 @@ static int fill_ports(struct latkit_bpf *skel)
  * called before latkit_bpf__load only). Entries are packed from 0, duplicates
  * skipped; .rodata starts zeroed, so a bounded memcpy stays NUL-terminated
  * (strncpy of exactly size-1 trips gcc -Wstringop-truncation at -O2). */
-static void comm_filter_add(struct latkit_bpf *skel, const char *name)
+static void comm_list_add(char (*flt)[LK_COMM_LEN], const char *what, const char *name)
 {
-    char (*flt)[LK_COMM_LEN] = (char (*)[LK_COMM_LEN])skel->rodata->cfg_comm_filter;
     int i;
 
     for (i = 0; i < LK_COMM_FILTER_MAX && flt[i][0]; i++)
         if (!strncmp(flt[i], name, LK_COMM_LEN))
             return;
     if (i == LK_COMM_FILTER_MAX) {
-        fprintf(stderr, "warn: comm filter full (%d entries), ignoring '%s'\n", LK_COMM_FILTER_MAX,
-                name);
+        fprintf(stderr, "warn: %s filter full (%d entries), ignoring '%s'\n", what,
+                LK_COMM_FILTER_MAX, name);
         return;
     }
     memcpy(flt[i], name, strnlen(name, LK_COMM_LEN - 1));
+}
+
+/* `--comm`: the operator's capture filter, applied on every path. */
+static void comm_filter_add(struct latkit_bpf *skel, const char *name)
+{
+    comm_list_add((char (*)[LK_COMM_LEN])skel->rodata->cfg_comm_filter, "comm", name);
+}
+
+/* The agent-derived TLS set, applied to the uprobe channels only (see
+ * cfg_tls_comm_filter in latkit.bpf.c). Kept apart from the list above because
+ * the two answer different questions: this one says *which server the uprobes
+ * are for*, and using it to gate the socket path as well used to make a
+ * plaintext port served by any other process silently invisible. */
+static void tls_comm_filter_add(struct latkit_bpf *skel, const char *name)
+{
+    comm_list_add((char (*)[LK_COMM_LEN])skel->rodata->cfg_tls_comm_filter, "TLS comm", name);
 }
 
 /* The comm set the kernel filter and the libssl scan work from, derived from
@@ -1278,34 +1293,38 @@ int main(int argc, char **argv)
 
     /* .rodata and map sizes are frozen at load time. */
     skel->rodata->cfg_capture_limit = opt_capture_limit;
-    if (opt_comm[0]) {
-        /* --comm: the user's exact kernel filter, with or without TLS. */
+    /* --comm: the operator's exact kernel filter, with or without TLS, on every
+     * path. Nothing else is ever added to it — see the second list below. */
+    if (opt_comm[0])
         comm_filter_add(skel, opt_comm);
-    } else if (tls_enabled) {
-        /* Go binaries first (РH13.3): they were named explicitly, so if the
-         * eight slots run out it must be a default that falls off the end, not
-         * the target the operator asked for. Their comm matters because the
-         * Go channel correlates plaintext through the *socket* path, which this
-         * very filter gates — the uprobes themselves are attached per binary
-         * and need no comm at all. */
-        for (int i = 0; i < opt_ntls_go; i++)
-            comm_filter_add(skel, path_basename(opt_tls_go[i]));
-        /* Attaching on pid=-1 hooks every process mapping a shared libssl —
-         * including a psql/mysql client that maps the same file — so the
-         * in-program comm filter is what keeps foreign SSL traffic out. It
+    if (tls_enabled) {
+        /* The uprobe gate (cfg_tls_comm_filter). Go binaries first (РH13.3):
+         * they were named explicitly, so if the eight slots run out it must be
+         * a default that falls off the end, not the target the operator asked
+         * for. Their basename matters because the Go probes attach by path but
+         * fire for anything mapping that binary's text.
+         *
+         * Attaching on pid=-1 hooks every process mapping a shared libssl —
+         * including a psql/mysql client that maps the same file — so this
+         * filter is what keeps foreign SSL traffic out of the channel. It
          * matches the *thread* comm while the scan matches the *process* comm,
          * and the two differ (находка М0): MySQL 8.x renames its session
          * threads to `connection` while the process stays `mysqld` — a filter
-         * of just the scanned comm would silently drop every event of an 8.x
-         * server. So the kernel gate is the scan set widened by `connection`.
-         * The socket path is port-filtered to the server side anyway, so the
-         * wider set changes nothing there. */
+         * of just the scanned comm would silently drop every decrypted event of
+         * an 8.x server. So the gate is the scan set widened by `connection`.
+         *
+         * It stays out of the socket path, which is port-filtered to the server
+         * side already (Р7). Until М9 the two shared one list, and the cost was
+         * a plaintext `--port 8081=http` served by a Go/Node/Python process
+         * going silently unobserved whenever TLS capture was on. */
+        for (int i = 0; i < opt_ntls_go; i++)
+            tls_comm_filter_add(skel, path_basename(opt_tls_go[i]));
         if (tls_scan_comm)
-            comm_filter_add(skel, tls_scan_comm);
+            tls_comm_filter_add(skel, tls_scan_comm);
         else
             for (const char **c = scan_comms; *c; c++)
-                comm_filter_add(skel, *c);
-        comm_filter_add(skel, "connection");
+                tls_comm_filter_add(skel, *c);
+        tls_comm_filter_add(skel, "connection");
     }
     err = bpf_map__set_max_entries(skel->maps.events, opt_ringbuf_bytes);
     if (err) {
