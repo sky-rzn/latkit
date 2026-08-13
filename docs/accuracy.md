@@ -268,3 +268,120 @@ Knobs (env): `SELECT_N`, `SLEEP2_N`, `SLEEP50_N`, `ROWS_N`, `ERR_N`,
 `TOL` (percent), `MIN_MS`, … — see the script header. Artifacts per run:
 `report.txt` (asserted verdicts), `join.tsv` (per-digest table: server
 count/latency vs agent), the digest dump and the agent dump.
+
+---
+
+# Accuracy validation — agent vs nginx (PLAN-HTTP.md М8)
+
+**Verdict: the acceptance holds.** On a lossless run the agent's per-request
+duration agrees with nginx's `$request_time` to **0.33 ms at p50 and 0.71 ms
+at p90** on the front leg, and with `$upstream_response_time` to 0.13 / 0.90 ms
+on the upstream leg — 0.21 % / 1.3 % relative on the requests slow enough for a
+relative number to mean anything (≥ 50 ms). Response-body bytes match
+**exactly** on every Content-Length response; the two families where they do
+not are both definitional and both listed below. **100 %** of the joinable
+requests were observed — the only log lines without a match are nginx's own
+readiness probes, which carry no request id and ran before the agent
+attached.
+
+Unlike the database stands, this comparison is **per request, not per
+statement family**: every request carries its own `X-Request-Id`, the agent
+reports it (`lkt_queries --proto http`, `reqid=`), nginx logs it, and the join
+is on that id. An aggregate comparison of two percentile curves can hide a
+systematic per-request error as long as it cancels out; this one cannot.
+
+Everything below is produced by `tests/bench/accuracy/run-http.sh`; the gates
+are asserted and the script exits non-zero on any regression.
+
+## Method
+
+Two views of one controlled workload against nginx 1.27 (`sendfile on`) in
+front of a Go `net/http` backend:
+
+1. **the agent** — `--record` over both legs (`-p 8080=http -p 8081=http`),
+   replayed offline through the real handler (`lkt_queries --proto http`), so
+   the artefact that produced the numbers is kept and re-runnable;
+2. **nginx's access log** — `$request_time`, `$upstream_response_time`,
+   `$body_bytes_sent`, `$status`, keyed by `$http_x_request_id`.
+
+**The two legs are different questions.** The front leg (client → nginx) is
+what `$request_time` measures; the upstream leg (nginx → application) is what
+`$upstream_response_time` measures. The bench's nginx config sets
+`Host: upstream-app` on the upstream side so the agent's own `host` label tells
+them apart — the same request id appears on both, and merging them would
+compare a proxy's inbound latency with its outbound one.
+
+**What is compared per request:** `request_time` against the agent's
+`upload + duration` (РH5 splits the interval that nginx reports as one number),
+`upstream_response_time` against the upstream leg's, and `body_bytes_sent`
+against the agent's `out`.
+
+**Workload:** N passes of {`/hello`, `/json/{id}`, a chunked response, a 50 ms
+route, a 404, a 500, a 1 MB static file through `sendfile`, a trickled upload,
+a single-call upload} — chosen to hit the shapes РH4 and РH5 are about rather
+than to produce a uniform flood.
+
+**Validity:** as on PG and MySQL, a run counts only if the agent dump shows
+zero `latkit_ringbuf_dropped_total` and zero `latkit_resync_total`.
+
+## Systematic differences (documented, not defects)
+
+- **The agent measures at the socket, nginx inside itself.** The residual
+  sub-millisecond gap above is that difference and nothing else: the agent's
+  interval starts at the first captured byte of the request and ends at the
+  last byte written to the socket, while `$request_time` starts when nginx has
+  read the first bytes into a worker. The agent's interval is the wider one,
+  which is the point of a network-to-network measurement — it contains the
+  time the server does not see.
+
+- **Chunked responses: decoded bytes vs wire bytes.** The agent counts
+  **decoded** body bytes, so a chunked body and a Content-Length body of the
+  same content report the same number (РH4); nginx counts what it wrote to the
+  socket, chunk framing included. The gap *is* the framing — 11 B at p50,
+  16 B at p90 on the bench's four-chunk response — and the joiner checks that
+  the agent is lower by a plausible overhead rather than requiring equality.
+
+- **A body that bypassed the socket is a declared lower bound.** A response
+  flagged `LK_QO_BODY_UNSEEN` (РH4: promised by Content-Length, not seen on the
+  socket — an old-kernel `sendfile`, or a transfer the capture lost the tail
+  of) reports fewer bytes than nginx sent. The assertion that means something
+  is that it is **never above** the truth, and that is what the bench gates; on
+  the reference run 4 of 270 requests were in this state, all of them the 1 MB
+  static file, short by ≤ 30 KB.
+
+- **A request body whose last call is cut by the capture budget loses its
+  upload interval.** An under-captured call's uncaptured tail is a hole of
+  known size, but it is detected lazily — when the *next* call on that
+  direction starts (Р9). For a request body that is the last thing the client
+  writes, that next call comes after the server has already answered, so the
+  body never reaches its Content-Length, the framer never publishes its end,
+  and the observation carries no `ts_req_done`: its `duration` then holds the
+  client's upload time and `bytes_in` is short by up to one budget. With the
+  default per-port budget of 2048 B (РH14) this is every upload whose final
+  write is larger than that. Consequences and the workaround:
+  - `latkit_http_request_upload_seconds` skips such units — the family is not
+    wrong, it is empty for them;
+  - `latkit_http_request_duration_seconds` includes the client's transfer, so
+    a slow uploader looks like a slow server;
+  - raising the port's budget (`--port 8080=http:32768`) restores the split for
+    bodies whose calls fit under it — measured: with 32 KB writes and a 32 KB
+    budget the same upload reports `upload=1.0 s, duration=176 µs`, against
+    `upload=0, duration=1.0 s` at the default.
+
+  The bench reports the count of affected requests on every run (`# NOTE:`),
+  and the e2e stand drives both shapes deliberately.
+
+## Reproduction
+
+```sh
+cmake -B build-rel -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-rel --target latkit -j
+tests/bench/accuracy/run-http.sh       # ~2 min; exits non-zero on failure
+```
+
+Knobs (env): `PASSES`, `TOL_MS`, `MIN_SAMPLES`, `AGENT_BIN`, `OUT` — see the
+script header. Artifacts per run: `report.txt` (the gates and the verdict),
+`join.tsv` (one row per request: both views side by side, plus the observation
+flags that explain a difference), `queries.txt` (the replayed observations),
+`run.lkt` (the recording itself — every number above is reproducible from it
+without the stand) and the agent's exit dump.

@@ -1,0 +1,23 @@
+	MGET /orders/42/items HTTP/1.1
+Host: shop.example
+User-Agent: curl/8.5.0
+
+]HTTP/1.1 200 OK
+Transfer-Encoding: chunked
+
+5
+hello
+3;ext=v
+abc
+0
+X-Sum: deadbeef
+
+	MGET /orders/42/items HTTP/1.1
+Host: shop.example
+User-Agent: curl/8.5.0
+
+EHTTP/1.1 200 OK
+Content-Type: text/plain
+Content-Length: 5
+
+hello

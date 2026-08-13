@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Seed-corpus writer for the three fuzz targets (task 8.3, Р51).
+/* Seed-corpus writer for the fuzz targets (task 8.3, Р51).
  *
  * Coverage-guided fuzzing starts orders of magnitude faster from inputs that
  * already parse: this tool writes small, valid-ish seeds into
- * <root>/{pg,norm,pipe}/ — PostgreSQL v3 wire sessions for fuzz_pg, plain SQL
- * for fuzz_norm, and scenario-encoded sessions (fuzz_pipe_ops.h) for
+ * <root>/{pg,my,http,norm,pipe}/ — PostgreSQL v3 and MySQL classic wire
+ * sessions, HTTP/1.x byte streams (PLAN-HTTP.md М8), plain SQL and request
+ * targets for fuzz_norm, and scenario-encoded sessions (fuzz_pipe_ops.h) for
  * fuzz_pipe. The campaign script (campaign.sh) regenerates them into the
  * working corpus before every run and minimises the result back into
  * tests/fuzz/corpus/ with -merge=1; the committed corpus, not this tool's
@@ -39,6 +40,11 @@ static void put_u8(unsigned v)
     uint8_t b = (uint8_t)v;
 
     put(&b, 1);
+}
+
+static void put_str(const char *s)
+{
+    put(s, strlen(s));
 }
 
 static void be32(uint32_t v)
@@ -365,7 +371,40 @@ static void norm_seeds(const char *root)
     write_route(root, "route_degenerate", "\n//a//..//%2E%2E/*?");
 }
 
+/* --- canned HTTP/1.x pieces (PLAN-HTTP.md М8) -------------------------------
+ * Shared by the http seeds and the http pipe scenarios, so the two targets
+ * start from the same shapes and a change to one cannot quietly diverge. */
+#define HTTP_SEED_GET                                                                              \
+    "GET /orders/42/items HTTP/1.1\r\nHost: shop.example\r\nUser-Agent: curl/8.5.0\r\n\r\n"
+#define HTTP_SEED_POST                                                                             \
+    "POST /orders HTTP/1.1\r\nHost: shop.example\r\nContent-Type: application/json\r\n"            \
+    "Content-Length: 9\r\n\r\n{\"sku\":1}"
+#define HTTP_SEED_200                                                                              \
+    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello"
+#define HTTP_SEED_404 "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+#define HTTP_SEED_CHUNKED                                                                          \
+    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n3;ext=v\r\nabc\r\n"        \
+    "0\r\nX-Sum: deadbeef\r\n\r\n"
+/* The preface only: what follows it is binary (a SETTINGS frame), and the
+ * seeds that want it append the bytes with an explicit length — a NUL inside a
+ * string constant would silently truncate every strlen-based writer here. */
+#define HTTP_SEED_H2 "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+#define HTTP_SEED_WS_REQ                                                                           \
+    "GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"                 \
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+#define HTTP_SEED_WS_RESP                                                                          \
+    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+
 /* --- pipe seeds: scenarios over the ops format ------------------------------ */
+
+/* Every scenario opens with the protocol-selector byte (fuzz_pipe_ops.h). It is
+ * not optional bookkeeping: the interpreter consumes byte 0 before the first
+ * op, so a seed that omits it loses its opening OPEN to the selector and runs
+ * the whole scenario against a lazily created — hence dirty — connection. */
+static void sc_begin(unsigned proto)
+{
+    put_u8(proto & PIPE_PROTO_MASK);
+}
 
 /* Emit one DATA op wrapping the wire bytes currently in wirebuf[wfrom..blen). */
 static void sc_data(int slot, enum pipe_op dir_op, unsigned meta, const void *p, size_t n)
@@ -403,6 +442,7 @@ static void pipe_seeds(const char *root)
     unsigned clean = PIPE_DATA_SHAPE(PIPE_SHAPE_CONT);
 
     /* clean session: open, startup, auth, one query, close */
+    sc_begin(PIPE_PROTO_PG);
     put_u8(PIPE_OP(PIPE_OP_OPEN, 0, 0));
     snap_begin();
     wire_startup();
@@ -430,6 +470,7 @@ static void pipe_seeds(const char *root)
 
     /* loss and recovery: a seq gap dirties both directions, the backend
      * resyncs on the Z anchor, the frontend on a call boundary (Р10/Р19) */
+    sc_begin(PIPE_PROTO_PG);
     put_u8(PIPE_OP(PIPE_OP_OPEN, 1, 0));
     snap_begin();
     wire_startup();
@@ -452,6 +493,7 @@ static void pipe_seeds(const char *root)
     write_seed(root, "pipe", "gap_resync");
 
     /* TLS flip: SSLRequest + 'S', then the whole session again decrypted (Р38) */
+    sc_begin(PIPE_PROTO_PG);
     put_u8(PIPE_OP(PIPE_OP_OPEN, 2, 0));
     snap_begin();
     be32(8);
@@ -484,6 +526,7 @@ static void pipe_seeds(const char *root)
 
     /* churn: fresh cookies leak old entries, sweep and the LRU ceiling collect
      * them; a synthetic open joins mid-session via resync */
+    sc_begin(PIPE_PROTO_PG);
     for (int i = 0; i < 6; i++) {
         put_u8(PIPE_OP(PIPE_OP_OPEN, 3, PIPE_OPEN_FRESH));
         snap_begin();
@@ -502,6 +545,7 @@ static void pipe_seeds(const char *root)
     write_seed(root, "pipe", "churn_sweep");
 
     /* capture holes: budget-cut tails and an intra-call hole over a big body */
+    sc_begin(PIPE_PROTO_PG);
     put_u8(PIPE_OP(PIPE_OP_OPEN, 0, 0));
     snap_begin();
     wire_startup();
@@ -519,6 +563,7 @@ static void pipe_seeds(const char *root)
 
     /* raw records into decode: short, unknown type, and a data record whose
      * dir byte is garbage — corrupt-replay-file paths (LK_DEC_SHORT/UNKNOWN) */
+    sc_begin(PIPE_PROTO_PG);
     put_u8(PIPE_OP(PIPE_OP_RAW, 0, 0));
     put_u8(4);
     put("\x00\x01\x02\x03", 4); /* shorter than lk_ev_hdr */
@@ -549,6 +594,48 @@ static void pipe_seeds(const char *root)
         put(rec, sizeof(rec));
     }
     write_seed(root, "pipe", "raw_records");
+
+    /* --- http scenarios (PLAN-HTTP.md М8) -------------------------------
+     * The same seams, reached through the stream framer (РH1) instead of the
+     * message one: a clean keep-alive connection first, then the two shapes
+     * that only exist on this path — a header block cut by the per-call budget
+     * (РH14) and a lost event in the middle of a body, which the arithmetic
+     * skip is supposed to survive without a resync. */
+    sc_begin(PIPE_PROTO_HTTP);
+    put_u8(PIPE_OP(PIPE_OP_OPEN, 0, 0));
+    sc_data(0, PIPE_OP_RECV, clean, HTTP_SEED_GET, strlen(HTTP_SEED_GET));
+    sc_data(0, PIPE_OP_SEND, clean, HTTP_SEED_200, strlen(HTTP_SEED_200));
+    sc_data(0, PIPE_OP_RECV, clean, HTTP_SEED_POST, strlen(HTTP_SEED_POST));
+    sc_data(0, PIPE_OP_SEND, clean, HTTP_SEED_404, strlen(HTTP_SEED_404));
+    put_u8(PIPE_OP(PIPE_OP_CLOSE, 0, 0));
+    write_seed(root, "pipe", "http_session");
+
+    sc_begin(PIPE_PROTO_HTTP);
+    put_u8(PIPE_OP(PIPE_OP_OPEN, 1, 0));
+    /* A head whose call is cut short: the tail is a hole of known size, and the
+     * prefix is published rather than dropped. */
+    sc_data(1, PIPE_OP_RECV, PIPE_DATA_SHAPE(PIPE_SHAPE_NEW_TAIL) | PIPE_DATA_TAIL(2),
+            HTTP_SEED_GET, strlen(HTTP_SEED_GET));
+    /* A lost event where a body was owed: the length was known in advance, so
+     * this costs nothing but has to be exercised on the pipeline path. */
+    sc_data(1, PIPE_OP_SEND, clean | PIPE_DATA_GAP, HTTP_SEED_CHUNKED, strlen(HTTP_SEED_CHUNKED));
+    sc_data(1, PIPE_OP_RECV, clean, HTTP_SEED_GET, strlen(HTTP_SEED_GET));
+    sc_data(1, PIPE_OP_SEND, clean, HTTP_SEED_200, strlen(HTTP_SEED_200));
+    put_u8(PIPE_OP(PIPE_OP_CLOSE, 1, 0));
+    write_seed(root, "pipe", "http_holes");
+
+    /* The blind zones, one connection each: nothing may be framed past them. */
+    sc_begin(PIPE_PROTO_HTTP);
+    put_u8(PIPE_OP(PIPE_OP_OPEN, 2, 0));
+    sc_data(2, PIPE_OP_RECV, clean, HTTP_SEED_H2 "\x00\x00\x12\x04", strlen(HTTP_SEED_H2) + 4);
+    sc_data(2, PIPE_OP_RECV, clean, HTTP_SEED_GET, strlen(HTTP_SEED_GET));
+    put_u8(PIPE_OP(PIPE_OP_CLOSE, 2, 0));
+    put_u8(PIPE_OP(PIPE_OP_OPEN, 3, 0));
+    sc_data(3, PIPE_OP_RECV, clean, HTTP_SEED_WS_REQ, strlen(HTTP_SEED_WS_REQ));
+    sc_data(3, PIPE_OP_SEND, clean, HTTP_SEED_WS_RESP, strlen(HTTP_SEED_WS_RESP));
+    sc_data(3, PIPE_OP_SEND, clean, "\x81\x05hello", 7);
+    put_u8(PIPE_OP(PIPE_OP_CLOSE, 3, 0));
+    write_seed(root, "pipe", "http_blind");
 }
 
 /* --- mysql seeds: whole classic-protocol sessions (MYSQL.md М7) -------------
@@ -724,14 +811,73 @@ static void my_seeds(const char *root)
     write_seed(root, "my", "ssl_request");
 }
 
+/* --- http seeds: raw HTTP/1.x byte streams (PLAN-HTTP.md М8) ----------------
+ * fuzz_http feeds one input through both directions of one connection, so a
+ * seed is simply request bytes followed by response bytes. The interesting half
+ * is the last group: the desynchronisation primitives. They are here not
+ * because the agent could be exploited by them — it answers no requests — but
+ * because they are exactly the inputs on which a server and an observer can
+ * come to different conclusions about where a message ends, and an observer
+ * that silently picked one reading would report somebody else's traffic under
+ * this request's labels. */
+static void http_seeds(const char *root)
+{
+    put_str(HTTP_SEED_GET);
+    put_str(HTTP_SEED_200);
+    write_seed(root, "http", "get_200");
+
+    put_str(HTTP_SEED_POST);
+    put_str(HTTP_SEED_CHUNKED);
+    write_seed(root, "http", "post_chunked_resp");
+
+    /* The three request-dependent body rules in one stream: a 100-continue
+     * upload, a HEAD whose Content-Length describes nothing, and a 304. */
+    put_str("PUT /uploads/42 HTTP/1.1\r\nHost: h\r\nExpect: 100-continue\r\n"
+            "Content-Length: 4\r\n\r\nbody");
+    put_str("HEAD /x HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("HTTP/1.1 100 Continue\r\n\r\n"
+            "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\n"
+            "HTTP/1.1 304 Not Modified\r\nContent-Length: 7\r\n\r\n");
+    write_seed(root, "http", "body_rules");
+
+    put_str(HTTP_SEED_H2);
+    put("\x00\x00\x12\x04\x00\x00\x00\x00\x00", 9); /* a SETTINGS frame */
+    write_seed(root, "http", "h2_preface");
+
+    put_str(HTTP_SEED_WS_REQ);
+    put_str(HTTP_SEED_WS_RESP);
+    put("\x81\x05hello", 7);
+    write_seed(root, "http", "upgrade_101");
+
+    /* The smuggling family, one seed per primitive so a corpus minimiser keeps
+     * them apart: Content-Length together with Transfer-Encoding, two
+     * Content-Lengths, and a chunk size that is not a chunk size. */
+    put_str("POST /a HTTP/1.1\r\nHost: h\r\nContent-Length: 6\r\n"
+            "Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+            "GET /smuggled HTTP/1.1\r\nHost: h\r\n\r\n");
+    write_seed(root, "http", "smuggle_cl_te");
+
+    put_str("POST /b HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\nContent-Length: 6\r\n"
+            "\r\nhello!");
+    put_str("POST /c HTTP/1.1\r\nHost: h\r\nContent-Length: +5\r\n\r\nhello");
+    write_seed(root, "http", "smuggle_dup_cl");
+
+    put_str("POST /d HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
+            "ffffffffffffffffff\r\nx\r\n0\r\n\r\n");
+    write_seed(root, "http", "smuggle_chunk_size");
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
-        fprintf(stderr, "usage: gen_seeds <corpus-root>  (writes into pg/ my/ norm/ pipe/)\n");
+        fprintf(stderr, "usage: gen_seeds <corpus-root>"
+                        "  (writes into pg/ my/ http/ norm/ pipe/)\n");
         return 1;
     }
     pg_seeds(argv[1]);
     my_seeds(argv[1]);
+    http_seeds(argv[1]);
     norm_seeds(argv[1]);
     pipe_seeds(argv[1]);
     return 0;

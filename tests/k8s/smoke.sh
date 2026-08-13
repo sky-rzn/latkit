@@ -17,6 +17,9 @@
 #   ./smoke.sh            # build image, up kind, assert, tear the cluster down
 #   DB=mysql ./smoke.sh   # the same smoke against mysql:8.4 (LATKIT_PORT patched
 #                         # to 3306=mysql; client forced onto TCP) — MYSQL.md М7
+#   DB=http ./smoke.sh    # the same against nginx (LATKIT_PORT=80=http), where
+#                         # the counter that must grow is the http profile's own
+#                         # latkit_http_requests_total — PLAN-HTTP.md М8
 #   KEEP=1 ./smoke.sh     # leave the cluster up afterwards for inspection
 #   SKIP_BUILD=1 ./smoke.sh   # reuse an already-built/loaded latkit:latest
 #
@@ -45,22 +48,30 @@ MANIFEST="$REPO_ROOT/deploy/k8s/latkit-daemonset.yaml"
 PF_PID=""
 fails=0
 
-# Database engine under test (MYSQL.md М7): postgres (the default) or mysql. It
-# selects the workload pod/client and the agent's LATKIT_PORT — a mysql run
-# patches the DaemonSet to `3306=mysql` before the rollout so the agent frames
-# and parses the classic protocol.
+# The workload under test (MYSQL.md М7, PLAN-HTTP.md М8): postgres (the
+# default), mysql, or http. It selects the workload pod and client, the agent's
+# LATKIT_PORT — patched into the DaemonSet before the rollout so the agent
+# frames the right protocol — and which observation counter must grow, since
+# the two profiles of РH10 report under different family names.
 DB=${DB:-postgres}
 case "$DB" in
 postgres)
     DB_IMAGE=postgres:16
     LATKIT_PORT_VAL=5432
+    COUNTER=latkit_queries_total
     ;;
 mysql)
     DB_IMAGE=mysql:8.4
     LATKIT_PORT_VAL="3306=mysql"
+    COUNTER=latkit_queries_total
+    ;;
+http)
+    DB_IMAGE=nginx:1.27-alpine
+    LATKIT_PORT_VAL="80=http"
+    COUNTER=latkit_http_requests_total
     ;;
 *)
-    echo "smoke: unknown DB '$DB' (want postgres|mysql)" >&2
+    echo "smoke: unknown DB '$DB' (want postgres|mysql|http)" >&2
     exit 2
     ;;
 esac
@@ -102,7 +113,18 @@ pgb() { kubectl -n "$NS" exec pg -- pgbench -h 127.0.0.1 -U postgres "$@" postgr
 
 # db_deploy — bring up the workload pod and wait for it to accept TCP.
 db_deploy() {
-    if [ "$DB" = mysql ]; then
+    if [ "$DB" = http ]; then
+        # Stock nginx, its default site: the point of this smoke is the
+        # DaemonSet path, not the server's configuration. busybox wget inside
+        # the image is the client, over 127.0.0.1 — loopback still goes through
+        # tcp_sendmsg, which is what the agent hooks.
+        kubectl -n "$NS" run web --image="$DB_IMAGE" --port=80 >/dev/null
+        kubectl -n "$NS" wait --for=condition=Ready pod/web --timeout=120s >/dev/null
+        for _ in $(seq 1 30); do
+            kubectl -n "$NS" exec web -- wget -q -O- http://127.0.0.1/ >/dev/null 2>&1 && break
+            sleep 1
+        done
+    elif [ "$DB" = mysql ]; then
         # MySQL 8.4 has no server --skip-ssl; the clients opt out of TLS with
         # --ssl-mode=DISABLED so the wire stays plaintext for the capture, and
         # --get-server-public-key auths caching_sha2 over that link (plan risk 2).
@@ -130,7 +152,18 @@ db_deploy() {
 # db_load DURATION — drive a burst of TCP queries for ~DURATION seconds.
 db_load() {
     local secs="$1"
-    if [ "$DB" = mysql ]; then
+    if [ "$DB" = http ]; then
+        # A 200 and a 404 per iteration: both status classes of РH10 end up in
+        # the exposition, and neither is an error the capture should complain
+        # about.
+        kubectl -n "$NS" exec web -- sh -c '
+            end=$(( $(date +%s) + '"$secs"' ))
+            while [ "$(date +%s)" -lt "$end" ]; do
+                wget -q -O- http://127.0.0.1/ >/dev/null 2>&1
+                wget -q -O- http://127.0.0.1/nope >/dev/null 2>&1
+            done
+            exit 0' >/dev/null 2>&1   # busybox wget exits 1 on the 404: expected
+    elif [ "$DB" = mysql ]; then
         kubectl -n "$NS" exec db -- bash -c '
             end=$(( $(date +%s) + '"$secs"' ))
             while [ "$(date +%s)" -lt "$end" ]; do
@@ -179,7 +212,20 @@ else
     exit 1
 fi
 
-POD=$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=latkit -o jsonpath='{.items[0].metadata.name}')
+# `set env` above rolls the DaemonSet, so the pod list can be momentarily empty
+# even after `rollout status` returns: the old pod is gone and the new one is
+# still being scheduled. Wait for a Ready pod by name rather than reading the
+# list once (this bit the mysql path too, silently, as a rare flake).
+POD=""
+for _ in $(seq 1 60); do
+    POD=$(kubectl -n "$NS" get pod -l app.kubernetes.io/name=latkit \
+          --field-selector=status.phase=Running \
+          -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+    [ -n "$POD" ] && break
+    sleep 2
+done
+[ -n "$POD" ] || { fail "no running latkit pod after the rollout"; exit 1; }
+kubectl -n "$NS" wait --for=condition=Ready "pod/$POD" --timeout=120s >/dev/null
 note "agent pod: $POD"
 
 # --- 3. port-forward the agent from the host --------------------------------
@@ -198,7 +244,7 @@ else
 fi
 
 # --- 4. database workload over TCP ------------------------------------------
-log "deploying $DB and driving load over TCP"
+log "deploying the $DB workload and driving load over TCP"
 db_deploy
 
 ev0=$(msum latkit_events_total)
@@ -220,22 +266,22 @@ else
     fail "events_total is still 0 — no TCP seen (pgbench on the unix socket? wrong node?)"
 fi
 
-q1=$(msum latkit_queries_total)
-note "sum(latkit_queries_total) = $q1"
+q1=$(msum "$COUNTER")
+note "sum($COUNTER) = $q1"
 if [ "$q1" -gt 0 ]; then
-    pass "latkit_queries_total present and > 0"
+    pass "$COUNTER present and > 0"
 else
-    fail "latkit_queries_total missing or zero"
+    fail "$COUNTER missing or zero"
 fi
 
 note "second load burst — counter must grow"
 db_load 8
-q2=$(msum latkit_queries_total)
-note "sum(latkit_queries_total) after +burst = $q2"
+q2=$(msum "$COUNTER")
+note "sum($COUNTER) after +burst = $q2"
 if [ "$q2" -gt "$q1" ]; then
-    pass "queries_total increased under load"
+    pass "$COUNTER increased under load"
 else
-    fail "queries_total did not grow (pipeline stalled?)"
+    fail "$COUNTER did not grow (pipeline stalled?)"
 fi
 
 log "clean-capture counters (must all be 0)"

@@ -1873,6 +1873,625 @@ static void build_my_synthetic_midsession(struct fx *x)
     b.x->resyncs = 2;
 }
 
+/* --- HTTP/1.x wire helpers (PLAN-HTTP.md М8) ------------------------------
+ * HTTP is text, so these fixtures are the traces themselves: the bytes below
+ * are what a client and a server put on the wire, and the expectations beside
+ * them are the five synthetic messages of РH3 the framer publishes for them —
+ * 'R' request head, 'S' response head, 'I' interim, 'D' body bytes (count
+ * only, never payload), 'E' body end, '!' framer note. The message characters
+ * are spelled out rather than included from src/proto/http/http.h: the harness
+ * links the protocol library, it does not share its internals, and a fixture
+ * that agreed with the framer by construction would assert nothing.
+ *
+ * Where a Content-Length appears it is computed from the body it describes,
+ * for the same reason: a fixture whose framing header disagreed with its own
+ * body would be exercising the error path by accident. */
+
+#define HTTP_FX_HOST "latkit.test"
+#define HTTP_FX_UA   "curl/8.5.0"
+/* The two fields every request in the set carries: the host that becomes the
+ * `host` label (РH10) and the agent that becomes the session's app slot. */
+#define HTTP_FX_HDRS "Host: " HTTP_FX_HOST "\r\nUser-Agent: " HTTP_FX_UA "\r\n"
+
+/* Note codes, mirroring enum lk_http_note (http.h) — the value travels in the
+ * '!' message's len field, so the expectation has to name it. */
+#define FX_HTTP_NOTE_HEAD_HOLE     4
+#define FX_HTTP_NOTE_BODY_UNSEEN   12
+#define FX_HTTP_NOTE_BLIND_H2      15
+#define FX_HTTP_NOTE_BLIND_UPGRADE 16
+#define FX_HTTP_NOTE_BLIND_CONNECT 17
+
+static void httpbld_init(struct bld *b, struct fx *x)
+{
+    bld_init(b, x);
+    b->tuple.dport = 8080; /* an http port (realism; run_fixture forces ops) */
+
+    /* Every HTTP fixture opens exactly one session, off the first request head
+     * (there is no handshake to hang one on): the host in the db slot, the user
+     * slot empty — HTTP usually carries no identity at all. */
+    x->sessions = 1;
+    x->sess_db = HTTP_FX_HOST;
+    x->sess_user = "";
+    x->obs_kind = LK_Q_REQUEST;
+}
+
+/* One fully captured call carrying `s`; returns its length. */
+static __u32 http_call(struct bld *b, enum lk_dir dir, const char *s)
+{
+    __u32 n = (__u32)strlen(s);
+
+    call(b, dir, (const __u8 *)s, n);
+    return n;
+}
+
+/* A request head, alone in its call. `flags` carries LK_MSG_AFTER_RESYNC where
+ * the fixture rejoins a stream. Rule 5 (no framing header, no body) closes the
+ * message immediately, so a bodiless request is 'R' + an empty 'E'. */
+static void http_req(struct bld *b, const char *head, bool body_follows, __u16 flags)
+{
+    __u32 n = http_call(b, LK_DIR_RECV, head);
+
+    expect(b, LK_DIR_RECV, 'R', n, flags);
+    if (!body_follows)
+        expect(b, LK_DIR_RECV, 'E', 0, 0);
+}
+
+/* A response head and its body in one call — the common shape on the wire. An
+ * empty body means the head said so (Content-Length: 0) or the request did
+ * (HEAD, 204, 304): either way the framer closes the message at once. */
+static void http_resp(struct bld *b, const char *head, const char *body, __u16 flags)
+{
+    char w[8192];
+    __u32 hn = (__u32)strlen(head), bn = (__u32)strlen(body);
+
+    memcpy(w, head, hn);
+    memcpy(w + hn, body, bn);
+    call(b, LK_DIR_SEND, (const __u8 *)w, hn + bn);
+    expect(b, LK_DIR_SEND, 'S', hn, flags);
+    if (bn)
+        expect(b, LK_DIR_SEND, 'D', bn, 0);
+    expect(b, LK_DIR_SEND, 'E', bn, 0);
+}
+
+/* A body in its own call: the shape that makes the four timings of РH5 visible
+ * — the head and the last body byte land on different events, so the upload
+ * interval (request) or the TTFB (response) is measurable rather than zero. */
+static void http_body(struct bld *b, enum lk_dir dir, const char *body)
+{
+    __u32 n = http_call(b, dir, body);
+
+    expect(b, dir, 'D', n, 0);
+    expect(b, dir, 'E', n, 0);
+}
+
+/* The 200 every "and then an ordinary exchange" step in the set answers with. */
+#define HTTP_FX_OK_HEAD "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\n\r\n"
+#define HTTP_FX_OK_BODY "hello, world!"
+
+/* --- HTTP fixtures --------------------------------------------------------- */
+
+/* The base case: one GET, one 200 with a Content-Length body. Everything an
+ * observation reports is present and nothing is degraded — the row every other
+ * HTTP fixture is a deviation from. */
+static void build_http_get(struct fx *x)
+{
+    struct bld b;
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+    http_req(&b, "GET /hello HTTP/1.1\r\n" HTTP_FX_HDRS "\r\n", false, 0);
+    http_resp(&b, HTTP_FX_OK_HEAD, HTTP_FX_OK_BODY, 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "/hello";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_out = 13;
+    b.x->obs_text = "/hello";
+}
+
+/* A POST with a Content-Length body, uploaded in its own call: the shape РH5
+ * exists for. The id in the path is what the route templater must collapse
+ * (РH7) — `/orders/42/items` is one route, not one per order. */
+static void build_http_post(struct fx *x)
+{
+    struct bld b;
+    static const char body[] = "{\"sku\":\"ABC-1\",\"qty\":3}";
+    char head[256];
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+    snprintf(head, sizeof(head),
+             "POST /orders/42/items HTTP/1.1\r\n" HTTP_FX_HDRS
+             "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n",
+             sizeof(body) - 1);
+    http_req(&b, head, true, 0);
+    http_body(&b, LK_DIR_RECV, body);
+    http_resp(&b, "HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n", "ok", 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_op = "POST";
+    b.x->obs_route = "/orders/{id}/items";
+    b.x->obs_status = 201;
+    b.x->obs_bytes_in = sizeof(body) - 1;
+    b.x->obs_bytes_out = 2;
+    b.x->obs_text = "/orders/42/items";
+}
+
+/* A chunked *request* body with a trailer section. 'D' reports decoded bytes,
+ * so the eleven bytes of "hello world" are eleven whichever framing carried
+ * them — the invariant the chunked path exists to keep. */
+static void build_http_chunked_req(struct fx *x)
+{
+    struct bld b;
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+    http_req(&b,
+             "POST /upload HTTP/1.1\r\n" HTTP_FX_HDRS
+             "Transfer-Encoding: chunked\r\nTrailer: X-Checksum\r\n\r\n",
+             true, 0);
+    http_call(&b, LK_DIR_RECV, "5\r\nhello\r\n6\r\n world\r\n");
+    expect(&b, LK_DIR_RECV, 'D', 5, 0);
+    expect(&b, LK_DIR_RECV, 'D', 6, 0);
+    http_call(&b, LK_DIR_RECV, "0\r\nX-Checksum: 0xdeadbeef\r\n\r\n");
+    expect(&b, LK_DIR_RECV, 'E', 11, 0);
+    http_resp(&b, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", "ok", 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_op = "POST";
+    b.x->obs_route = "/upload";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_in = 11;
+    b.x->obs_bytes_out = 2;
+    b.x->obs_text = "/upload";
+}
+
+/* A chunked response delivered as three separate calls — Go's default shape
+ * when it does not know the length in advance (М0 recon item 2), and the one
+ * where the last body byte is far from the first: TTFB and duration differ. */
+static void build_http_chunked_resp(struct fx *x)
+{
+    struct bld b;
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+    http_req(&b, "GET /stream HTTP/1.1\r\n" HTTP_FX_HDRS "\r\n", false, 0);
+
+    {
+        const char *head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n"
+                           "Transfer-Encoding: chunked\r\n\r\n";
+        __u32 n = http_call(&b, LK_DIR_SEND, head);
+
+        expect(&b, LK_DIR_SEND, 'S', n, 0);
+    }
+    for (int i = 0; i < 3; i++) {
+        http_call(&b, LK_DIR_SEND, "4\r\nabcd\r\n");
+        expect(&b, LK_DIR_SEND, 'D', 4, 0);
+    }
+    http_call(&b, LK_DIR_SEND, "0\r\n\r\n");
+    expect(&b, LK_DIR_SEND, 'E', 12, 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "/stream";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_out = 12;
+    b.x->obs_text = "/stream";
+}
+
+/* Expect: 100-continue. The interim answer is 'I': it does not close the unit,
+ * the final 200 does — and the unit is flagged, because the interval before the
+ * body is a server round trip and not the client's upload time (РH5). */
+static void build_http_continue(struct fx *x)
+{
+    struct bld b;
+    static const char body[] = "0123456789abcdef";
+    char head[256];
+    __u32 n;
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+    snprintf(head, sizeof(head),
+             "PUT /uploads/2026-08-12/report HTTP/1.1\r\n" HTTP_FX_HDRS
+             "Expect: 100-continue\r\nContent-Length: %zu\r\n\r\n",
+             sizeof(body) - 1);
+    http_req(&b, head, true, 0);
+    n = http_call(&b, LK_DIR_SEND, "HTTP/1.1 100 Continue\r\n\r\n");
+    expect(&b, LK_DIR_SEND, 'I', n, 0);
+    http_body(&b, LK_DIR_RECV, body);
+    http_resp(&b, "HTTP/1.1 204 No Content\r\n\r\n", "", 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_op = "PUT";
+    /* Both a date and a word longer than the classifier's ceiling are ids by
+     * РH7's rules; `/uploads` and the file name are not. */
+    b.x->obs_route = "/uploads/{id}/report";
+    b.x->obs_status = 204;
+    b.x->obs_bytes_in = sizeof(body) - 1;
+    b.x->obs_flags = LK_QO_EXPECT_CONT;
+    b.x->obs_text = "/uploads/2026-08-12/report";
+}
+
+/* Four requests in one write and four responses in another: in-flight depth
+ * above one (РH6). Every unit of the batch is flagged — none of them is
+ * comparable with a standalone request, because the server's queue is in the
+ * measurement. */
+static void build_http_pipelined(struct fx *x)
+{
+    struct bld b;
+    char w[2048];
+    size_t off = 0;
+    static const char *const paths[] = {"/a", "/b", "/c", "/d"};
+    __u32 hn[4], rn;
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+
+    for (int i = 0; i < 4; i++) {
+        int k =
+            snprintf(w + off, sizeof(w) - off, "GET %s HTTP/1.1\r\n" HTTP_FX_HDRS "\r\n", paths[i]);
+
+        hn[i] = (__u32)k;
+        off += (size_t)k;
+    }
+    call(&b, LK_DIR_RECV, (const __u8 *)w, (__u32)off);
+    for (int i = 0; i < 4; i++) {
+        expect(&b, LK_DIR_RECV, 'R', hn[i], 0);
+        expect(&b, LK_DIR_RECV, 'E', 0, 0);
+    }
+
+    off = 0;
+    for (int i = 0; i < 4; i++) {
+        int k = snprintf(w + off, sizeof(w) - off, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n%c",
+                         'a' + i);
+
+        off += (size_t)k;
+    }
+    rn = (__u32)(off / 4) - 1; /* the four heads are the same length */
+    call(&b, LK_DIR_SEND, (const __u8 *)w, (__u32)off);
+    for (int i = 0; i < 4; i++) {
+        expect(&b, LK_DIR_SEND, 'S', rn, 0);
+        expect(&b, LK_DIR_SEND, 'D', 1, 0);
+        expect(&b, LK_DIR_SEND, 'E', 1, 0);
+    }
+    ev_close(&b);
+
+    b.x->queries = 4;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "/d";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_out = 1;
+    b.x->obs_flags = LK_QO_PIPELINED;
+    b.x->obs_text = "/d";
+}
+
+/* Fifty exchanges on one socket: the keep-alive case, where a framing error
+ * anywhere would show up as a desynchronised remainder rather than as one bad
+ * observation. Sequential requests are not pipelining and must not be flagged
+ * as such. */
+static void build_http_keepalive_50(struct fx *x)
+{
+    struct bld b;
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+    for (int i = 0; i < 50; i++) {
+        http_req(&b, "GET /hello HTTP/1.1\r\n" HTTP_FX_HDRS "\r\n", false, 0);
+        http_resp(&b, HTTP_FX_OK_HEAD, HTTP_FX_OK_BODY, 0);
+    }
+    ev_close(&b);
+
+    b.x->queries = 50;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "/hello";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_out = 13;
+    b.x->obs_text = "/hello";
+}
+
+/* A 404: counted, given its own flag, and deliberately *not* an error — the
+ * client asked for something that does not exist, the server did its job
+ * (РH10). errors_sql stays at zero. */
+static void build_http_404(struct fx *x)
+{
+    struct bld b;
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+    http_req(&b, "GET /nope HTTP/1.1\r\n" HTTP_FX_HDRS "\r\n", false, 0);
+    http_resp(&b, "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\n", "not found", 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "/nope";
+    b.x->obs_status = 404;
+    b.x->obs_bytes_out = 9;
+    b.x->obs_flags = LK_QO_CLIENT_ERR;
+    b.x->obs_text = "/nope";
+}
+
+/* A 500: the other half of РH10 — this one *is* an error, it ticks errors_sql
+ * and it reaches latkit_http_errors_total under its exact code. */
+static void build_http_500(struct fx *x)
+{
+    struct bld b;
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+    http_req(&b, "GET /boom HTTP/1.1\r\n" HTTP_FX_HDRS "\r\n", false, 0);
+    http_resp(&b, "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 5\r\n\r\n", "oops!", 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->errors_sql = 1;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "/boom";
+    b.x->obs_status = 500;
+    b.x->obs_bytes_out = 5;
+    b.x->obs_flags = LK_QO_ERROR;
+    b.x->obs_text = "/boom";
+}
+
+/* A HEAD answered with a Content-Length describing a body that never comes,
+ * followed by an ordinary GET on the same connection. Reading that length as a
+ * body would swallow the next request whole: the GET being observed at all is
+ * the assertion, and its 13 bytes are the proof the direction never drifted. */
+static void build_http_head(struct fx *x)
+{
+    struct bld b;
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+    http_req(&b, "HEAD /hello HTTP/1.1\r\n" HTTP_FX_HDRS "\r\n", false, 0);
+    http_resp(&b, HTTP_FX_OK_HEAD, "", 0);
+    http_req(&b, "GET /hello HTTP/1.1\r\n" HTTP_FX_HDRS "\r\n", false, 0);
+    http_resp(&b, HTTP_FX_OK_HEAD, HTTP_FX_OK_BODY, 0);
+    ev_close(&b);
+
+    b.x->queries = 2;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "/hello";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_out = 13;
+    b.x->obs_text = "/hello";
+}
+
+/* A websocket handshake. The handshake itself is an ordinary exchange and is
+ * observed — the 101 is its status; only what follows is opaque, and the
+ * connection is counted as a blind zone with its reason (РH4). */
+static void build_http_upgrade_blind(struct fx *x)
+{
+    struct bld b;
+    __u32 n;
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+    http_req(&b,
+             "GET /ws HTTP/1.1\r\n" HTTP_FX_HDRS "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+             false, 0);
+    n = http_call(&b, LK_DIR_SEND,
+                  "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                  "Connection: Upgrade\r\n"
+                  "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n");
+    expect(&b, LK_DIR_SEND, 'S', n, 0);
+    expect(&b, LK_DIR_SEND, 'E', 0, 0);
+    expect(&b, LK_DIR_SEND, '!', FX_HTTP_NOTE_BLIND_UPGRADE, 0);
+
+    /* Opaque frames from here on: the connection is LK_CONN_IGNORE, so these
+     * events are dropped before the framer ever sees them. */
+    call(&b, LK_DIR_SEND, (const __u8 *)"\x81\x05hello", 7);
+    call(&b, LK_DIR_RECV,
+         (const __u8 *)"\x81\x85\x01\x02\x03\x04"
+                       "abcde",
+         11);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->blind_conns = 1;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "/ws";
+    b.x->obs_status = 101;
+    b.x->obs_text = "/ws";
+}
+
+/* The HTTP/2 connection preface, by prior knowledge. Recognised, named and
+ * counted — and with it goes gRPC (§8 of the plan). No observation is invented
+ * out of HPACK bytes. */
+static void build_http_h2_blind(struct fx *x)
+{
+    struct bld b;
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+    http_call(&b, LK_DIR_RECV, "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n");
+    expect(&b, LK_DIR_RECV, '!', FX_HTTP_NOTE_BLIND_H2, 0);
+    /* A SETTINGS frame and whatever follows: dropped, not framed. */
+    call(&b, LK_DIR_RECV, (const __u8 *)"\x00\x00\x00\x04\x00\x00\x00\x00\x00", 9);
+    call(&b, LK_DIR_SEND, (const __u8 *)"\x00\x00\x00\x04\x01\x00\x00\x00\x00", 9);
+    ev_close(&b);
+
+    b.x->sessions = 0; /* no request head was ever parsed */
+    b.x->sess_db = NULL;
+    b.x->sess_user = NULL;
+    b.x->blind_conns = 1;
+}
+
+/* A CONNECT tunnel: the exchange that sets it up is observed (method, status,
+ * timings), the tunnel itself is a blind zone. There is no route — an
+ * authority-form target is not a path, and reporting "/" for it would be a
+ * label invented out of nothing. */
+static void build_http_connect_blind(struct fx *x)
+{
+    struct bld b;
+    __u32 n;
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+    http_req(&b,
+             "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n"
+             "User-Agent: " HTTP_FX_UA "\r\n\r\n",
+             false, 0);
+    n = http_call(&b, LK_DIR_SEND, "HTTP/1.1 200 Connection Established\r\n\r\n");
+    expect(&b, LK_DIR_SEND, 'S', n, 0);
+    expect(&b, LK_DIR_SEND, 'E', 0, 0);
+    expect(&b, LK_DIR_SEND, '!', FX_HTTP_NOTE_BLIND_CONNECT, 0);
+    call(&b, LK_DIR_RECV, (const __u8 *)"\x16\x03\x01\x00\x05\x01\x00\x00\x01\x00", 10);
+    ev_close(&b);
+
+    b.x->sess_db = "example.com:443";
+    b.x->queries = 1;
+    b.x->blind_conns = 1;
+    b.x->obs_op = "CONNECT";
+    /* An authority-form target is not a path: there is no route to template and
+     * no target to report, and the observation says so instead of inventing a
+     * "/" that would key a label. */
+    b.x->obs_route = "";
+    b.x->obs_status = 200;
+    b.x->obs_flags = LK_QO_NO_TEXT;
+    b.x->obs_text = "";
+}
+
+/* РH4's sendfile degradation: a megabyte promised by Content-Length, not one
+ * byte of it on the socket, and then the status line of the next response. The
+ * unit closes here with what was seen — a lower bound — and says so with
+ * LK_QO_BODY_UNSEEN rather than reporting a body it never observed. */
+static void build_http_sendfile_body_unseen(struct fx *x)
+{
+    struct bld b;
+    __u32 n;
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+    http_req(&b, "GET /big.bin HTTP/1.1\r\n" HTTP_FX_HDRS "\r\n", false, 0);
+    n = http_call(&b, LK_DIR_SEND,
+                  "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                  "Content-Length: 1048576\r\n\r\n");
+    expect(&b, LK_DIR_SEND, 'S', n, 0);
+
+    http_req(&b, "GET /hello HTTP/1.1\r\n" HTTP_FX_HDRS "\r\n", false, 0);
+    /* The next status line arrives where the body was owed: the note comes
+     * first, then the empty 'E' that closes the abandoned message. */
+    {
+        char w[512];
+        __u32 hn = (__u32)strlen(HTTP_FX_OK_HEAD);
+
+        memcpy(w, HTTP_FX_OK_HEAD, hn);
+        memcpy(w + hn, HTTP_FX_OK_BODY, 13);
+        call(&b, LK_DIR_SEND, (const __u8 *)w, hn + 13);
+        expect(&b, LK_DIR_SEND, '!', FX_HTTP_NOTE_BODY_UNSEEN, 0);
+        expect(&b, LK_DIR_SEND, 'E', 0, 0);
+        expect(&b, LK_DIR_SEND, 'S', hn, 0);
+        expect(&b, LK_DIR_SEND, 'D', 13, 0);
+        expect(&b, LK_DIR_SEND, 'E', 13, 0);
+    }
+    ev_close(&b);
+
+    b.x->queries = 2;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "/hello";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_out = 13;
+    /* Marked pipelined, and rightly so: from the socket's side the second
+     * request arrived while the first response was still owing a megabyte. The
+     * client was not pipelining — it was waiting for bytes that went out
+     * through sendfile — but an observer that claimed to know the difference
+     * would be claiming to see the body it just admitted it cannot. */
+    b.x->obs_flags = LK_QO_PIPELINED;
+    b.x->obs_text = "/hello";
+}
+
+/* A header block bigger than the per-call capture budget (РH14): 4 KB of
+ * cookie, 2 KB captured. This is the normal outcome for a fat header block, not
+ * an error — the start line and the first fields come first, so the method and
+ * the route survive and the observation is flagged as a prefix.
+ *
+ * The client writes the block in two calls, which is what the М0
+ * `huge-head-cap2048` traces show curl doing and also what makes the
+ * degradation visible where it happens: an under-captured call's tail is a hole
+ * of known size, but it is detected lazily, when the *next* call on the
+ * direction starts (Р9). Had the head been one write, the truncated 'R' would
+ * surface only after the server had already answered. */
+static void build_http_huge_head(struct fx *x)
+{
+    struct bld b;
+    char head[4096];
+    size_t off;
+
+    httpbld_init(&b, x);
+    ev_open(&b, false);
+
+    off = (size_t)snprintf(head, sizeof(head),
+                           "GET /profile/42 HTTP/1.1\r\n" HTTP_FX_HDRS "Cookie: session=");
+    while (off < sizeof(head) - 2) {
+        head[off] = (char)('A' + off % 26);
+        off++;
+    }
+    memcpy(head + off, "\r\n", 2);
+    off += 2;
+
+    /* The call is honest about its length; the budget cut it at 2048 (Р9). */
+    ev_data(&b, LK_DIR_RECV, (__u32)off, 0, (const __u8 *)head, 2048);
+    /* The second write closes the first call: 2 KB of hole, so the block can
+     * never be completed — what did arrive is published as a prefix, the note
+     * names the reason, and the direction starts looking for an anchor. Its own
+     * bytes are not one, and are dropped. */
+    http_call(&b, LK_DIR_RECV, "X-Trace-Tag: last-header-line\r\n\r\n");
+    expect(&b, LK_DIR_RECV, 'R', 2048, LK_MSG_BODY_TRUNC);
+    expect(&b, LK_DIR_RECV, '!', FX_HTTP_NOTE_HEAD_HOLE, 0);
+    http_resp(&b, HTTP_FX_OK_HEAD, HTTP_FX_OK_BODY, 0);
+
+    /* The direction is scanning; the next request line is an anchor. */
+    http_req(&b, "GET /hello HTTP/1.1\r\n" HTTP_FX_HDRS "\r\n", false, LK_MSG_AFTER_RESYNC);
+    http_resp(&b, HTTP_FX_OK_HEAD, HTTP_FX_OK_BODY, 0);
+    ev_close(&b);
+
+    b.x->clean = false; /* the hole is the point of the fixture */
+    b.x->resyncs = 1;
+    b.x->queries = 2;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "/hello";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_out = 13;
+    b.x->obs_text = "/hello";
+}
+
+/* The agent attached mid-stream (synthetic OPEN, Р10): both directions start
+ * dirty, in the middle of somebody else's response body. Neither is framed
+ * until a textual anchor appears — and HTTP's are the strongest of the three
+ * protocols, so recovery costs exactly one exchange. */
+static void build_http_synthetic_midstream(struct fx *x)
+{
+    struct bld b;
+
+    httpbld_init(&b, x);
+    ev_open(&b, true); /* synthetic: both directions marked dirty */
+
+    /* Mid-body debris, on both sides. Nothing here is a start line. */
+    http_call(&b, LK_DIR_SEND, "...ody of a response we joined halfway through\r\n");
+    http_call(&b, LK_DIR_RECV, "trailing bytes of a request body, equally opaque");
+
+    http_req(&b, "GET /hello HTTP/1.1\r\n" HTTP_FX_HDRS "\r\n", false, LK_MSG_AFTER_RESYNC);
+    http_resp(&b, HTTP_FX_OK_HEAD, HTTP_FX_OK_BODY, LK_MSG_AFTER_RESYNC);
+    ev_close(&b);
+
+    b.x->clean = false;
+    b.x->resyncs = 2;
+    b.x->queries = 1;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "/hello";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_out = 13;
+    b.x->obs_text = "/hello";
+}
+
 const struct fixture lk_fixtures[] = {
     {"simple_query", build_simple_query, NULL},
     {"error", build_error, NULL},
@@ -1898,5 +2517,22 @@ const struct fixture lk_fixtures[] = {
     {"my_compressed", build_my_compressed, "mysql"},
     {"my_ssl", build_my_ssl, "mysql"},
     {"my_synthetic_midsession", build_my_synthetic_midsession, "mysql"},
+    /* HTTP set (PLAN-HTTP.md М8): framed and parsed as http. */
+    {"http_get", build_http_get, "http"},
+    {"http_post", build_http_post, "http"},
+    {"http_chunked_req", build_http_chunked_req, "http"},
+    {"http_chunked_resp", build_http_chunked_resp, "http"},
+    {"http_continue", build_http_continue, "http"},
+    {"http_pipelined", build_http_pipelined, "http"},
+    {"http_keepalive_50", build_http_keepalive_50, "http"},
+    {"http_404", build_http_404, "http"},
+    {"http_500", build_http_500, "http"},
+    {"http_head", build_http_head, "http"},
+    {"http_upgrade_blind", build_http_upgrade_blind, "http"},
+    {"http_h2_blind", build_http_h2_blind, "http"},
+    {"http_connect_blind", build_http_connect_blind, "http"},
+    {"http_sendfile_body_unseen", build_http_sendfile_body_unseen, "http"},
+    {"http_huge_head", build_http_huge_head, "http"},
+    {"http_synthetic_midstream", build_http_synthetic_midstream, "http"},
 };
 const size_t lk_nfixtures = sizeof(lk_fixtures) / sizeof(lk_fixtures[0]);

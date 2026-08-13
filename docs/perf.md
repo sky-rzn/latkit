@@ -382,3 +382,77 @@ justification policy — empty today by design: the harness is memcheck-clean
 (0 errors, all heap freed), and a leak there is a leak in code the agent runs
 24/7. memcheck is nightly-only (~20–50× slowdown); ASAN stays the fast PR
 echelon. Built without sanitizers on purpose — ASAN and valgrind don't mix.
+
+---
+
+## HTTP overhead (PLAN-HTTP.md М8)
+
+`tests/bench/run-http.sh` — the http twin of the stand above, same shape
+(paired A/B runs at a **capped** rate, medians compared), three loads, and one
+saturation probe that exists to check a design decision rather than a cost.
+
+The cap matters as much here as it does for PostgreSQL: run at saturation, wrk
+and the agent compete for the same cores and the throughput difference measures
+the scheduler. wrk has no `-R`, so the fleet is paced through
+`tests/bench/wrk-pace.lua`.
+
+Measured 2026-08-12, kernel 7.0.0-27, 22 cores, nginx 1.27 in front of a Go
+`net/http` backend, 1 pair × 10 s per load:
+
+```
+load    rps A      rps B      ΔTPS    p99 A>B         agent CPU   drops  resyncs
+small   13652.0    13601.7    -0.4%   0.59>0.69 ms    0.038 cores    0       0
+proxy   11766.1    11874.0    +0.9%   2.47>1.81 ms    0.063 cores    0      32
+big       591.4      591.0    -0.1%   2.17>2.65 ms    0.004 cores    0      78
+```
+
+- **small** — 5-byte static responses through nginx: the per-request cost, two
+  heads and a route lookup per exchange and almost no bytes, i.e. the worst
+  case per byte delivered.
+- **proxy** — the same rate proxied to the Go backend, so **two** legs are
+  observed per client request (client→nginx and nginx→backend). That is what a
+  real deployment costs, and it is why this row's CPU is the highest.
+- **big** — 1 MB static bodies through `sendfile`: the per-byte cost, which is
+  near zero because the body is never captured (see below).
+
+ΔTPS is noise in every row (±1%), p99 moves by tenths of a millisecond in both
+directions, and the agent costs **0.04–0.06 cores at ~13k requests/s** —
+0.15–0.25 cores per 50k, the same order as the PostgreSQL stand's 0.31 cores
+per 50k queries/s, for a protocol that parses two heads per unit instead of one
+command.
+
+The `resyncs` in the proxy and big rows are the capture-budget tail of
+docs/accuracy.md §HTTP: a body whose last call is cut has its hole detected
+only when the next call starts, and if that hole runs past the body's end the
+direction rejoins on the next head anchor. No events were dropped in any row.
+
+### The per-port budget, measured (РH14)
+
+The plan's claim is that a 2048-byte per-call capture budget is what keeps the
+ringbuf lossless on a multi-gigabit delivery. Checked **uncapped**, on 1 MB
+bodies written through the socket (`sendfile off` — a sendfile body arrives at
+`tcp_sendmsg` as a page iterator the probe cannot copy from at all, so no budget
+ever bites on it):
+
+```
+budget           rps       MB/s     ringbuf drops
+default (2048)   2592.0    2530     0
+fat (32768)      1267.3    1240     1037
+```
+
+At 2.5 GB/s the default budget loses nothing. Widen it 16× and the same load
+delivers half the throughput and drops a thousand events — every one of them a
+hole some observation then has to survive. The budget is not a tuning knob for
+comfort; it is the reason the numbers above are trustworthy.
+
+### Reproduction
+
+```sh
+cmake -B build-rel -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-rel --target latkit -j
+tests/bench/run-http.sh            # ~5 min with the defaults
+```
+
+Knobs (env): `PAIRS`, `DURATION`, `CONNS`, `THREADS`, `RATE`, `BIG_RATE`,
+`FAT_BUDGET`, `WRK_IMAGE`, `AGENT_BIN`, `OUT`. Artifacts: `runs.tsv` (one row
+per pair, both views plus the agent's counters) and `budget.tsv`.

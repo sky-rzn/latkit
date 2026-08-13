@@ -22,7 +22,8 @@
 #     the kind of attach that a kernel change breaks silently, which is why the
 #     matrix runs them.
 #
-#   sudo tests/kernel/smoke.sh [--port N] [--repeat N] [--no-tls] [--mysql] [--build DIR]
+#   sudo tests/kernel/smoke.sh [--port N] [--repeat N] [--no-tls] [--mysql|--http]
+#                              [--build DIR]
 set -u
 
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -30,7 +31,7 @@ BUILD=${BUILD_DIR:-$REPO_ROOT/build}
 PORT=5499
 REPEAT=3
 DO_TLS=1
-MYSQL=0
+PROTO=pg
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -40,16 +41,25 @@ while [ $# -gt 0 ]; do
     # Stream the mysql fixtures with the agent framing the port as mysql
     # (МYSQL.md М7: BPF is unchanged, so one plaintext replay confirms the
     # classic protocol over a real socket). TLS is the M5 e2e stand's job.
-    --mysql) MYSQL=1; DO_TLS=0; shift ;;
+    --mysql) PROTO=mysql; DO_TLS=0; shift ;;
+    # Stream the http fixtures with the agent framing the port as http
+    # (PLAN-HTTP.md М8). Worth its own matrix run even though М7 added no BPF
+    # for plaintext HTTP: the stream mode of РH1 takes a different path through
+    # lk_reasm_data than the two message-framed protocols, and a capture-layer
+    # regression that only bites there would otherwise show up nowhere.
+    --http) PROTO=http; DO_TLS=0; shift ;;
     --build) BUILD=$2; shift 2 ;;
-    *) echo "usage: $0 [--port N] [--repeat N] [--no-tls] [--mysql] [--build DIR]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--port N] [--repeat N] [--no-tls] [--mysql|--http] [--build DIR]" >&2; exit 2 ;;
     esac
 done
 
-# The agent frames the loopback port as pg by default, mysql with --mysql; the
-# replayer is told to match with -m (pgstream streams the right fixture set).
-if [ "$MYSQL" = 1 ]; then PORT_SPEC="$PORT=mysql"; PGSTREAM_PROTO="-m"
-else PORT_SPEC="$PORT"; PGSTREAM_PROTO=""; fi
+# The agent frames the loopback port as pg by default; the replayer is told to
+# match (-m / -H), so both sides agree on which fixture set travels the socket.
+case "$PROTO" in
+mysql) PORT_SPEC="$PORT=mysql"; PGSTREAM_PROTO="-m" ;;
+http)  PORT_SPEC="$PORT=http";  PGSTREAM_PROTO="-H" ;;
+*)     PORT_SPEC="$PORT";       PGSTREAM_PROTO="" ;;
+esac
 
 AGENT=$BUILD/latkit
 PGSTREAM=$BUILD/tests/kernel/pgstream
@@ -73,6 +83,15 @@ trap cleanup EXIT
 metric() { # metric FILE NAME
     awk -v m="$2" '$1 == m || substr($1, 1, length(m) + 1) == m"{" { s += $NF }
                    END { printf "%.0f\n", s + 0 }' "$1"
+}
+
+# metric_lbl FILE NAME LABEL-SUBSTRING — the same sum, over the series whose
+# label set contains the given text. One profile's families are keyed by labels
+# the other does not have, so an assertion about a status class needs this.
+metric_lbl() {
+    awk -v m="$2" -v l="$3" \
+        'substr($1, 1, length(m) + 1) == m"{" && index($1, l) { s += $NF }
+         END { printf "%.0f\n", s + 0 }' "$1"
 }
 
 assert_eq() { # assert_eq LABEL GOT WANT
@@ -120,8 +139,18 @@ assert_phase() { # assert_phase NAME SUMMARY_LINE
     [ -s "$prom" ] || { fail "$name: no metrics dump ($prom)"; return; }
     assert_eq "$name: connections_opened_total" "$(metric "$prom" latkit_connections_opened_total)" "$conns"
     assert_eq "$name: connections_active" "$(metric "$prom" latkit_connections_active)" 0
-    assert_eq "$name: queries_total" "$(metric "$prom" latkit_queries_total)" "$queries"
-    assert_eq "$name: query_errors_total" "$(metric "$prom" latkit_query_errors_total)" "$errors"
+    # The observation counters live in the profile's own families (РH10), so
+    # which two lines are read depends on the protocol under test. For http the
+    # error count is the 5xx class rather than latkit_http_errors_total, which
+    # РH9 defines as every status >= 400 — a 404 is counted there and is
+    # deliberately not an error.
+    if [ "$PROTO" = http ]; then
+        assert_eq "$name: http_requests_total" "$(metric "$prom" latkit_http_requests_total)" "$queries"
+        assert_eq "$name: http 5xx" "$(metric_lbl "$prom" latkit_http_requests_total 'status="5xx"')" "$errors"
+    else
+        assert_eq "$name: queries_total" "$(metric "$prom" latkit_queries_total)" "$queries"
+        assert_eq "$name: query_errors_total" "$(metric "$prom" latkit_query_errors_total)" "$errors"
+    fi
     assert_eq "$name: parse_errors_total" "$(metric "$prom" latkit_parse_errors_total)" 0
     assert_eq "$name: unknown_msgs_total" "$(metric "$prom" latkit_unknown_msgs_total)" 0
     assert_eq "$name: resync_total" "$(metric "$prom" latkit_resync_total)" 0

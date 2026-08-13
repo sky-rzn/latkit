@@ -57,11 +57,21 @@ struct pipe_slot {
     bool mark[2];  /* per dir: loss seen — next message must be AFTER_RESYNC */
 };
 
+/* Which message contract the emitted lk_msg are checked against — the same
+ * choice as the protocol, named apart because it is about the *invariants*,
+ * and HTTP's are a different set (synthetic message types, no startup
+ * framing) rather than a variation of the database ones. */
+enum pipe_msg_check {
+    PIPE_MSG_PG = 0,
+    PIPE_MSG_MY,
+    PIPE_MSG_HTTP,
+};
+
 struct pipe_ctx {
     struct lk_pipeline pipe;
     struct lk_proto *proto;
-    const struct lk_proto_ops *ops;  /* selected by the leading input byte */
-    bool mysql;                      /* the message contract to check against */
+    const struct lk_proto_ops *ops; /* selected by the leading input byte */
+    enum pipe_msg_check msg_check;
     const struct lk_msg_sink *psink; /* = lk_proto_sink(proto) */
     struct pipe_slot slot[PIPE_SLOTS];
     __u64 now;
@@ -82,7 +92,10 @@ static void pipe_on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const str
     struct pipe_ctx *px = ctx;
     struct pipe_slot *s = slot_of(px, c->cookie);
 
-    fz_check_msg(m, px->mysql);
+    if (px->msg_check == PIPE_MSG_HTTP)
+        fz_check_http_msg(m);
+    else
+        fz_check_msg(m, px->msg_check == PIPE_MSG_MY);
     /* Р19: nothing is emitted across a loss — the first message after it must
      * announce the resync. The len==0 one-byte SSL reply bypasses framing
      * (cross-direction flag, Р10) and is exempt. */
@@ -116,13 +129,24 @@ static void pipe_on_conn_close(void *ctx, struct lk_conn *c)
 static void pipe_on_query(void *ctx, const struct lk_conn *c, const struct lk_session *s,
                           const struct lk_query_obs *o)
 {
-    (void)ctx;
+    struct pipe_ctx *px = ctx;
+
     (void)c;
     fz_check_obs(o);
-    /* The aggregator's next step over live traffic: normalise the text. The
-     * stability check makes the fingerprint contract part of this target. */
-    if (o->text)
-        fz_check_norm_stable(o->text, o->text_len, LK_SQL_PG); /* PG pipeline */
+    /* The aggregator's next step over live traffic: turn the observation's text
+     * into the label it will be keyed by. Which normaliser that is depends on
+     * the protocol — SQL for the databases, the route templater for HTTP, whose
+     * text is a request target (РH7) — and either way the stability check makes
+     * the fingerprint contract part of this target. */
+    if (px->msg_check == PIPE_MSG_HTTP) {
+        if (o->text)
+            fz_check_route_stable(o->op ? o->op : "", o->op ? strlen(o->op) : 0, o->text,
+                                  o->text_len, NULL);
+        if (o->route)
+            fz_read_bytes(o->route, o->route_len);
+    } else if (o->text) {
+        fz_check_norm_stable(o->text, o->text_len, LK_SQL_PG);
+    }
     if (s)
         fz_read_bytes(s->user, strnlen(s->user, sizeof(s->user)));
 }
@@ -367,18 +391,21 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     for (int i = 0; i < PIPE_SLOTS; i++)
         px.slot[i].cookie = PIPE_COOKIE_BASE + (__u64)i * PIPE_COOKIE_STEP;
 
-    /* First input byte selects the wire protocol (МYSQL.md М7): mysql when
-     * bit 0 is set, else the pg default. The scenario proper starts at byte 1. */
+    /* First input byte selects the wire protocol (МYSQL.md М7, PLAN-HTTP.md
+     * М8); the scenario proper starts at byte 1. An unknown selector falls
+     * back to pg rather than being rejected: every byte string has to remain a
+     * valid scenario. */
     {
-        const struct lk_proto_ops *ops = lk_proto_registry[0];
+        const struct lk_proto_ops *ops = lk_proto_registry[0], *sel = NULL;
+        unsigned want = r.p < r.end ? (*r.p++ & PIPE_PROTO_MASK) : PIPE_PROTO_PG;
 
-        if (r.p < r.end && (*r.p++ & PIPE_PROTO_MYSQL)) {
-            const struct lk_proto_ops *my = lk_proto_find("mysql", 5);
-
-            if (my) {
-                ops = my;
-                px.mysql = true;
-            }
+        if (want == PIPE_PROTO_MYSQL)
+            sel = lk_proto_find("mysql", 5);
+        else if (want == PIPE_PROTO_HTTP)
+            sel = lk_proto_find("http", 4);
+        if (sel) {
+            ops = sel;
+            px.msg_check = want == PIPE_PROTO_MYSQL ? PIPE_MSG_MY : PIPE_MSG_HTTP;
         }
         px.ops = ops;
         px.proto = ops->proto_new(&qsink);

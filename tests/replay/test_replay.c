@@ -58,6 +58,7 @@ struct collector {
     struct lk_session last_session;
     struct lk_query_obs last_obs; /* text pointer nulled; see last_text */
     char last_text[256];          /* last_obs.text copied out (it dangles) */
+    char last_route[256];         /* ... and the HTTP route beside it (М8) */
 
     /* Aggregator (task 4.3): the same observations tee into the metrics facade,
      * exactly as events.c wires them over live traffic. */
@@ -99,6 +100,12 @@ static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session
         col->last_text[o->text_len] = '\0';
     }
     col->last_obs.text = NULL;
+    col->last_route[0] = '\0';
+    if (o->route && o->route_len < sizeof(col->last_route)) {
+        memcpy(col->last_route, o->route, o->route_len);
+        col->last_route[o->route_len] = '\0';
+    }
+    col->last_obs.route = NULL;
     if (col->msink->on_query)
         col->msink->on_query(col->msink->ctx, c, s, o);
 
@@ -282,6 +289,133 @@ static const struct metric_expect metric_expects[] = {
     {"my_synthetic_midsession", NULL, NULL, 0, 0, 0, 0, NULL, NULL, NULL, NULL},
 };
 
+/* --- М8: the exposition the HTTP fixtures produce --------------------------
+ * The table above is query-shaped — one series, keyed by normalised SQL — and
+ * an http series is keyed by (route, method, host, user) under its own family
+ * names (РH9/РH10). Widening it would produce a row that says little about
+ * either profile, so the http fixtures pin exposition lines directly. That also
+ * buys the one thing the single-series form cannot express: several series per
+ * fixture, which is exactly what the HEAD row is about — one path, two methods,
+ * two identities that must not merge (РH7). */
+#define HTTP_LBL(route, method)                                                                    \
+    "route=\"" route "\",method=\"" method "\",host=\"latkit.test\",user=\"-\",proto=\"http\""
+
+struct http_line {
+    const char *prefix;      /* full label set, up to the value */
+    unsigned long long want; /* the value the line must carry */
+};
+
+struct http_metric_expect {
+    const char *name;         /* fixture stem */
+    struct http_line want[6]; /* NULL-terminated */
+    const char *absent[2];    /* lines that must NOT exist */
+};
+
+static const struct http_metric_expect http_metric_expects[] = {
+    /* The base case, whole: the request counted under its status class, the
+     * duration under code="ok", the response body in the byte counter. */
+    {"http_get",
+     {{"latkit_http_requests_total{" HTTP_LBL("/hello", "GET") ",status=\"2xx\"}", 1},
+      {"latkit_http_request_duration_seconds_count{" HTTP_LBL("/hello", "GET") ",code=\"ok\"}", 1},
+      {"latkit_http_ttfb_seconds_count{" HTTP_LBL("/hello", "GET") "}", 1},
+      {"latkit_http_bytes_total{" HTTP_LBL("/hello", "GET") ",direction=\"out\"}", 13},
+      {NULL, 0}},
+     {NULL}},
+    /* The id is gone from the label and the upload family has the unit: a POST
+     * is the only shape where the client's upload time is a separate number. */
+    {"http_post",
+     {{"latkit_http_requests_total{" HTTP_LBL("/orders/{id}/items", "POST") ",status=\"2xx\"}", 1},
+      {"latkit_http_request_upload_seconds_count{" HTTP_LBL("/orders/{id}/items", "POST") "}", 1},
+      {"latkit_http_bytes_total{" HTTP_LBL("/orders/{id}/items", "POST") ",direction=\"in\"}", 23},
+      {NULL, 0}},
+     {NULL}},
+    /* Chunked reports decoded bytes, so the byte counters cannot tell which
+     * framing carried the body — the invariant, stated as a metric. */
+    {"http_chunked_req",
+     {{"latkit_http_bytes_total{" HTTP_LBL("/upload", "POST") ",direction=\"in\"}", 11}, {NULL, 0}},
+     {NULL}},
+    {"http_chunked_resp",
+     {{"latkit_http_bytes_total{" HTTP_LBL("/stream", "GET") ",direction=\"out\"}", 12}, {NULL, 0}},
+     {NULL}},
+    /* РH5: a unit that waited for a 100 Continue is dropped by the upload
+     * family (the interval holds a server round trip) and kept by every other. */
+    {"http_continue",
+     {{"latkit_http_requests_total{" HTTP_LBL("/uploads/{id}/report", "PUT") ",status=\"2xx\"}", 1},
+      {"latkit_http_request_duration_seconds_count{" HTTP_LBL("/uploads/{id}/report",
+                                                              "PUT") ",code=\"ok\"}",
+       1},
+      {NULL, 0}},
+     {"latkit_http_request_upload_seconds_count", NULL}},
+    /* Four routes from one batch, none of them merged. */
+    {"http_pipelined",
+     {{"latkit_http_requests_total{" HTTP_LBL("/a", "GET") ",status=\"2xx\"}", 1},
+      {"latkit_http_requests_total{" HTTP_LBL("/d", "GET") ",status=\"2xx\"}", 1},
+      {"latkit_metric_series", 4},
+      {NULL, 0}},
+     {NULL}},
+    /* Fifty exchanges, one series: keep-alive must not multiply anything. */
+    {"http_keepalive_50",
+     {{"latkit_http_requests_total{" HTTP_LBL("/hello", "GET") ",status=\"2xx\"}", 50},
+      {"latkit_http_bytes_total{" HTTP_LBL("/hello", "GET") ",direction=\"out\"}", 650},
+      {"latkit_metric_series", 1},
+      {NULL, 0}},
+     {NULL}},
+    /* РH9/РH10, both halves. `latkit_http_errors_total` is every status >= 400
+     * by its exact code, so a 404 is in it — what separates the two is the
+     * latency series: a client asking for something that does not exist is a
+     * successful unit of work (code="ok"), a server failing is not. */
+    {"http_404",
+     {{"latkit_http_requests_total{" HTTP_LBL("/nope", "GET") ",status=\"4xx\"}", 1},
+      {"latkit_http_request_duration_seconds_count{" HTTP_LBL("/nope", "GET") ",code=\"ok\"}", 1},
+      {"latkit_http_errors_total{code=\"404\",host=\"latkit.test\",user=\"-\",proto=\"http\"}", 1},
+      {NULL, 0}},
+     {"latkit_http_request_duration_seconds_count{" HTTP_LBL("/nope", "GET") ",code=\"error\"}",
+      NULL}},
+    {"http_500",
+     {{"latkit_http_requests_total{" HTTP_LBL("/boom", "GET") ",status=\"5xx\"}", 1},
+      {"latkit_http_request_duration_seconds_count{" HTTP_LBL("/boom", "GET") ",code=\"error\"}",
+       1},
+      {"latkit_http_errors_total{code=\"500\",host=\"latkit.test\",user=\"-\",proto=\"http\"}", 1},
+      {NULL, 0}},
+     {NULL}},
+    /* One path, two methods, two series — and the HEAD one carries no bytes,
+     * which is the whole reason a HEAD response's Content-Length is not a body. */
+    {"http_head",
+     {{"latkit_http_requests_total{" HTTP_LBL("/hello", "HEAD") ",status=\"2xx\"}", 1},
+      {"latkit_http_requests_total{" HTTP_LBL("/hello", "GET") ",status=\"2xx\"}", 1},
+      {"latkit_http_bytes_total{" HTTP_LBL("/hello", "HEAD") ",direction=\"out\"}", 0},
+      {"latkit_metric_series", 2},
+      {NULL, 0}},
+     {NULL}},
+    /* The handshake is an exchange and is reported as one; 101 is its own
+     * status class, not an error. */
+    {"http_upgrade_blind",
+     {{"latkit_http_requests_total{" HTTP_LBL("/ws", "GET") ",status=\"1xx\"}", 1}, {NULL, 0}},
+     {"latkit_http_errors_total", NULL}},
+    /* A blind zone produces no series at all: nothing is invented from bytes
+     * we admit we cannot read. */
+    {"http_h2_blind",
+     {{"latkit_metric_series", 0}, {NULL, 0}},
+     {"latkit_http_requests_total", NULL}},
+    /* РH4: the body was promised and never seen, so the byte counter reports
+     * the lower bound it actually observed rather than the promised megabyte. */
+    {"http_sendfile_body_unseen",
+     {{"latkit_http_bytes_total{" HTTP_LBL("/big.bin", "GET") ",direction=\"out\"}", 0},
+      {"latkit_http_requests_total{" HTTP_LBL("/big.bin", "GET") ",status=\"2xx\"}", 1},
+      {NULL, 0}},
+     {NULL}},
+    /* РH14: the head was cut by the capture budget and the route still made it
+     * into the label — the point of publishing the prefix rather than dropping
+     * the head whole. */
+    {"http_huge_head",
+     {{"latkit_http_requests_total{" HTTP_LBL("/profile/{id}", "GET") ",status=\"2xx\"}", 1},
+      {NULL, 0}},
+     {NULL}},
+    {"http_synthetic_midstream",
+     {{"latkit_http_requests_total{" HTTP_LBL("/hello", "GET") ",status=\"2xx\"}", 1}, {NULL, 0}},
+     {NULL}},
+};
+
 /* Numeric value on the dump line that begins (at column 0) with `prefix` and is
  * followed by a space. Returns 1 and sets *out, or 0 if no such line exists. */
 static int dump_line_val(const char *buf, const char *prefix, double *out)
@@ -317,16 +451,47 @@ static int check_line(const char *fixname, const char *buf, const char *prefix,
     return 0;
 }
 
+/* Is there any line starting at column 0 with `prefix`? Unlike dump_line_val
+ * this does not require a space after it, so a *family* name matches its
+ * labelled series — which is what an absence check needs: "no line of this
+ * family exists", not "no unlabelled line of this exact name exists". */
+static const char *dump_line_with(const char *buf, const char *prefix)
+{
+    size_t plen = strlen(prefix);
+    const char *p = buf;
+
+    while ((p = strstr(p, prefix))) {
+        if (p == buf || p[-1] == '\n')
+            return p;
+        p += plen;
+    }
+    return NULL;
+}
+
 /* Assert the dump has no line beginning with `prefix` (used to prove no query
  * series exist for the loss / TLS fixtures). */
 static int check_absent(const char *fixname, const char *buf, const char *prefix)
 {
-    double v;
+    const char *line = dump_line_with(buf, prefix);
 
-    if (dump_line_val(buf, prefix, &v)) {
-        fprintf(stderr, "FAIL %s: metrics dump has unexpected \"%s\" = %g\n", fixname, prefix, v);
+    if (line) {
+        int n = (int)strcspn(line, "\n");
+
+        fprintf(stderr, "FAIL %s: metrics dump has unexpected \"%.*s\"\n", fixname, n, line);
         return 1;
     }
+    return 0;
+}
+
+/* One HTTP fixture's exposition rows (М8). */
+static int check_http_metrics(const struct http_metric_expect *e, const char *buf)
+{
+    for (size_t i = 0; i < sizeof(e->want) / sizeof(e->want[0]) && e->want[i].prefix; i++)
+        if (check_line(e->name, buf, e->want[i].prefix, e->want[i].want))
+            return 1;
+    for (size_t i = 0; i < sizeof(e->absent) / sizeof(e->absent[0]) && e->absent[i]; i++)
+        if (check_absent(e->name, buf, e->absent[i]))
+            return 1;
     return 0;
 }
 
@@ -550,6 +715,17 @@ static int run_fixture(const struct fixture *fix)
                 (unsigned long long)lk_proto_stats(col.proto)->errors_sql);
         goto fail;
     }
+    /* PLAN-HTTP.md М8: a parse error or a blind zone appearing anywhere in the
+     * set is a finding, so both are pinned on every fixture, not only on the
+     * three that are about them. */
+    if (lk_proto_stats(col.proto)->parse_errors != x.parse_errors ||
+        lk_proto_stats(col.proto)->blind_conns != x.blind_conns) {
+        fprintf(stderr, "FAIL %s: expected parse_errors=%llu blind=%llu, got %llu/%llu\n",
+                fix->name, (unsigned long long)x.parse_errors, (unsigned long long)x.blind_conns,
+                (unsigned long long)lk_proto_stats(col.proto)->parse_errors,
+                (unsigned long long)lk_proto_stats(col.proto)->blind_conns);
+        goto fail;
+    }
     /* Last observation's fields (task 3.3): kind/rows/flags always, text and
      * SQLSTATE only when the fixture pins them. */
     if (x.queries) {
@@ -572,6 +748,31 @@ static int run_fixture(const struct fixture *fix)
         if (x.obs_sqlstate && strcmp(col.last_obs.sqlstate, x.obs_sqlstate)) {
             fprintf(stderr, "FAIL %s: obs sqlstate expected \"%s\", got \"%s\"\n", fix->name,
                     x.obs_sqlstate, col.last_obs.sqlstate);
+            goto fail;
+        }
+        /* HTTP (М8): method, status and the byte counts in both directions. */
+        if (x.obs_op && (!col.last_obs.op || strcmp(col.last_obs.op, x.obs_op))) {
+            fprintf(stderr, "FAIL %s: obs op expected \"%s\", got \"%s\"\n", fix->name, x.obs_op,
+                    col.last_obs.op ? col.last_obs.op : "(none)");
+            goto fail;
+        }
+        if (x.obs_status && col.last_obs.err_code != x.obs_status) {
+            fprintf(stderr, "FAIL %s: obs status expected %u, got %u\n", fix->name, x.obs_status,
+                    col.last_obs.err_code);
+            goto fail;
+        }
+        if (col.last_obs.bytes_in != x.obs_bytes_in || col.last_obs.bytes_out != x.obs_bytes_out) {
+            fprintf(stderr, "FAIL %s: obs bytes expected in=%llu out=%llu, got in=%llu out=%llu\n",
+                    fix->name, (unsigned long long)x.obs_bytes_in,
+                    (unsigned long long)x.obs_bytes_out, (unsigned long long)col.last_obs.bytes_in,
+                    (unsigned long long)col.last_obs.bytes_out);
+            goto fail;
+        }
+        /* The route is the one field of an HTTP observation that may become a
+         * label, so "" (expect none) is a distinct expectation from unset. */
+        if (x.obs_route && strcmp(col.last_route, x.obs_route)) {
+            fprintf(stderr, "FAIL %s: obs route expected \"%s\", got \"%s\"\n", fix->name,
+                    x.obs_route, col.last_route);
             goto fail;
         }
     }
@@ -598,6 +799,20 @@ static int run_fixture(const struct fixture *fix)
                     goto fail;
                 break;
             }
+        /* М8: the same, for the http profile's own families (РH9). */
+        for (size_t k = 0; k < sizeof(http_metric_expects) / sizeof(http_metric_expects[0]); k++)
+            if (!strcmp(http_metric_expects[k].name, fix->name)) {
+                if (check_http_metrics(&http_metric_expects[k], a))
+                    goto fail;
+                break;
+            }
+        /* РH10's profile split, checked on every fixture rather than in one
+         * row: an http observation must never reach the database families, and
+         * a PG/MySQL one must never reach the http families. */
+        if (check_absent(fix->name, a,
+                         fix->proto && !strcmp(fix->proto, "http") ? "latkit_query_"
+                                                                   : "latkit_http_"))
+            goto fail;
     }
 
     /* Task 5.3: the span sink saw the same observations at ratio=1.0, so every

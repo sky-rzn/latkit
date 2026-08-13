@@ -25,7 +25,9 @@ struct fx_msg {
     __u16 flags; /* expected LK_MSG_* */
 };
 
-#define FX_MAX_MSGS 32
+/* An HTTP keep-alive fixture is 50 exchanges of five messages (PLAN-HTTP.md
+ * М8), which is what sets this ceiling; the PG/MySQL fixtures use a handful. */
+#define FX_MAX_MSGS 288
 
 /* A built fixture: the trace bytes and everything test_replay asserts. */
 struct fx {
@@ -56,14 +58,33 @@ struct fx {
 
     /* Parser counters (task 3.4), always checked against lk_proto_stats. */
     __u64 errors_sql; /* expected LK_QO_ERROR observations */
+
+    /* --- HTTP expectations (PLAN-HTTP.md М8) -------------------------------
+     * An HTTP observation's identity is a method, a templated route and a
+     * status, not rows and a SQLSTATE, so the last-observation checks above
+     * would pin nothing that matters. These are checked when queries > 0 and
+     * the fixture sets them; obs_route = "" means "expect no route at all"
+     * (the authority-form CONNECT), NULL means "do not check". */
+    const char *obs_op;    /* lk_query_obs.op — the method */
+    const char *obs_route; /* lk_query_obs.route — the template, never the path */
+    __u16 obs_status;      /* lk_query_obs.err_code — set on every http obs */
+    __u64 obs_bytes_in;    /* request body bytes */
+    __u64 obs_bytes_out;   /* response body bytes */
+
+    /* Counters that are zero for every PG/MySQL fixture and are the point of
+     * several HTTP ones; always checked, so a new blind zone or a new parse
+     * error cannot appear anywhere in the set without a test saying so. */
+    __u64 parse_errors; /* lk_proto_stats.parse_errors */
+    __u64 blind_conns;  /* ... blind_conns (РH4: h2 / upgrade / CONNECT) */
 };
 
 struct fixture {
     const char *name; /* file stem: tests/fixtures/<name>.lkt */
     void (*build)(struct fx *x);
     const char *proto; /* NULL = pg (the registry head); "mysql" for the
-                          MySQL mirror set (MYSQL.md М7) — selects both the
-                          framer and the handler run over the fixture */
+                          MySQL mirror set (MYSQL.md М7), "http" for the HTTP
+                          one (PLAN-HTTP.md М8) — selects both the framer and
+                          the handler run over the fixture */
 };
 
 extern const struct fixture lk_fixtures[];

@@ -6,11 +6,18 @@
  * cross-module seams are sensitive to (resync after holes, startup phase,
  * lazy-created dirty entries, the TLS flip, LRU/idle eviction).
  *
- * The very first input byte is the protocol selector (MYSQL.md М7): bit 0
- * chooses the wire protocol every connection frames and parses as — 0 = pg
- * (the registry head, the historical behaviour), 1 = mysql. The rest of the
- * byte is reserved. This lets one corpus fuzz both framers and both handlers
- * through the same pipeline seams; the scenario proper begins at byte 1.
+ * The very first input byte is the protocol selector (MYSQL.md М7,
+ * PLAN-HTTP.md М8): bits 1..0 choose the wire protocol every connection frames
+ * and parses as — 0 = pg (the registry head, the historical behaviour),
+ * 1 = mysql, 2 = http, 3 folds back to pg. The rest of the byte is reserved.
+ * This lets one corpus fuzz every framer and handler through the same pipeline
+ * seams; the scenario proper begins at byte 1.
+ *
+ * HTTP is the reason the field is worth two bits rather than one: it is the
+ * only protocol in the registry that frames in stream mode (РH1), so the
+ * seams this target exists to shake — the seq detector, the budget-cut tail,
+ * the synthetic entry, the TLS flip — reach it down a different path inside
+ * lk_reasm_data than the one the two message-framed protocols take.
  *
  * A scenario is a sequence of ops. The op byte packs three fields:
  *
@@ -93,7 +100,10 @@ enum pipe_shape {
 #define PIPE_SLOTS    4
 #define PIPE_DATA_MAX 2048 /* 3-bit arg << 8 | len byte */
 
-/* Leading protocol-selector byte: bit 0 picks mysql over the pg default. */
+/* Leading protocol-selector byte: bits 1..0 pick the protocol, pg by default. */
+#define PIPE_PROTO_MASK  3
+#define PIPE_PROTO_PG    0
 #define PIPE_PROTO_MYSQL 1
+#define PIPE_PROTO_HTTP  2
 
 #endif /* LATKIT_FUZZ_PIPE_OPS_H */

@@ -24,6 +24,7 @@ KEEP=1 ./verify.sh   # same, but leave the stand running to poke at it
 ./verify-mysql-tls.sh  # MySQL TLS stand: mysqld require_secure_transport=ON,
                        #   -p 3306=mysql --tls auto (MYSQL.md этап М5)
 
+./verify-http.sh         # plaintext HTTP: nginx + a Go backend, both legs (М8)
 ./verify-http-tls.sh     # HTTPS via nginx + libssl uprobes (PLAN-HTTP.md М7)
 ./verify-http-go-tls.sh  # HTTPS via a Go net/http server + --tls-go (М7, РH13.3)
 ```
@@ -80,14 +81,35 @@ Prometheus on 9090), <http://localhost:9752/metrics> (the agent),
   `rate()` window under steady load. That is real captured latency, not a
   histogram error.
 
-## Not here yet: the plaintext HTTP stand
+## The plaintext HTTP stand (М8)
 
-The HTTP track's *plaintext* e2e stand (`docker-compose.http.yml` +
-`verify-http.sh`: nginx, a Go backend, a load generator) belongs to PLAN-HTTP.md
-М8 and does not exist yet — the two HTTPS stands above arrived with М7 because
-they are what that stage had to prove. So the М6 claim "the agent's span shows
-up in a trace backend as a child of the client's span" is verified **offline**
-rather than in a live Jaeger:
+`docker-compose.http.yml` + `verify-http.sh`: nginx in front of a Go `net/http`
+backend, **both legs observed** (`-p 8080=http -p 8081=http`), a curl load loop
+shaped to hit the cases РH4 and РH5 are about, and — behind `--profile burst`,
+so a runner that cannot pull the image still runs every correctness check — a
+`wrk` burst. It asserts the М8 list in one run:
+
+- `latkit_http_requests_total` exists and grows;
+- every route label is templated — no raw id, no query string, bounded
+  cardinality (РH7);
+- the injected 500 and 404 are both visible and told apart: both counted, only
+  one an error (РH10);
+- the durations are plausible, and `/slow`'s deliberate 50 ms shows up in
+  **TTFB** rather than only in the duration — the two are measured, not copied
+  from each other (РH5);
+- the upload family holds the trickling client's transfer and skips the units
+  that have no interval to report;
+- the front and upstream legs keep distinct label sets — a proxy's two legs are
+  two latencies;
+- an 8 MB `sendfile` body is accounted to the byte on this kernel (РH4);
+- and nothing went blind, nothing was dropped, no parse error on clean traffic.
+
+It needs a Go toolchain: the backend is built on the host and bind-mounted, the
+same recipe the Go-TLS stand uses.
+
+The М6 claim about spans in somebody else's trace stays verified **offline**,
+and deliberately so — the corpus carries real recorded `traceparent` traffic
+that no synthetic stand can improve on:
 
 - `tests/replay/http_queries_traces.sh` replays the recorded `*/traceparent.lkt`
   corpus traces (four servers, a real W3C context on the wire) through the
@@ -98,11 +120,6 @@ rather than in a live Jaeger:
 - `tests/unit/test_otlp_enc.c` asserts the same span on the wire, decoding the
   encoder's protobuf: `SPAN_KIND_SERVER`, `parent_span_id`, `trace_state`, and
   the HTTP semconv attributes with no `db.*` among them.
-
-What that pair does not cover is a real collector accepting the payload, which is
-exactly what the live stand adds — the base stand already validates the traces
-pipeline for database spans (the collector 400s malformed OTLP), and the HTTP one
-extends it to this span shape in М8.
 
 ## Files
 
@@ -117,3 +134,7 @@ extends it to this span shape in М8.
 | `verify-tls.sh` | the TLS assert set: same series + `latkit_tls_*` provenance |
 | `docker-compose.mysql-tls.yml` | standalone MySQL TLS stand (MYSQL.md этап М5) |
 | `verify-mysql-tls.sh` | MySQL twin of `verify-tls.sh` |
+| `docker-compose.http.yml` | plaintext HTTP stand: nginx + Go backend, both legs (М8) |
+| `nginx-http.conf` | its nginx: static with `sendfile on`, a reverse-proxy leg |
+| `httpbackend/` | the Go application server the stand proxies to (built on the host) |
+| `verify-http.sh` | the М8 assert set: routes, statuses, the four timings, blind zones |

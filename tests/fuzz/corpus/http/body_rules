@@ -1,0 +1,19 @@
+PUT /uploads/42 HTTP/1.1
+Host: h
+Expect: 100-continue
+Content-Length: 4
+
+bodyHEAD /x HTTP/1.1
+Host: h
+
+HTTP/1.1 100 Continue
+
+HTTP/1.1 201 Created
+Content-Length: 0
+
+HTTP/1.1 200 OK
+Content-Length: 99
+
+HTTP/1.1 304 Not Modified
+Content-Length: 7
+

@@ -120,9 +120,9 @@ for trace in "$DIR"/*/*.lkt; do
     # --- statuses (РH10: 4xx and 5xx are different things) ---------------
     */statuses)
         nobs 3
-        has '^http .* status=404 .* flags=0x100 route=/nope target=/nope$'   # client error
-        has '^http .* status=500 .* flags=0x1 route=/boom target=/boom$'     # server error
-        has '^http .* status=302 .* flags=0x0 route=/redirect target=/redirect$' # neither
+        has '^http .* status=404 .* flags=0x100 .* route=/nope target=/nope$'   # client error
+        has '^http .* status=500 .* flags=0x1 .* route=/boom target=/boom$'     # server error
+        has '^http .* status=302 .* flags=0x0 .* route=/redirect target=/redirect$' # neither
         ;;
     # --- the request decides how to read the response --------------------
     */head)

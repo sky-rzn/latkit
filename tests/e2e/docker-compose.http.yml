@@ -1,0 +1,166 @@
+# Plaintext HTTP e2e stand (PLAN-HTTP.md М8): nginx + a Go backend + load +
+# latkit + prometheus. The twin of docker-compose.yml (postgres) and
+# docker-compose.mysql.yml for the third protocol, and the stand the two HTTPS
+# ones (М7) are variations of.
+#
+#   ./verify-http.sh          # build agent + backend, up, assert, down
+#   KEEP=1 ./verify-http.sh   # leave it running
+#
+# What it is for: everything the plan asks of М8's e2e leg in one run —
+# requests_total grows, durations and TTFB are non-zero and plausible, an
+# injected 500 and 404 are visible and told apart (РH10), every route label is
+# templated (not one raw id survives, РH7), and on an HTTP/1.1-only stand the
+# blind-zone counters are zero.
+#
+# Two ports are observed rather than one: 8080 is the front leg (client to
+# nginx) and 8081 the upstream leg (nginx to the Go backend). A reverse proxy
+# is the ordinary shape of a real deployment, and each leg has its own
+# latencies — the point of a per-port observation is that they do not merge.
+#
+# The traffic stays on the compose bridge (service names, no published ports),
+# for the same reason the database stands do: a localhost hop goes through
+# docker-proxy, which splices the payload past the capture point.
+
+services:
+  # The application server: Go net/http, plaintext, built on the host by
+  # verify-http.sh and bind-mounted (no image build, no toolchain in the image).
+  backend:
+    image: alpine:3.20
+    volumes:
+      - ../../build/httpbackend:/srv/httpbackend:ro
+    command: ["/srv/httpbackend"]
+    environment:
+      LISTEN: ":8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8081/hello || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # The front: static files with sendfile on, and a reverse-proxy leg to the
+  # backend. The 8 MB file is generated at startup — committing one would put a
+  # binary blob in the tree for no reason.
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./nginx-http.conf:/etc/nginx/nginx.conf:ro
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        mkdir -p /www/static
+        head -c 8388608 /dev/urandom > /www/static/big.bin
+        printf 'small\n' > /www/static/small.txt
+        exec nginx -g 'daemon off;'
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8080/hello || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Steady, deliberately shaped load: one pass covers every assertion the
+  # verify script makes, and it repeats so the rate windows have data. curl
+  # rather than a load generator here on purpose — this leg is about *what* is
+  # observed; how much of it the agent survives is the perf bench's question
+  # (tests/bench/run-http.sh), and the optional `burst` profile below.
+  load:
+    image: curlimages/curl:latest
+    depends_on:
+      nginx:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        i=0
+        while true; do
+          i=$$((i + 1))
+          # Front leg: nginx answers /hello itself, proxies the rest.
+          curl -s -o /dev/null http://nginx:8080/hello
+          curl -s -o /dev/null http://nginx:8080/json/$$i          # -> /json/{id}
+          curl -s -o /dev/null http://nginx:8080/chunked           # chunked body
+          curl -s -o /dev/null http://nginx:8080/slow              # TTFB >> 0
+          curl -s -o /dev/null http://nginx:8080/boom              # 500
+          curl -s -o /dev/null http://nginx:8080/nope              # 404
+          curl -s -o /dev/null --data-binary @/dev/null \
+               -H 'Content-Type: application/octet-stream' \
+               http://nginx:8080/upload
+          # Two uploads, and only one of them has an upload interval to report
+          # (РH5):
+          #   - a *slow* client trickling its body in small writes over half a
+          #     second: the interval between the first request byte and the
+          #     last is real, and it belongs to the client, not the server.
+          #     `Expect:` empty suppresses the 100-continue curl would send
+          #     otherwise, which РH5 excludes from the family on purpose;
+          #   - a client that hands the kernel the whole request in one call:
+          #     head and body share one capture event, so there is no interval
+          #     to measure and the family must skip the unit rather than
+          #     report a zero.
+          # The writes are kept under the per-port capture budget (РH14, 2048 B
+          # by default) deliberately: a body whose *last* write is cut by the
+          # budget has its tail hole detected only when the next call on that
+          # direction starts (Р9), which is after the server has answered — so
+          # that unit reports no upload interval and its duration absorbs the
+          # upload. docs/accuracy.md §"HTTP" records that as a systematic
+          # discrepancy; here we exercise both sides of it knowingly.
+          (for i in 1 2 3 4 5 6 7 8 9 10; do head -c 512 /dev/zero; sleep 0.05; done) |
+              curl -s -o /dev/null -H 'Expect:' -T - http://nginx:8080/upload
+          head -c 131072 /dev/zero | curl -s -o /dev/null \
+               --data-binary @- http://nginx:8080/upload
+          # Static: the sendfile path (8 MB) and a small file.
+          curl -s -o /dev/null http://nginx:8080/static/big.bin
+          curl -s -o /dev/null http://nginx:8080/static/small.txt
+          # Keep-alive: five exchanges on one connection.
+          curl -s -o /dev/null http://nginx:8080/hello \
+               --next -s -o /dev/null http://nginx:8080/hello \
+               --next -s -o /dev/null http://nginx:8080/hello \
+               --next -s -o /dev/null http://nginx:8080/hello \
+               --next -s -o /dev/null http://nginx:8080/hello
+          sleep 0.2
+        done
+    restart: "no"
+
+  # Optional throughput burst (`--profile burst`): the same stand under a real
+  # load generator, to check the pipeline holds its accounting at rate rather
+  # than at a trickle. Kept out of the default set so a stand that cannot pull
+  # this image still runs every correctness assertion.
+  wrk:
+    image: williamyeh/wrk:latest
+    profiles: ["burst"]
+    depends_on:
+      nginx:
+        condition: service_healthy
+    command: ["-t2", "-c32", "-d20s", "http://nginx:8080/hello"]
+    restart: "no"
+
+  latkit:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.latkit
+    depends_on:
+      nginx:
+        condition: service_healthy
+    privileged: true
+    pid: host
+    volumes:
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+    command:
+      - "-p"
+      - "8080=http"   # the front leg
+      - "-p"
+      - "8081=http"   # the upstream leg (nginx -> backend)
+      - "--prom-listen"
+      - "0.0.0.0:9752"
+    ports: ["9755:9752"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      - latkit
+    volumes:
+      - ./prometheus-http.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=1h"
+    ports: ["19092:9090"]
