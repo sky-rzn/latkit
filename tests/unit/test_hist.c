@@ -8,8 +8,11 @@
  *     overflow, below-range -> underflow, above-range -> overflow;
  *   - merge is cell-wise;
  *   - the classic text export: cumulative le buckets, +Inf == count, _sum;
- *   - and the same for the octave *size* grid (РH9): boundaries, the empty-body
- *     edge, the 1 GiB overflow, merge, and integer le values in the export. */
+ *   - and the same for the octave *size* grids (РH9, РS7): boundaries, the
+ *     empty-body edge, the 1 GiB overflow, merge, integer le values in the
+ *     export — and that a histogram carries which of the two grids it is on, so
+ *     an object distribution reaching 1 TiB and a response distribution
+ *     starting at 64 B live in one dump without either rebucketing the other. */
 #include <float.h>
 #include <math.h>
 #include <stdio.h>
@@ -149,8 +152,9 @@ static int test_bhist_buckets(void)
 {
     struct lk_bhist h = {0};
 
-    CHECK(lk_bhist_bound(0) == 64.0);
-    CHECK(lk_bhist_bound(LK_BHIST_NBUCKETS - 1) == 1073741824.0); /* 1 GiB */
+    CHECK(lk_bhist_bound(&h, 0) == 64.0);
+    CHECK(lk_bhist_bound(&h, LK_BHIST_NBUCKETS - 1) == 1073741824.0); /* 1 GiB */
+    CHECK(lk_bhist_nbuckets(&h) == LK_BHIST_NBUCKETS); /* a zeroed grid is the default one */
 
     lk_bhist_observe(&h, 0);  /* a 204: no body at all */
     lk_bhist_observe(&h, 64); /* exactly on the first boundary */
@@ -214,10 +218,44 @@ static int test_bhist_dump(void)
     return 0;
 }
 
+/* The object grid (РS7, PLAN-MINIO.md МS2): the same machine one grid over, so
+ * that "1 KiB … 1 TiB" is a property of the histogram and not of the code that
+ * writes it. Its reason for existing is the two boundary cases below — a
+ * multipart part of 64 MiB is a *cell* here and the top cell of the default
+ * grid, and a 500 GiB object is a cell here and pure overflow there. */
+static int test_ohist_grid(void)
+{
+    struct lk_bhist h = {0}, acc = {0};
+
+    lk_bhist_init(&h, LK_OHIST_MIN_LOG2, LK_OHIST_NBUCKETS);
+    CHECK(lk_bhist_nbuckets(&h) == LK_OHIST_NBUCKETS);
+    CHECK(lk_bhist_bound(&h, 0) == 1024.0);
+    CHECK(lk_bhist_bound(&h, LK_OHIST_NBUCKETS - 1) == 1099511627776.0); /* 1 TiB */
+
+    lk_bhist_observe(&h, 512);                   /* a marker object: the first cell */
+    lk_bhist_observe(&h, 64ull << 20);           /* a multipart part */
+    lk_bhist_observe(&h, 800ull << 30);          /* most of a terabyte: still a cell */
+    lk_bhist_observe(&h, 4ull << 40);            /* past 1 TiB: overflow */
+    CHECK(h.bucket[0] == 1);                     /* (0, 1 KiB] */
+    CHECK(h.bucket[16] == 1);                    /* le = 2^26 = 64 MiB */
+    CHECK(h.bucket[LK_OHIST_NBUCKETS - 1] == 1); /* (512 GiB, 1 TiB] */
+    CHECK(h.overflow == 1);
+    CHECK(h.count == 4);
+
+    /* A zeroed accumulator takes the grid of what it merges — the property the
+     * dump's per-family accumulators rely on. */
+    lk_bhist_merge(&acc, &h);
+    CHECK(lk_bhist_nbuckets(&acc) == LK_OHIST_NBUCKETS);
+    CHECK(lk_bhist_bound(&acc, 0) == 1024.0);
+    CHECK(acc.count == 4 && acc.overflow == 1);
+    return 0;
+}
+
 int main(void)
 {
     if (test_index_inverse() || test_observe() || test_clamp() || test_merge() ||
-        test_classic_dump() || test_bhist_buckets() || test_bhist_merge() || test_bhist_dump())
+        test_classic_dump() || test_bhist_buckets() || test_bhist_merge() || test_bhist_dump() ||
+        test_ohist_grid())
         return 1;
     printf("test_hist: all passed\n");
     return 0;

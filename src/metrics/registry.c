@@ -106,7 +106,8 @@ enum {
     RF_TXN = 1u << 9,       /* latkit_txn_duration_seconds */
     RF_UPLOAD = 1u << 10,   /* latkit_http_request_upload_seconds */
     RF_BYTES = 1u << 11,    /* latkit_http_bytes_total{direction} */
-    RF_SIZE = 1u << 12,     /* latkit_http_response_size_bytes */
+    RF_SIZE = 1u << 12,     /* latkit_http_response_size_bytes / _s3_object_size_bytes */
+    RF_INTERNAL = 1u << 13, /* latkit_s3_internal_requests_total (РS2) */
 };
 
 struct reg_family {
@@ -117,9 +118,18 @@ struct reg_profile {
     uint32_t families;
     /* Label keys. k_op is NULL for a profile whose slot identity is the text
      * alone; every other key is mandatory, because a family printed without a
-     * key that is part of its identity emits duplicate series. */
+     * key that is part of its identity emits duplicate series. Note that k_slot
+     * and k_op are the two halves of the *dictionary slot*, whatever they are
+     * called: for s3 the slot is the operation (`op="PutObject"`) and k_op is
+     * still the HTTP verb (`method="PUT"`), because the fingerprint covers both
+     * exactly as it does for a route. */
     const char *k_slot, *k_op, *k_db, *k_user, *k_err;
+    /* The octave grid of f_size (hist.h): which one is a property of what the
+     * family measures — an HTTP response body and an S3 object are different
+     * questions with different extents. 0 = the default (РH9) grid. */
+    uint8_t size_min_log2, size_nbuckets;
     struct reg_family f_total, f_dur, f_rows, f_second, f_err, f_upload, f_bytes, f_size;
+    struct reg_family f_internal;
 };
 
 static const struct reg_profile profiles[LK_N_PROFILES] = {
@@ -161,6 +171,56 @@ static const struct reg_profile profiles[LK_N_PROFILES] = {
                          "Time spent receiving the request body in seconds."},
             .f_bytes = {"latkit_http_bytes_total", "HTTP body bytes observed, by direction."},
             .f_size = {"latkit_http_response_size_bytes", "Response body size in bytes."},
+        },
+    /* The S3 profile (РS7, PLAN-MINIO.md МS2). The same seven families as the
+     * http one and the same engine underneath — an S3 exchange *is* an HTTP
+     * exchange (РS1) — with four differences, and each of them is a difference
+     * in what the number means rather than in how it is computed:
+     *
+     *   - the slot is the **operation**, a value from a closed table (РS2), so
+     *     `op` needs no top-K reasoning to stay bounded and reads as a name
+     *     rather than as a path;
+     *   - the dim slot the http profile fills with the request's Host holds the
+     *     **bucket** (РS3), and the user slot the **access key** (РS4);
+     *   - the error label is the symbolic **S3 code** — `NoSuchKey` and
+     *     `NoSuchBucket` are both `404` and are not the same page at 3 a.m.
+     *     (РS5) — falling back to the status when no code was readable;
+     *   - the size family measures the **object**, on the object grid and with
+     *     the aws-chunked framing discounted (РS6), because a distribution that
+     *     moves with the client's chunk size describes the client.
+     *
+     * `rows` and `txn` are off: an object store has neither. */
+    [LK_PROF_S3] =
+        {
+            .families = RF_RTOTAL | RF_DURATION | RF_TTFB | RF_ERRORS | RF_UPLOAD | RF_BYTES |
+                        RF_SIZE | RF_INTERNAL,
+            .k_slot = "op",
+            .k_op = "method",
+            .k_db = "bucket",
+            .k_user = "user",
+            .k_err = "s3code",
+            .size_min_log2 = LK_OHIST_MIN_LOG2,
+            .size_nbuckets = LK_OHIST_NBUCKETS,
+            .f_total = {"latkit_s3_requests_total",
+                        "S3 operations observed, by operation and status class."},
+            .f_dur = {"latkit_s3_request_duration_seconds",
+                      "Server-side S3 latency in seconds: last response byte minus last request "
+                      "byte, so a slow upload is not a slow server (РH5)."},
+            .f_second = {"latkit_s3_ttfb_seconds",
+                         "Time to the first response byte in seconds, from the end of the "
+                         "request."},
+            .f_err = {"latkit_s3_errors_total",
+                      "Failed S3 operations by error code — the `<Code>` of the error body, or "
+                      "the HTTP status when none was readable (operation-independent)."},
+            .f_upload = {"latkit_s3_request_upload_seconds",
+                         "Time spent receiving the request body in seconds."},
+            .f_bytes = {"latkit_s3_bytes_total", "S3 body bytes on the wire, by direction."},
+            .f_size = {"latkit_s3_object_size_bytes",
+                       "Size in bytes of the payload an operation moved, with the aws-chunked "
+                       "framing discounted (РS6)."},
+            .f_internal = {"latkit_s3_internal_requests_total",
+                           "Requests to the server's own API (/minio/...): counted here and "
+                           "reported in no other family (РS2)."},
         },
 };
 
@@ -221,13 +281,17 @@ struct lk_registry {
      * key already determines the profile — hence which namespace to read the id
      * back through. */
     struct {
-        char code[8];
+        /* A SQLSTATE is 5 bytes and an HTTP status 3; the S3 vocabulary of РS5
+         * reaches 45 (`ServerSideEncryptionConfigurationNotFoundError`), which
+         * is what sizes this. 9 KB of table for the three namespaces together. */
+        char code[48];
     } err_codes[LK_N_PROFILES][LK_MAX_ERR_CODES];
     uint32_t n_err_codes[LK_N_PROFILES];
 
     uint64_t truncated_obs[LK_N_PROFILES]; /* latkit_queries_truncated_total */
     uint64_t total_obs[LK_N_PROFILES];
     uint64_t other_obs[LK_N_PROFILES];
+    uint64_t internal_obs[LK_N_PROFILES]; /* latkit_s3_internal_requests_total (РS2) */
 
     uint64_t created_ns; /* mono; registry construction -> start_time of the fixed families */
 };
@@ -517,10 +581,17 @@ static struct lk_hist *series_upload(struct series *s)
     return s->upload;
 }
 
-static struct lk_bhist *series_size(struct series *s)
+/* The size histogram, on its profile's grid (hist.h): the two grids differ, so
+ * the family it belongs to has to be known at the moment it is created. A NULL
+ * profile means "whatever it turns out to be" — the eviction fold, where the
+ * grid arrives with the histogram being merged in. */
+static struct lk_bhist *series_size(struct series *s, const struct reg_profile *pf)
 {
-    if (!s->size)
+    if (!s->size) {
         s->size = calloc(1, sizeof(*s->size));
+        if (s->size && pf && pf->size_nbuckets)
+            lk_bhist_init(s->size, pf->size_min_log2, pf->size_nbuckets);
+    }
     return s->size;
 }
 
@@ -558,7 +629,7 @@ static void evict_lru(struct lk_registry *r)
                     lk_hist_merge(du, s->upload);
             }
             if (s->size) {
-                struct lk_bhist *ds = series_size(dst);
+                struct lk_bhist *ds = series_size(dst, NULL);
 
                 if (ds)
                     lk_bhist_merge(ds, s->size);
@@ -609,16 +680,28 @@ void lk_reg_observe(struct lk_registry *r, const struct lk_reg_obs *o)
 {
     uint8_t prof = o->profile < LK_N_PROFILES ? o->profile : LK_PROF_QUERY;
     const struct reg_profile *pf = &profiles[prof];
-    uint32_t dim = intern_dim(r, o->db ? o->db : "", o->user ? o->user : "");
-    uint32_t proto = intern_proto(r, o->proto, prof);
     uint32_t ndims = reg_ndims(r);
     uint32_t nprotos = reg_nprotos();
     uint8_t kind = o->kind < LK_N_QKINDS ? o->kind : LK_QK_SIMPLE;
     uint8_t qc = o->qcode < LK_N_QCODES ? o->qcode : LK_QCODE_OK;
-    uint32_t qslot;
+    uint32_t dim, proto, qslot;
     struct series *s;
 
     r->used[prof] = true;
+    /* Counted and nothing else (РS2): MinIO's own `/minio/…` surface is not an
+     * S3 API, and on a distributed pool it is most of the traffic on the port —
+     * so it may not touch a family that says "requests", or a latency, or a
+     * byte count. It is not simply dropped either: a health-check flood and an
+     * inter-node storm are things an operator needs to see, and this counter is
+     * where they are visible. Ahead of the interning below, because such a
+     * request has no bucket and no access key and must not spend a dimension
+     * slot saying so. The observation ends here. */
+    if (o->internal && (pf->families & RF_INTERNAL)) {
+        r->internal_obs[prof]++;
+        return;
+    }
+    dim = intern_dim(r, o->db ? o->db : "", o->user ? o->user : "");
+    proto = intern_proto(r, o->proto, prof);
     /* latkit_queries_total{db,user,proto,kind,code} — every observation of a
      * profile that has the family. The http profile does not: its exchange
      * counter is keyed by route and lives on the series (RF_RTOTAL below), and
@@ -672,10 +755,10 @@ void lk_reg_observe(struct lk_registry *r, const struct lk_reg_obs *o)
             lk_hist_observe(up, o->upload_seconds);
     }
     if (o->has_size && (pf->families & RF_SIZE)) {
-        struct lk_bhist *sz = series_size(s);
+        struct lk_bhist *sz = series_size(s, pf);
 
         if (sz)
-            lk_bhist_observe(sz, o->bytes_out);
+            lk_bhist_observe(sz, o->size_bytes);
     }
 }
 
@@ -1132,6 +1215,9 @@ static void write_qkeyed_bytes(FILE *f, const struct reg_profile *pf, const stru
         fprintf(f, "# TYPE %s histogram\n", pf->f_size.name);
         for (uint32_t i = 0; i < n;) {
             uint32_t j = i;
+            /* The accumulator takes the family's grid from the series it
+             * merges (hist.h); every series in this loop belongs to one
+             * family, so they all agree. */
             struct lk_bhist acc = {0};
             bool any = false;
 
@@ -1235,6 +1321,11 @@ static void write_profile(const struct lk_registry *r, FILE *f, uint8_t prof,
         fprintf(f, "# HELP latkit_queries_other_total Observations folded into query=\"other\".\n");
         fprintf(f, "# TYPE latkit_queries_other_total counter\n");
         fprintf(f, "latkit_queries_other_total %llu\n", (unsigned long long)r->other_obs[prof]);
+    }
+    if (pf->families & RF_INTERNAL) {
+        fprintf(f, "# HELP %s %s\n", pf->f_internal.name, pf->f_internal.help);
+        fprintf(f, "# TYPE %s counter\n", pf->f_internal.name);
+        fprintf(f, "%s %llu\n", pf->f_internal.name, (unsigned long long)r->internal_obs[prof]);
     }
 
     /* --- latkit_txn_duration_seconds{db,user,proto,status} -------------- */
@@ -1637,6 +1728,17 @@ static void iter_profile(const struct lk_registry *r, uint8_t prof, lk_metrics_i
             .type = LK_MT_COUNTER,
             .created_ns = r->created_ns,
             .val = (double)r->other_obs[prof],
+        };
+
+        fn(ctx, &v);
+    }
+    if (pf->families & RF_INTERNAL) {
+        struct lk_metric_view v = {
+            .name = pf->f_internal.name,
+            .help = pf->f_internal.help,
+            .type = LK_MT_COUNTER,
+            .created_ns = r->created_ns,
+            .val = (double)r->internal_obs[prof],
         };
 
         fn(ctx, &v);

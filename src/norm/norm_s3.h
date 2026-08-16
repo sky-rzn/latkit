@@ -145,6 +145,17 @@ const char *lk_s3_op_other(void);
  * than against a copy of it that can drift. */
 const char *lk_s3_op_at(uint32_t i);
 
+/* Does this operation's body carry object data (МS2/РS7)? True for the four
+ * operations that move an object's own bytes over the wire, false for every
+ * other payload an S3 exchange can carry — a listing, a key list, a multipart
+ * manifest, an event stream, an error document. It is what decides whether an
+ * exchange's size belongs in `latkit_s3_object_size_bytes`, and it takes the
+ * operation *name* because the caller holds the observation's copy of it rather
+ * than the table entry. lk_s3_data_op_at enumerates the four (i = 0, 1, … until
+ * NULL) so a test can hold them against the table. */
+bool lk_s3_op_is_data(const char *op, uint32_t n);
+const char *lk_s3_data_op_at(uint32_t i);
+
 /* Is this a code the AWS/MinIO error vocabulary defines? Unknown codes fold to
  * `s3code="other"` upstream — a server is free to invent a code and must not be
  * free to invent a series (РS5). */

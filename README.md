@@ -517,8 +517,17 @@ ones — `latkit_http_request_duration_seconds{route,method,host,user,proto,code
 `latkit_http_ttfb_seconds`, `latkit_http_request_upload_seconds`,
 `latkit_http_requests_total{…,status}`, `latkit_http_errors_total{code,…}`,
 `latkit_http_bytes_total{…,direction}`, `latkit_http_response_size_bytes` —
-because a request has no rows, no SQLSTATE and no transaction. One registry, two
-label profiles ([docs/notes-metrics.md](docs/notes-metrics.md)).
+because a request has no rows, no SQLSTATE and no transaction. An S3 port reads
+the same exchange under the object store's nouns:
+`latkit_s3_request_duration_seconds{op,method,bucket,user,proto,code}`,
+`latkit_s3_ttfb_seconds`, `latkit_s3_request_upload_seconds`,
+`latkit_s3_requests_total{…,status}`, `latkit_s3_errors_total{s3code,…}` (the
+symbolic code, because `NoSuchKey` and `NoSuchBucket` are both `404`),
+`latkit_s3_bytes_total{…,direction}`, `latkit_s3_object_size_bytes` (the logical
+object size, chunk framing discounted) and
+`latkit_s3_internal_requests_total` (MinIO's own `/minio/…` surface, counted and
+in nothing that says "requests"). One registry, three label profiles
+([docs/notes-metrics.md](docs/notes-metrics.md)).
 For a valid exposition use `latkit --dump-metrics` + `kill -USR1`.
 
 ## Development

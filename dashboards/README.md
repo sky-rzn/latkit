@@ -1,7 +1,7 @@
 # Grafana dashboards
 
-Five provisioned dashboards for latkit (Р42, РH9). Fixed `uid`s — cross-links and
-provisioning depend on them, so don't change them:
+Six provisioned dashboards for latkit (Р42, РH9, РS7). Fixed `uid`s — cross-links
+and provisioning depend on them, so don't change them:
 
 | file | uid | what |
 |---|---|---|
@@ -10,6 +10,7 @@ provisioning depend on them, so don't change them:
 | `latkit-drilldown.json` | `latkit-drilldown` | one `$db`/`$user`/`$query` selection: latency, first-row, rows, SQLSTATE |
 | `latkit-health.json` | `latkit-health` | every agent self-metric: losses, cardinality, OTLP, TLS, cgroup, `process_*`, pipeline overhead |
 | `latkit-http.json` | `latkit-http` | HTTP ports (`--port 8080=http`): RPS and duration/TTFB by route, status classes, sizes and throughput, blind zones, `route="other"` share |
+| `latkit-s3.json` | `latkit-s3` | S3 ports (`--port 9000=s3`): operations/s and duration/TTFB by operation, top buckets and access keys, errors by S3 code, throughput, object sizes, and the traffic that is not an S3 API |
 
 ## Design rules (enforced by `lint.sh`)
 
@@ -34,6 +35,17 @@ the 5xx share, and the share of requests reported as `route="other"` — the
 signal for whether route templating (РH7) is working on *your* API. A large or
 growing `other` share means the heuristic is losing: raise `--top-queries`, or
 name the routes explicitly with `--http-routes`.
+
+The S3 dashboard has the same headline slot and it means something else there.
+`op` comes from a closed table (РS2), so its cardinality is bounded whatever the
+traffic does and `op="other"` is not a cardinality warning — it is an **ageing**
+one: the S3 API grows, and a rising `other` share says the table in
+`docs/notes-s3proto.md` has fallen behind the server. Its last panel is the
+counterpart honesty number: `latkit_s3_internal_requests_total` (MinIO's own
+`/minio/…` surface, counted and in no family that says "requests") beside the
+blind connections, because on a distributed pool most of the traffic on port
+9000 is the cluster talking to itself and a dashboard that hid that would be
+lying about the port.
 
 Note: the drilldown's *time to first row* panel needs the agent's
 `--first-row-hist` (`LATKIT_FIRST_ROW_HIST=1`); without it that histogram family

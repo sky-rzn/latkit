@@ -12,10 +12,11 @@
  *   - the (db,user) dimension limit spills to (other,other);
  *   - the dump is valid text format with stable, escaped labels.
  *
- * Since М5 it also covers the second observation profile (РH10): the http
+ * Since М5 it also covers the observation profiles (РH10, РS7): the http and s3
  * families and their label keys, the fact that a PG-only registry prints none of
- * them, that the two profiles share the dictionary and nothing else, and that
- * the structured (OTLP) walk emits the same families the text dump does. */
+ * them, that the profiles share the dictionary and nothing else — including the
+ * two size grids, which must not borrow each other's boundaries — and that the
+ * structured (OTLP) walk emits the same families the text dump does. */
 #include <stdio.h>
 #include <string.h>
 
@@ -281,6 +282,7 @@ static void http_obs(struct lk_registry *r, uint64_t fp, const char *route, cons
         .has_upload = in > 0,
         .upload_seconds = 0.5,
         .has_size = true,
+        .size_bytes = out, /* the http profile histograms the response body */
         .bytes_in = in,
         .bytes_out = out,
     };
@@ -337,6 +339,137 @@ static int test_http_profile(void)
     return 0;
 }
 
+/* --- the s3 profile (РS7, PLAN-MINIO.md МS2) ------------------------------ */
+
+static void s3_obs(struct lk_registry *r, uint64_t fp, const char *op, const char *method,
+                   const char *bucket, uint16_t status, const char *s3code, uint64_t obj)
+{
+    char code[8];
+    struct lk_reg_obs o = {
+        .fp = fp,
+        .label = op,
+        .op = method,
+        .db = bucket,
+        .user = "AKIALK",
+        .proto = "s3",
+        .profile = LK_PROF_S3,
+        .kind = LK_QK_REQUEST,
+        .sclass = (uint8_t)(LK_SCLASS_1XX + status / 100 - 1),
+        .qcode = status >= 500 ? LK_QCODE_ERROR : LK_QCODE_OK,
+        .has_duration = true,
+        .dcode = status >= 500 ? LK_CODE_ERROR : LK_CODE_OK,
+        .dur_seconds = 0.03,
+        .has_first_row = true,
+        .first_row_seconds = 0.01,
+        .has_size = obj > 0,
+        .size_bytes = obj,
+        .bytes_in = obj,
+    };
+
+    if (status >= 400) {
+        snprintf(code, sizeof(code), "%u", status);
+        o.err_code = s3code ? s3code : code;
+    }
+    lk_reg_observe(r, &o);
+}
+
+/* One profile row away from the http one, and the whole difference shows in the
+ * dump: the S3 nouns on every family, the symbolic error code, the object grid
+ * under the size histogram, and `internal` counted outside all of them. */
+static int test_s3_profile(void)
+{
+    struct lk_registry *r = reg(8, 8);
+    char buf[65536];
+
+    CHECK(r);
+    s3_obs(r, 1, "PutObject", "PUT", "photos", 200, NULL, 1048576);
+    s3_obs(r, 1, "PutObject", "PUT", "photos", 200, NULL, 64ull << 20);
+    s3_obs(r, 2, "GetObject", "GET", "photos", 404, "NoSuchKey", 0);
+    s3_obs(r, 2, "GetObject", "GET", "photos", 404, "NoSuchBucket", 0);
+
+#define ID(m) m "op=\"PutObject\",method=\"PUT\",bucket=\"photos\",user=\"AKIALK\",proto=\"s3\""
+    dump(r, buf, sizeof(buf));
+    CHECK(contains(buf, ID("latkit_s3_requests_total{") ",status=\"2xx\"} 2\n"));
+    CHECK(contains(buf, ID("latkit_s3_request_duration_seconds_count{") ",code=\"ok\"} 2\n"));
+    CHECK(contains(buf, ID("latkit_s3_ttfb_seconds_count{") "} 2\n"));
+    CHECK(contains(buf, ID("latkit_s3_bytes_total{") ",direction=\"in\"} 68157440\n"));
+    CHECK(contains(buf, ID("latkit_s3_object_size_bytes_count{") "} 2\n"));
+    /* the object grid, not the response-size one: it starts at 1 KiB and holds
+     * a 64 MiB part in a cell of its own (hist.h) */
+    CHECK(contains(buf, ID("latkit_s3_object_size_bytes_bucket{") ",le=\"1024\"} 0\n"));
+    CHECK(contains(buf, ID("latkit_s3_object_size_bytes_bucket{") ",le=\"1048576\"} 1\n"));
+    CHECK(contains(buf, ID("latkit_s3_object_size_bytes_bucket{") ",le=\"67108864\"} 2\n"));
+    CHECK(contains(buf, ID("latkit_s3_object_size_bytes_bucket{") ",le=\"1099511627776\"} 2\n"));
+#undef ID
+    /* two 404s, two different failures — the whole reason РS5 reads the body */
+    CHECK(contains(buf, "latkit_s3_errors_total{s3code=\"NoSuchKey\",bucket=\"photos\","
+                        "user=\"AKIALK\",proto=\"s3\"} 1\n"));
+    CHECK(contains(buf, "latkit_s3_errors_total{s3code=\"NoSuchBucket\","));
+    CHECK(contains(buf, "latkit_s3_requests_total{op=\"GetObject\",method=\"GET\",bucket="
+                        "\"photos\",user=\"AKIALK\",proto=\"s3\",status=\"4xx\"} 2\n"));
+    /* the two families an object store has no use for stay out of its block */
+    CHECK(!contains(buf, "latkit_s3_rows"));
+    CHECK(!contains(buf, "proto=\"s3\",kind="));
+    CHECK(!contains(buf, "latkit_txn_duration_seconds{db=\"photos\""));
+    /* the http families are not printed by an s3-only registry, and vice versa */
+    CHECK(!contains(buf, "latkit_http_"));
+
+    /* `/minio/…`: counted, and in no family that says "requests" (РS2) */
+    CHECK(contains(buf, "latkit_s3_internal_requests_total 0\n"));
+    struct lk_reg_obs internal = {
+        .profile = LK_PROF_S3,
+        .proto = "s3",
+        .internal = true,
+        .label = "internal",
+        .op = "GET",
+        .db = "-",
+        .user = "-",
+        .has_duration = true,
+        .dur_seconds = 0.001,
+    };
+
+    lk_reg_observe(r, &internal);
+    lk_reg_observe(r, &internal);
+    dump(r, buf, sizeof(buf));
+    CHECK(contains(buf, "latkit_s3_internal_requests_total 2\n"));
+    CHECK(!contains(buf, "op=\"internal\""));
+    CHECK(lk_reg_series_count_sum(r) == lk_reg_total_obs(r));
+    lk_reg_free(r);
+    return 0;
+}
+
+/* The three profiles share one dictionary and one dimension table and nothing
+ * else: an S3 operation and an HTTP route never land in each other's labels,
+ * and the two size histograms keep their own grids in one dump. */
+static int test_s3_http_split(void)
+{
+    struct lk_registry *r = reg(8, 8);
+    static char buf[1 << 18]; /* three profiles' families in one dump */
+
+    CHECK(r);
+    http_obs(r, 1, "/orders/{id}", "GET", "shop.example", 200, 0, 1500);
+    s3_obs(r, 2, "GetObject", "GET", "photos", 200, NULL, 4096);
+
+    dump(r, buf, sizeof(buf));
+    CHECK(contains(buf, "latkit_http_response_size_bytes_bucket{route=\"/orders/{id}\",method="
+                        "\"GET\",host=\"shop.example\",user=\"-\",proto=\"http\",le=\"64\"} 0\n"));
+    CHECK(contains(buf, "latkit_s3_object_size_bytes_bucket{op=\"GetObject\",method=\"GET\",bucket="
+                        "\"photos\",user=\"AKIALK\",proto=\"s3\",le=\"4096\"} 1\n"));
+    /* one grid per family, and neither borrowed the other's boundaries */
+    CHECK(!contains(buf, "latkit_s3_object_size_bytes_bucket{op=\"GetObject\",method=\"GET\","
+                         "bucket=\"photos\",user=\"AKIALK\",proto=\"s3\",le=\"64\"}"));
+    CHECK(!contains(buf,
+                    "latkit_http_response_size_bytes_bucket{route=\"/orders/{id}\",method="
+                    "\"GET\",host=\"shop.example\",user=\"-\",proto=\"http\",le=\"1024\"} 0\n"
+                    "latkit_http_response_size_bytes_bucket{route=\"/orders/{id}\",method="
+                    "\"GET\",host=\"shop.example\",user=\"-\",proto=\"http\",le=\"2199023255552"
+                    "\"}"));
+    CHECK(!contains(buf, "op=\"/orders/{id}\""));
+    CHECK(!contains(buf, "route=\"GetObject\""));
+    lk_reg_free(r);
+    return 0;
+}
+
 /* A PG-only registry emits no http blocks at all — the property that keeps an
  * existing exposition byte-identical (РH15). */
 static int test_http_absent_without_traffic(void)
@@ -348,6 +481,7 @@ static int test_http_absent_without_traffic(void)
     obs(r, 1, "select ?", "app", "alice", LK_CODE_OK);
     dump(r, buf, sizeof(buf));
     CHECK(!contains(buf, "latkit_http_"));
+    CHECK(!contains(buf, "latkit_s3_"));
     CHECK(contains(buf, "# TYPE latkit_queries_total counter\n"));
     lk_reg_free(r);
     return 0;
@@ -408,16 +542,27 @@ static int test_iter_matches_dump(void)
     struct iter_seen seen = {{0}, 0, 0};
     char buf[65536], want[128];
     static const char *const http_families[] = {
-        "latkit_http_requests_total",      "latkit_http_request_duration_seconds",
-        "latkit_http_ttfb_seconds",        "latkit_http_request_upload_seconds",
-        "latkit_http_errors_total",        "latkit_http_bytes_total",
+        "latkit_http_requests_total",
+        "latkit_http_request_duration_seconds",
+        "latkit_http_ttfb_seconds",
+        "latkit_http_request_upload_seconds",
+        "latkit_http_errors_total",
+        "latkit_http_bytes_total",
         "latkit_http_response_size_bytes",
+        "latkit_s3_requests_total",
+        "latkit_s3_request_duration_seconds",
+        "latkit_s3_ttfb_seconds",
+        "latkit_s3_errors_total",
+        "latkit_s3_bytes_total",
+        "latkit_s3_object_size_bytes",
+        "latkit_s3_internal_requests_total",
     };
 
     CHECK(r);
     obs(r, 1, "select ?", "app", "alice", LK_CODE_OK);
     lk_reg_observe_txn(r, "app", "alice", "pg", false, 0.4);
     http_obs(r, 2, "/orders/{id}", "GET", "shop", 500, 10, 900);
+    s3_obs(r, 3, "PutObject", "PUT", "photos", 403, "SignatureDoesNotMatch", 8192);
 
     lk_reg_iter(r, iter_cb, &seen);
     dump(r, buf, sizeof(buf));
@@ -444,8 +589,8 @@ int main(void)
 {
     if (test_overflow_to_other() || test_evict_reset() || test_doorkeeper() ||
         test_cardinality_ceiling() || test_dim_limit() || test_dump_format() ||
-        test_proto_split() || test_http_profile() || test_http_absent_without_traffic() ||
-        test_profile_mix() || test_iter_matches_dump())
+        test_proto_split() || test_http_profile() || test_s3_profile() || test_s3_http_split() ||
+        test_http_absent_without_traffic() || test_profile_mix() || test_iter_matches_dump())
         return 1;
     printf("test_registry: all passed\n");
     return 0;

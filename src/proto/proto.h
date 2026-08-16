@@ -87,6 +87,13 @@ enum lk_query_kind {
  * the body), so it is not the client's upload time and the upload family skips
  * the unit. Duration and TTFB are unaffected — they start at ts_req_done. */
 #define LK_QO_EXPECT_CONT (1 << 10)
+/* S3 (РS2): the request went to the server's own API (`/minio/…`), which is not
+ * an S3 operation and on a distributed pool is most of the traffic on the port.
+ * The observation exists — it is real traffic and `--queries` shows it — but the
+ * metrics facade counts it and reports it in no family that says "requests"
+ * (МS2). Set by the dialect, which is the only component that knows the
+ * server's own surface when it sees one. */
+#define LK_QO_INTERNAL (1 << 11)
 #define LK_QO_BODY_UNSEEN                                                                          \
     (1 << 9) /* РH4: the response body was promised and did not                                   \
                 arrive in full — an old-kernel sendfile that                                     \
@@ -333,6 +340,7 @@ enum lk_otel_kind {
 enum lk_proto_profile {
     LK_PROTO_PROF_QUERY = 0, /* latkit_query_*{query,db,user} */
     LK_PROTO_PROF_HTTP,      /* latkit_http_*{route,method,host,user} */
+    LK_PROTO_PROF_S3,        /* latkit_s3_*{op,method,bucket,user} (РS7, МS2) */
 };
 
 /* --- the HTTP dialect seam (РH8) ------------------------------------------ */

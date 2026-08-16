@@ -355,6 +355,40 @@ static int test_closed_set(void)
     return 0;
 }
 
+/* --- which operations move an object (МS2) --------------------------------- */
+
+/* The four names that feed latkit_s3_object_size_bytes are compared as strings
+ * (the caller holds a copy of the operation, not the table entry), so they can
+ * drift from the table without anything failing to compile. Here they cannot:
+ * each must be a value the classifier can actually produce, and the operations
+ * whose bodies are *not* object data must stay out. */
+static int test_data_ops(void)
+{
+    const char *op;
+
+    for (uint32_t i = 0; (op = lk_s3_data_op_at(i)); i++) {
+        CHECK(in_table(op));
+        CHECK(lk_s3_op_is_data(op, (uint32_t)strlen(op)));
+    }
+    CHECK(lk_s3_op_is_data("GetObject", 9));
+    CHECK(lk_s3_op_is_data("UploadPart", 10));
+    /* A listing, a manifest, an event stream and a server-side copy all carry
+     * payload, and none of it is an object (РS7). */
+    CHECK(!lk_s3_op_is_data("ListObjectsV2", 13));
+    CHECK(!lk_s3_op_is_data("CompleteMultipartUpload", 23));
+    CHECK(!lk_s3_op_is_data("SelectObjectContent", 19));
+    CHECK(!lk_s3_op_is_data("CopyObject", 10));
+    CHECK(!lk_s3_op_is_data("UploadPartCopy", 14));
+    CHECK(!lk_s3_op_is_data("HeadObject", 10));
+    CHECK(!lk_s3_op_is_data("other", 5));
+    CHECK(!lk_s3_op_is_data("internal", 8));
+    /* Length-honest: a prefix of a data op is not one. */
+    CHECK(!lk_s3_op_is_data("GetObjectTagging", 16));
+    CHECK(!lk_s3_op_is_data("GetObject", 3));
+    CHECK(!lk_s3_op_is_data(NULL, 0));
+    return 0;
+}
+
 /* --- the fingerprint ------------------------------------------------------- */
 
 static int test_fingerprint(void)
@@ -383,7 +417,7 @@ int main(void)
 {
     if (test_shapes() || test_listings() || test_multipart() || test_copy_source() ||
         test_subresources() || test_addressing() || test_bucket_names() || test_internal() ||
-        test_garbage() || test_fingerprint() || test_closed_set())
+        test_garbage() || test_data_ops() || test_fingerprint() || test_closed_set())
         return 1;
     printf("test_s3_op: all ok\n");
     return 0;

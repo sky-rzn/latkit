@@ -172,16 +172,18 @@ static void enc_exp_hist_dp(struct pbuf *pb, const struct lk_metric_view *v,
     pb_submsg_end(pb, dp);
 }
 
-/* HistogramDataPoint from the РH9 octave size grid. An explicit-bucket
- * Histogram rather than an ExponentialHistogram because that is what the grid
- * *is* — 25 fixed powers of two — and mapping it onto a scale/offset pair would
- * mean either lying about the zero bucket or inventing sub-buckets that hold
- * nothing. The bounds go out with every export; they are 200 bytes on a payload
- * that is already kilobytes. */
+/* HistogramDataPoint from an octave size grid (РH9 response sizes, РS7 object
+ * sizes — the histogram carries which). An explicit-bucket Histogram rather
+ * than an ExponentialHistogram because that is what the grid *is* — fixed
+ * powers of two — and mapping it onto a scale/offset pair would mean either
+ * lying about the zero bucket or inventing sub-buckets that hold nothing. The
+ * bounds go out with every export; they are 200 bytes on a payload that is
+ * already kilobytes. */
 static void enc_hist_dp(struct pbuf *pb, const struct lk_metric_view *v,
                         const struct lk_timebase *tb, uint64_t now)
 {
     const struct lk_bhist *h = v->bhist;
+    unsigned nb = lk_bhist_nbuckets(h);
     size_t dp = pb_submsg_begin(pb, 1); /* data_points */
     size_t packed;
 
@@ -191,14 +193,14 @@ static void enc_hist_dp(struct pbuf *pb, const struct lk_metric_view *v,
     pb_field_double(pb, 5, h->sum);                         /* sum */
 
     packed = pb_submsg_begin(pb, 6); /* bucket_counts: nbounds + 1 entries */
-    for (int i = 0; i < LK_BHIST_NBUCKETS; i++)
+    for (unsigned i = 0; i < nb; i++)
         pb_fixed64(pb, h->bucket[i]);
     pb_fixed64(pb, h->overflow);
     pb_submsg_end(pb, packed);
 
     packed = pb_submsg_begin(pb, 7); /* explicit_bounds */
-    for (int i = 0; i < LK_BHIST_NBUCKETS; i++)
-        pb_double(pb, lk_bhist_bound(i));
+    for (unsigned i = 0; i < nb; i++)
+        pb_double(pb, lk_bhist_bound(h, (int)i));
     pb_submsg_end(pb, packed);
 
     enc_attrs(pb, 9, v);

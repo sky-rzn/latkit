@@ -255,6 +255,13 @@ static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct http_conn *h
         o.route_len = route.text_len;
         o.route_fp = route.fp;
     }
+    /* The classifier recognised the server talking to itself rather than to a
+     * client (LK_ROUTE_F_INTERNAL, only ever the S3 dialect's `/minio/…`, РS2).
+     * The observation is emitted exactly like any other — it is real traffic and
+     * `--queries` shows it — and carries one bit saying it is not an operation,
+     * which is what М5's profile needs to count it apart (МS2). */
+    if (route.flags & LK_ROUTE_F_INTERNAL)
+        o.flags |= LK_QO_INTERNAL;
     /* The dialect's last word: the fields only it knows how to fill (the S3
      * error code and the logical object size, РS5/РS6). It runs after the common
      * ones and may not touch them — everything above this line is the same for

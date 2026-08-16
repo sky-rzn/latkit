@@ -66,7 +66,7 @@ void lk_reg_free(struct lk_registry *r);
  *   - latkit_queries_truncated_total                           (if truncated)
  *   - latkit_queries_other_total, latkit_txn_duration_seconds
  *
- *   LK_PROF_HTTP (http, and later the s3 dialect)
+ *   LK_PROF_HTTP (http)
  *   - latkit_http_requests_total{route,method,host,user,proto,status}
  *   - latkit_http_request_duration_seconds{route,method,host,user,proto,code}
  *   - latkit_http_ttfb_seconds{route,method,host,user,proto}     (if has_first_row)
@@ -75,11 +75,25 @@ void lk_reg_free(struct lk_registry *r);
  *   - latkit_http_bytes_total{route,method,host,user,proto,direction}
  *   - latkit_http_response_size_bytes{route,method,host,user,proto} (if has_size)
  *
- * РH9 lists the http label sets without `user`; it is here because the series
- * identity must stay unique whatever `--http-user basic` does — a family printed
+ *   LK_PROF_S3 (s3, PLAN-MINIO.md МS2/РS7) — the same shapes under the S3
+ *   nouns: the dictionary slot is the operation, the dim slots are the bucket
+ *   and the access key, the error label is the symbolic S3 code
+ *   - latkit_s3_requests_total{op,method,bucket,user,proto,status}
+ *   - latkit_s3_request_duration_seconds{op,method,bucket,user,proto,code}
+ *   - latkit_s3_ttfb_seconds{op,method,bucket,user,proto}        (if has_first_row)
+ *   - latkit_s3_request_upload_seconds{op,method,bucket,user,proto} (if has_upload)
+ *   - latkit_s3_errors_total{s3code,bucket,user,proto}           (if err_code != NULL)
+ *   - latkit_s3_bytes_total{op,method,bucket,user,proto,direction}
+ *   - latkit_s3_object_size_bytes{op,method,bucket,user,proto}   (if has_size)
+ *   - latkit_s3_internal_requests_total                          (if internal)
+ *
+ * РH9 lists the http label sets without `user`, and РS7 the s3 ones without
+ * `user` and `method`; they are here because the series identity must stay
+ * unique whatever `--http-user basic` / `--s3-user off` does — a family printed
  * without a key that is part of its key would emit duplicate label sets the
  * moment two users share a route, and a duplicate series is a scrape error, not
- * a cosmetic issue. Without that flag it is the constant "-" and costs nothing.
+ * a cosmetic issue. Without those flags `user` is the constant "-" and costs
+ * nothing; `method` is nearly a function of the operation and costs as little.
  *
  * `fp`/`label` come from the normaliser (norm_sql for the query profile,
  * norm_route for the http one); `label` NULL or `force_other` routes the
@@ -99,6 +113,9 @@ struct lk_reg_obs {
     uint8_t qcode;            /* enum lk_qcode: ok|error|aborted|canceled */
     uint8_t sclass;           /* enum lk_sclass, http only: the `status` label */
     bool force_other;         /* skip the dictionary, record under `other` */
+    bool internal;            /* s3 (РS2): the server's own API, not an S3 operation.
+                                 Counted in the profile's internal counter and
+                                 reported nowhere else — every other field is ignored */
     bool has_duration;        /* observe duration + rows (+ first_row); else counter-only */
     enum lk_code dcode;       /* duration series code: ok|error (Р23/Р25; http: 5xx) */
     double dur_seconds;       /* server-side latency (Р25 / РH5) */
@@ -107,9 +124,12 @@ struct lk_reg_obs {
     double first_row_seconds; /* time to first DataRow / http TTFB (РH5) */
     bool has_upload;          /* http: the request body took measurable time (РH5) */
     double upload_seconds;    /* ... ts_req_done - ts_start */
-    bool has_size;            /* http: the response size is worth histogramming */
+    bool has_size;            /* http/s3: the size below is worth histogramming */
+    uint64_t size_bytes;      /* the size-histogram sample: the response body for http,
+                                 the logical object size for s3 (РS6) — the two
+                                 differ, and so do the grids they are recorded on */
     uint64_t bytes_in;        /* http: request body bytes */
-    uint64_t bytes_out;       /* http: response body bytes (also the size sample) */
+    uint64_t bytes_out;       /* http: response body bytes */
     bool truncated;           /* text was a capture-budget/label prefix */
     const char *err_code;     /* SQLSTATE / HTTP status >= 400; non-NULL -> the
                                  profile's error counter */

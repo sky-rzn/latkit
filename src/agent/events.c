@@ -854,6 +854,12 @@ struct lk_events *lk_events_new(const struct lk_events_cfg *cfg)
     if (cfg->query_label_len)
         mcfg.query_label_len = cfg->query_label_len;
     mcfg.first_row_hist = cfg->first_row_hist;
+    /* One table of interned dimensions serves every profile, so the limit is
+     * one number for the whole registry; which number is the CLI's decision,
+     * and it follows the ports being watched (РS4: an s3 port's dimension is
+     * (bucket, access key), which is a much larger space than (schema, role)). */
+    if (cfg->max_session_dims)
+        mcfg.max_session_dims = cfg->max_session_dims;
     e->metrics = lk_metrics_new(&mcfg);
     if (!e->metrics) {
         free(e);

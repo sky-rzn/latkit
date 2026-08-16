@@ -217,10 +217,10 @@ const struct lk_proto_ops lk_proto_s3_ops = {
     /* Not a database, so db_system stays NULL and otel_kind says so — the span
      * is an HTTP one with S3 attributes on top (РS7), not a db.* one. */
     .otel_kind = LK_OTEL_KIND_HTTP,
-    /* The `latkit_s3_*` families of РS7 are МS2's; until then an S3 port reports
-     * in the HTTP profile, which is the same set of measurements under other
-     * names — no observation is lost in the meantime, only relabelled. */
-    .profile = LK_PROTO_PROF_HTTP,
+    /* The `latkit_s3_*` families of РS7 (МS2): the same engine and the same
+     * measurements as the http profile, under the S3 nouns — `op`, `bucket`,
+     * the symbolic error code and the object size. */
+    .profile = LK_PROTO_PROF_S3,
     .role = LK_ROLE_SERVER,
     .flags = LK_PROTO_F_STREAM,
     .sql_dialect = LK_SQL_PG, /* unused: nothing here reaches the SQL normaliser */

@@ -1,8 +1,10 @@
 #!/bin/sh
-# МS1 acceptance (PLAN-MINIO.md): the --queries view over the МS0 corpus must
-# yield the expected observations per scenario — the operation (РS2), the bucket
-# (РS3), the access key (РS4), the status and the S3 error code (РS5) and both
-# byte counts (РS6) — with parse_errors == 0 on every clean trace.
+# МS1 + МS2 acceptance (PLAN-MINIO.md): the --queries view over the МS0 corpus
+# must yield the expected observations per scenario — the operation (РS2), the
+# bucket (РS3), the access key (РS4), the status and the S3 error code (РS5) and
+# both byte counts (РS6) — with parse_errors == 0 on every clean trace; and the
+# same replay through the metrics aggregator must produce the `latkit_s3_*`
+# families of РS7 (the section at the bottom).
 #
 #   s3_queries_traces.sh <lkt_queries binary> <tests/traces/s3 dir>
 #
@@ -336,9 +338,81 @@ for trace in "$DIR"/*/*.lkt; do
     esac
 done
 
+# --- МS2 (РS7): the exposition the corpus produces -------------------------
+# The same replay, teed into the real aggregator and dumped once over every
+# trace. This is what a metric consumer sees, and it can only be checked here:
+# the per-observation view above says nothing about which *family* a number
+# landed in, under which label keys, or whether the result is a valid scrape.
+trace="metrics"
+out=$("$LKT" --proto s3 --quiet --metrics "$DIR"/*/*.lkt 2>&1)
+
+for fam in requests_total request_duration_seconds_count ttfb_seconds_count \
+           request_upload_seconds_count errors_total bytes_total \
+           object_size_bytes_count; do
+    has "^latkit_s3_$fam\{"
+done
+has '^latkit_s3_internal_requests_total [1-9]'
+
+# The S3 nouns, on the families РS7 names them for.
+has '^latkit_s3_requests_total\{op="GetObject",method="GET",bucket="lkbucket",user="lkroot",proto="s3",status="2xx"\}'
+has '^latkit_s3_request_duration_seconds_count\{op="PutObject",method="PUT",bucket="lkbucket",'
+
+# `op` is a table value everywhere it is printed — the closed-set property of
+# РS2, restated where it actually protects cardinality. No slash, no query, no
+# percent-escape, and above all no object key.
+bad=$(printf '%s\n' "$out" | grep -oE 'op="[^"]*"' | sort -u | grep -E '/|\?|%' | head -1)
+[ -n "$bad" ] && fail "an S3 metric label carries a path: '$bad'"
+
+# The failure has a name, not a status (РS5): both 404s of the corpus are in
+# the error counter under the code that tells them apart.
+has '^latkit_s3_errors_total\{s3code="NoSuchKey",'
+has '^latkit_s3_errors_total\{s3code="NoSuchBucket",'
+has '^latkit_s3_errors_total\{s3code="SignatureDoesNotMatch",'
+lacks '^latkit_s3_errors_total\{s3code="404"'
+
+# The object size is the object's, not the signed stream's (РS6): chunked-put
+# carries 1050102 bytes on the wire and 1048576 of object, and the corpus has
+# exactly one such upload — so the distribution's sum must not contain the
+# framing overhead.
+has '^latkit_s3_object_size_bytes_bucket\{op="PutObject".*le="1048576"\} [1-9]'
+bad=$(printf '%s\n' "$out" | grep -E '^latkit_s3_object_size_bytes_bucket\{op="(ListObjectsV2|ListObjects|DeleteObjects|CompleteMultipartUpload|HeadObject|CopyObject)"' | head -1)
+[ -n "$bad" ] && fail "a non-object payload reached the object-size histogram: '$bad'"
+
+# The object grid, not the response-size one (hist.h): 1 KiB … 1 TiB.
+has '^latkit_s3_object_size_bytes_bucket\{.*le="1099511627776"\}'
+lacks '^latkit_s3_object_size_bytes_bucket\{.*le="64"\}'
+
+# MinIO's own surface is counted and appears in nothing else (РS2) — the corpus
+# has 169 such requests across the health, internal and distributed traces.
+lacks 'op="internal"'
+
+# Nothing S3 reaches the database or http families, and the PG-shaped counters
+# stay at zero — the profile split of РH10 with a third profile in it.
+lacks '^latkit_http_'
+lacks '^latkit_quer(y|ies)_.*proto="s3"'
+has '^latkit_queries_other_total 0$'
+
+# A valid exposition prints every series exactly once: the check that catches a
+# family whose label set dropped a key that is part of its identity.
+dup=$(printf '%s\n' "$out" | grep -v '^#' | grep '^latkit_' |
+      sed 's/ [^ ]*$//' | sort | uniq -d | head -1)
+[ -n "$dup" ] && fail "duplicate series in the exposition: '$dup'"
+
+# And no object key, anywhere in the dump — the corpus-wide privacy invariant of
+# МS1, restated over the metric labels the МS2 families introduce. Structural
+# rather than by name, because a bucket may legitimately be called `small.bin`
+# (a path-style `GET /small.bin` is a listing of a bucket by that name, РS3):
+# every label value here is an operation from the table, a method, a validated
+# bucket name, an access key or a bounded enum, and not one of those alphabets
+# contains a slash, a percent, a space or a traversal. The corpus deliberately
+# contains keys that contain all four.
+bad=$(printf '%s\n' "$out" | grep '^latkit_s3_' | grep -oE '[a-z0-9_]+="[^"]*"' |
+      sort -u | grep -E '="[^"]*([/% ]|\.\.)' | head -1)
+[ -n "$bad" ] && fail "an object key reached a metric label: '$bad'"
+
 echo "---"
 if [ "$fails" -eq 0 ]; then
-    echo "s3 МS1: trace expectations met"
+    echo "s3 МS1/МS2: trace expectations met"
     exit 0
 fi
 echo "$fails check(s) failed"

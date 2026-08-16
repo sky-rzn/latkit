@@ -516,6 +516,94 @@ static int test_http_status_split(void)
     return 0;
 }
 
+/* An S3 connection reports through the s3 profile (РS7, PLAN-MINIO.md МS2).
+ * The same observation shape as an HTTP one — it is the same exchange — read
+ * under the S3 nouns, plus the three facts only this dialect produces: the
+ * symbolic error code, the logical object size, and the request that is the
+ * server's own business and is not an operation at all. */
+static int test_s3_profile(void)
+{
+    struct lk_metrics *m = lk_metrics_new(NULL);
+    struct lk_conn sconn = {.cookie = 0x9000, .ops = &lk_proto_s3_ops};
+    char buf[65536];
+    struct lk_query_obs o = {
+        .ts_start_ns = 0,
+        .ts_req_done_ns = NS_500MS,
+        .ts_first_row_ns = NS_500MS + NS_125MS,
+        .ts_complete_ns = NS_500MS + NS_250MS,
+        .ts_ready_ns = NS_500MS + NS_250MS,
+        .text = "/photos/2026/holiday.jpg",
+        .text_len = 24,
+        /* the aws-chunked case of РS6: 1050102 bytes of signed stream carrying a
+         * 1 MiB object, and only one of the two is a size distribution */
+        .bytes_in = 1050102,
+        .obj_bytes = 1048576,
+        .op = "PUT",
+        .route = "PutObject",
+        .route_len = 9,
+        .route_fp = 0x5301,
+        .err_code = 200,
+        .kind = LK_Q_REQUEST,
+    };
+
+    CHECK(m);
+    set_session("photos", "AKIALKROOT"); /* bucket -> db slot, access key -> user */
+    g_sink = lk_metrics_query_sink(m);
+    g_sink->on_query(g_sink->ctx, &sconn, &g_sess, &o);
+    dump(m, buf, sizeof(buf));
+
+#define ID(m) m "op=\"PutObject\",method=\"PUT\",bucket=\"photos\",user=\"AKIALKROOT\",proto=\"s3\""
+    CHECK(has(buf, ID("latkit_s3_requests_total{") ",status=\"2xx\"} 1\n"));
+    CHECK(has(buf, ID("latkit_s3_request_duration_seconds_sum{") ",code=\"ok\"} 0.25\n"));
+    CHECK(has(buf, ID("latkit_s3_ttfb_seconds_sum{") "} 0.125\n"));
+    CHECK(has(buf, ID("latkit_s3_request_upload_seconds_sum{") "} 0.5\n"));
+    CHECK(has(buf, ID("latkit_s3_bytes_total{") ",direction=\"in\"} 1050102\n"));
+    /* the object, not the stream that carried it, on the object grid */
+    CHECK(has(buf, ID("latkit_s3_object_size_bytes_sum{") "} 1048576\n"));
+    CHECK(has(buf, ID("latkit_s3_object_size_bytes_bucket{") ",le=\"1048576\"} 1\n"));
+#undef ID
+    /* the object key reached no label, exactly as РS2 promises */
+    CHECK(!has(buf, "holiday"));
+    CHECK(!has(buf, "latkit_http_"));
+
+    /* A 404 with a code: the error counter names the failure, not the status. */
+    o.route = "GetObject";
+    o.route_len = 9;
+    o.route_fp = 0x5302;
+    o.op = "GET";
+    o.err_code = 404;
+    o.err_name = "NoSuchKey";
+    o.obj_bytes = 0;
+    o.flags = LK_QO_CLIENT_ERR;
+    g_sink->on_query(g_sink->ctx, &sconn, &g_sess, &o);
+    /* ... and one without: the status is the honest fallback (РS5). */
+    o.err_name = NULL;
+    o.err_code = 500;
+    o.flags = LK_QO_ERROR;
+    g_sink->on_query(g_sink->ctx, &sconn, &g_sess, &o);
+    dump(m, buf, sizeof(buf));
+    CHECK(has(buf, "latkit_s3_errors_total{s3code=\"NoSuchKey\",bucket=\"photos\","
+                   "user=\"AKIALKROOT\",proto=\"s3\"} 1\n"));
+    CHECK(has(buf, "latkit_s3_errors_total{s3code=\"500\","));
+    /* a failing GET recorded no object size — an error document is not an
+     * object, and neither is a listing */
+    CHECK(!has(buf, "latkit_s3_object_size_bytes_count{op=\"GetObject\""));
+
+    /* `/minio/health/live`: counted, and in nothing that says "requests" (РS2). */
+    o.route = "internal";
+    o.route_len = 8;
+    o.route_fp = 0x5303;
+    o.err_code = 200;
+    o.err_name = NULL;
+    o.flags = LK_QO_INTERNAL;
+    g_sink->on_query(g_sink->ctx, &sconn, &g_sess, &o);
+    dump(m, buf, sizeof(buf));
+    CHECK(has(buf, "latkit_s3_internal_requests_total 1\n"));
+    CHECK(!has(buf, "op=\"internal\""));
+    lk_metrics_free(m);
+    return 0;
+}
+
 /* The selfstats provider (task 4.4) emits the standard process_* series. */
 static int test_selfstats_provider(void)
 {
@@ -541,7 +629,8 @@ int main(void)
     if (test_ok_query() || test_error_query() || test_no_duration() || test_no_text_other() ||
         test_truncated() || test_pipelined_duration() || test_txn() || test_first_row_flag() ||
         test_scalars() || test_labeled_scalars() || test_providers() || test_selfstats_provider() ||
-        test_mysql_proto_label() || test_http_profile() || test_http_status_split())
+        test_mysql_proto_label() || test_http_profile() || test_http_status_split() ||
+        test_s3_profile())
         return 1;
     printf("test_metrics: all passed\n");
     return 0;

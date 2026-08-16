@@ -123,6 +123,72 @@ overflow is reported as `route="other"`, and its share is a headline panel on
 the HTTP dashboard. A large or growing share is the signal to raise
 `--top-queries` or to pin the routes with `--http-routes`.
 
+### S3 metrics (РS7, PLAN-MINIO.md МS2)
+
+An S3 port (`--port 9000=s3`) is the same HTTP exchange (РS1) reported under a
+third profile. Nothing in the engine differs — the dictionary, the doorkeeper,
+the dimension limit and the `other` fold are shared — and everything in the
+*nouns* does, because "which route, which host" and "which operation, which
+bucket" are not the same question.
+
+| Series | Type | Labels |
+|---|---|---|
+| `latkit_s3_requests_total` | counter | `op, method, bucket, user, proto, status` — `status` is the **class** |
+| `latkit_s3_request_duration_seconds` | histogram | `op, method, bucket, user, proto, code` — `code`=`ok\|error` (error = 5xx) |
+| `latkit_s3_ttfb_seconds` | histogram | `op, method, bucket, user, proto` |
+| `latkit_s3_request_upload_seconds` | histogram | `op, method, bucket, user, proto` |
+| `latkit_s3_errors_total` | counter | `s3code, bucket, user, proto` — the symbolic code, **no** `op` |
+| `latkit_s3_bytes_total` | counter | `op, method, bucket, user, proto, direction` |
+| `latkit_s3_object_size_bytes` | histogram | `op, method, bucket, user, proto` — the object grid below |
+| `latkit_s3_internal_requests_total` | counter | none |
+
+Four things are worth knowing, and each is a decision rather than a convention:
+
+- **`op` is a lookup, not a heuristic** (РS2). It comes from the closed table of
+  [notes-s3proto.md](notes-s3proto.md), so its cardinality is a compile-time
+  constant (~45 values plus `other`) and the object key — the most sensitive
+  part of an S3 request — is never a candidate for a label. The top-K
+  dictionary is still underneath it, and still cannot be filled by hostile
+  input. Consequently `op="other"` means something different from
+  `route="other"`: not "the templater lost" but "the table has aged" (risk 5),
+  which is why it has its own dashboard panel.
+- **`bucket` and `user` take the two dimension slots** the query profile uses
+  for `db` and `user` (РS3/РS4): the bucket after it passes the S3 naming rules
+  (a name that fails them becomes `bucket="other"` rather than travelling into a
+  label), the access key ID out of the request's own signature or presigned
+  query. The signature, the chunk signatures and `X-Amz-Security-Token` are
+  never copied. Because the dimension is (bucket × tenant) rather than (schema ×
+  role), an agent watching an S3 port raises `max_session_dims` from 32 to
+  **128**.
+- **The failure has a name.** `s3code` is the `<Code>` of the error body (РS5),
+  matched against the known S3 vocabulary and folded to `other` outside it;
+  `NoSuchKey` and `NoSuchBucket` are both `404` and are different problems. A
+  failing response that carried no code — a bodiless `HEAD` error from a server
+  that sends no `x-minio-error-code` — is counted under its numeric status
+  instead, so the label space is "S3 codes ∪ HTTP statuses".
+- **`/minio/…` is counted and nothing more.** MinIO's own surface — health
+  probes, the admin API, inter-node RPC — is not an S3 API, and on a
+  distributed pool it is *most* of the traffic on the port (79 % of the data
+  events in the МS0 measurement). It lands in
+  `latkit_s3_internal_requests_total` and in no family that says "requests",
+  which is the whole point of counting it separately.
+
+**Object sizes get a second octave grid**: `le` = 1 KiB … 1 TiB (31 buckets),
+against the HTTP response grid's 64 B … 1 GiB. The extent is a property of what
+is being measured — an object store's distribution lives where a web server's
+overflow cell is, and a 64 B first bucket would spend seven cells on sizes S3
+never sees. The sample is the **logical** size (РS6): with `aws-chunked` that is
+`x-amz-decoded-content-length` rather than the wire count, because the signed
+chunk framing costs ~87 bytes per chunk (17 % at 1 KB chunks) and a distribution
+built on the wire count would follow the client's buffer size instead of the
+objects. Only the four operations that actually move object bytes feed it —
+`GetObject`, `PutObject`, `UploadPart`, `PostObject` — and only when the server
+accepted the request: a listing's XML, a multipart manifest and an error
+document are payload too, and none of them is an object. `CopyObject` and
+`UploadPartCopy` move objects entirely inside the server and are missing from
+both this histogram and `latkit_s3_bytes_total`, which is the same documented
+blind spot.
+
 ### Connection and self metrics (Р27)
 
 | Series | Type | Source |
@@ -231,23 +297,31 @@ live `lk_query_obs` during the `on_query` callback (it dangles afterwards).
 
 ## Observation profiles (РH10)
 
-One registry, two vocabularies. The cardinality machinery — the top-K
+One registry, three vocabularies. The cardinality machinery — the top-K
 dictionary, the doorkeeper, the `(db,user)` limit, the fold into `other`, the
 OTLP iterator — is written once and is protocol-blind; what a profile supplies
 is a family-name set, a label-key set and a mask of which families an
 observation touches (`src/metrics/registry.c`, `struct reg_profile`). `pg` and
-`mysql` use the `query` profile, `http` the `http` one, and the S3 dialect
-(PLAN-MINIO.md) will add a third without touching the engine.
+`mysql` use the `query` profile, `http` the `http` one, and `s3` the third
+(РS7) — which was added by adding a table row, one grid constant and a counter,
+and touched no part of the engine at all.
 
 Two properties fall out of that and are worth stating, because both are tested:
 
 - **a profile prints nothing until it has seen an observation.** A PostgreSQL-
   only agent's exposition is byte-for-byte what it was before HTTP existed
   (РH15) — no empty `latkit_http_*` blocks appear;
-- **the dictionary is shared, the label spaces are not.** An HTTP route and a
-  SQL statement compete for the same `K` slots (one knob, one memory bound), but
-  a route never lands in a `query` label and each profile's `other` counter is
-  its own.
+- **the dictionary is shared, the label spaces are not.** An HTTP route, an S3
+  operation and a SQL statement compete for the same `K` slots (one knob, one
+  memory bound), but a route never lands in a `query` label and each profile's
+  `other` counter is its own.
+
+The **dimension** table is shared too, and that is why one knob moves when an S3
+port is configured: `max_session_dims` defaults to 32 for a database agent and
+to 128 when any watched port speaks `s3` (РS4), because the dimension there is
+(bucket × access key) and a deployment has thousands of buckets where a database
+has a handful of schemas. An agent watching both gets the larger of the two,
+which costs kilobytes.
 
 ## Cardinality control: top-K, doorkeeper, `other` (Р23)
 

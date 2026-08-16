@@ -641,6 +641,39 @@ bool lk_s3_code_known(const char *p, uint32_t n)
     return false;
 }
 
+/* --- which operations move an object (МS2, РS7) --------------------------- */
+
+/* The four whose body *is* object data. Everything else that carries a body
+ * carries something else: a listing's XML, the key list of a `DeleteObjects`,
+ * the manifest of a `CompleteMultipartUpload`, the event stream of a `Select`,
+ * or an error document. All of those are payload and none of them is an object,
+ * so `latkit_s3_object_size_bytes` would stop describing objects the moment it
+ * counted them — a distribution mixing 300-byte error bodies with 64 MiB parts
+ * says nothing about either. `CopyObject` and `UploadPartCopy` do move objects,
+ * and deliberately not through us: the bytes stay inside the server, which is
+ * the same documented blind spot `bytes_*` has for them.
+ *
+ * Names rather than pointers because the caller holds a *copy* of the operation
+ * (the route text of an observation), not the table entry lk_s3_op returned.
+ * test_s3_op checks every name here against the table, so a typo is a failing
+ * test and not a family that quietly stopped recording. */
+static const char *const s3_data_ops[] = {"GetObject", "PutObject", "UploadPart", "PostObject"};
+
+bool lk_s3_op_is_data(const char *op, uint32_t n)
+{
+    if (!op)
+        return false;
+    for (uint32_t i = 0; i < sizeof(s3_data_ops) / sizeof(s3_data_ops[0]); i++)
+        if (strlen(s3_data_ops[i]) == n && !memcmp(s3_data_ops[i], op, n))
+            return true;
+    return false;
+}
+
+const char *lk_s3_data_op_at(uint32_t i)
+{
+    return i < sizeof(s3_data_ops) / sizeof(s3_data_ops[0]) ? s3_data_ops[i] : NULL;
+}
+
 /* --- the entry point ------------------------------------------------------ */
 
 void lk_norm_s3(const char *method, uint32_t method_len, const char *query, uint32_t query_len,
@@ -669,8 +702,15 @@ void lk_norm_s3(const char *method, uint32_t method_len, const char *query, uint
     out->fp = XXH3_64bits_digest(&xh);
     /* Not a path with its identifiers collapsed but a name from a closed set —
      * so it is "templated" in the only sense a consumer cares about: it is safe
-     * to be a label. */
+     * to be a label. The second flag travels the one fact a consumer cannot
+     * recover from the name: `internal` is the server's own surface and not an
+     * S3 operation (РS2), which is what keeps a health-check flood out of every
+     * family that says "requests" (МS2). By pointer, because that is the
+     * property the table guarantees — `lk_s3_op` returns table entries and never
+     * a slice of the input. */
     out->flags = LK_ROUTE_F_TEMPLATED;
+    if (op == lk_s3_op_internal())
+        out->flags |= LK_ROUTE_F_INTERNAL;
 }
 
 /* --- fuzz entry ----------------------------------------------------------- */

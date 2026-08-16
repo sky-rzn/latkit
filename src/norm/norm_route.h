@@ -91,6 +91,13 @@
 #define LK_ROUTE_F_GIVEN      (1 << 3) /* the app declared it (--http-route-header) */
 #define LK_ROUTE_F_QUERY      (1 << 4) /* a --http-query-keys pair is part of the route */
 #define LK_ROUTE_F_TRUNC      (1 << 5) /* the template hit LK_ROUTE_TEXT_MAX */
+/* The classifier recognised the server's *own* API rather than the protocol it
+ * speaks to clients — `/minio/…` for the S3 dialect (РS2). The request is real
+ * traffic and stays an observation; what the flag says is that it is not an
+ * operation, so the metrics profile counts it and reports it in no family that
+ * says "requests" (МS2). The base dialect never sets it: a plain HTTP server's
+ * own endpoints are indistinguishable from the ones it serves. */
+#define LK_ROUTE_F_INTERNAL (1 << 6)
 
 /* An explicit route map, parsed from `--http-routes FILE`. Opaque: it owns one
  * copy of the text the patterns point into, so a caller keeps a single pointer

@@ -19,6 +19,7 @@
 #include <string.h>
 #include <time.h>
 
+#include "norm_s3.h"
 #include "norm_sql.h"
 #include "proto.h"
 #include "registry.h"
@@ -132,27 +133,43 @@ static void mx_on_session(void *ctx, const struct lk_conn *c, const struct lk_se
     sess_store(ctx, c->cookie, s->database, s->user, lk_conn_proto(c)->name);
 }
 
-/* One HTTP exchange -> the http profile's families (РH9/РH10, М5). Everything
- * that differs from the database path is here rather than in branches of
- * mx_on_query below, because the two share almost nothing: the identity is a
- * (method, route) pair instead of normalised SQL, the outcome is a status code
- * whose 4xx half is the *client's* fault, and the timings are РH5's four rather
- * than Р25's two.
+/* One HTTP exchange -> the http (or s3) profile's families (РH9/РH10, М5;
+ * РS7, МS2). Everything that differs from the database path is here rather than
+ * in branches of mx_on_query below, because the two share almost nothing: the
+ * identity is a (method, route) pair instead of normalised SQL, the outcome is
+ * a status code whose 4xx half is the *client's* fault, and the timings are
+ * РH5's four rather than Р25's two.
  *
  * The labels (РH10): the route in the dictionary slot, the request's own Host in
  * the db slot — not the connection's, since one keep-alive socket serves several
  * virtual hosts — and the user slot empty ("-") unless `--http-user basic` was
  * asked for. "-" rather than "": an empty label value means "absent" to
- * Prometheus, and these are present and deliberately anonymous. */
+ * Prometheus, and these are present and deliberately anonymous.
+ *
+ * The S3 dialect is the same function because it is the same exchange: what the
+ * dialect changed is what the slots *hold* (the operation, the bucket, the
+ * access key — filled in by the handler, РS2/РS3/РS4), and the three things it
+ * could not put in an existing slot arrive as their own fields on the
+ * observation. They are the whole of the s3 branch below. */
 static void mx_http_obs(struct lk_metrics *m, const struct lk_proto_ops *ops,
                         const struct lk_session *s, const struct lk_query_obs *o)
 {
     struct lk_reg_obs ro = {0};
+    bool s3 = ops->profile == LK_PROTO_PROF_S3;
     uint16_t fl = o->flags;
     char code[8];
 
-    ro.profile = LK_PROF_HTTP;
+    ro.profile = s3 ? LK_PROF_S3 : LK_PROF_HTTP;
     ro.proto = ops->name;
+    /* MinIO's own surface is counted and reported nowhere else (РS2). Decided
+     * by the dialect, which is the only component that knows what `/minio/` is;
+     * everything below this line would otherwise report a health check as an
+     * S3 operation with a latency and a bucket. */
+    if (s3 && (fl & LK_QO_INTERNAL)) {
+        ro.internal = true;
+        lk_reg_observe(m->reg, &ro);
+        return;
+    }
     ro.db = s->database[0] ? s->database : "-";
     ro.user = s->user[0] ? s->user : "-";
     ro.op = o->op;
@@ -167,8 +184,14 @@ static void mx_http_obs(struct lk_metrics *m, const struct lk_proto_ops *ops,
     ro.qcode = (fl & LK_QO_ERROR) ? LK_QCODE_ERROR : LK_QCODE_OK;
     ro.dcode = (fl & LK_QO_ERROR) ? LK_CODE_ERROR : LK_CODE_OK;
     if (o->err_code >= 400) {
+        /* The failure's name, and for S3 that is not the status (РS5):
+         * `NoSuchKey` and `NoSuchBucket` are both 404 and are two different
+         * problems. The code is already folded to a known one or to `other` by
+         * the dialect, so it is a bounded label; when no body carried one — a
+         * failing HEAD from a server that sends no `x-minio-error-code` — the
+         * status is the honest fallback and the label space is the http one. */
         snprintf(code, sizeof(code), "%u", o->err_code);
-        ro.err_code = code;
+        ro.err_code = (s3 && o->err_name) ? o->err_name : code;
     }
 
     /* The four timings (РH5). The server's clock starts when the request body
@@ -193,6 +216,24 @@ static void mx_http_obs(struct lk_metrics *m, const struct lk_proto_ops *ops,
      * it — an undercount of a total is honest enough to graph — but the size
      * *distribution* would be actively misleading, so that unit is left out. */
     ro.has_size = !(fl & LK_QO_BODY_UNSEEN);
+    /* What the distribution is *of*, and the two answers differ (РS6): an HTTP
+     * response body, or the size of the object an S3 operation moved — with the
+     * aws-chunked framing discounted, because a chunked upload's wire count
+     * moves with the client's buffer size and would describe the client rather
+     * than the objects.
+     *
+     * Three conditions, and each of them is the difference between a size
+     * histogram and a body-size histogram (МS2): the operation must be one that
+     * carries object data at all (a listing's XML is not an object, nor is an
+     * error document); the server must have accepted it, since a refused upload
+     * stored nothing; and there must have been a body, because `0` would
+     * otherwise mean "an empty object" and every HEAD and DELETE would pile into
+     * the first bucket. A genuinely empty object is indistinguishable from a
+     * bodiless response here and is lost with them — it is also not a size
+     * anybody plots. */
+    ro.size_bytes = s3 ? o->obj_bytes : o->bytes_out;
+    if (s3 && (!o->obj_bytes || o->err_code >= 400 || !lk_s3_op_is_data(o->route, o->route_len)))
+        ro.has_size = false;
 
     /* The route is the only thing here that may become a label, and it is
      * already templated (РH7). No route — a CONNECT, or a head we never read —
@@ -220,7 +261,7 @@ static void mx_on_query(void *ctx, const struct lk_conn *c, const struct lk_sess
     uint16_t fl = o->flags;
 
     sess_store(m, c->cookie, s->database, s->user, ops->name);
-    if (ops->profile == LK_PROTO_PROF_HTTP) {
+    if (ops->profile == LK_PROTO_PROF_HTTP || ops->profile == LK_PROTO_PROF_S3) {
         mx_http_obs(m, ops, s, o);
         return;
     }

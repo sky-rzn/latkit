@@ -53,6 +53,10 @@ struct lk_events_cfg {
     /* Aggregator (stage 4). The parser's standard consumer is now the metrics
      * aggregator; --queries is a debug tee in front of it. */
     __u32 top_queries;             /* --top-queries (K); 0 = default */
+    __u32 max_session_dims;        /* distinct (db,user)/(bucket,user) pairs before the
+                                      `other` spill; 0 = metrics default. Derived from the
+                                      port set rather than a flag: an s3 port raises it
+                                      (РS4) */
     __u32 query_label_len;         /* --query-label-len; 0 = default */
     bool first_row_hist;           /* --first-row-hist */
     bool dump_metrics;             /* --dump-metrics[=path] given */

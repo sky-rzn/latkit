@@ -83,6 +83,16 @@ check "global caps the http default" "$(capof -p 8080=http --capture-limit 1024)
 check "explicit port budget wins"   "$(capof -p 8080=http:4096 --capture-limit 1024)" "4096"
 check "explicit budget over a db port" "$(capof -p 8080=pg:512)"              "512"
 
+# --- the dimension limit follows the ports (РS4, PLAN-MINIO.md МS2) ---
+# It has no flag of its own on purpose: the (bucket, access key) space of an S3
+# port is much larger than the (schema, role) one of a database, so the limit is
+# derived from what is being watched rather than from something an operator has
+# to know to raise.
+check "dims default"          "$(get max_session_dims)"                             "32"
+check "dims raised by s3"     "$(get max_session_dims -- -p 9000=s3)"               "128"
+check "dims raised in a mix"  "$(get max_session_dims -- -p 5432 -p 9000=s3)"       "128"
+check "dims unchanged by http" "$(get max_session_dims -- -p 8080=http)"            "32"
+
 # --- the Go TLS channel (РH13.3, М7) ---
 check "tls_go default"        "$(get tls_go)"                                       ""
 check "tls_go flag"           "$(get tls_go -- --tls-go /usr/bin/caddy)"            "/usr/bin/caddy"

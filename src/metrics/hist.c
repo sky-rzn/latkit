@@ -150,23 +150,43 @@ void lk_hist_write(const struct lk_hist *h, FILE *f, const char *metric, const c
 
 /* --- size histogram (РH9) -------------------------------------------------- */
 
-double lk_bhist_bound(int i)
+void lk_bhist_init(struct lk_bhist *h, unsigned min_log2, unsigned nbuckets)
 {
-    return ldexp(1.0, LK_BHIST_MIN_LOG2 + i);
+    h->min_log2 = (uint8_t)min_log2;
+    h->nbuckets = (uint8_t)(nbuckets <= LK_BHIST_MAX_NBUCKETS ? nbuckets : LK_BHIST_MAX_NBUCKETS);
+}
+
+unsigned lk_bhist_nbuckets(const struct lk_bhist *h)
+{
+    return h->nbuckets ? h->nbuckets : LK_BHIST_NBUCKETS;
+}
+
+/* The grid of a histogram nobody initialised: the default one, resolved on
+ * first use so that `struct lk_bhist h = {0}` keeps meaning what it meant
+ * before the grid became a field (РH9 response sizes). */
+static unsigned bh_min_log2(const struct lk_bhist *h)
+{
+    return h->nbuckets ? h->min_log2 : LK_BHIST_MIN_LOG2;
+}
+
+double lk_bhist_bound(const struct lk_bhist *h, int i)
+{
+    return ldexp(1.0, (int)bh_min_log2(h) + i);
 }
 
 void lk_bhist_observe(struct lk_bhist *h, uint64_t bytes)
 {
-    int i = 0;
+    unsigned n = lk_bhist_nbuckets(h), min = bh_min_log2(h);
+    unsigned i = 0;
 
     h->count++;
     h->sum += (double)bytes;
-    /* Walking the 25 boundaries beats a bit-scan plus its edge cases: the
+    /* Walking the boundaries beats a bit-scan plus its edge cases: the
      * observation happens once per completed response, not once per packet, and
-     * the loop is 25 comparisons on a hot cache line at the very worst. */
-    while (i < LK_BHIST_NBUCKETS && bytes > (1ull << (LK_BHIST_MIN_LOG2 + i)))
+     * the loop is 31 comparisons on a hot cache line at the very worst. */
+    while (i < n && bytes > (1ull << (min + i)))
         i++;
-    if (i == LK_BHIST_NBUCKETS)
+    if (i == n)
         h->overflow++;
     else
         h->bucket[i]++;
@@ -174,7 +194,9 @@ void lk_bhist_observe(struct lk_bhist *h, uint64_t bytes)
 
 void lk_bhist_merge(struct lk_bhist *dst, const struct lk_bhist *src)
 {
-    for (int i = 0; i < LK_BHIST_NBUCKETS; i++)
+    if (!dst->nbuckets)
+        lk_bhist_init(dst, bh_min_log2(src), lk_bhist_nbuckets(src));
+    for (unsigned i = 0; i < lk_bhist_nbuckets(dst); i++)
         dst->bucket[i] += src->bucket[i];
     dst->overflow += src->overflow;
     dst->sum += src->sum;
@@ -184,15 +206,16 @@ void lk_bhist_merge(struct lk_bhist *dst, const struct lk_bhist *src)
 void lk_bhist_write(const struct lk_bhist *h, FILE *f, const char *metric, const char *labelset)
 {
     const char *sep = labelset[0] ? "," : "";
+    unsigned n = lk_bhist_nbuckets(h);
     uint64_t cum = 0;
 
-    for (int i = 0; i < LK_BHIST_NBUCKETS; i++) {
+    for (unsigned i = 0; i < n; i++) {
         cum += h->bucket[i];
         /* The bounds are exact powers of two below 2^53, so %.0f prints the
-         * integer Prometheus expects (64, 128, … 1073741824) with no exponent
-         * and no rounding. */
-        fprintf(f, "%s_bucket{%s%sle=\"%.0f\"} %llu\n", metric, labelset, sep, lk_bhist_bound(i),
-                (unsigned long long)cum);
+         * integer Prometheus expects (64, 128, … 1099511627776) with no
+         * exponent and no rounding. */
+        fprintf(f, "%s_bucket{%s%sle=\"%.0f\"} %llu\n", metric, labelset, sep,
+                lk_bhist_bound(h, (int)i), (unsigned long long)cum);
     }
     fprintf(f, "%s_bucket{%s%sle=\"+Inf\"} %llu\n", metric, labelset, sep,
             (unsigned long long)h->count);

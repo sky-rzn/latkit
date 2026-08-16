@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dashboards/lint.sh — structural + nomenclature lint for the five latkit
+# dashboards/lint.sh — structural + nomenclature lint for the six latkit
 # dashboards (Р42, РH9). Runs in CI (job dashboards-lint) with only jq installed:
 # no build, no root, no BPF.
 #
@@ -59,7 +59,7 @@ JQ_DS='.. | objects | select(has("datasource")) | .datasource'
 
 shopt -s nullglob
 files=("$here"/latkit-*.json)
-[ ${#files[@]} -eq 5 ] || err "expected 5 dashboards, found ${#files[@]}"
+[ ${#files[@]} -eq 6 ] || err "expected 6 dashboards, found ${#files[@]}"
 
 for f in "${files[@]}"; do
     base="$(basename "$f" .json)"

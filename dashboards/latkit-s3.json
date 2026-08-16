@@ -1,0 +1,1268 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "enable": true,
+        "expr": "sum(rate(latkit_ringbuf_dropped_total[$__rate_interval])) + sum(rate(latkit_resync_total[$__rate_interval])) > 0",
+        "iconColor": "red",
+        "name": "capture degraded",
+        "titleFormat": "capture degraded",
+        "textFormat": "ringbuf drops / resync in this window",
+        "step": "$__rate_interval",
+        "hide": false
+      }
+    ]
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "latkit",
+    "s3",
+    "minio"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data source",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      },
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(latkit_s3_requests_total, proto)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "proto",
+        "multi": true,
+        "name": "proto",
+        "options": [],
+        "query": {
+          "query": "label_values(latkit_s3_requests_total, proto)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "text": "10",
+          "value": "10"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Top-N",
+        "multi": false,
+        "name": "topk",
+        "options": [],
+        "query": "5,10,20",
+        "skipUrlSync": false,
+        "type": "custom"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "timepicker": null,
+  "timezone": "browser",
+  "title": "latkit — S3 / MinIO",
+  "uid": "latkit-s3",
+  "version": 1,
+  "links": null,
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Operations/s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_s3_requests_total{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "value"
+        }
+      ],
+      "description": "Every S3 API call the agent saw on the watched port. MinIO's own `/minio/…` traffic is not in here and not in any panel of this dashboard except \"Not an S3 API\" — on a distributed pool it is most of the requests on the port, and none of them is an S3 operation (РS2)."
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "p95 duration",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_s3_request_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "value"
+        }
+      ],
+      "description": "Server-side: from the last byte of the request to the last byte of the response (РH5). A slow upload is not a slow server, and it is measured in its own panel."
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Error share",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "(sum(rate(latkit_s3_errors_total{proto=~\"$proto\"}[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(latkit_s3_requests_total{proto=~\"$proto\"}[$__rate_interval])), 0.001)",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "value"
+        }
+      ],
+      "description": "Every failing operation, 4xx included: on an object store a 404 is routine (a client checking whether a key exists) and a 403 is not, so the split by code below is the panel to read, not this one."
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "op=\"other\" share",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "(sum(rate(latkit_s3_requests_total{proto=~\"$proto\",op=\"other\"}[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(latkit_s3_requests_total{proto=~\"$proto\"}[$__rate_interval])), 0.001)",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "value"
+        }
+      ],
+      "description": "Requests the operation table did not recognise (РS2). Unlike an HTTP route this is never a cardinality problem — the label set is closed by construction — it is an *ageing* signal: the S3 API grows, and a growing share here means docs/notes-s3proto.md needs a new row (risk 5)."
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Duration (server-side, from end of request)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(latkit_s3_request_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_s3_request_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_s3_request_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "C",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p99"
+        }
+      ],
+      "description": "ts_complete − ts_req_done (РH5). On an object store this is dominated by the body transfer for large GETs, which is why it is graphed beside TTFB rather than instead of it."
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "TTFB (time to first response byte)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(latkit_s3_ttfb_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_s3_ttfb_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_s3_ttfb_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "C",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p99"
+        }
+      ],
+      "description": "How long the server thought before answering, with the transfer excluded. TTFB rising while duration holds is the server; duration rising while TTFB holds is the objects or the network."
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "Top operations by rate",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk($topk, sum by (op) (rate(latkit_s3_requests_total{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{op}}"
+        }
+      ],
+      "description": "The operation mix. `op` comes from a closed table (РS2), so this panel cannot fan out however hostile the traffic is — the top-N is for legibility, not for cardinality."
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Operations/s by status class",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (status) (rate(latkit_s3_requests_total{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{status}}"
+        }
+      ],
+      "description": "The class, not the code: five series. The exact S3 code lives in the errors panel below, where it is free of the operation label."
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Top buckets by rate",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk($topk, sum by (bucket) (rate(latkit_s3_requests_total{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{bucket}}"
+        }
+      ],
+      "description": "bucket=\"other\" is a name that failed the S3 naming rules and was refused a label (РS3); bucket=\"-\" is a service-level request (ListBuckets) that names no bucket at all. Both are facts, and they are different facts."
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Top access keys by rate",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk($topk, sum by (user) (rate(latkit_s3_requests_total{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{user}}"
+        }
+      ],
+      "description": "The access key ID out of the request's own signature (РS4) — the public half of the pair, which is what an audit log records. user=\"-\" is an anonymous request, user=\"other\" is the dimension limit spilling (--max-session-dims worth of ephemeral STS credentials). The signature itself never leaves the agent."
+    },
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "Throughput",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 28
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (direction) (rate(latkit_s3_bytes_total{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{direction}}"
+        }
+      ],
+      "description": "Body bytes on the wire, both directions. Server-side copies (CopyObject, UploadPartCopy) move data that never crosses a socket and are missing here by construction; so are bodies sent with sendfile on a kernel without the exit probe (РH4)."
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Object size",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 28
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(latkit_s3_object_size_bytes_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_s3_object_size_bytes_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_s3_object_size_bytes_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "C",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p99"
+        }
+      ],
+      "description": "The size of the objects that moved — GetObject, PutObject, UploadPart, PostObject — on an octave grid of 1 KiB … 1 TiB (РS7). The aws-chunked framing is discounted (РS6), so this follows the objects and not the client's buffer size; a listing's XML and an error document are payload but not objects, and are not in here."
+    },
+    {
+      "id": 50,
+      "type": "timeseries",
+      "title": "Errors by S3 code",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 36
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk($topk, sum by (s3code) (rate(latkit_s3_errors_total{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{s3code}}"
+        }
+      ],
+      "description": "The `<Code>` of the error body, not the status (РS5): NoSuchKey and NoSuchBucket are both 404 and are two different pages at 3 a.m. A code outside the known vocabulary folds to `other`; a failure whose body carried none is counted under its numeric status."
+    },
+    {
+      "id": 51,
+      "type": "timeseries",
+      "title": "Request upload time",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 36
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(latkit_s3_request_upload_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_s3_request_upload_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_s3_request_upload_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "C",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p99"
+        }
+      ],
+      "description": "The client's own time sending a body (РH5), kept out of the duration above. Uploads that waited for `100-continue` are excluded — that interval contains a server round trip."
+    },
+    {
+      "id": 52,
+      "type": "table",
+      "title": "Top operations by p99 duration",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 36
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "p99",
+            "desc": true
+          }
+        ]
+      },
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "user": true,
+              "proto": true,
+              "bucket": true,
+              "code": true,
+              "method": true
+            },
+            "renameByName": {}
+          }
+        }
+      ],
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk($topk, histogram_quantile(0.99, sum by (le, op) (rate(latkit_s3_request_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval]))))",
+          "refId": "A",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "legendFormat": null
+        }
+      ],
+      "description": "Where the latency is, by operation rather than by key — which is the whole point of a closed operation table."
+    },
+    {
+      "id": 60,
+      "type": "timeseries",
+      "title": "Capture health",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 44
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_resync_total[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "resync"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(latkit_queries_dropped_total{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "dropped {{reason}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_ringbuf_dropped_total[$__rate_interval]))",
+          "refId": "C",
+          "range": true,
+          "instant": false,
+          "legendFormat": "ringbuf drops"
+        }
+      ],
+      "description": "When these are nonzero the numbers above are a sample, not a census (Р5/Р27). An object store is the workload most likely to make them nonzero — gigabytes per second of body is a lot of events."
+    },
+    {
+      "id": 61,
+      "type": "timeseries",
+      "title": "Not an S3 API",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 44
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_s3_internal_requests_total[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "internal (/minio/...)"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(latkit_ignored_conns_total{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "blind {{reason}}"
+        }
+      ],
+      "description": "Traffic on the S3 port that is not an S3 operation, and what happened to it. `internal` is MinIO's own surface — health probes, the admin API, inter-node RPC — counted here and reported in no other family (РS2). `blind` connections are the ones we deliberately do not parse: the grid websocket between pool members shows up as reason=upgrade, and h2 means a client negotiated HTTP/2 and is invisible to us (РH4)."
+    }
+  ]
+}

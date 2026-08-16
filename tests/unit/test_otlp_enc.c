@@ -316,6 +316,53 @@ static void test_bhist(void)
     pb_free(&pb);
 }
 
+/* The object grid (РS7) goes through the same encoder and must go out as *its
+ * own* bounds: the explicit_bounds array is what tells a backend where the
+ * buckets are, so a histogram exported against the wrong grid is not a rounding
+ * error but a wrong answer, and nothing downstream could detect it. */
+static void test_bhist_object_grid(void)
+{
+    struct lk_bhist h = {0};
+    struct lk_label lbl[1] = {{"op", "PutObject"}};
+    struct lk_metric_view v = {
+        .name = "latkit_s3_object_size_bytes",
+        .type = LK_MT_HIST_BYTES,
+        .labels = lbl,
+        .nlabels = 1,
+        .created_ns = CREATED,
+    };
+    struct pbuf pb;
+    struct field metric, hi, dp, counts, bounds;
+
+    lk_bhist_init(&h, LK_OHIST_MIN_LOG2, LK_OHIST_NBUCKETS);
+    lk_bhist_observe(&h, 64ull << 20); /* a multipart part: le = 64 MiB */
+    lk_bhist_observe(&h, 4ull << 40);  /* past 1 TiB: the overflow cell */
+
+    v.bhist = &h;
+    encode_one(&pb, &v);
+    EXPECT(find(pb.buf, pb.len, 2, &metric), "ohist: metric present");
+    EXPECT(find(metric.data, metric.len, 9, &hi), "ohist: Histogram (field 9) present");
+    EXPECT(find(hi.data, hi.len, 1, &dp), "ohist: data point present");
+    EXPECT(find(dp.data, dp.len, 6, &counts), "ohist: bucket_counts present");
+    EXPECT(counts.len == 8 * (LK_OHIST_NBUCKETS + 1), "ohist: 32 packed fixed64 counts");
+    EXPECT(find(dp.data, dp.len, 7, &bounds), "ohist: explicit_bounds present");
+    EXPECT(bounds.len == 8 * LK_OHIST_NBUCKETS, "ohist: 31 packed bounds");
+    {
+        const uint8_t *c = counts.data, *b = bounds.data;
+        uint64_t c16 = 0, clast = 0, b0 = 0, blast = 0;
+
+        memcpy(&c16, c + 8 * 16, 8);
+        memcpy(&clast, c + 8 * LK_OHIST_NBUCKETS, 8);
+        memcpy(&b0, b, 8);
+        memcpy(&blast, b + 8 * (LK_OHIST_NBUCKETS - 1), 8);
+        EXPECT(c16 == 1, "ohist: bucket_counts[16]=1 (64 MiB)");
+        EXPECT(clast == 1, "ohist: overflow cell=1 (4 TiB)");
+        EXPECT(as_double(b0) == 1024.0, "ohist: first bound = 1 KiB");
+        EXPECT(as_double(blast) == 1099511627776.0, "ohist: last bound = 1 TiB");
+    }
+    pb_free(&pb);
+}
+
 /* --- span encoder (task 5.3, and the HTTP shape РH11 / М6) ---------------- */
 
 /* Decode one Span out of a freshly encoded pbuf. */
@@ -489,6 +536,7 @@ int main(void)
     test_gauge();
     test_hist();
     test_bhist();
+    test_bhist_object_grid();
     test_span_db();
     test_span_http();
     printf(failures ? "\n%d FAILURES\n" : "\nall otlp encoder tests passed\n", failures);

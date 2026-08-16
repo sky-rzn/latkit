@@ -94,8 +94,9 @@ static const char *opt_record;
 static char opt_comm[16];
 static const char *opt_cgroup[LK_MAX_CGROUPS]; /* --cgroup glob patterns */
 static int opt_ncgroup;
-static __u32 opt_top_queries;     /* 0 = metrics default (K = 500) */
-static __u32 opt_query_label_len; /* 0 = metrics default (256) */
+static __u32 opt_top_queries;      /* 0 = metrics default (K = 500) */
+static __u32 opt_max_session_dims; /* 0 = metrics default (32); raised for an s3 port, РS4 */
+static __u32 opt_query_label_len;  /* 0 = metrics default (256) */
 static bool opt_first_row_hist;
 static bool opt_dump_metrics;
 static const char *opt_dump_metrics_path;                    /* NULL = stderr */
@@ -934,6 +935,18 @@ static int parse_args(int argc, char **argv)
     /* The port→protocol map handed to the conn table (РМ2). */
     for (int i = 0; i < opt_nports; i++)
         opt_port_protos[i] = (struct lk_port_proto){.port = opt_ports[i], .ops = opt_port_ops[i]};
+    /* РS4: the dimension of an S3 port is (bucket, access key), and a
+     * deployment has thousands of buckets where a database has a handful of
+     * schemas — 32 would spill into (other,other) almost at once and take the
+     * split by bucket, half of what an S3 dashboard is for, with it. Derived
+     * from the port set rather than given a flag of its own: the limit follows
+     * what is being watched, and an agent watching both a database and an
+     * object store gets the larger of the two for kilobytes. */
+    for (int i = 0; i < opt_nports; i++)
+        if (opt_port_ops[i] && opt_port_ops[i]->profile == LK_PROTO_PROF_S3) {
+            opt_max_session_dims = LK_MAX_SESSION_DIMS_S3;
+            break;
+        }
     return 0;
 }
 
@@ -1144,6 +1157,8 @@ static void print_config(void)
     printf("\n");
     printf("s3_user=%s\n", opt_s3_no_user ? "off" : "accesskey");
     printf("top_queries=%u\n", opt_top_queries ? opt_top_queries : LK_TOP_QUERIES_DEFAULT);
+    printf("max_session_dims=%u\n",
+           opt_max_session_dims ? opt_max_session_dims : LK_MAX_SESSION_DIMS_DEFAULT);
     printf("query_label_len=%u\n",
            opt_query_label_len ? opt_query_label_len : LK_QUERY_LABEL_LEN_DEFAULT);
     printf("first_row_hist=%d\n", opt_first_row_hist);
@@ -1521,6 +1536,7 @@ int main(int argc, char **argv)
         .messages = opt_messages,
         .queries = opt_queries,
         .top_queries = opt_top_queries,
+        .max_session_dims = opt_max_session_dims,
         .query_label_len = opt_query_label_len,
         .first_row_hist = opt_first_row_hist,
         .dump_metrics = opt_dump_metrics,

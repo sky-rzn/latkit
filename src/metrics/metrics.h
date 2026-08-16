@@ -25,6 +25,16 @@
 #define LK_QUERY_LABEL_LEN_DEFAULT  256
 #define LK_MAX_SESSION_DIMS_DEFAULT 32
 
+/* The same limit for a deployment that watches an S3 port (РS4). A database
+ * host serves a handful of (db,user) pairs; an object store serves thousands of
+ * buckets times its tenants, and the dimension is (bucket,access key). 32 would
+ * spill almost immediately into (other,other) and the split by bucket — half of
+ * what an S3 dashboard is for — would be gone. 128 is four times the room at
+ * four times the cost of the flat per-dim arrays, which is kilobytes; the limit
+ * itself stays, because the spill is the defence and STS credentials are
+ * ephemeral by design. */
+#define LK_MAX_SESSION_DIMS_S3 128
+
 /* Hard cap on the stored query label (Р28): the buffer size, so
  * query_label_len is clamped to [1, LK_QUERY_LABEL_MAX - 1] characters. */
 #define LK_QUERY_LABEL_MAX 256
@@ -78,6 +88,7 @@ enum lk_qkind {
 enum lk_profile {
     LK_PROF_QUERY = 0, /* pg / mysql: latkit_query_* keyed by (query,db,user) */
     LK_PROF_HTTP,      /* http: latkit_http_* keyed by (route,method,host,user) */
+    LK_PROF_S3,        /* s3: latkit_s3_* keyed by (op,method,bucket,user) — РS7 */
     LK_N_PROFILES,
 };
 
