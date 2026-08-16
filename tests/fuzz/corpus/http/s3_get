@@ -1,0 +1,10 @@
+ýGET /lkbucket/small.bin HTTP/1.1
+Host: minio.lktest:9000
+X-Amz-Content-Sha256: UNSIGNED-PAYLOAD
+Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260816/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-date,Signature=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+HTTP/1.1 200 OK
+X-Amz-Request-Id: 185F3C0A9B2D4E71
+Content-Length: 5
+
+hello

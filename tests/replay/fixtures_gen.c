@@ -2492,47 +2492,768 @@ static void build_http_synthetic_midstream(struct fx *x)
     b.x->obs_text = "/hello";
 }
 
+/* --- S3 wire helpers (PLAN-MINIO.md МS4) -----------------------------------
+ * The same builders as the HTTP set — S3 *is* HTTP/1.1 and the framer is shared
+ * byte for byte (РS1) — over MinIO's own header shapes, taken from the МS0
+ * corpus rather than invented: the `Authorization` spelling minio-go writes (no
+ * space after the comma), `x-amz-content-sha256` as the marker of an
+ * `aws-chunked` upload (never `Content-Encoding`), `x-amz-request-id` on every
+ * response, and `x-minio-error-code` on the one error that has no body to carry
+ * a code. The point of a fixture here is not that HTTP framing works — the М8
+ * set settles that — but that the *dialect* reads the same four things off it
+ * every time: the operation, the bucket, the access key and the failure's name.
+ *
+ * Neither an object key nor a signature appears in any expectation below, and
+ * that is checked rather than asserted: several of these fixtures carry keys
+ * with characters a label may not contain, and the corpus-wide privacy check in
+ * test_replay looks for them in the exposition. */
+
+#define S3_FX_HOST   "minio.lktest:9000"
+#define S3_FX_DOMAIN "minio.lktest" /* MINIO_DOMAIN, for the virtual-host form */
+#define S3_FX_BUCKET "lkbucket"
+#define S3_FX_AK     "lkroot"
+#define S3_FX_UA     "MinIO (linux; amd64) minio-go/v7.0.70"
+#define S3_FX_REQID  "185F3C0A9B2D4E71"
+#define S3_FX_SIG    "5c1f7a0e0d3b4a2c9e8f7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a3928"
+#define S3_FX_HOSTID "dd9025bab4ad464b049177c95eb6ebf374d3b3fd1af9251148b658df7ac2e3e8"
+
+/* The three fields every signed request carries. `X-Amz-Date` is here because
+ * the head sizes the corpus measured (405..583 bytes) are made of these. */
+#define S3_FX_HDRS                                                                                 \
+    "Host: " S3_FX_HOST "\r\nUser-Agent: " S3_FX_UA "\r\nX-Amz-Date: 20260816T101112Z\r\n"
+
+/* SigV4, in the spelling minio-go uses: no space after `aws4_request,`. Both
+ * spellings are in the МS0 corpus and both are valid; this is the one the
+ * client that generates most of MinIO's traffic writes. The dialect reads
+ * `Credential=` and walks past `Signature=` without copying it (РS4). */
+#define S3_FX_AUTH                                                                                 \
+    "Authorization: AWS4-HMAC-SHA256 Credential=" S3_FX_AK                                         \
+    "/20260816/us-east-1/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;"                 \
+    "x-amz-date,Signature=" S3_FX_SIG "\r\n"
+
+#define S3_FX_SHA256_EMPTY                                                                         \
+    "X-Amz-Content-Sha256: "                                                                       \
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\r\n"
+
+/* What MinIO puts on every response. The request id is the join key of the МS4
+ * accuracy bench and reaches the span; the rest is here so the head is the size
+ * a real one is. */
+#define S3_FX_RESP_HDRS                                                                            \
+    "Accept-Ranges: bytes\r\nServer: MinIO\r\nVary: Origin,Accept-Encoding\r\n"                    \
+    "X-Amz-Id-2: " S3_FX_HOSTID "\r\nX-Amz-Request-Id: " S3_FX_REQID "\r\n"                        \
+    "X-Content-Type-Options: nosniff\r\nDate: Sun, 16 Aug 2026 10:11:12 GMT\r\n"
+
+/* The bounded prefix of a failing body the framer hands the dialect (РS5). The
+ * value is spelled out rather than included from http.h for the same reason the
+ * message characters are: a fixture that agreed with the framer by construction
+ * would assert nothing. */
+#define FX_S3_ERRB_MAX 256
+
+/* An S3 error document, in MinIO's field order. `<Key>` and `<Resource>` sit
+ * right after `<Code>` — which is the whole reason the prefix is bounded, read
+ * once and never stored. */
+static const char *s3_err_xml(char *buf, size_t cap, const char *code, const char *msg,
+                              const char *key)
+{
+    snprintf(buf, cap,
+             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+             "<Error><Code>%s</Code><Message>%s</Message>"
+             "<Key>%s</Key><BucketName>" S3_FX_BUCKET "</BucketName>"
+             "<Resource>/" S3_FX_BUCKET "/%s</Resource>"
+             "<RequestId>" S3_FX_REQID "</RequestId>"
+             "<HostId>" S3_FX_HOSTID "</HostId></Error>",
+             code, msg, key, key);
+    return buf;
+}
+
+/* n bytes of deterministic payload, NUL-terminated. The fixtures carry real
+ * bodies so a Content-Length and what follows it can never disagree. */
+static const char *s3_payload(char *buf, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        buf[i] = (char)('a' + i % 26);
+    buf[n] = '\0';
+    return buf;
+}
+
+static void s3bld_init(struct bld *b, struct fx *x)
+{
+    bld_init(b, x);
+    b->tuple.dport = 9000; /* the port PLAN-MINIO.md writes; run_fixture forces ops */
+
+    /* The session is the connection's opening statement (http_req.c): the first
+     * request's bucket and access key, in the same two slots the base dialect
+     * fills with a Host and nothing. Fixtures whose first request has neither
+     * override both. */
+    x->sessions = 1;
+    x->sess_db = S3_FX_BUCKET;
+    x->sess_user = S3_FX_AK;
+    x->obs_kind = LK_Q_REQUEST;
+    x->check_obj_bytes = true;
+}
+
+/* A response head alone in its call, so the body's first byte lands on a later
+ * event and TTFB is a measurement rather than a zero (РH5). */
+static void s3_resp_head(struct bld *b, const char *head)
+{
+    __u32 n = http_call(b, LK_DIR_SEND, head);
+
+    expect(b, LK_DIR_SEND, 'S', n, 0);
+}
+
+/* A failing response, head and body in one call: 'S', then the bounded prefix
+ * the dialect reads `<Code>` out of, then the body's own accounting. The prefix
+ * is a message of its own precisely so that it is visible here — a body byte
+ * reaching the handler is the one exception to "bodies are never read" and a
+ * test set that could not see it would not be watching the exception. */
+static void s3_resp_err(struct bld *b, const char *head, const char *body)
+{
+    char w[4096];
+    __u32 hn = (__u32)strlen(head), bn = (__u32)strlen(body);
+
+    memcpy(w, head, hn);
+    memcpy(w + hn, body, bn);
+    call(b, LK_DIR_SEND, (const __u8 *)w, hn + bn);
+    expect(b, LK_DIR_SEND, 'S', hn, 0);
+    expect(b, LK_DIR_SEND, 'X', bn > FX_S3_ERRB_MAX ? FX_S3_ERRB_MAX : bn, 0);
+    expect(b, LK_DIR_SEND, 'D', bn, 0);
+    expect(b, LK_DIR_SEND, 'E', bn, 0);
+}
+
+/* --- S3 fixtures ------------------------------------------------------------ */
+
+/* The base case: one `GetObject`, path-style, signed, answered with a
+ * Content-Length body of its own. Everything the dialect reports is present and
+ * nothing is degraded — the row the other eleven are deviations from. */
+static void build_s3_get(struct fx *x)
+{
+    struct bld b;
+    char body[1025], head[512];
+
+    s3bld_init(&b, x);
+    ev_open(&b, false);
+    http_req(&b,
+             "GET /" S3_FX_BUCKET "/small.bin HTTP/1.1\r\n" S3_FX_HDRS S3_FX_SHA256_EMPTY S3_FX_AUTH
+             "\r\n",
+             false, 0);
+    snprintf(head, sizeof(head),
+             "HTTP/1.1 200 OK\r\n" S3_FX_RESP_HDRS
+             "Content-Type: application/octet-stream\r\nContent-Length: 1024\r\n"
+             "ETag: \"9a0364b9e99bb480dd25e1f0284c8555\"\r\n\r\n");
+    s3_resp_head(&b, head);
+    http_body(&b, LK_DIR_SEND, s3_payload(body, 1024));
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "GetObject";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_out = 1024;
+    /* No `aws-chunked` framing to discount, so the object's size is the wire's:
+     * the assertion is that the two agree, not that one was computed (РS6). */
+    b.x->obs_obj_bytes = 1024;
+    b.x->obs_err_name = "";
+    b.x->obs_text = "/" S3_FX_BUCKET "/small.bin";
+}
+
+/* `PutObject` with an ordinary Content-Length body — the aws-cli / boto3 shape,
+ * where the two byte counts agree by arithmetic. Uploaded in its own call, so
+ * the client's transfer is an interval the upload family can hold (РH5). */
+static void build_s3_put(struct fx *x)
+{
+    struct bld b;
+    char body[8193], head[640];
+
+    s3bld_init(&b, x);
+    ev_open(&b, false);
+    snprintf(head, sizeof(head),
+             "PUT /" S3_FX_BUCKET "/report.bin HTTP/1.1\r\n" S3_FX_HDRS S3_FX_AUTH
+             "Content-Length: 8192\r\nContent-Type: application/octet-stream\r\n"
+             "X-Amz-Content-Sha256: UNSIGNED-PAYLOAD\r\n\r\n");
+    http_req(&b, head, true, 0);
+    http_body(&b, LK_DIR_RECV, s3_payload(body, 8192));
+    http_resp(&b,
+              "HTTP/1.1 200 OK\r\n" S3_FX_RESP_HDRS
+              "ETag: \"5d41402abc4b2a76b9719d911017c592\"\r\nContent-Length: 0\r\n\r\n",
+              "", 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_op = "PUT";
+    b.x->obs_route = "PutObject";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_in = 8192;
+    b.x->obs_obj_bytes = 8192;
+    b.x->obs_err_name = "";
+    b.x->obs_text = "/" S3_FX_BUCKET "/report.bin";
+}
+
+/* РS6, the whole of it: an `aws-chunked` upload, where the wire count and the
+ * object's size are different numbers and only one of them describes the data.
+ * The framing is identified by `x-amz-content-sha256: STREAMING-…` and the size
+ * by `x-amz-decoded-content-length` — never by `Content-Encoding`, which
+ * minio-go does not send and which every MinIO-client upload would therefore
+ * miss (МS0's first recorded finding).
+ *
+ * Note what the framer sees: an ordinary Content-Length body. The signed chunk
+ * stream is HTTP payload, not HTTP chunking, so the 'D' count is the wire's and
+ * the discount happens in the dialect — which is exactly the split the two
+ * expectations below pin. */
+static void build_s3_chunked_put(struct fx *x)
+{
+    struct bld b;
+    /* One 16 KiB chunk and the closing one, signed: 21 + 64 + 2 bytes of chunk
+     * header, the data, its CRLF, and an 86-byte final chunk — 175 bytes of
+     * framing over 16384 of object. The corpus measures the same overhead at
+     * scale (1050102 on the wire for 1048576 of object, 16 chunks), which is
+     * where the ~0.13 % of §"Two sizes" comes from. */
+    static const __u32 obj = 16384, wire = 16559;
+    char head[768];
+    char *body = malloc(wire + 1);
+
+    s3bld_init(&b, x);
+    ev_open(&b, false);
+    snprintf(head, sizeof(head),
+             "PUT /" S3_FX_BUCKET "/chunked.bin HTTP/1.1\r\n" S3_FX_HDRS S3_FX_AUTH
+             "Content-Encoding: aws-chunked\r\n"
+             "Content-Length: %u\r\nX-Amz-Decoded-Content-Length: %u\r\n"
+             "X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n\r\n",
+             wire, obj);
+    http_req(&b, head, true, 0);
+    /* The body's bytes are payload to the framer and are never parsed, so the
+     * fixture carries a filler of the promised length rather than a hand-built
+     * chunk chain: what is under test here is the arithmetic of two headers. */
+    s3_payload(body, wire);
+    /* Written in 8 KiB pieces, as a client does: the framer reports each call's
+     * bytes with a 'D' and closes the body with an 'E' whose length is their
+     * sum — the wire's, which is the number the dialect then has to discount. */
+    for (__u32 off = 0; off < wire; off += 8192) {
+        __u32 n = wire - off > 8192 ? 8192 : wire - off;
+
+        call(&b, LK_DIR_RECV, (const __u8 *)body + off, n);
+        expect(&b, LK_DIR_RECV, 'D', n, 0);
+    }
+    free(body);
+    expect(&b, LK_DIR_RECV, 'E', wire, 0);
+    http_resp(&b,
+              "HTTP/1.1 200 OK\r\n" S3_FX_RESP_HDRS
+              "ETag: \"d41d8cd98f00b204e9800998ecf8427e-1\"\r\nContent-Length: 0\r\n\r\n",
+              "", 0);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_op = "PUT";
+    b.x->obs_route = "PutObject";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_in = wire; /* what crossed the socket */
+    b.x->obs_obj_bytes = obj; /* what was stored */
+    b.x->obs_err_name = "";
+    b.x->obs_text = "/" S3_FX_BUCKET "/chunked.bin";
+}
+
+/* The four operations that share `?uploadId` and are told apart by the method
+ * alone (МS0: "`?uploadId` alone selects four different operations"). Create,
+ * two parts, complete — one connection, four observations, four distinct
+ * operations, and the parts are the only two that reach the object-size
+ * histogram. */
+static void build_s3_multipart(struct fx *x)
+{
+    struct bld b;
+    static const char *const upid = "ZDk3MGM5MzQtN2Y4Ni00YjE2LWE4MTgtM2M5ZmQ4MDkxYjRi";
+    char head[768], body[4097], xml[512];
+
+    s3bld_init(&b, x);
+    ev_open(&b, false);
+
+    snprintf(head, sizeof(head),
+             "POST /" S3_FX_BUCKET
+             "/big.bin?uploads= HTTP/1.1\r\n" S3_FX_HDRS S3_FX_AUTH S3_FX_SHA256_EMPTY
+             "Content-Length: 0\r\n\r\n");
+    http_req(&b, head, false, 0);
+    snprintf(xml, sizeof(xml),
+             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+             "<InitiateMultipartUploadResult><Bucket>" S3_FX_BUCKET "</Bucket>"
+             "<Key>big.bin</Key><UploadId>%s</UploadId></InitiateMultipartUploadResult>",
+             upid);
+    snprintf(head, sizeof(head),
+             "HTTP/1.1 200 OK\r\n" S3_FX_RESP_HDRS
+             "Content-Type: application/xml\r\nContent-Length: %zu\r\n\r\n",
+             strlen(xml));
+    http_resp(&b, head, xml, 0);
+
+    for (int part = 1; part <= 2; part++) {
+        snprintf(head, sizeof(head),
+                 "PUT /" S3_FX_BUCKET "/big.bin?partNumber=%d&uploadId=%s "
+                 "HTTP/1.1\r\n" S3_FX_HDRS S3_FX_AUTH
+                 "Content-Length: 4096\r\nX-Amz-Content-Sha256: UNSIGNED-PAYLOAD\r\n\r\n",
+                 part, upid);
+        http_req(&b, head, true, 0);
+        http_body(&b, LK_DIR_RECV, s3_payload(body, 4096));
+        snprintf(head, sizeof(head),
+                 "HTTP/1.1 200 OK\r\n" S3_FX_RESP_HDRS
+                 "ETag: \"7c4a8d09ca3762af61e59520943dc264\"\r\nContent-Length: 0\r\n\r\n");
+        http_resp(&b, head, "", 0);
+    }
+
+    snprintf(head, sizeof(head),
+             "POST /" S3_FX_BUCKET "/big.bin?uploadId=%s HTTP/1.1\r\n" S3_FX_HDRS S3_FX_AUTH
+             "Content-Length: 234\r\nContent-Type: application/xml\r\n\r\n",
+             upid);
+    http_req(&b, head, true, 0);
+    {
+        /* The manifest: 234 bytes of XML naming the parts. A request body we do
+         * not read, exactly like the key list of a DeleteObjects (§1). */
+        char manifest[235];
+
+        http_body(&b, LK_DIR_RECV, s3_payload(manifest, 234));
+    }
+    snprintf(xml, sizeof(xml),
+             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+             "<CompleteMultipartUploadResult><Location>http://" S3_FX_HOST "/" S3_FX_BUCKET
+             "/big.bin</Location><Bucket>" S3_FX_BUCKET "</Bucket><Key>big.bin</Key>"
+             "<ETag>&#34;3858f62230ac3c915f300c664312c11f-2&#34;</ETag>"
+             "</CompleteMultipartUploadResult>");
+    snprintf(head, sizeof(head),
+             "HTTP/1.1 200 OK\r\n" S3_FX_RESP_HDRS
+             "Content-Type: application/xml\r\nContent-Length: %zu\r\n\r\n",
+             strlen(xml));
+    http_resp(&b, head, xml, 0);
+    ev_close(&b);
+
+    b.x->queries = 4;
+    b.x->obs_op = "POST";
+    b.x->obs_route = "CompleteMultipartUpload";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_in = 234;
+    b.x->obs_bytes_out = (__u64)strlen(xml);
+    /* The manifest is payload and is counted as bytes, but it is not an object:
+     * the size the observation reports is the request body's, and МS2's rule
+     * that only a data operation feeds the histogram is what keeps it out. */
+    b.x->obs_obj_bytes = 234;
+    b.x->obs_err_name = "";
+    b.x->obs_text = "/" S3_FX_BUCKET "/big.bin?uploadId=ZDk3MGM5MzQtN2Y4Ni00YjE2LWE4MTgtM2M5ZmQ4"
+                    "MDkxYjRi";
+}
+
+/* Two listings that are three different things to the classifier: a V2 listing
+ * of a bucket, and a `ListBuckets` at service level where there is no bucket at
+ * all. The empty dim slot is a distinct fact from a refused name (РS3) and the
+ * exposition prints it as `-`.
+ *
+ * The V2 target also carries `max-keys`, whose *name* contains "key" — so the
+ * redactor blanks its value in the raw target (РH12). Pinned rather than worked
+ * around: substring matching is the documented rule, and a fixture that quietly
+ * chose a key the rule misses would hide the one place an operator meets it. */
+static void build_s3_list(struct fx *x)
+{
+    struct bld b;
+    char head[768], xml[512];
+
+    s3bld_init(&b, x);
+    ev_open(&b, false);
+
+    snprintf(head, sizeof(head),
+             "GET /" S3_FX_BUCKET "?list-type=2&prefix=logs%%2F&delimiter=%%2F&max-keys=1000 "
+             "HTTP/1.1\r\n" S3_FX_HDRS S3_FX_SHA256_EMPTY S3_FX_AUTH "\r\n");
+    http_req(&b, head, false, 0);
+    snprintf(xml, sizeof(xml),
+             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+             "<ListBucketResult><Name>" S3_FX_BUCKET "</Name><Prefix>logs/</Prefix>"
+             "<KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>"
+             "<Contents><Key>logs/2026-08-16.log</Key><Size>4096</Size></Contents>"
+             "</ListBucketResult>");
+    snprintf(head, sizeof(head),
+             "HTTP/1.1 200 OK\r\n" S3_FX_RESP_HDRS
+             "Content-Type: application/xml\r\nContent-Length: %zu\r\n\r\n",
+             strlen(xml));
+    http_resp(&b, head, xml, 0);
+
+    http_req(&b, "GET / HTTP/1.1\r\n" S3_FX_HDRS S3_FX_SHA256_EMPTY S3_FX_AUTH "\r\n", false, 0);
+    snprintf(xml, sizeof(xml),
+             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+             "<ListAllMyBucketsResult><Owner><ID>" S3_FX_AK "</ID></Owner><Buckets>"
+             "<Bucket><Name>" S3_FX_BUCKET "</Name>"
+             "<CreationDate>2026-08-16T09:00:00.000Z</CreationDate></Bucket>"
+             "</Buckets></ListAllMyBucketsResult>");
+    snprintf(head, sizeof(head),
+             "HTTP/1.1 200 OK\r\n" S3_FX_RESP_HDRS
+             "Content-Type: application/xml\r\nContent-Length: %zu\r\n\r\n",
+             strlen(xml));
+    http_resp(&b, head, xml, 0);
+    ev_close(&b);
+
+    b.x->queries = 2;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "ListBuckets";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_out = (__u64)strlen(xml);
+    /* A listing's XML is payload and is counted in bytes, but it is not an
+     * object and must not reach the size histogram — asserted in the metric
+     * table, which is the only place the difference is visible. */
+    b.x->obs_obj_bytes = (__u64)strlen(xml);
+    b.x->obs_err_name = "";
+    b.x->obs_text = "/";
+}
+
+/* РS5, the reason a body byte is read at all: two `404`s that are not the same
+ * failure, and the two ways MinIO names them. The GET's error document carries
+ * `<Code>NoSuchKey</Code>` — inside a prefix that also holds `<Key>` and
+ * `<Resource>`, which is why the prefix is bounded and dropped. The HEAD has no
+ * body to carry anything (`Content-Length: 0`), and MinIO fills the gap with
+ * `X-Minio-Error-Code`; without it, boto3 reports such failures as the literal
+ * string "404" and so would we. */
+static void build_s3_error_404(struct fx *x)
+{
+    struct bld b;
+    char xml[1024], head[768];
+
+    s3bld_init(&b, x);
+    ev_open(&b, false);
+
+    http_req(&b,
+             "GET /" S3_FX_BUCKET
+             "/missing.bin HTTP/1.1\r\n" S3_FX_HDRS S3_FX_SHA256_EMPTY S3_FX_AUTH "\r\n",
+             false, 0);
+    s3_err_xml(xml, sizeof(xml), "NoSuchKey", "The specified key does not exist.", "missing.bin");
+    snprintf(head, sizeof(head),
+             "HTTP/1.1 404 Not Found\r\n" S3_FX_RESP_HDRS
+             "Content-Type: application/xml\r\nContent-Length: %zu\r\n\r\n",
+             strlen(xml));
+    s3_resp_err(&b, head, xml);
+
+    http_req(&b,
+             "HEAD /" S3_FX_BUCKET
+             "/missing.bin HTTP/1.1\r\n" S3_FX_HDRS S3_FX_SHA256_EMPTY S3_FX_AUTH "\r\n",
+             false, 0);
+    http_resp(&b,
+              "HTTP/1.1 404 Not Found\r\n" S3_FX_RESP_HDRS
+              "X-Minio-Error-Code: NoSuchKey\r\nX-Minio-Error-Desc: \"The specified key does "
+              "not exist.\"\r\nContent-Length: 0\r\n\r\n",
+              "", 0);
+    ev_close(&b);
+
+    b.x->queries = 2;
+    b.x->obs_op = "HEAD";
+    b.x->obs_route = "HeadObject";
+    b.x->obs_status = 404;
+    /* A 4xx is the client being told no, not the server failing: it is counted
+     * apart and never reaches errors_sql (РH10). */
+    b.x->obs_flags = LK_QO_CLIENT_ERR;
+    b.x->obs_err_name = "NoSuchKey";
+    b.x->obs_obj_bytes = 0;
+    b.x->obs_text = "/" S3_FX_BUCKET "/missing.bin";
+}
+
+/* The other half of РS4: a request with a valid `Credential=` and a signature
+ * that does not verify. The access key is still read and still labelled — "who
+ * is hammering us with bad credentials" is the question this answers, and it
+ * cannot be answered by a dialect that gave up on the request because the
+ * server did. */
+static void build_s3_error_403(struct fx *x)
+{
+    struct bld b;
+    char xml[1024], head[768];
+
+    s3bld_init(&b, x);
+    ev_open(&b, false);
+    http_req(&b,
+             "GET /" S3_FX_BUCKET
+             "/secret.bin HTTP/1.1\r\n" S3_FX_HDRS S3_FX_SHA256_EMPTY S3_FX_AUTH "\r\n",
+             false, 0);
+    s3_err_xml(xml, sizeof(xml), "SignatureDoesNotMatch",
+               "The request signature we calculated does not match the signature you provided.",
+               "secret.bin");
+    snprintf(head, sizeof(head),
+             "HTTP/1.1 403 Forbidden\r\n" S3_FX_RESP_HDRS
+             "Content-Type: application/xml\r\nContent-Length: %zu\r\n\r\n",
+             strlen(xml));
+    s3_resp_err(&b, head, xml);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "GetObject";
+    b.x->obs_status = 403;
+    b.x->obs_flags = LK_QO_CLIENT_ERR;
+    b.x->obs_bytes_out = (__u64)strlen(xml);
+    b.x->obs_obj_bytes = (__u64)strlen(xml);
+    b.x->obs_err_name = "SignatureDoesNotMatch";
+    b.x->obs_text = "/" S3_FX_BUCKET "/secret.bin";
+}
+
+/* A presigned URL: no `Authorization` header anywhere, the credential in the
+ * query string, percent-encoded. The label is the same one a header would have
+ * given (РS4) — and the signature beside it is blanked out of the raw target by
+ * the redactor before it can reach a span (РH12), which is what the expected
+ * text below spells out. */
+static void build_s3_presigned(struct fx *x)
+{
+    struct bld b;
+    char body[1025], head[768];
+
+    s3bld_init(&b, x);
+    ev_open(&b, false);
+    snprintf(head, sizeof(head),
+             "GET /" S3_FX_BUCKET "/small.bin?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+             "&X-Amz-Credential=" S3_FX_AK "%%2F20260816%%2Fus-east-1%%2Fs3%%2Faws4_request"
+             "&X-Amz-Date=20260816T101112Z&X-Amz-Expires=3600"
+             "&X-Amz-SignedHeaders=host&X-Amz-Signature=" S3_FX_SIG " HTTP/1.1\r\n" S3_FX_HDRS
+             "\r\n");
+    http_req(&b, head, false, 0);
+    snprintf(head, sizeof(head),
+             "HTTP/1.1 200 OK\r\n" S3_FX_RESP_HDRS
+             "Content-Type: application/octet-stream\r\nContent-Length: 1024\r\n\r\n");
+    s3_resp_head(&b, head);
+    http_body(&b, LK_DIR_SEND, s3_payload(body, 1024));
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "GetObject";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_out = 1024;
+    b.x->obs_obj_bytes = 1024;
+    b.x->obs_err_name = "";
+    /* `X-Amz-Credential` survives — it names the public half of the pair, which
+     * is the label. `X-Amz-Signature` and `X-Amz-SignedHeaders` do not: both
+     * contain "sig", and the rule is a substring match on the key. */
+    b.x->obs_text = "/" S3_FX_BUCKET "/small.bin?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+                    "&X-Amz-Credential=" S3_FX_AK "%2F20260816%2Fus-east-1%2Fs3%2Faws4_request"
+                    "&X-Amz-Date=20260816T101112Z&X-Amz-Expires=3600"
+                    "&X-Amz-SignedHeaders=***&X-Amz-Signature=***";
+}
+
+/* No credential carrier at all: the user slot stays empty and the exposition
+ * prints `-`. Not an invented identity, and not the anonymous request folded in
+ * with the signed ones. MinIO answers `403 AccessDenied` and closes the
+ * connection without sending `Connection: close` (МS0's last finding), which is
+ * why this fixture ends where it does. */
+static void build_s3_anonymous(struct fx *x)
+{
+    struct bld b;
+    char xml[1024], head[768];
+
+    s3bld_init(&b, x);
+    /* The first request carries no access key, so neither does the session. */
+    x->sess_user = "";
+    ev_open(&b, false);
+    http_req(&b, "GET /" S3_FX_BUCKET "/small.bin HTTP/1.1\r\n" S3_FX_HDRS "\r\n", false, 0);
+    s3_err_xml(xml, sizeof(xml), "AccessDenied", "Access Denied.", "small.bin");
+    snprintf(head, sizeof(head),
+             "HTTP/1.1 403 Forbidden\r\n" S3_FX_RESP_HDRS
+             "Connection: close\r\nContent-Type: application/xml\r\nContent-Length: %zu\r\n\r\n",
+             strlen(xml));
+    s3_resp_err(&b, head, xml);
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "GetObject";
+    b.x->obs_status = 403;
+    b.x->obs_flags = LK_QO_CLIENT_ERR;
+    b.x->obs_bytes_out = (__u64)strlen(xml);
+    b.x->obs_obj_bytes = (__u64)strlen(xml);
+    b.x->obs_err_name = "AccessDenied";
+    b.x->obs_text = "/" S3_FX_BUCKET "/small.bin";
+}
+
+/* MinIO talking to itself (РS2). Three shapes of it: the liveness probe a k8s
+ * deployment runs all day, the admin API, and a peer call that a single node
+ * answers `404 NoSuchBucket` — the case that decides the order of the checks,
+ * because a bucket named `minio` is a perfectly legal name and reading the
+ * first segment as one here would report a health check as an S3 operation.
+ *
+ * All three are observed and none of them is an operation: the exposition must
+ * carry the internal counter and not one `latkit_s3_requests_total` series,
+ * which is what the metric table asserts. On a distributed pool this is four
+ * fifths of the port (МS0 recon item 6). */
+static void build_s3_internal_path(struct fx *x)
+{
+    struct bld b;
+    char xml[1024], head[768];
+    static const char *const info = "{\"mode\":\"online\",\"region\":\"\",\"servers\":[]}";
+
+    s3bld_init(&b, x);
+    /* No bucket and no credential on the first request: both slots stay empty,
+     * and the session says so rather than borrowing from a later one. */
+    x->sess_db = "";
+    x->sess_user = "";
+    ev_open(&b, false);
+
+    http_req(&b, "GET /minio/health/live HTTP/1.1\r\n" S3_FX_HDRS "\r\n", false, 0);
+    http_resp(&b,
+              "HTTP/1.1 200 OK\r\n" S3_FX_RESP_HDRS
+              "X-Minio-Deployment-Id: 7d5a1e2c-4b6f-4b2e-9a1d-0f3c2b1a4e5d\r\n"
+              "Content-Length: 0\r\n\r\n",
+              "", 0);
+
+    http_req(
+        &b, "GET /minio/admin/v3/info HTTP/1.1\r\n" S3_FX_HDRS S3_FX_SHA256_EMPTY S3_FX_AUTH "\r\n",
+        false, 0);
+    snprintf(head, sizeof(head),
+             "HTTP/1.1 200 OK\r\n" S3_FX_RESP_HDRS
+             "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n",
+             strlen(info));
+    http_resp(&b, head, info, 0);
+
+    http_req(&b,
+             "GET /minio/storage/lkdisk/v51/readall?disk-id=x HTTP/1.1\r\n" S3_FX_HDRS
+                 S3_FX_SHA256_EMPTY S3_FX_AUTH "\r\n",
+             false, 0);
+    s3_err_xml(xml, sizeof(xml), "NoSuchBucket", "The specified bucket does not exist.", "minio");
+    snprintf(head, sizeof(head),
+             "HTTP/1.1 404 Not Found\r\n" S3_FX_RESP_HDRS
+             "Content-Type: application/xml\r\nContent-Length: %zu\r\n\r\n",
+             strlen(xml));
+    s3_resp_err(&b, head, xml);
+    ev_close(&b);
+
+    b.x->queries = 3;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "internal";
+    b.x->obs_status = 404;
+    /* Internal *and* a client error: the observation is emitted with everything
+     * it knows and one bit saying it is not an S3 operation. What that bit costs
+     * it is every family but the counter — asserted in the metric table. */
+    b.x->obs_flags = LK_QO_CLIENT_ERR | LK_QO_INTERNAL;
+    b.x->obs_bytes_out = (__u64)strlen(xml);
+    b.x->obs_obj_bytes = (__u64)strlen(xml);
+    b.x->obs_err_name = "NoSuchBucket";
+    b.x->obs_text = "/minio/storage/lkdisk/v51/readall?disk-id=x";
+}
+
+/* Virtual-host-style addressing (РS3): the bucket is the leading label of the
+ * Host and the *whole* path is the key. Read path-style, `GET /small.bin` would
+ * be a listing of a bucket called `small.bin` — which is why the form is a
+ * decision made once, where the evidence is, and why it needs `--s3-domain`:
+ * MinIO itself refuses this form unless MINIO_DOMAIN is set, so an agent that
+ * guessed would be guessing about a server-side setting it cannot see. */
+static void build_s3_vhost_style(struct fx *x)
+{
+    struct bld b;
+    char body[1025], head[768];
+
+    s3bld_init(&b, x);
+    ev_open(&b, false);
+    snprintf(head, sizeof(head),
+             "GET /small.bin HTTP/1.1\r\nHost: " S3_FX_BUCKET "." S3_FX_HOST
+             "\r\nUser-Agent: " S3_FX_UA
+             "\r\nX-Amz-Date: 20260816T101112Z\r\n" S3_FX_SHA256_EMPTY S3_FX_AUTH "\r\n");
+    http_req(&b, head, false, 0);
+    snprintf(head, sizeof(head),
+             "HTTP/1.1 200 OK\r\n" S3_FX_RESP_HDRS
+             "Content-Type: application/octet-stream\r\nContent-Length: 1024\r\n\r\n");
+    s3_resp_head(&b, head);
+    http_body(&b, LK_DIR_SEND, s3_payload(body, 1024));
+    ev_close(&b);
+
+    b.x->queries = 1;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "GetObject";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_out = 1024;
+    b.x->obs_obj_bytes = 1024;
+    b.x->obs_err_name = "";
+    b.x->obs_text = "/small.bin";
+}
+
+/* The agent attached mid-stream (Р10): both directions start dirty, in the
+ * middle of somebody else's object body — which on this port is the common
+ * case, since an object body is most of what the socket carries. Neither
+ * direction is framed until a start line appears, and the debris below is
+ * deliberately full of things that are nearly one. */
+static void build_s3_synthetic_midstream(struct fx *x)
+{
+    struct bld b;
+    char body[1025], head[768];
+
+    s3bld_init(&b, x);
+    ev_open(&b, true);
+    http_call(&b, LK_DIR_SEND, "...the tail of an object body we joined halfway through\r\n");
+    http_call(&b, LK_DIR_RECV, "8000\r\nchunk-signature=0f3c2b1a4e5d6c7b8a99\r\nopaque payload");
+
+    http_req(&b,
+             "GET /" S3_FX_BUCKET "/small.bin HTTP/1.1\r\n" S3_FX_HDRS S3_FX_SHA256_EMPTY S3_FX_AUTH
+             "\r\n",
+             false, LK_MSG_AFTER_RESYNC);
+    snprintf(head, sizeof(head),
+             "HTTP/1.1 200 OK\r\n" S3_FX_RESP_HDRS
+             "Content-Type: application/octet-stream\r\nContent-Length: 1024\r\n\r\n");
+    {
+        __u32 n = http_call(&b, LK_DIR_SEND, head);
+
+        expect(&b, LK_DIR_SEND, 'S', n, LK_MSG_AFTER_RESYNC);
+    }
+    http_body(&b, LK_DIR_SEND, s3_payload(body, 1024));
+    ev_close(&b);
+
+    b.x->clean = false;
+    b.x->resyncs = 2;
+    b.x->queries = 1;
+    b.x->obs_op = "GET";
+    b.x->obs_route = "GetObject";
+    b.x->obs_status = 200;
+    b.x->obs_bytes_out = 1024;
+    b.x->obs_obj_bytes = 1024;
+    b.x->obs_err_name = "";
+    b.x->obs_text = "/" S3_FX_BUCKET "/small.bin";
+}
+
 const struct fixture lk_fixtures[] = {
-    {"simple_query", build_simple_query, NULL},
-    {"error", build_error, NULL},
-    {"multi_statement", build_multi_statement, NULL},
-    {"cancel", build_cancel, NULL},
-    {"extended", build_extended, NULL},
-    {"prepared", build_prepared, NULL},
-    {"pipeline_error", build_pipeline_error, NULL},
-    {"bind_unknown", build_bind_unknown, NULL},
-    {"copy_in", build_copy_in, NULL},
-    {"copy_out", build_copy_out, NULL},
-    {"session_gap", build_session_gap, NULL},
-    {"ssl_plain", build_ssl_plain, NULL},
-    {"ssl_tls", build_ssl_tls, NULL},
-    {"synthetic_midsession", build_synthetic_midsession, NULL},
+    {"simple_query", build_simple_query, NULL, NULL},
+    {"error", build_error, NULL, NULL},
+    {"multi_statement", build_multi_statement, NULL, NULL},
+    {"cancel", build_cancel, NULL, NULL},
+    {"extended", build_extended, NULL, NULL},
+    {"prepared", build_prepared, NULL, NULL},
+    {"pipeline_error", build_pipeline_error, NULL, NULL},
+    {"bind_unknown", build_bind_unknown, NULL, NULL},
+    {"copy_in", build_copy_in, NULL, NULL},
+    {"copy_out", build_copy_out, NULL, NULL},
+    {"session_gap", build_session_gap, NULL, NULL},
+    {"ssl_plain", build_ssl_plain, NULL, NULL},
+    {"ssl_tls", build_ssl_tls, NULL, NULL},
+    {"synthetic_midsession", build_synthetic_midsession, NULL, NULL},
     /* MySQL mirror set (MYSQL.md М7): framed and parsed as mysql. */
-    {"my_simple_query", build_my_simple_query, "mysql"},
-    {"my_error", build_my_error, "mysql"},
-    {"my_multi_statement", build_my_multi_statement, "mysql"},
-    {"my_prepared", build_my_prepared, "mysql"},
-    {"my_load_data", build_my_load_data, "mysql"},
-    {"my_cursor_fetch", build_my_cursor_fetch, "mysql"},
-    {"my_compressed", build_my_compressed, "mysql"},
-    {"my_ssl", build_my_ssl, "mysql"},
-    {"my_synthetic_midsession", build_my_synthetic_midsession, "mysql"},
+    {"my_simple_query", build_my_simple_query, "mysql", NULL},
+    {"my_error", build_my_error, "mysql", NULL},
+    {"my_multi_statement", build_my_multi_statement, "mysql", NULL},
+    {"my_prepared", build_my_prepared, "mysql", NULL},
+    {"my_load_data", build_my_load_data, "mysql", NULL},
+    {"my_cursor_fetch", build_my_cursor_fetch, "mysql", NULL},
+    {"my_compressed", build_my_compressed, "mysql", NULL},
+    {"my_ssl", build_my_ssl, "mysql", NULL},
+    {"my_synthetic_midsession", build_my_synthetic_midsession, "mysql", NULL},
     /* HTTP set (PLAN-HTTP.md М8): framed and parsed as http. */
-    {"http_get", build_http_get, "http"},
-    {"http_post", build_http_post, "http"},
-    {"http_chunked_req", build_http_chunked_req, "http"},
-    {"http_chunked_resp", build_http_chunked_resp, "http"},
-    {"http_continue", build_http_continue, "http"},
-    {"http_pipelined", build_http_pipelined, "http"},
-    {"http_keepalive_50", build_http_keepalive_50, "http"},
-    {"http_404", build_http_404, "http"},
-    {"http_500", build_http_500, "http"},
-    {"http_head", build_http_head, "http"},
-    {"http_upgrade_blind", build_http_upgrade_blind, "http"},
-    {"http_h2_blind", build_http_h2_blind, "http"},
-    {"http_connect_blind", build_http_connect_blind, "http"},
-    {"http_sendfile_body_unseen", build_http_sendfile_body_unseen, "http"},
-    {"http_huge_head", build_http_huge_head, "http"},
-    {"http_synthetic_midstream", build_http_synthetic_midstream, "http"},
+    {"http_get", build_http_get, "http", NULL},
+    {"http_post", build_http_post, "http", NULL},
+    {"http_chunked_req", build_http_chunked_req, "http", NULL},
+    {"http_chunked_resp", build_http_chunked_resp, "http", NULL},
+    {"http_continue", build_http_continue, "http", NULL},
+    {"http_pipelined", build_http_pipelined, "http", NULL},
+    {"http_keepalive_50", build_http_keepalive_50, "http", NULL},
+    {"http_404", build_http_404, "http", NULL},
+    {"http_500", build_http_500, "http", NULL},
+    {"http_head", build_http_head, "http", NULL},
+    {"http_upgrade_blind", build_http_upgrade_blind, "http", NULL},
+    {"http_h2_blind", build_http_h2_blind, "http", NULL},
+    {"http_connect_blind", build_http_connect_blind, "http", NULL},
+    {"http_sendfile_body_unseen", build_http_sendfile_body_unseen, "http", NULL},
+    {"http_huge_head", build_http_huge_head, "http", NULL},
+    {"http_synthetic_midstream", build_http_synthetic_midstream, "http", NULL},
+    /* S3 set (PLAN-MINIO.md МS4): the http framer with the s3 dialect on top —
+     * the same registry entry `--port 9000=s3` installs. */
+    {"s3_get", build_s3_get, "s3", NULL},
+    {"s3_put", build_s3_put, "s3", NULL},
+    {"s3_chunked_put", build_s3_chunked_put, "s3", NULL},
+    {"s3_multipart", build_s3_multipart, "s3", NULL},
+    {"s3_list", build_s3_list, "s3", NULL},
+    {"s3_error_404", build_s3_error_404, "s3", NULL},
+    {"s3_error_403", build_s3_error_403, "s3", NULL},
+    {"s3_presigned", build_s3_presigned, "s3", NULL},
+    {"s3_anonymous", build_s3_anonymous, "s3", NULL},
+    {"s3_internal_path", build_s3_internal_path, "s3", NULL},
+    {"s3_vhost_style", build_s3_vhost_style, "s3", S3_FX_DOMAIN},
+    {"s3_synthetic_midstream", build_s3_synthetic_midstream, "s3", NULL},
 };
 const size_t lk_nfixtures = sizeof(lk_fixtures) / sizeof(lk_fixtures[0]);

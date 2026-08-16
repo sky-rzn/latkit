@@ -71,6 +71,19 @@ struct fx {
     __u64 obs_bytes_in;    /* request body bytes */
     __u64 obs_bytes_out;   /* response body bytes */
 
+    /* --- S3 expectations (PLAN-MINIO.md МS4) -------------------------------
+     * The two fields an S3 observation has that no other HTTP one does, and
+     * both are the point of a fixture rather than a detail of it: the failure's
+     * name, which the status cannot express (РS5), and the object's size with
+     * the aws-chunked framing discounted (РS6). Checked when queries > 0;
+     * obs_err_name = "" means "expect no code at all", NULL means do not check.
+     * obs_obj_bytes is always checked on an s3 fixture, because "the logical
+     * size equals the wire size" is itself an assertion on every shape that is
+     * not chunked. */
+    const char *obs_err_name; /* lk_query_obs.err_name — NoSuchKey, ... */
+    __u64 obs_obj_bytes;      /* lk_query_obs.obj_bytes */
+    bool check_obj_bytes;     /* set by the s3 builders: 0 is a real expectation */
+
     /* Counters that are zero for every PG/MySQL fixture and are the point of
      * several HTTP ones; always checked, so a new blind zone or a new parse
      * error cannot appear anywhere in the set without a test saying so. */
@@ -81,10 +94,16 @@ struct fx {
 struct fixture {
     const char *name; /* file stem: tests/fixtures/<name>.lkt */
     void (*build)(struct fx *x);
-    const char *proto; /* NULL = pg (the registry head); "mysql" for the
-                          MySQL mirror set (MYSQL.md М7), "http" for the HTTP
-                          one (PLAN-HTTP.md М8) — selects both the framer and
-                          the handler run over the fixture */
+    const char *proto;     /* NULL = pg (the registry head); "mysql" for the
+                              MySQL mirror set (MYSQL.md М7), "http" for the HTTP
+                              one (PLAN-HTTP.md М8), "s3" for the S3 one
+                              (PLAN-MINIO.md МS4) — selects both the framer and
+                              the handler run over the fixture */
+    const char *s3_domain; /* --s3-domain for this fixture (РS3): NULL = none,
+                              and then every request is read path-style, which
+                              is what MinIO itself does without MINIO_DOMAIN.
+                              Only the virtual-host fixture sets it, exactly as
+                              only a configured deployment gets that form */
 };
 
 extern const struct fixture lk_fixtures[];

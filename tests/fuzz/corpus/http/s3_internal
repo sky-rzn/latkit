@@ -1,0 +1,19 @@
+ýGET /minio/health/live HTTP/1.1
+Host: h
+
+GET /minio/admin/v3/info HTTP/1.1
+Host: h
+
+POST /minio/peer/v51/loadbucketmetadata?bucket=b HTTP/1.1
+Host: h
+Content-Length: 0
+
+GET /minio HTTP/1.1
+Host: h
+
+GET /minio/ HTTP/1.1
+Host: h
+
+GET /minioo/x HTTP/1.1
+Host: h
+

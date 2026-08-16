@@ -20,6 +20,8 @@
 #   DB=http ./smoke.sh    # the same against nginx (LATKIT_PORT=80=http), where
 #                         # the counter that must grow is the http profile's own
 #                         # latkit_http_requests_total — PLAN-HTTP.md М8
+#   DB=s3 ./smoke.sh      # the same against MinIO (LATKIT_PORT=9000=s3), where
+#                         # it is latkit_s3_requests_total — PLAN-MINIO.md МS4
 #   KEEP=1 ./smoke.sh     # leave the cluster up afterwards for inspection
 #   SKIP_BUILD=1 ./smoke.sh   # reuse an already-built/loaded latkit:latest
 #
@@ -48,11 +50,12 @@ MANIFEST="$REPO_ROOT/deploy/k8s/latkit-daemonset.yaml"
 PF_PID=""
 fails=0
 
-# The workload under test (MYSQL.md М7, PLAN-HTTP.md М8): postgres (the
-# default), mysql, or http. It selects the workload pod and client, the agent's
-# LATKIT_PORT — patched into the DaemonSet before the rollout so the agent
-# frames the right protocol — and which observation counter must grow, since
-# the two profiles of РH10 report under different family names.
+# The workload under test (MYSQL.md М7, PLAN-HTTP.md М8, PLAN-MINIO.md МS4):
+# postgres (the default), mysql, http or s3. It selects the workload pod and
+# client, the agent's LATKIT_PORT — patched into the DaemonSet before the
+# rollout so the agent frames the right protocol — and which observation counter
+# must grow, since the three profiles of РH10/РS7 report under different family
+# names.
 DB=${DB:-postgres}
 case "$DB" in
 postgres)
@@ -70,8 +73,13 @@ http)
     LATKIT_PORT_VAL="80=http"
     COUNTER=latkit_http_requests_total
     ;;
+s3)
+    DB_IMAGE=minio/minio:latest
+    LATKIT_PORT_VAL="9000=s3"
+    COUNTER=latkit_s3_requests_total
+    ;;
 *)
-    echo "smoke: unknown DB '$DB' (want postgres|mysql|http)" >&2
+    echo "smoke: unknown DB '$DB' (want postgres|mysql|http|s3)" >&2
     exit 2
     ;;
 esac
@@ -113,7 +121,22 @@ pgb() { kubectl -n "$NS" exec pg -- pgbench -h 127.0.0.1 -U postgres "$@" postgr
 
 # db_deploy — bring up the workload pod and wait for it to accept TCP.
 db_deploy() {
-    if [ "$DB" = http ]; then
+    if [ "$DB" = s3 ]; then
+        # A single-node MinIO, and `curl` from inside the same image as the
+        # client. The requests below are anonymous on purpose: a signed one
+        # would need an SDK in the pod, and what this smoke is about is the
+        # DaemonSet path — an S3 request that is refused is still an S3 request,
+        # classified, labelled with its bucket and counted (РS4's `user="-"`).
+        kubectl -n "$NS" run obj --image="$DB_IMAGE" --port=9000 \
+            --env=MINIO_ROOT_USER=lkroot --env=MINIO_ROOT_PASSWORD=lkrootpass123 \
+            --env=MINIO_UPDATE=off -- server /data --address :9000 >/dev/null
+        kubectl -n "$NS" wait --for=condition=Ready pod/obj --timeout=180s >/dev/null
+        for _ in $(seq 1 60); do
+            kubectl -n "$NS" exec obj -- \
+                curl -fsS http://127.0.0.1:9000/minio/health/live >/dev/null 2>&1 && break
+            sleep 2
+        done
+    elif [ "$DB" = http ]; then
         # Stock nginx, its default site: the point of this smoke is the
         # DaemonSet path, not the server's configuration. busybox wget inside
         # the image is the client, over 127.0.0.1 — loopback still goes through
@@ -152,7 +175,18 @@ db_deploy() {
 # db_load DURATION — drive a burst of TCP queries for ~DURATION seconds.
 db_load() {
     local secs="$1"
-    if [ "$DB" = http ]; then
+    if [ "$DB" = s3 ]; then
+        # Three shapes per iteration: an object read, a HEAD and a listing —
+        # three rows of the operation table (РS2), all refused, all counted.
+        kubectl -n "$NS" exec obj -- sh -c '
+            end=$(( $(date +%s) + '"$secs"' ))
+            while [ "$(date +%s)" -lt "$end" ]; do
+                curl -s -o /dev/null http://127.0.0.1:9000/lkbucket/obj.bin
+                curl -s -o /dev/null -I http://127.0.0.1:9000/lkbucket/obj.bin
+                curl -s -o /dev/null "http://127.0.0.1:9000/lkbucket?list-type=2"
+            done
+            exit 0' >/dev/null 2>&1
+    elif [ "$DB" = http ]; then
         # A 200 and a 404 per iteration: both status classes of РH10 end up in
         # the exposition, and neither is an error the capture should complain
         # about.

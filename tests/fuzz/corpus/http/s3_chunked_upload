@@ -1,0 +1,24 @@
+ýPUT /b/k HTTP/1.1
+Host: h
+Content-Length: 4
+X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD
+X-Amz-Decoded-Content-Length: 2
+
+abcdPUT /b/k HTTP/1.1
+Host: h
+Content-Length: 0
+X-Amz-Decoded-Content-Length: 99999999999999999999999999
+
+PUT /b/k HTTP/1.1
+Host: h
+Content-Length: 0
+X-Amz-Decoded-Content-Length: -1
+
+PUT /b/k HTTP/1.1
+Host: h
+Content-Length: 0
+X-Amz-Content-Sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER
+
+HTTP/1.1 200 OK
+Content-Length: 0
+

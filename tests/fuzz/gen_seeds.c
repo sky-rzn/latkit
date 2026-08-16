@@ -868,6 +868,138 @@ static void http_seeds(const char *root)
     write_seed(root, "http", "smuggle_chunk_size");
 }
 
+/* --- s3 seeds: the same target, the S3 dialect (PLAN-MINIO.md МS4) ----------
+ * Same directory and same target as the http seeds, distinguished by the 0xFD
+ * selector fuzz_http.c reads off byte 0 — which is why every one of these opens
+ * with `\xfd`. What they seed is not the framer, which the http seeds already
+ * cover, but the four readers the dialect adds on top of it, each fed the shape
+ * an unauthenticated client can send: a signature it can spell three ways, a
+ * bucket it can put in either of two places, an error body it does not control
+ * but a *server* can be made to produce, and a query string that decides which
+ * of ~45 operations this is.
+ *
+ * The corpus deliberately includes malformed versions of each: a `Credential=`
+ * with no slash, a decoded-content-length that is not a number, an XML body cut
+ * mid-tag. A parser that only ever saw the well-formed shapes would be a parser
+ * nobody had tested. */
+static void s3_seeds(const char *root)
+{
+#define S3_SEED_AUTH                                                                               \
+    "Authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260816/us-east-1/s3/"       \
+    "aws4_request,SignedHeaders=host;x-amz-date,Signature=" HEX64 "\r\n"
+#define HEX64 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+    put("\xfd", 1);
+    put_str("GET /lkbucket/small.bin HTTP/1.1\r\nHost: minio.lktest:9000\r\n"
+            "X-Amz-Content-Sha256: UNSIGNED-PAYLOAD\r\n" S3_SEED_AUTH "\r\n");
+    put_str("HTTP/1.1 200 OK\r\nX-Amz-Request-Id: 185F3C0A9B2D4E71\r\n"
+            "Content-Length: 5\r\n\r\nhello");
+    write_seed(root, "http", "s3_get");
+
+    /* Every way a caller can name itself, including the ones that name nothing:
+     * both SigV4 spellings, SigV2, a presigned query, and two credentials that
+     * are not credentials. */
+    put("\xfd", 1);
+    put_str("GET /b/k HTTP/1.1\r\nHost: h\r\n" S3_SEED_AUTH "\r\n");
+    put_str("GET /b/k HTTP/1.1\r\nHost: h\r\nAuthorization: AWS4-HMAC-SHA256 "
+            "Credential=AKIA/20260816/us-east-1/s3/aws4_request, SignedHeaders=host, "
+            "Signature=" HEX64 "\r\n\r\n");
+    put_str("GET /b/k HTTP/1.1\r\nHost: h\r\nAuthorization: AWS AKIAEXAMPLE:frJIUN8DYpKDtOLCwo//"
+            "yllqDzg=\r\n\r\n");
+    /* SigV2 with a path where the key belongs — the shape that used to put a
+     * slash into the `user` label, and the МS4 campaign's one finding. */
+    put_str("GET /b/k HTTP/1.1\r\nHost: h\r\nAuthorization: AWS lkbucket/small.bin:sig\r\n\r\n");
+    put_str("GET /b/k?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIA%2F20260816%2Fus-"
+            "east-1%2Fs3%2Faws4_request&X-Amz-Signature=" HEX64 " HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("GET /b/k HTTP/1.1\r\nHost: h\r\nAuthorization: AWS4-HMAC-SHA256 Credential=\r\n\r\n");
+    put_str("GET /b/k HTTP/1.1\r\nHost: h\r\nAuthorization: AWS4-HMAC-SHA256 "
+            "Credential=no-slash-at-all-and-rather-long-with-it\r\n\r\n");
+    write_seed(root, "http", "s3_credentials");
+
+    /* The one path on which a body byte reaches the handler (РS5). Four
+     * shapes: a well-formed error document, one truncated inside `<Code>`, one
+     * that is not XML at all, and a HEAD error that has no body and carries the
+     * code in a header instead. */
+    put("\xfd", 1);
+    put_str("GET /b/missing HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("HEAD /b/missing HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("GET /b/broken HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("GET /b/plain HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("HTTP/1.1 404 Not Found\r\nContent-Length: 120\r\n\r\n"
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NoSuchKey</Code>"
+            "<Message>no</Message><Key>missing</Key></Error>");
+    put_str("HTTP/1.1 404 Not Found\r\nX-Minio-Error-Code: NoSuchKey\r\n"
+            "Content-Length: 0\r\n\r\n");
+    put_str("HTTP/1.1 403 Forbidden\r\nContent-Length: 34\r\n\r\n"
+            "<Error><Code>SignatureDoesNo");
+    put_str("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 11\r\n\r\nnot xml at ");
+    write_seed(root, "http", "s3_error_body");
+
+    /* РS6: the two sizes, and the header pair that produces them — with a
+     * decoded length that is not a number, one that overflows, and a streaming
+     * marker with no length beside it. */
+    put("\xfd", 1);
+    put_str("PUT /b/k HTTP/1.1\r\nHost: h\r\nContent-Length: 4\r\n"
+            "X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\r\n"
+            "X-Amz-Decoded-Content-Length: 2\r\n\r\nabcd");
+    put_str("PUT /b/k HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n"
+            "X-Amz-Decoded-Content-Length: 99999999999999999999999999\r\n\r\n");
+    put_str("PUT /b/k HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n"
+            "X-Amz-Decoded-Content-Length: -1\r\n\r\n");
+    put_str("PUT /b/k HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n"
+            "X-Amz-Content-Sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\r\n\r\n");
+    put_str("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+    write_seed(root, "http", "s3_chunked_upload");
+
+    /* РS3: where the bucket is, and what is not a bucket. Virtual-host form
+     * against a configured domain, path-style, service level, and the names
+     * MinIO itself answers `400 InvalidBucketName` — which must become `other`
+     * and never a label. */
+    put("\xfd", 1);
+    put_str("GET /small.bin HTTP/1.1\r\nHost: lkbucket.s3.lktest\r\n\r\n");
+    put_str("GET /small.bin HTTP/1.1\r\nHost: .s3.lktest\r\n\r\n");
+    put_str("GET /small.bin HTTP/1.1\r\nHost: A_B.s3.lktest:9000\r\n\r\n");
+    put_str("GET / HTTP/1.1\r\nHost: s3.lktest\r\n\r\n");
+    put_str("GET /192.168.1.1/k HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("GET /a..b/k HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("GET /%2e%2e%2f%2e%2e%2fetc%2fpasswd HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("GET //// HTTP/1.1\r\nHost: h\r\n\r\n");
+    write_seed(root, "http", "s3_buckets");
+
+    /* РS2: the query keys that select an operation, including the four that
+     * share `?uploadId`, a sub-resource, and shapes with no value, no key and a
+     * key repeated — the classifier walks the query, so the query is input. */
+    put("\xfd", 1);
+    put_str("POST /b/k?uploads= HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("PUT /b/k?partNumber=1&uploadId=X HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n");
+    put_str("GET /b/k?uploadId=X HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("POST /b/k?uploadId=X HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n");
+    put_str("DELETE /b/k?uploadId=X HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("POST /b?delete= HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n");
+    put_str("GET /b?list-type=2&prefix=&delimiter=&max-keys=0&continuation-token=x "
+            "HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("GET /b?acl&tagging&policy&versioning&lifecycle&=&&x HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("PUT /b/k HTTP/1.1\r\nHost: h\r\nX-Amz-Copy-Source: /other/key\r\n"
+            "Content-Length: 0\r\n\r\n");
+    put_str("PROPFIND /b/k?uploads HTTP/1.1\r\nHost: h\r\n\r\n");
+    write_seed(root, "http", "s3_operations");
+
+    /* РS2's other half: MinIO's own surface, which is counted and never
+     * observed — and the bucket literally called `minio`, which is the reason
+     * the prefix is checked before the bucket rules and not after. */
+    put("\xfd", 1);
+    put_str("GET /minio/health/live HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("GET /minio/admin/v3/info HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("POST /minio/peer/v51/loadbucketmetadata?bucket=b HTTP/1.1\r\nHost: h\r\n"
+            "Content-Length: 0\r\n\r\n");
+    put_str("GET /minio HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("GET /minio/ HTTP/1.1\r\nHost: h\r\n\r\n");
+    put_str("GET /minioo/x HTTP/1.1\r\nHost: h\r\n\r\n");
+    write_seed(root, "http", "s3_internal");
+#undef S3_SEED_AUTH
+#undef HEX64
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
@@ -878,6 +1010,7 @@ int main(int argc, char **argv)
     pg_seeds(argv[1]);
     my_seeds(argv[1]);
     http_seeds(argv[1]);
+    s3_seeds(argv[1]);
     norm_seeds(argv[1]);
     pipe_seeds(argv[1]);
     return 0;

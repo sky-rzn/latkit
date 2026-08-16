@@ -456,3 +456,94 @@ tests/bench/run-http.sh            # ~5 min with the defaults
 Knobs (env): `PAIRS`, `DURATION`, `CONNS`, `THREADS`, `RATE`, `BIG_RATE`,
 `FAT_BUDGET`, `WRK_IMAGE`, `AGENT_BIN`, `OUT`. Artifacts: `runs.tsv` (one row
 per pair, both views plus the agent's counters) and `budget.tsv`.
+
+## S3 overhead (PLAN-MINIO.md МS4)
+
+`tests/bench/run-s3.sh` — the object-store twin of the three stands above, same
+shape (paired A/B runs at a **capped** rate, medians compared), driven by
+`warp`, MinIO's own benchmark, because an object store's cost is not a request
+rate but bytes. The cap is warp's own `--rps-limit`.
+
+Two things this stand measures that no earlier one could, and both come from
+МS0's reconnaissance rather than from the plan's original text:
+
+- **the distributed case.** On a four-node pool most of what arrives on the S3
+  port is the cluster talking to itself (recon item 6: 90 % of connections, 79 %
+  of data events on the corpus stand), so the same client load costs the agent
+  several times as much. `MODE=dist` runs the pool; a benchmark run only against
+  a single node measures the easy case.
+- **ringbuf pressure at object-store volume** (risk 2 of the plan), through a
+  budget comparison at saturation. This is where РH14 stops being an assumption.
+
+Measured 2026-08-16, kernel 7.0.0-27, 22 cores, `minio/minio:latest`, warp mixed
+at 1 MiB objects, 8 concurrent, capped at 400 obj/s (≈ 240 MiB/s), 20 s per run:
+
+```
+mode    obj/s A   obj/s B   ΔOBJ    MiB/s B   p99 A>B          agent CPU    drops  resyncs
+single    398.5     399.6   +0.3%     239.2   57.9>47.0 ms     0.010 cores      0        0
+dist      398.3     387.0   -2.8%     232.2   72.4>105.7 ms    0.160 cores      0    10454
+```
+
+- **single** — one node. The agent costs **0.010 cores** at 400 operations/s
+  and 240 MiB/s, and ΔTPS is noise. Per pair it observed ~8 180 operations and
+  no internal traffic at all: a single node has nobody to talk to.
+- **dist** — the same client load against a four-node pool, and the same ~8 190
+  client operations — beside **~15 000 internal ones**, i.e. **65 % of what the
+  port carries is the cluster itself**. That is what the 16× CPU is: the agent's
+  cost tracks the port, not the client. The −2.8 % and the p99 movement are that
+  pair's variance rather than a signal (the two pairs read +0.0 % / 51 ms and
+  −5.7 % / 160 ms with four MinIOs and warp on the same 22 cores); what the row
+  is for is the CPU column and the internal share beside it.
+- The `resyncs` are the capture-budget tail of docs/accuracy.md §S3: a 1 MiB
+  object goes out in 128 KiB writes, each cut to the port's 2048-byte budget,
+  and the last one's hole is never detected — so the direction rejoins on the
+  next head anchor. Two per large GET, and no events were dropped in any row.
+
+### The per-port budget, measured on a pool (РH14, risk 2)
+
+Uncapped this time — a saturation probe, not an overhead measurement — with the
+default 2048-byte budget and with a deliberately fat one:
+
+```
+mode    budget           obj/s     MiB/s    ringbuf drops   events
+single  default (2048)   1468.2    880.6    0               314 179
+single  fat (32768)      1186.1    711.9    0             1 286 429
+dist    default (2048)    353.4    211.9    0               484 498
+dist    fat (32768)       251.9    151.1    48 527           659 211
+```
+
+The single-node default row is the multi-gigabit case the plan asks for: 880
+MiB/s is **7.4 Gbit/s of object delivery observed with zero dropped records**,
+and the same 314 179 records is what the database stands see in a fraction of
+the traffic — the drop-rate claim of МS4, measured.
+
+The mechanism is visible in the event counts: a call captured at 2048 B is one
+ringbuf record, and the same call captured at 32 KiB is eight (`LK_CHUNK` is
+4096) — so widening the budget multiplies the *record* rate by four to eight
+without adding a single observation. On one node with 22 cores the ring absorbs
+it and only throughput suffers (−19 %). On the pool, where the same client load
+already produces three times the events, it does not: **7.4 % of records are
+dropped and delivery falls by 29 %**. Every dropped record is a hole some
+observation then has to survive.
+
+That is the whole argument of РH14 on an object store, and it is why the budget
+is not a comfort knob: the default is what makes the numbers above trustworthy.
+
+### Reproduction
+
+```sh
+cmake -B build-rel -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-rel --target latkit -j
+tests/bench/run-s3.sh                 # single node, ~6 min
+MODE=dist tests/bench/run-s3.sh       # the four-node pool
+```
+
+Knobs (env): `PAIRS`, `DURATION`, `CONCURRENT`, `RPS`, `OBJ_SIZE`, `OBJECTS`,
+`FAT_BUDGET`, `MODE`, `PORT`, `MINIO_IMAGE`, `WARP_IMAGE`, `AGENT_BIN`, `OUT`.
+Artifacts: `runs.tsv` (one row per pair, both views plus the agent's counters),
+`share.tsv` (operations vs internal, per pair), `budget.tsv` and `warp.log`.
+
+A pair whose load generator reported no throughput is dropped from the medians
+and the count is printed — averaging a failed run into the baseline would report
+the agent as making the server twice as fast, which is exactly what the first
+attempt at this table did before the pool-readiness probe was fixed.

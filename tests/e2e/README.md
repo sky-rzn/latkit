@@ -28,6 +28,9 @@ KEEP=1 ./verify.sh   # same, but leave the stand running to poke at it
 ./verify-http-tls.sh     # HTTPS via nginx + libssl uprobes (PLAN-HTTP.md М7)
 ./verify-http-go-tls.sh  # HTTPS via a Go net/http server + --tls-go (М7, РH13.3)
 
+./verify-s3.sh           # plaintext S3: MinIO, mc + busybox wget, one agent
+                         #   on -p 9402=s3 (PLAN-MINIO.md МS4)
+WARP=1 ./verify-s3.sh    # + the warp profile: MinIO's own benchmark for volume
 ./verify-s3-tls.sh       # S3 over TLS: two MinIOs (one with certificates, one
                          #   without), mc against both, one agent each, and the
                          #   two legs compared (PLAN-MINIO.md МS3, РS8)
@@ -73,6 +76,29 @@ refuses at startup with a cause and a way forward. Ports are 9401/9444 rather
 than 9000 on purpose: the agent's port filter is kernel-wide, and a stand on
 9000 would capture any other MinIO on the host.
 
+`verify-s3.sh` is the plaintext S3 stand, and what it asserts is the list МS4
+names: the `latkit_s3_*` families exist and grow, every operation is a value
+from the closed table with `op="other"` at zero, the bucket and the access key
+are labels, the injected 404s arrive **with their S3 codes** (`NoSuchKey` and
+`NoSuchBucket` are the same status and not the same page), no failure falls back
+to a bare numeric status, the timings are three separate numbers, and the blind
+zones, parse errors and drops are zero on an HTTP/1.1 run.
+
+Two of its checks exist only here. The first is РS6 as a ratio: `mc` uploads
+through `aws-chunked`, so the *object* bytes must be strictly fewer than the
+*wire* bytes and by the framing's own margin — measured 0.16 %, where a
+histogram fed from the wire count would read exactly 1.0. The second is that
+MinIO's own surface is counted and nothing more: the container's health probes
+land in `latkit_s3_internal_requests_total` and in no family that says
+"requests", and no `/minio/...` path is read as a bucket called `minio`.
+
+It needs two clients, and the reason is worth knowing: `mc` refuses to configure
+an alias whose credentials the server rejects, so the refused-caller cases of
+РS4 — an anonymous request, and a signature from an access key that does not
+exist — are driven by busybox `wget` with a hand-written `Authorization` header.
+That is also the honest shape of the thing being tested, since no SDK would ever
+generate it. Port 9402, for the same reason 9401/9444 are used above.
+
 `verify.sh` builds `build/latkit` on the host first (the image just wraps that
 binary — the BPF skeleton toolchain is not reproduced in a container), brings the
 stand up, and asserts:
@@ -90,6 +116,11 @@ stand up, and asserts:
 By hand, once up: <http://localhost:19090> (Prometheus — 19090 to avoid a host
 Prometheus on 9090), <http://localhost:9752/metrics> (the agent),
 `docker compose logs -f otel-collector` (the debug dump of every metric/span).
+The S3 stands publish their own: <http://localhost:19094> and
+<http://localhost:9757/metrics> for `verify-s3.sh`, <http://localhost:19093>
+and 9755/9756 for the two legs of `verify-s3-tls.sh`. Every stand has a distinct
+set, because they can be up at the same time and the agent's port filter is
+kernel-wide.
 
 ## Requirements & caveats
 

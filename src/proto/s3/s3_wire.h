@@ -103,9 +103,17 @@ static inline bool s3_auth_access_key(struct http_span v, char *out, __u32 cap)
 
     if (v.n > 4 && !memcmp(v.p, "AWS ", 4)) {
         /* SigV2: the key runs to the colon that separates it from the
-         * signature. No colon means a malformed header, not a nameless key. */
+         * signature. No colon means a malformed header, not a nameless key.
+         *
+         * A `/` before that colon means it is not a key at all: the SigV4 and
+         * presigned readers below stop *at* the first `/` because that is where
+         * the credential scope begins, so a slash is the one byte an access key
+         * can never contain — and it is also the byte a path is made of. This
+         * is the only branch that could have carried one into a label, and the
+         * МS4 fuzzer found it there (`tests/fuzz/corpus/http/s3_sigv2_slash`). */
         for (i = 4; i < v.n && v.p[i] != ':'; i++)
-            ;
+            if (v.p[i] == '/')
+                return false;
         if (i == v.n)
             return false;
         return s3_copy_label(out, cap, v.p + 4, i - 4);

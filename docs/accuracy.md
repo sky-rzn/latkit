@@ -401,3 +401,151 @@ script header. Artifacts per run: `report.txt` (the gates and the verdict),
 flags that explain a difference), `queries.txt` (the replayed observations),
 `run.lkt` (the recording itself — every number above is reproducible from it
 without the stand) and the agent's exit dump.
+
+---
+
+# Accuracy validation — agent vs MinIO (PLAN-MINIO.md МS4)
+
+**Verdict: the acceptance holds.** On a lossless run the agent's per-request
+duration agrees with MinIO's own `callStats.duration` to **0.17 ms at p50 and
+0.29 ms at p90**, and the split of РH5 reassembles into MinIO's single
+`timeToFirstByte` to **0.19 / 0.30 ms**. Response-body bytes match **exactly**
+on every request that was not a declared lower bound (855/855), every status
+matches, **100 %** of the 880 requests MinIO traced were observed, and — the
+assertion no other stand here can make — **100 % of the operations agree with
+the name MinIO itself gives them**.
+
+That last one is why an S3 accuracy bench is worth more than an HTTP one. The
+reference is not a log line about latency: it is the server naming the request.
+`op` is the label the whole S3 profile is keyed by (РS2), and this is the one
+place it can be checked against the authority on what an S3 operation is,
+rather than against our own table.
+
+Everything below is produced by `tests/bench/accuracy/run-s3.sh`; the gates are
+asserted and the script exits non-zero on any regression.
+
+## Method
+
+Two views of one controlled workload against `minio/minio:latest` on a compose
+bridge:
+
+1. **the agent** — `--record` on `-p 9403=s3`, replayed offline through the
+   real handler (`lkt_queries --proto s3`), so the artefact that produced the
+   numbers is kept and re-runnable;
+2. **MinIO** — `mc admin trace -v --json --call s3`, one object per S3 request
+   carrying `callStats.duration`, `.timeToFirstByte`, `.rx`, `.tx`, the status
+   and the `api` name, joined on the `X-Amz-Request-Id` the server answered
+   with. МS1 reads that header off the response head for exactly this purpose.
+
+**What is compared per request** (`tests/bench/accuracy/s3_join.py`):
+
+| MinIO | agent | gate |
+|---|---|---|
+| `callStats.duration` | `upload + dur` | p90 gap ≤ 5 ms |
+| `callStats.timeToFirstByte` | `upload + ttfb` | p90 gap ≤ 5 ms |
+| `callStats.tx` | `out` | exact |
+| `statusCode` | `status` | exact |
+| `api` (`s3.GetObject`) | `route` | ≥ 99 % agree |
+
+**Why `upload` is added back on the left-hand rows.** MinIO measures both of its
+numbers from one origin — the moment the request arrived — so its
+`timeToFirstByte` includes the time it spent reading the request body. РH5
+splits that interval deliberately (`upload` is the client's, `dur`/`ttfb` are
+the server's) because on an object store a slow uploader and a slow server are
+different incidents. Adding `upload` back is therefore not a fudge to make two
+numbers agree: it is the statement that **the split is exact**, and it is
+checked as such. A bench that compared `ttfb` against `timeToFirstByte`
+directly would be asserting that MinIO makes the same distinction, which it
+does not.
+
+**Workload:** N passes of {`PutObject` small, `PutObject` 1 MiB (both
+`aws-chunked`, since `mc` is minio-go), `GetObject` of each, `HeadObject`, a V2
+listing, a 404 `NoSuchKey`, a 404 `NoSuchBucket`, a batched delete} plus one
+multipart upload — the shapes РS5 and РS6 are about, not a uniform flood. On
+the reference run that is 880 requests across nine operations.
+
+**Validity:** as on the three stands before it, a run counts only if the agent
+dump shows zero `latkit_ringbuf_dropped_total` and zero `latkit_resync_total`.
+
+**A second, aggregate opinion:** MinIO's own Prometheus endpoint. Printed, not
+gated — the two count over slightly different windows, since the agent attaches
+after the server starts — but a factor-of-two difference there would mean
+something is counted twice or not at all. Measured: `minio_s3_requests_total`
+882 against `latkit_s3_requests_total` 880, a ratio of 0.998, the two missing
+requests being the ones the server answered before the probes were attached.
+
+## Systematic differences (documented, not defects)
+
+- **`callStats.rx` is not the request's wire bytes and is not compared.** MinIO
+  charges a fixed ~93-byte estimate for the head and counts the `aws-chunked`
+  stream as it decodes it, so its `rx` is neither our `bytes_in` (the wire) nor
+  our `obj_bytes` (the object). The РS6 claim is checked where it can be
+  checked — in the e2e stand's exposition, where the object bytes are compared
+  against the wire counter over the same requests, and come out 0.16 % lower,
+  which is the signed-chunk framing to within a rounding of the notes'
+  measurement.
+
+- **The last write of a large response is missing from `bytes_out`, by exactly
+  one call's uncaptured tail.** This is the Р9 lazy-hole rule that §HTTP
+  documents for *request* bodies, arriving on the response side because an
+  object store is the first thing here that writes megabytes back: MinIO sends
+  a 1 MiB object in 128 KiB `write(2)` calls, each captured at the port's
+  2048-byte budget (РH14) with the remaining 129024 bytes reported as a hole —
+  but a hole is only detected when the *next* call on that direction starts, and
+  the body's last call has no next call. So the unit is closed by the following
+  request head with `LK_QO_BODY_UNSEEN` and `out = 919552` of 1048576, short by
+  exactly 129024 = 131072 − 2048.
+
+  Measured: 25 of 880 requests, all of them the 1 MiB `GetObject`, every one
+  short by exactly that amount. The observation **declares** itself a lower
+  bound, and what the bench gates is that it is never *above* the truth. The
+  shortfall is bounded by one call: `max(0, write size − capture budget)`,
+  independent of the object's size. Raising the port's budget shrinks it
+  (`--port 9000=s3:32768` → 98304); closing it properly would mean crediting a
+  Content-Length body's outstanding tail when the unit is retired, which is a
+  change to the HTTP framer's hole accounting and belongs to that track, not to
+  this milestone.
+
+  Operationally: `latkit_s3_bytes_total{direction="out"}` under-reports
+  large-object reads by ~12 % at the default budget, `latkit_s3_object_size_bytes`
+  is unaffected on uploads (it reads a header, not the body) and equally short
+  on downloads, and the timings — which is what the profile is for — are
+  unaffected entirely.
+
+- **MinIO's name for an operation is not always the S3 API's name.** The server
+  calls the handler `s3.GetBucketObjectLockConfig` where the API calls the
+  request `GetObjectLockConfiguration`, and `s3.DeleteMultipleObjects` where the
+  API says `DeleteObjects`. The classifier produces the **API's** names — those
+  are what an operator reads in AWS documentation and writes in an IAM policy —
+  so the join carries a small alias table (`MINIO_API_ALIASES` in
+  `s3_join.py`). A pair that is neither equal nor aliased is printed as a
+  disagreement, which is the "the S3 API grew and the table did not" signal of
+  risk 5 arriving from the server rather than from a rising `op="other"` share.
+  On the reference run: none.
+
+- **`sendfile` does not arise.** МS0 recon item 3 measured zero
+  `sendfile`/`splice`/`copy_file_range` in MinIO under load — object bodies go
+  out through ordinary `write(2)` — so the РH4 degradation that makes nginx byte
+  accounting a lower bound has no MinIO equivalent. What is left is the
+  budget-tail above, which is a different mechanism with a different (and
+  bounded) size.
+
+## Reproduction
+
+```sh
+cmake -B build-rel -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-rel --target latkit -j
+tests/bench/accuracy/run-s3.sh        # ~2 min; exits non-zero on failure
+```
+
+Knobs (env): `PASSES`, `TOL_MS`, `MIN_SAMPLES`, `PORT`, `AGENT_BIN`, `OUT` —
+see the script header. Artifacts per run: `report.txt` (the gates and the
+verdict), `join.tsv` (one row per request, both views side by side plus the
+observation flags that explain a difference), `trace.json` (MinIO's own view),
+`queries.txt` (the replayed observations), `run.lkt` (the recording — every
+number above is reproducible from it without the stand), `minio.prom` and the
+agent's exit dump.
+
+The trace is read for five fields and nothing else: `-v` mode includes response
+**bodies**, and an S3 error body carries the object key (РS5), which has no
+business in a bench artefact.

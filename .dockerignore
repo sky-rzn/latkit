@@ -5,6 +5,13 @@ build/
 build-*/
 demo/
 dump.txt
+# Benchmark and accuracy artefacts. They are gitignored but not context-ignored,
+# and a stand that ran a container as root leaves directories the daemon's
+# context sender cannot read — which fails the release build with a permission
+# error that has nothing to do with the release.
+tests/bench/out/
+tests/bench/accuracy/out/
+tests/longrun/out/
 # ...except the host-built dev binary the e2e stand copies into its image
 # (tests/e2e/Dockerfile.latkit); the release Dockerfile builds from source
 # and never references it.

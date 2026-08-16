@@ -1,0 +1,93 @@
+# libFuzzer dictionary for the S3 dialect (fuzz_http with the 0xFD selector;
+# PLAN-MINIO.md МS4). Concatenated with http.dict by campaign.sh and CI, because
+# libFuzzer takes a single -dict and the S3 branch needs both alphabets: the
+# framer's tokens to get a well-formed exchange at all, and these to make the
+# dialect take an interesting branch once it has one.
+#
+# What is *not* here is deliberate. There is no entry for an object key, a
+# signature value or a security token: the dialect's contract is that it never
+# reads them, and seeding the mutator with them would be seeding it to check
+# whether we broke that — which the corpus-wide invariant in fuzz_http.c already
+# does, on every input, without needing the fuzzer to guess.
+
+# --- the selector (fuzz_http.c: byte 0) -------------------------------------
+sel_s3="\xfd"
+
+# --- addressing (РS3) --------------------------------------------------------
+h_host_vhost="Host: lkbucket.s3.lktest\x0d\x0a"
+h_host_path="Host: minio.lktest:9000\x0d\x0a"
+p_bucket_key="/lkbucket/small.bin"
+p_bucket="/lkbucket"
+p_service="/"
+b_bad_upper="/AB/k"
+b_bad_dots="/a..b/k"
+b_bad_ip="/192.168.1.1/k"
+b_bad_us="/a_b_c/k"
+
+# --- MinIO's own surface (РS2): counted, never observed ---------------------
+p_health="/minio/health/live"
+p_admin="/minio/admin/v3/info"
+p_peer="/minio/peer/v51/loadbucketmetadata"
+p_storage="/minio/storage/lkdisk/v51/readall"
+p_grid="/minio/grid/v51"
+
+# --- the query keys that select an operation (РS2) --------------------------
+q_uploads="?uploads="
+q_upload_id="?uploadId="
+q_part="?partNumber=1&uploadId="
+q_delete="?delete="
+q_list_v2="?list-type=2"
+q_versions="?versions"
+q_acl="?acl"
+q_tagging="?tagging"
+q_policy="?policy"
+q_versioning="?versioning"
+q_lifecycle="?lifecycle"
+q_location="?location"
+q_uploads_list="?uploads&max-uploads=1"
+q_select="?select&select-type=2"
+q_attributes="?attributes"
+
+# --- the signature, in every spelling the corpus contains (РS4) -------------
+# `Credential=` is what the dialect reads; the rest is here so the mutator can
+# build a header the reader has to walk past.
+h_authz_v4="Authorization: AWS4-HMAC-SHA256 Credential="
+sig_scope="/20260816/us-east-1/s3/aws4_request,"
+sig_scope_sp="/20260816/us-east-1/s3/aws4_request, "
+sig_signed="SignedHeaders=host;x-amz-content-sha256;x-amz-date,"
+sig_sig="Signature="
+h_authz_v2="Authorization: AWS AKIAEXAMPLE:"
+q_presign_cred="?X-Amz-Credential=AKIA%2F20260816%2Fus-east-1%2Fs3%2Faws4_request"
+q_presign_alg="&X-Amz-Algorithm=AWS4-HMAC-SHA256"
+q_presign_sig="&X-Amz-Signature="
+
+# --- the two sizes (РS6) -----------------------------------------------------
+h_sha_streaming="X-Amz-Content-Sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD\x0d\x0a"
+h_sha_trailer="X-Amz-Content-Sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER\x0d\x0a"
+h_sha_unsigned="X-Amz-Content-Sha256: UNSIGNED-PAYLOAD\x0d\x0a"
+h_decoded_len="X-Amz-Decoded-Content-Length: "
+h_ce_aws="Content-Encoding: aws-chunked\x0d\x0a"
+chunk_sig="10000;chunk-signature="
+
+# --- the headers the dialect reads off a head -------------------------------
+h_copy_source="X-Amz-Copy-Source: /other/key\x0d\x0a"
+h_amz_date="X-Amz-Date: 20260816T101112Z\x0d\x0a"
+h_amz_reqid="X-Amz-Request-Id: 185F3C0A9B2D4E71\x0d\x0a"
+h_amz_version="X-Amz-Version-Id: null\x0d\x0a"
+h_minio_errcode="X-Minio-Error-Code: NoSuchKey\x0d\x0a"
+h_security_token="X-Amz-Security-Token: FQoGZXIvYXdzEBY\x0d\x0a"
+
+# --- the error document (РS5): the one body the framer hands up -------------
+xml_decl="<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+xml_err_open="<Error><Code>"
+xml_code_close="</Code><Message>"
+xml_key="</Message><Key>"
+xml_resource="</Key><Resource>"
+err_nosuchkey="NoSuchKey"
+err_nosuchbucket="NoSuchBucket"
+err_accessdenied="AccessDenied"
+err_sigmismatch="SignatureDoesNotMatch"
+err_invalidbucket="InvalidBucketName"
+err_slowdown="SlowDown"
+err_notagset="NoSuchTagSet"
+err_unknown="AnErrorCodeNobodyDefined"

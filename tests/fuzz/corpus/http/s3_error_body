@@ -1,0 +1,26 @@
+ýGET /b/missing HTTP/1.1
+Host: h
+
+HEAD /b/missing HTTP/1.1
+Host: h
+
+GET /b/broken HTTP/1.1
+Host: h
+
+GET /b/plain HTTP/1.1
+Host: h
+
+HTTP/1.1 404 Not Found
+Content-Length: 120
+
+<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchKey</Code><Message>no</Message><Key>missing</Key></Error>HTTP/1.1 404 Not Found
+X-Minio-Error-Code: NoSuchKey
+Content-Length: 0
+
+HTTP/1.1 403 Forbidden
+Content-Length: 34
+
+<Error><Code>SignatureDoesNoHTTP/1.1 500 Internal Server Error
+Content-Length: 11
+
+not xml at 

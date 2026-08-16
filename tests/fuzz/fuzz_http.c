@@ -15,7 +15,21 @@
  * the head buffer they were copied out of only if the copy really happened, and
  * a fuzzer that never looked at them would not notice.
  *
- * The connection is forced to the http vtable (lk_conn_table_set_protos):
+ * Since МS4 the same target also drives the **S3 dialect** (РS1), selected by a
+ * leading 0xFD — a byte that cannot begin an HTTP start line, so the whole
+ * pre-existing corpus keeps exercising the base dialect unshifted and the
+ * fuzzer switches flavours by mutating one byte (the idiom fuzz_norm uses for
+ * its three input languages). The dialect is where an S3 port's attack surface
+ * actually is: it reads four things the base one does not — a `Credential=` out
+ * of a signature, a bucket out of a Host or a path, `<Code>` out of a *body*
+ * prefix, and the operation out of a closed table — and every one of them is
+ * parsed from bytes an unauthenticated client chose. The S3 branch therefore
+ * carries one invariant of its own beside the shared ones (fz_check_s3_obs):
+ * whatever the input, the operation label is a bare identifier, never a slice
+ * of the path. That is what "the cardinality of `op` is bounded by
+ * construction" (РS2) means, checked against a mutator rather than a table.
+ *
+ * The connection is forced to the selected vtable (lk_conn_table_set_protos):
  * without it the framer would fall back to PG. One input feeds both directions
  * of one connection — the RECV pass drives request heads and their bodies, the
  * SEND pass drives status lines, chunked framing and the blind zones — with a
@@ -47,6 +61,56 @@
  * multi-megabyte single feed exercises nothing the low kilobytes do not. */
 #define LK_FUZZ_MAX_INPUT (1u << 20)
 
+/* Whether this run drives the S3 dialect, so the query sink knows which
+ * contract to hold the observation to. A file-scope flag rather than a sink
+ * context because the sink is installed once, before the input is read. */
+static bool fz_is_s3;
+
+/* РS2, from the outside: an S3 observation's `op` is a pointer into a static
+ * table, so no input — however much of it looks like a path — may produce a
+ * label with a path's alphabet in it. Checked here rather than only in
+ * test_s3_op because the classifier is reached through the framer and the
+ * header parser, and it is those two that decide what it is *given*.
+ *
+ * The two labels either side of it have *different* contracts, and the
+ * difference is worth stating because the first version of this check got it
+ * wrong and the fuzzer said so within the hour:
+ *
+ *   - the **bucket** is validated against the S3 naming rules before it may be
+ *     a label (РS3), so its alphabet is closed: lower-case, digits, `.` and
+ *     `-`. A name that fails becomes `other`, never the bytes that failed.
+ *   - the **access key** is not validated, because it cannot be: it is whatever
+ *     the deployment issued, and refusing an unfamiliar shape would lose the
+ *     label on exactly the servers whose keys are not AWS-shaped. What РS4
+ *     promises is that it is *bounded* (40 bytes, refused rather than clipped),
+ *     *printable* (a control byte rejects the whole value), and never the
+ *     signature or a path — the extractors stop at the `/` that begins the
+ *     credential scope, so the one byte an object key could not survive
+ *     without is the one byte that cannot appear. A `%` can: a client is free
+ *     to percent-encode its own key, and a fuzzer will.
+ */
+static void fz_check_s3_obs(const struct lk_session *s, const struct lk_query_obs *o)
+{
+    if (o->route) {
+        /* The longest name in the table is `DeleteBucketLifecycleConfiguration`
+         * at 34; a slice of a target would have no such ceiling. */
+        FZ_ASSERT(o->route_len > 0 && o->route_len <= 34);
+        for (__u32 i = 0; i < o->route_len; i++) {
+            char ch = o->route[i];
+
+            FZ_ASSERT((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                      (ch >= '0' && ch <= '9'));
+        }
+    }
+    if (!s)
+        return;
+    for (const char *p = s->database; *p; p++)
+        FZ_ASSERT((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '.' || *p == '-');
+    FZ_ASSERT(strlen(s->user) <= LK_S3_AK_MAX);
+    for (const char *p = s->user; *p; p++)
+        FZ_ASSERT((unsigned char)*p > 0x20 && (unsigned char)*p < 0x7f && *p != '/');
+}
+
 static void fz_on_query(void *ctx, const struct lk_conn *c, const struct lk_session *s,
                         const struct lk_query_obs *o)
 {
@@ -54,6 +118,8 @@ static void fz_on_query(void *ctx, const struct lk_conn *c, const struct lk_sess
     (void)c;
     fz_check_obs(o);
     FZ_ASSERT(o->kind == LK_Q_REQUEST); /* every http observation is one exchange */
+    if (fz_is_s3)
+        fz_check_s3_obs(s, o);
     if (s) {
         fz_read_bytes(s->database, strnlen(s->database, sizeof(s->database)));
         fz_read_bytes(s->user, strnlen(s->user, sizeof(s->user)));
@@ -119,7 +185,8 @@ static void fz_on_destroy(void *ctx, struct lk_conn *c)
  * from scratch so state never leaks between inputs. */
 int lk_http_fuzz_one(const uint8_t *data, size_t n)
 {
-    const struct lk_proto_ops *ops = lk_proto_find("http", 4);
+    const struct lk_proto_ops *ops;
+    struct lk_http_cfg cfg = {0};
     struct lk_proto *proto;
     struct fz_tee tee = {0};
     struct lk_reasm reasm;
@@ -127,14 +194,35 @@ int lk_http_fuzz_one(const uint8_t *data, size_t n)
     struct lk_conn *c;
     struct lk_tuple tuple = {0};
     __u32 lost = 0;
-    __u32 len = n > LK_FUZZ_MAX_INPUT ? LK_FUZZ_MAX_INPUT : (__u32)n;
+    __u32 len;
 
+    /* The dialect selector (МS4): 0xFD cannot begin an HTTP start line, so a
+     * corpus entry that does not carry it is an http input exactly as it was
+     * before this branch existed, and one mutated byte turns any of them into
+     * an S3 one. */
+    fz_is_s3 = n && data[0] == 0xFD;
+    if (fz_is_s3) {
+        data++;
+        n--;
+    }
+    len = n > LK_FUZZ_MAX_INPUT ? LK_FUZZ_MAX_INPUT : (__u32)n;
+    ops = fz_is_s3 ? lk_proto_find("s3", 2) : lk_proto_find("http", 4);
     if (!ops)
         return 0;
     /* Alternate the one configurable read of a credential header (РH10) so the
      * base64 decoder is on the fuzzed path rather than only in unit tests. The
      * switch is derived from the input so a crash reproduces from the file. */
-    lk_proto_http_configure(&(struct lk_http_cfg){.user_basic = (n & 1) != 0});
+    cfg.user_basic = (n & 1) != 0;
+    /* The same for the S3 knobs (РS3/РS4). A configured domain is what puts the
+     * virtual-host branch on the fuzzed path — without it every request is read
+     * path-style and the Host is never split — and `--s3-user off` is the
+     * configuration in which the signature parser must not run at all. */
+    if (fz_is_s3) {
+        cfg.s3.domains[cfg.s3.ndomains++] = "s3.lktest";
+        cfg.s3.domains[cfg.s3.ndomains++] = "minio.lktest";
+        cfg.s3.no_user = (n & 2) != 0;
+    }
+    lk_proto_http_configure(&cfg);
     proto = ops->proto_new(&(struct lk_query_sink){
         .on_query = fz_on_query, .on_session = fz_on_session}); /* М3: observations */
     if (!proto)
@@ -150,7 +238,7 @@ int lk_http_fuzz_one(const uint8_t *data, size_t n)
         lk_proto_free(proto);
         return 0;
     }
-    /* Force the http framer/handler on every entry (else the PG default). */
+    /* Force the selected framer/handler on every entry (else the PG default). */
     lk_conn_table_set_protos(tbl, NULL, 0, ops);
     lk_conn_table_on_destroy(tbl, fz_on_destroy, &tee);
 

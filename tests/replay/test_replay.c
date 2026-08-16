@@ -59,6 +59,7 @@ struct collector {
     struct lk_query_obs last_obs; /* text pointer nulled; see last_text */
     char last_text[256];          /* last_obs.text copied out (it dangles) */
     char last_route[256];         /* ... and the HTTP route beside it (М8) */
+    char last_err_name[64];       /* ... and the S3 error code (МS4) */
 
     /* Aggregator (task 4.3): the same observations tee into the metrics facade,
      * exactly as events.c wires them over live traffic. */
@@ -106,6 +107,11 @@ static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session
         col->last_route[o->route_len] = '\0';
     }
     col->last_obs.route = NULL;
+    /* Borrowed for the duration of the callback like the two above (proto.h),
+     * and pointing into the dialect's per-connection state, which outlives
+     * nothing in particular. */
+    snprintf(col->last_err_name, sizeof(col->last_err_name), "%s", o->err_name ? o->err_name : "");
+    col->last_obs.err_name = NULL;
     if (col->msink->on_query)
         col->msink->on_query(col->msink->ctx, c, s, o);
 
@@ -300,18 +306,18 @@ static const struct metric_expect metric_expects[] = {
 #define HTTP_LBL(route, method)                                                                    \
     "route=\"" route "\",method=\"" method "\",host=\"latkit.test\",user=\"-\",proto=\"http\""
 
-struct http_line {
+struct fam_line {
     const char *prefix;      /* full label set, up to the value */
     unsigned long long want; /* the value the line must carry */
 };
 
-struct http_metric_expect {
-    const char *name;         /* fixture stem */
-    struct http_line want[6]; /* NULL-terminated */
-    const char *absent[2];    /* lines that must NOT exist */
+struct fam_metric_expect {
+    const char *name;        /* fixture stem */
+    struct fam_line want[8]; /* NULL-terminated */
+    const char *absent[3];   /* lines that must NOT exist */
 };
 
-static const struct http_metric_expect http_metric_expects[] = {
+static const struct fam_metric_expect http_metric_expects[] = {
     /* The base case, whole: the request counted under its status class, the
      * duration under code="ok", the response body in the byte counter. */
     {"http_get",
@@ -416,6 +422,162 @@ static const struct http_metric_expect http_metric_expects[] = {
      {NULL}},
 };
 
+/* --- МS4: the exposition the S3 fixtures produce ----------------------------
+ * The s3 profile is the http one with the object store's nouns (РS7): the slot
+ * is an operation from a closed table, the dim slot holds a bucket, the user
+ * slot an access key, and the error label the symbolic code. Every row below is
+ * one of those four differences said as a number — plus the two families the
+ * http profile has no equivalent of at all, the internal counter and the object
+ * histogram on its own grid.
+ *
+ * Note what the label sets prove on their own: `op` never contains a slash, a
+ * percent or a segment of a path, on a corpus whose keys deliberately do. */
+#define S3_LBL(op, method, bucket, user)                                                           \
+    "op=\"" op "\",method=\"" method "\",bucket=\"" bucket "\",user=\"" user "\",proto=\"s3\""
+#define S3_MINE(op, method) S3_LBL(op, method, "lkbucket", "lkroot")
+
+static const struct fam_metric_expect s3_metric_expects[] = {
+    /* The base case, whole: the operation counted under its status class, the
+     * duration under code="ok", the body in the byte counter and the object in
+     * the size histogram — on the object grid, where 1024 is the first bound. */
+    {"s3_get",
+     {{"latkit_s3_requests_total{" S3_MINE("GetObject", "GET") ",status=\"2xx\"}", 1},
+      {"latkit_s3_request_duration_seconds_count{" S3_MINE("GetObject", "GET") ",code=\"ok\"}", 1},
+      {"latkit_s3_ttfb_seconds_count{" S3_MINE("GetObject", "GET") "}", 1},
+      {"latkit_s3_bytes_total{" S3_MINE("GetObject", "GET") ",direction=\"out\"}", 1024},
+      {"latkit_s3_object_size_bytes_bucket{" S3_MINE("GetObject", "GET") ",le=\"1024\"}", 1},
+      {"latkit_s3_internal_requests_total", 0},
+      {NULL, 0}},
+     {"latkit_s3_errors_total", NULL}},
+    /* An unchunked upload: the two counts agree, and the upload family holds the
+     * client's transfer because the body arrived in a call of its own (РH5). */
+    {"s3_put",
+     {{"latkit_s3_requests_total{" S3_MINE("PutObject", "PUT") ",status=\"2xx\"}", 1},
+      {"latkit_s3_bytes_total{" S3_MINE("PutObject", "PUT") ",direction=\"in\"}", 8192},
+      {"latkit_s3_request_upload_seconds_count{" S3_MINE("PutObject", "PUT") "}", 1},
+      {"latkit_s3_object_size_bytes_bucket{" S3_MINE("PutObject", "PUT") ",le=\"8192\"}", 1},
+      {NULL, 0}},
+     {NULL}},
+    /* РS6 as a pair of numbers that must not be the same one: 16559 bytes
+     * crossed the socket and 16384 bytes of object were stored, and it is the
+     * second that the distribution is built on. A histogram fed from the wire
+     * count would put this upload one bucket higher and would move with the
+     * client's chunk size rather than with the objects. */
+    {"s3_chunked_put",
+     {{"latkit_s3_bytes_total{" S3_MINE("PutObject", "PUT") ",direction=\"in\"}", 16559},
+      {"latkit_s3_object_size_bytes_bucket{" S3_MINE("PutObject", "PUT") ",le=\"16384\"}", 1},
+      {"latkit_s3_object_size_bytes_sum{" S3_MINE("PutObject", "PUT") "}", 16384},
+      {NULL, 0}},
+     {NULL}},
+    /* Four exchanges off one `?uploadId`, three operations, and only the two
+     * parts in the size histogram: a manifest is payload and is not an object. */
+    {"s3_multipart",
+     {{"latkit_s3_requests_total{" S3_MINE("CreateMultipartUpload", "POST") ",status=\"2xx\"}", 1},
+      {"latkit_s3_requests_total{" S3_MINE("UploadPart", "PUT") ",status=\"2xx\"}", 2},
+      {"latkit_s3_requests_total{" S3_MINE("CompleteMultipartUpload", "POST") ",status=\"2xx\"}",
+       1},
+      {"latkit_s3_object_size_bytes_count{" S3_MINE("UploadPart", "PUT") "}", 2},
+      /* Three series, not four: the two parts are one operation. */
+      {"latkit_metric_series", 3},
+      {NULL, 0}},
+     {"latkit_s3_object_size_bytes_count{op=\"CompleteMultipartUpload\"",
+      "latkit_s3_object_size_bytes_count{op=\"CreateMultipartUpload\"", NULL}},
+    /* A listing is bytes and not an object; and `ListBuckets` has no bucket at
+     * all, which is a different fact from a name we refused and prints as `-`. */
+    {"s3_list",
+     {{"latkit_s3_requests_total{" S3_MINE("ListObjectsV2", "GET") ",status=\"2xx\"}", 1},
+      {"latkit_s3_requests_total{" S3_LBL("ListBuckets", "GET", "-", "lkroot") ",status=\"2xx\"}",
+       1},
+      {NULL, 0}},
+     {"latkit_s3_object_size_bytes_count{op=\"ListObjectsV2\"",
+      "latkit_s3_object_size_bytes_count{op=\"ListBuckets\"", NULL}},
+    /* РS5, the point of the whole error-body path: two 404s, one name. Both
+     * ways of reading it — the `<Code>` of a body and MinIO's header on the
+     * HEAD that has none — land in the same series, and the numeric status is
+     * nowhere in the error family. */
+    {"s3_error_404",
+     {{"latkit_s3_errors_total{s3code=\"NoSuchKey\",bucket=\"lkbucket\",user=\"lkroot\","
+       "proto=\"s3\"}",
+       2},
+      {"latkit_s3_requests_total{" S3_MINE("GetObject", "GET") ",status=\"4xx\"}", 1},
+      {"latkit_s3_requests_total{" S3_MINE("HeadObject", "HEAD") ",status=\"4xx\"}", 1},
+      /* A 4xx is a successful unit of work for the server (РH10): the client
+       * asked for something that is not there and was told so. */
+      {"latkit_s3_request_duration_seconds_count{" S3_MINE("GetObject", "GET") ",code=\"ok\"}", 1},
+      {NULL, 0}},
+     {"latkit_s3_errors_total{s3code=\"404\"", "latkit_s3_object_size_bytes_count{op=\"GetObject\"",
+      NULL}},
+    /* A signature that did not verify is still a named caller (РS4): the access
+     * key is in the label, and the signature is in no label anywhere. */
+    {"s3_error_403",
+     {{"latkit_s3_errors_total{s3code=\"SignatureDoesNotMatch\",bucket=\"lkbucket\","
+       "user=\"lkroot\",proto=\"s3\"}",
+       1},
+      {"latkit_s3_requests_total{" S3_MINE("GetObject", "GET") ",status=\"4xx\"}", 1},
+      {NULL, 0}},
+     {"latkit_s3_errors_total{s3code=\"403\"", NULL}},
+    /* The credential was in the query and the label is the same one a header
+     * would have given. */
+    {"s3_presigned",
+     {{"latkit_s3_requests_total{" S3_MINE("GetObject", "GET") ",status=\"2xx\"}", 1},
+      {"latkit_metric_series", 1},
+      {NULL, 0}},
+     {NULL}},
+    /* No credential at all: `-`, and not folded in with the signed callers. */
+    {"s3_anonymous",
+     {{"latkit_s3_requests_total{" S3_LBL("GetObject", "GET", "lkbucket", "-") ",status=\"4xx\"}",
+       1},
+      {"latkit_s3_errors_total{s3code=\"AccessDenied\",bucket=\"lkbucket\",user=\"-\","
+       "proto=\"s3\"}",
+       1},
+      {NULL, 0}},
+     {NULL}},
+    /* РS2's "counted, never observed", as the only two lines that can say it:
+     * three requests in the internal counter, and no series in any family that
+     * claims to describe an S3 operation — not even the error one, though one of
+     * the three was a 404. */
+    {"s3_internal_path",
+     {{"latkit_s3_internal_requests_total", 3}, {"latkit_metric_series", 0}, {NULL, 0}},
+     {"latkit_s3_requests_total", "latkit_s3_errors_total", "latkit_s3_bytes_total"}},
+    /* The bucket came from the Host and the whole path was the key: the series
+     * is indistinguishable from the path-style one, which is the point. */
+    {"s3_vhost_style",
+     {{"latkit_s3_requests_total{" S3_MINE("GetObject", "GET") ",status=\"2xx\"}", 1}, {NULL, 0}},
+     {NULL}},
+    {"s3_synthetic_midstream",
+     {{"latkit_s3_requests_total{" S3_MINE("GetObject", "GET") ",status=\"2xx\"}", 1}, {NULL, 0}},
+     {NULL}},
+};
+
+/* РS2/РH12 over the exposition, on every s3 fixture rather than in one row: no
+ * label value may contain a byte that only an object key could have put there.
+ * Structural rather than by name, because a bucket may legitimately be called
+ * `small.bin` — every label an s3 series carries is an operation from the table,
+ * a method, a validated bucket name, an access key or a bounded enum, and not
+ * one of those alphabets contains a slash, a space, a percent-escape or a `..`.
+ * The fixtures carry keys with all four. */
+static int check_no_key_labels(const char *fixname, const char *buf)
+{
+    const char *p = buf;
+
+    while ((p = strstr(p, "=\""))) {
+        const char *v = p + 2, *end = strchr(v, '"');
+
+        p = v;
+        if (!end)
+            break;
+        for (const char *q = v; q < end; q++)
+            if (*q == '/' || *q == ' ' || *q == '%' ||
+                (q[0] == '.' && q + 1 < end && q[1] == '.')) {
+                fprintf(stderr, "FAIL %s: an object key reached a metric label: \"%.*s\"\n",
+                        fixname, (int)(end - v), v);
+                return 1;
+            }
+        p = end;
+    }
+    return 0;
+}
+
 /* Numeric value on the dump line that begins (at column 0) with `prefix` and is
  * followed by a space. Returns 1 and sets *out, or 0 if no such line exists. */
 static int dump_line_val(const char *buf, const char *prefix, double *out)
@@ -483,8 +645,8 @@ static int check_absent(const char *fixname, const char *buf, const char *prefix
     return 0;
 }
 
-/* One HTTP fixture's exposition rows (М8). */
-static int check_http_metrics(const struct http_metric_expect *e, const char *buf)
+/* One fixture's exposition rows (М8, МS4). */
+static int check_fam_metrics(const struct fam_metric_expect *e, const char *buf)
 {
     for (size_t i = 0; i < sizeof(e->want) / sizeof(e->want[0]) && e->want[i].prefix; i++)
         if (check_line(e->name, buf, e->want[i].prefix, e->want[i].want))
@@ -571,6 +733,17 @@ static int run_fixture(const struct fixture *fix)
 
     fix->build(&x);
     CHECK(x.buf && x.len > 0);
+
+    /* The handler's startup configuration, reset per fixture: only the
+     * virtual-host one asks for a domain (РS3), and leaving it set afterwards
+     * would make a later path-style fixture read a bucket out of a Host. */
+    {
+        struct lk_http_cfg hcfg = {0};
+
+        if (fix->s3_domain)
+            hcfg.s3.domains[hcfg.s3.ndomains++] = fix->s3_domain;
+        lk_proto_http_configure(&hcfg);
+    }
 
     /* 1. Reproducibility: committed file == freshly built bytes. */
     snprintf(path, sizeof(path), "%s/%s.lkt", LK_FIXTURES_DIR, fix->name);
@@ -775,6 +948,19 @@ static int run_fixture(const struct fixture *fix)
                     x.obs_route, col.last_route);
             goto fail;
         }
+        /* S3 (МS4): the failure's name and the object's size — the two fields a
+         * dialect fills and the base HTTP one leaves alone. */
+        if (x.obs_err_name && strcmp(col.last_err_name, x.obs_err_name)) {
+            fprintf(stderr, "FAIL %s: obs err_name expected \"%s\", got \"%s\"\n", fix->name,
+                    x.obs_err_name, col.last_err_name);
+            goto fail;
+        }
+        if (x.check_obj_bytes && col.last_obs.obj_bytes != x.obs_obj_bytes) {
+            fprintf(stderr, "FAIL %s: obs obj_bytes expected %llu, got %llu\n", fix->name,
+                    (unsigned long long)x.obs_obj_bytes,
+                    (unsigned long long)col.last_obs.obj_bytes);
+            goto fail;
+        }
     }
 
     /* Aggregator (task 4.3): the metrics dump must be deterministic — two dumps
@@ -799,20 +985,37 @@ static int run_fixture(const struct fixture *fix)
                     goto fail;
                 break;
             }
-        /* М8: the same, for the http profile's own families (РH9). */
+        /* М8 / МS4: the same, for the http and s3 profiles' own families
+         * (РH9, РS7). */
         for (size_t k = 0; k < sizeof(http_metric_expects) / sizeof(http_metric_expects[0]); k++)
             if (!strcmp(http_metric_expects[k].name, fix->name)) {
-                if (check_http_metrics(&http_metric_expects[k], a))
+                if (check_fam_metrics(&http_metric_expects[k], a))
+                    goto fail;
+                break;
+            }
+        for (size_t k = 0; k < sizeof(s3_metric_expects) / sizeof(s3_metric_expects[0]); k++)
+            if (!strcmp(s3_metric_expects[k].name, fix->name)) {
+                if (check_fam_metrics(&s3_metric_expects[k], a))
                     goto fail;
                 break;
             }
         /* РH10's profile split, checked on every fixture rather than in one
-         * row: an http observation must never reach the database families, and
-         * a PG/MySQL one must never reach the http families. */
-        if (check_absent(fix->name, a,
-                         fix->proto && !strcmp(fix->proto, "http") ? "latkit_query_"
-                                                                   : "latkit_http_"))
-            goto fail;
+         * row: three profiles now, and an observation must reach exactly one of
+         * them — a PG query is never an http request, and an S3 operation is
+         * never reported under the http names it shares an engine with. */
+        {
+            static const char *const fams[] = {"latkit_query_", "latkit_http_", "latkit_s3_"};
+            const char *mine = !fix->proto                   ? fams[0]
+                               : !strcmp(fix->proto, "http") ? fams[1]
+                               : !strcmp(fix->proto, "s3")   ? fams[2]
+                                                             : fams[0];
+
+            for (size_t k = 0; k < sizeof(fams) / sizeof(fams[0]); k++)
+                if (fams[k] != mine && check_absent(fix->name, a, fams[k]))
+                    goto fail;
+            if (mine == fams[2] && check_no_key_labels(fix->name, a))
+                goto fail;
+        }
     }
 
     /* Task 5.3: the span sink saw the same observations at ratio=1.0, so every

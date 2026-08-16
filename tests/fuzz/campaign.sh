@@ -26,13 +26,15 @@ WORK=${WORK:-$BUILD/campaign-$(date +%Y%m%d-%H%M%S)}
 # Per-target dictionary: MySQL has its own byte alphabet (command / lenenc /
 # capability bytes) and HTTP is text with its own token set (methods, framing
 # headers, chunk shapes); pg.dict covers the pg framer, the norm SQL fragments
-# and the pipe scenarios well enough. fuzz_norm carries two input languages
-# behind one selector byte (SQL and, since М4, HTTP routes), and libFuzzer takes
-# a single -dict, so its dictionary is the concatenation — built once below.
+# and the pipe scenarios well enough. Two targets carry more than one input
+# language behind a selector byte — fuzz_norm (SQL, HTTP routes since М4, S3
+# classifier inputs since МS1) and fuzz_http (the base dialect and, since МS4,
+# S3 behind 0xFD) — and libFuzzer takes a single -dict, so both get a
+# concatenation, built once below.
 dict_for() {
     case "$1" in
     my) echo "$ROOT/tests/fuzz/dict/my.dict" ;;
-    http) echo "$ROOT/tests/fuzz/dict/http.dict" ;;
+    http) echo "$WORK/http.dict" ;;
     norm) echo "$WORK/norm.dict" ;;
     *) echo "$ROOT/tests/fuzz/dict/pg.dict" ;;
     esac
@@ -51,6 +53,7 @@ fi
 
 mkdir -p "$WORK/findings" "$WORK/seed"/{pg,my,http,norm,pipe}
 cat "$ROOT/tests/fuzz/dict/pg.dict" "$ROOT/tests/fuzz/dict/route.dict" > "$WORK/norm.dict"
+cat "$ROOT/tests/fuzz/dict/http.dict" "$ROOT/tests/fuzz/dict/s3.dict" > "$WORK/http.dict"
 "$BUILD/tests/fuzz/gen_seeds" "$WORK/seed" >/dev/null
 
 echo "campaign: $TIME s/target x $WORKERS workers x 5 targets" \
@@ -64,7 +67,10 @@ for t in pg my http norm pipe; do
     # The .lkt traces double as raw framer seeds for their protocol.
     [ "$t" = pg ] && cp "$ROOT"/tests/fixtures/*.lkt "$corp"/
     [ "$t" = my ] && cp "$ROOT"/tests/traces/mysql/*/*.lkt "$corp"/ 2>/dev/null || true
-    [ "$t" = http ] && cp "$ROOT"/tests/traces/http/*/*.lkt "$corp"/ 2>/dev/null || true
+    # ... and, for http, the S3 corpus too: same target, same framer, the
+    # dialect chosen by a byte the mutator can flip (МS4).
+    [ "$t" = http ] && cp "$ROOT"/tests/traces/http/*/*.lkt "$ROOT"/tests/traces/s3/*/*.lkt \
+                          "$corp"/ 2>/dev/null || true
 
     echo "=== fuzz_$t: $TIME s, $WORKERS workers ==="
     mkdir -p "$WORK/run-$t"

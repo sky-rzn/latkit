@@ -48,18 +48,32 @@ while [ $# -gt 0 ]; do
     # lk_reasm_data than the two message-framed protocols, and a capture-layer
     # regression that only bites there would otherwise show up nowhere.
     --http) PROTO=http; DO_TLS=0; shift ;;
+    # Stream the s3 fixtures with the agent framing the port as s3
+    # (PLAN-MINIO.md МS4). The capture layer is the http one byte for byte, so
+    # this run is not about BPF: it is about the registry entry and the dialect
+    # surviving a real socket, and about the s3 profile's counters being the
+    # ones a live agent then exports.
+    --s3) PROTO=s3; DO_TLS=0; shift ;;
     --build) BUILD=$2; shift 2 ;;
-    *) echo "usage: $0 [--port N] [--repeat N] [--no-tls] [--mysql|--http] [--build DIR]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--port N] [--repeat N] [--no-tls] [--mysql|--http|--s3] [--build DIR]" >&2; exit 2 ;;
     esac
 done
 
 # The agent frames the loopback port as pg by default; the replayer is told to
-# match (-m / -H), so both sides agree on which fixture set travels the socket.
+# match (-m / -H / -S), so both sides agree on which fixture set travels the
+# socket.
 case "$PROTO" in
 mysql) PORT_SPEC="$PORT=mysql"; PGSTREAM_PROTO="-m" ;;
 http)  PORT_SPEC="$PORT=http";  PGSTREAM_PROTO="-H" ;;
+s3)    PORT_SPEC="$PORT=s3";    PGSTREAM_PROTO="-S"
+       # The one fixture that addresses its bucket through the Host needs the
+       # server's domain, exactly as a deployment with MINIO_DOMAIN set does
+       # (РS3); without it that request is read path-style and classifies as
+       # something else entirely — correctly, but not as what it is.
+       PROTO_ARGS="--s3-domain minio.lktest" ;;
 *)     PORT_SPEC="$PORT";       PGSTREAM_PROTO="" ;;
 esac
+PROTO_ARGS=${PROTO_ARGS:-}
 
 AGENT=$BUILD/latkit
 PGSTREAM=$BUILD/tests/kernel/pgstream
@@ -105,7 +119,7 @@ assert_gt0() { # assert_gt0 LABEL GOT
 start_agent() { # start_agent NAME EXTRA_ARGS...
     local name=$1; shift
     "$AGENT" -p "$PORT_SPEC" --prom-listen none --dump-metrics="$TMP/$name.prom" \
-        "$@" 2>"$TMP/$name.log" &
+        $PROTO_ARGS "$@" 2>"$TMP/$name.log" &
     agent_pid=$!
     for _ in $(seq 1 40); do
         grep -q 'attached, capturing' "$TMP/$name.log" && return 0
@@ -147,6 +161,15 @@ assert_phase() { # assert_phase NAME SUMMARY_LINE
     if [ "$PROTO" = http ]; then
         assert_eq "$name: http_requests_total" "$(metric "$prom" latkit_http_requests_total)" "$queries"
         assert_eq "$name: http 5xx" "$(metric_lbl "$prom" latkit_http_requests_total 'status="5xx"')" "$errors"
+    elif [ "$PROTO" = s3 ]; then
+        # The s3 profile counts MinIO's own API apart and in no family that says
+        # "requests" (РS2), so the fixtures' internal-path connection is in the
+        # observation total the replayer reports but not in requests_total. The
+        # two lines together are the assertion.
+        assert_eq "$name: s3 requests + internal" \
+            "$(( $(metric "$prom" latkit_s3_requests_total) + \
+                 $(metric "$prom" latkit_s3_internal_requests_total) ))" "$queries"
+        assert_eq "$name: s3 5xx" "$(metric_lbl "$prom" latkit_s3_requests_total 'status="5xx"')" "$errors"
     else
         assert_eq "$name: queries_total" "$(metric "$prom" latkit_queries_total)" "$queries"
         assert_eq "$name: query_errors_total" "$(metric "$prom" latkit_query_errors_total)" "$errors"

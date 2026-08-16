@@ -1,0 +1,24 @@
+ýGET /small.bin HTTP/1.1
+Host: lkbucket.s3.lktest
+
+GET /small.bin HTTP/1.1
+Host: .s3.lktest
+
+GET /small.bin HTTP/1.1
+Host: A_B.s3.lktest:9000
+
+GET / HTTP/1.1
+Host: s3.lktest
+
+GET /192.168.1.1/k HTTP/1.1
+Host: h
+
+GET /a..b/k HTTP/1.1
+Host: h
+
+GET /%2e%2e%2f%2e%2e%2fetc%2fpasswd HTTP/1.1
+Host: h
+
+GET //// HTTP/1.1
+Host: h
+

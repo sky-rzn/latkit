@@ -115,13 +115,14 @@ int main(int argc, char **argv)
     struct sockaddr_in addr = {.sin_family = AF_INET};
     int port = 5432, repeat = 1, opt, lfd, one = 1;
     /* NULL = pg; "mysql" with -m (МYSQL.md М7), "http" with -H (PLAN-HTTP.md
-     * М8). The agent must be told the same thing (-p PORT=<proto>): these are
-     * raw bytes on a socket, and which framer reads them is the port's
-     * configuration, not something the wire announces. */
+     * М8), "s3" with -S (PLAN-MINIO.md МS4). The agent must be told the same
+     * thing (-p PORT=<proto>): these are raw bytes on a socket, and which
+     * framer reads them is the port's configuration, not something the wire
+     * announces — which for s3 is the whole point, since its bytes are HTTP. */
     const char *proto = NULL;
     size_t n, conns = 0;
 
-    while ((opt = getopt(argc, argv, "p:r:mHh")) != -1) {
+    while ((opt = getopt(argc, argv, "p:r:mHSh")) != -1) {
         switch (opt) {
         case 'p':
             port = atoi(optarg);
@@ -135,8 +136,11 @@ int main(int argc, char **argv)
         case 'H':
             proto = "http"; /* stream the http fixtures (agent: -p PORT=http) */
             break;
+        case 'S':
+            proto = "s3"; /* stream the s3 fixtures (agent: -p PORT=s3) */
+            break;
         default:
-            fprintf(stderr, "usage: %s [-p port] [-r repeat] [-m|-H]\n", argv[0]);
+            fprintf(stderr, "usage: %s [-p port] [-r repeat] [-m|-H|-S]\n", argv[0]);
             return opt == 'h' ? 0 : 1;
         }
     }

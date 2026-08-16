@@ -1,0 +1,167 @@
+# Plaintext S3 e2e stand (PLAN-MINIO.md МS4): MinIO, two load generators and one
+# agent watching :9402. Drive it with ./verify-s3.sh.
+#
+#   ./verify-s3.sh          # build the agent, up, assert, down
+#   KEEP=1 ./verify-s3.sh   # leave it running
+#   WARP=1 ./verify-s3.sh   # also run the warp profile (mixed, 4 concurrent)
+#
+# Two load generators, because they answer different questions:
+#
+#   - **`mc`** (MinIO's own client) drives a fixed sequence with deliberate
+#     failures in it — a missing object, a missing bucket, a bad secret — so the
+#     assertions can name the exact S3 code each one must produce (РS5). It is
+#     also the client whose uploads are `aws-chunked` and whose listings are
+#     gzipped (МS0 recon item 4), which is to say the S3-specific framing rather
+#     than a curl approximation of it.
+#   - **`warp`** (behind a compose profile) is volume: MinIO's own benchmark
+#     tool, mixed GET/PUT/STAT/DELETE, which is what the perf and drop-rate
+#     claims are made against.
+#
+# The pieces that matter, and why:
+#
+#   - **Port 9402, not 9000.** The agent's port filter is kernel-wide: a stand on
+#     9000 would capture any other MinIO on the host, which is somebody else's
+#     data in our metrics and our assertions. 9401/9444 belong to the МS3 stand,
+#     so this one takes the next number.
+#   - **No published server ports.** Traffic stays on the compose bridge for the
+#     usual reason — a localhost hop goes through docker-proxy, which splices
+#     past the capture point.
+#   - **Two clients, because a correct client cannot produce a wrong request.**
+#     `mc` refuses to configure an alias whose credentials the server rejects,
+#     so the refused-caller cases of РS4 — an anonymous request and a signature
+#     from an access key that does not exist — are driven by busybox `wget` with
+#     a hand-written `Authorization` header. That is also the honest shape of the
+#     thing being tested: "who is hammering us with bad credentials" is asked
+#     about traffic no SDK would ever generate.
+
+name: latkit-s3
+
+networks:
+  default:
+    name: latkit-s3-net
+
+services:
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: lkroot
+      MINIO_ROOT_PASSWORD: lkrootpass123
+      MINIO_UPDATE: "off"
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    command: ["server", "/data", "--address", ":9402"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9402/minio/health/live || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+
+  # The fixed sequence: every shape the МS4 acceptance list names, in an order
+  # that repeats, so a counter can be watched growing.
+  load:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MC_CONFIG_DIR: /tmp/mc
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        set -e
+        mc() { /usr/bin/mc --quiet --no-color "$$@"; }
+        mc alias set lk http://minio:9402 lkroot lkrootpass123 >/dev/null
+        mc mb --ignore-existing lk/lkbucket >/dev/null 2>&1 || true
+        head -c 1048576 /dev/urandom > /tmp/big.bin
+        i=0
+        while true; do
+          i=$$((i + 1))
+          mc cp /etc/os-release lk/lkbucket/obj-$$i  >/dev/null 2>&1 || true
+          mc cp /tmp/big.bin    lk/lkbucket/big-$$i  >/dev/null 2>&1 || true
+          mc cat                lk/lkbucket/obj-$$i  >/dev/null 2>&1 || true
+          mc cat                lk/lkbucket/big-$$i  >/dev/null 2>&1 || true
+          mc stat               lk/lkbucket/obj-$$i  >/dev/null 2>&1 || true
+          mc ls                 lk/lkbucket          >/dev/null 2>&1 || true
+          # The two deliberate failures a signed client can make. Both are 404
+          # and they are not the same page at 3 a.m., which is the whole
+          # argument of РS5.
+          mc cat lk/lkbucket/no-such-object          >/dev/null 2>&1 || true
+          mc ls  lk/no-such-bucket-lk                >/dev/null 2>&1 || true
+          mc rm  lk/lkbucket/obj-$$i                 >/dev/null 2>&1 || true
+          mc rm  lk/lkbucket/big-$$i                 >/dev/null 2>&1 || true
+          sleep 0.3
+        done
+    restart: "no"
+
+  # The requests no SDK will make: no credentials at all, and a signature from
+  # an access key that does not exist. busybox wget, because `mc` refuses to
+  # configure an alias the server rejects — and because a hand-written header is
+  # exactly what the traffic this is about looks like (РS4).
+  probe:
+    image: alpine:3.20
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        SIG=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+        AUTH="AWS4-HMAC-SHA256 Credential=lkbad/20260816/us-east-1/s3/aws4_request,\
+        SignedHeaders=host;x-amz-date,Signature=$$SIG"
+        while true; do
+          # Anonymous: no credential carrier at all -> user="-", AccessDenied.
+          wget -q -O- http://minio:9402/lkbucket/probe.txt >/dev/null 2>&1 || true
+          # Signed by a key that does not exist: still a named caller, which is
+          # the point — the extractor runs on the request, not on the outcome.
+          wget -q -O- --header="Authorization: $$AUTH" \
+               --header="X-Amz-Date: 20260816T101112Z" \
+               http://minio:9402/lkbucket/probe.txt >/dev/null 2>&1 || true
+          sleep 1
+        done
+    restart: "no"
+
+  # Volume, on demand: MinIO's own benchmark. `--noclear` leaves the objects
+  # behind so a second run does not spend its time re-uploading them.
+  warp:
+    image: minio/warp:latest
+    profiles: ["warp"]
+    depends_on:
+      minio:
+        condition: service_healthy
+    command:
+      - "mixed"
+      - "--host=minio:9402"
+      - "--access-key=lkroot"
+      - "--secret-key=lkrootpass123"
+      - "--bucket=lkwarp"
+      - "--duration=30s"
+      - "--obj.size=1MiB"
+      - "--objects=200"
+      - "--concurrent=4"
+      - "--noclear"
+      - "--no-color"
+
+  latkit:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.latkit
+    depends_on:
+      minio:
+        condition: service_healthy
+    privileged: true
+    pid: host
+    volumes:
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+    command: ["-p", "9402=s3", "--prom-listen", "0.0.0.0:9752"]
+    ports: ["9757:9752"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      - latkit
+    volumes:
+      - ./prometheus-s3-plain.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=6h"
+    ports: ["19094:9090"]

@@ -1,0 +1,35 @@
+ýPOST /b/k?uploads= HTTP/1.1
+Host: h
+
+PUT /b/k?partNumber=1&uploadId=X HTTP/1.1
+Host: h
+Content-Length: 0
+
+GET /b/k?uploadId=X HTTP/1.1
+Host: h
+
+POST /b/k?uploadId=X HTTP/1.1
+Host: h
+Content-Length: 0
+
+DELETE /b/k?uploadId=X HTTP/1.1
+Host: h
+
+POST /b?delete= HTTP/1.1
+Host: h
+Content-Length: 0
+
+GET /b?list-type=2&prefix=&delimiter=&max-keys=0&continuation-token=x HTTP/1.1
+Host: h
+
+GET /b?acl&tagging&policy&versioning&lifecycle&=&&x HTTP/1.1
+Host: h
+
+PUT /b/k HTTP/1.1
+Host: h
+X-Amz-Copy-Source: /other/key
+Content-Length: 0
+
+PROPFIND /b/k?uploads HTTP/1.1
+Host: h
+

@@ -181,6 +181,12 @@ jobs:
           # own alphabets, and pg.dict covers pg, norm and the pipe scenarios.
           dict=tests/fuzz/dict/${{ matrix.target }}.dict
           [ -f "$dict" ] || dict=tests/fuzz/dict/pg.dict
+          # fuzz_http drives two dialects behind the 0xFD selector (МS4) and
+          # libFuzzer takes one -dict, so the http target gets both alphabets.
+          if [ "${{ matrix.target }}" = http ]; then
+            cat tests/fuzz/dict/http.dict tests/fuzz/dict/s3.dict > work.dict
+            dict=work.dict
+          fi
           ./build-fuzz/tests/fuzz/fuzz_${{ matrix.target }} work \
               -max_total_time="$budget" -max_len=4096 -timeout=10 \
               -dict="$dict" -print_final_stats=1 \

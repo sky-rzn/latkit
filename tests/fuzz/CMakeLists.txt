@@ -85,9 +85,16 @@ add_test(NAME fuzz_my_corpus
                  ${CMAKE_SOURCE_DIR}/tests/traces/mysql/maria1011)
 # fuzz_http replays its own corpus plus the recorded HTTP traces (М0): raw .lkt
 # bytes are also valid framer input, and they carry the real header shapes.
+# Since МS4 the same target also drives the S3 dialect behind a 0xFD selector
+# byte (the `s3_*` seeds carry it), so the МS0 MinIO corpus joins the list —
+# 51 traces of real S3 sessions, including the distributed pool's own traffic
+# and the decrypted TLS channel.
 add_test(NAME fuzz_http_corpus
          COMMAND fuzz_http -runs=0 ${FUZZ_CORPUS}/http
                  ${CMAKE_SOURCE_DIR}/tests/traces/http/nginx
-                 ${CMAKE_SOURCE_DIR}/tests/traces/http/go)
+                 ${CMAKE_SOURCE_DIR}/tests/traces/http/go
+                 ${CMAKE_SOURCE_DIR}/tests/traces/s3/minio
+                 ${CMAKE_SOURCE_DIR}/tests/traces/s3/dist
+                 ${CMAKE_SOURCE_DIR}/tests/traces/s3/tls)
 add_test(NAME fuzz_norm_corpus COMMAND fuzz_norm -runs=0 ${FUZZ_CORPUS}/norm)
 add_test(NAME fuzz_pipe_corpus COMMAND fuzz_pipe -runs=0 ${FUZZ_CORPUS}/pipe)

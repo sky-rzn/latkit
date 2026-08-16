@@ -1,0 +1,11 @@
+# Prometheus config for the plaintext S3 stand (PLAN-MINIO.md МS4). One agent,
+# one job — the assertions here are about what an S3 port produces, not about
+# comparing two legs (that is the МS3 stand's job).
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: latkit
+    static_configs:
+      - targets: ["latkit:9752"]

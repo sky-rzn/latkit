@@ -388,6 +388,11 @@ static int test_key_parser_refusals(void)
         "AWS4-HMAC-SHA256",
         "AWS ",
         "AWS nocolon",
+        /* A SigV2 key with a path in it. The scope separator of SigV4 is the
+         * one byte an access key cannot contain, and this branch is the only
+         * one that could have copied it into a label (МS4's fuzzer found it). */
+        "AWS lkbucket/small.bin:frJIUN8DYpKDtOLCwo//yllqDzg=",
+        "AWS /:sig",
         "",
     };
 
