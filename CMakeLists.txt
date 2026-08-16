@@ -169,12 +169,14 @@ set(PROTO_SRC src/proto/registry.c src/proto/pg/pg.c src/proto/pg/pg_frame.c
               src/proto/http/http_frame.c src/proto/http/http.c
               src/proto/http/http_req.c src/proto/http/http_resp.c
               src/proto/http/http_route.c
-              src/proto/s3/s3_dialect.c)
+              src/proto/s3/s3_dialect.c
+              src/proto/redis/redis_frame.c src/proto/redis/redis.c)
 set(PROTO_INC ${CMAKE_CURRENT_SOURCE_DIR}/src/proto
               ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/pg
               ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/my
               ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/http
               ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/s3
+              ${CMAKE_CURRENT_SOURCE_DIR}/src/proto/redis
               ${CMAKE_CURRENT_SOURCE_DIR}/src/agent
               ${CMAKE_CURRENT_SOURCE_DIR}/src/bpf
               # proto.h carries enum lk_sql_dialect (lk_proto_ops.sql_dialect,

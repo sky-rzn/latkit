@@ -491,6 +491,14 @@ struct lk_proto *lk_proto_http_new(const struct lk_query_sink *out);
  * hangs off `.dialect`, in src/proto/s3/s3_dialect.c. */
 extern const struct lk_proto_ops lk_proto_s3_ops;
 
+/* Redis (RESP2/RESP3): stream framing (РR2) in src/proto/redis/redis_frame.c,
+ * the handler in src/proto/redis/redis.c — `--port 6379=redis`. A new protocol
+ * rather than a dialect (РR1): RESP has no heads, no statuses and no routes, so
+ * the `.dialect` seam above does not apply to it and stays NULL. Valkey, KeyDB,
+ * Dragonfly and Sentinel are the same wire and the same entry. */
+extern const struct lk_proto_ops lk_proto_redis_ops;
+struct lk_proto *lk_proto_redis_new(const struct lk_query_sink *out);
+
 /* Handler-wide HTTP settings (РH10/РH7). Process-wide rather than per-handler
  * because there is exactly one http handler instance per agent and the values
  * are fixed at startup from the CLI; the *dialect* is per port and travels on

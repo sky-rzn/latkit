@@ -52,6 +52,18 @@ struct lk_port_cfg {
  * flagged truncated. */
 #define LK_HTTP_CAPTURE_LIMIT 2048
 
+/* Default per-call budget of a Redis port (РR13), and the smallest of the three
+ * for the protocol with by far the highest event rate. A RESP exchange is tiny
+ * except when it carries a value, and the value is never read: measured over an
+ * application-shaped load, 31 of 32 commands and 29 of 32 replies fit whole
+ * under 512 bytes, while the outliers are a 64 KB `SET`, a `KEYS *` over a
+ * million keys and a 213 KB `COMMAND DOCS`. Everything the agent needs — the
+ * type byte, the error symbol, the declared length, the command and its
+ * subcommand — is in the first few dozen bytes, and the budget is chosen so
+ * that what falls outside it is a bulk *payload*, which the framer skips
+ * arithmetically, rather than a header, which it cannot. */
+#define LK_REDIS_CAPTURE_LIMIT 512
+
 /* Data-event payload size classes (design decision Р4): the reserve size is
  * picked per chunk from the actual capture size, so small control messages do
  * not burn 4 KiB of ringbuf each. */

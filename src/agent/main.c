@@ -46,12 +46,14 @@ static bool opt_events;
 static bool opt_messages;
 static bool opt_queries;
 static __u16 opt_ports[LK_MAX_PORTS];
-/* Protocol per port (РМ2): parallel to opt_ports, from `--port N[=pg|mysql|http]`;
- * a bare number is the default protocol (pg, the registry head). */
+/* Protocol per port (РМ2): parallel to opt_ports, from
+ * `--port N[=pg|mysql|http|s3|redis]`; a bare number is the default protocol
+ * (pg, the registry head). */
 static const struct lk_proto_ops *opt_port_ops[LK_MAX_PORTS];
 /* Per-port capture budget (РH14): the `:BYTES` suffix of `--port 8080=http:2048`,
  * 0 = "no explicit value", which resolves to the protocol's own default (http:
- * 2048, LK_HTTP_CAPTURE_LIMIT) capped by --capture-limit, or to --capture-limit
+ * 2048, LK_HTTP_CAPTURE_LIMIT; redis: 512, LK_REDIS_CAPTURE_LIMIT — РR13)
+ * capped by --capture-limit, or to --capture-limit
  * itself for a protocol that asks for nothing special. port_cap_limit() below is
  * the single place that precedence lives; the kernel only applies the result. */
 static __u32 opt_port_caps[LK_MAX_PORTS];
@@ -144,10 +146,12 @@ static void usage(FILE *out, const char *argv0)
             "usage: %s [options]\n"
             "  -p, --port PORT[=PROTO[:BYTES]]\n"
             "                        local (server) port to capture, optionally with\n"
-            "                        its wire protocol (pg | mysql | http; default:\n"
-            "                        pg) and a per-port capture budget in bytes\n"
-            "                        (default: 8192 for a database port, 2048 for\n"
-            "                        http, where only heads are read);\n"
+            "                        its wire protocol (pg | mysql | http | s3 |\n"
+            "                        redis; default: pg) and a per-port capture\n"
+            "                        budget in bytes (default: 8192 for a database\n"
+            "                        port, 2048 for http/s3, where only heads are\n"
+            "                        read, 512 for redis, where a command is a verb\n"
+            "                        and a key);\n"
             "                        repeatable, up to %d ports (default: %d)\n"
             "      --ringbuf-bytes N ringbuf size, power-of-two bytes (default: %d)\n"
             "      --capture-limit N capture budget per send/recv call, bytes\n"
@@ -1081,7 +1085,9 @@ static void configure_http(void)
  *
  *   `--port 8080=http:4096`  an explicit per-port value wins outright — it was
  *                            typed for this port, by someone who meant it;
- *   protocol default         http asks for 2048 (heads are all it reads), the
+ *   protocol default         http asks for 2048 (heads are all it reads), redis
+ *                            for 512 (a command is a verb and a key, and the
+ *                            rate is an order of magnitude higher — РR13), the
  *                            database protocols ask for nothing. Capped by
  *                            --capture-limit: a global budget is a ceiling, so
  *                            lowering it must lower every port with it;

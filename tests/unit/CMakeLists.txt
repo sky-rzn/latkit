@@ -117,6 +117,28 @@ foreach(t http_req http_resp http_unit)
     add_test(NAME ${t} COMMAND test_${t})
 endforeach()
 
+# RESP wire helpers (PLAN-REDIS.md МR1, РR2): header-only, so the test just
+# includes redis_wire.h — the type table, the strict length parse the server's
+# own protocol errors define, the null forms and the two resync anchors.
+add_executable(test_redis_wire test_redis_wire.c)
+target_include_directories(test_redis_wire PRIVATE ${CMAKE_SOURCE_DIR}/src/proto/redis)
+add_test(NAME redis_wire COMMAND test_redis_wire)
+
+# RESP framer (МR1): the reassembly matrix over lk_proto_redis_ops — nesting and
+# the element stack, inline commands, a bulk skipped through a capture hole and
+# an aggregate that cannot be, corrupt lengths, and the call-boundary anchors.
+# test_redis_stream is the acceptance invariant: the same bytes cut anywhere
+# produce the same messages, which is the only honest way to state that the
+# no-copy path and the slab path agree.
+foreach(t redis_frame redis_stream)
+    add_executable(test_${t} test_${t}.c)
+    target_include_directories(test_${t} PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent
+        ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/redis)
+    target_link_libraries(test_${t} latkit_proto)
+    add_test(NAME ${t} COMMAND test_${t})
+endforeach()
+
 # Startup/auth/session (task 3.2): white-box over the PG handler (links the
 # libbpf-free proto lib; includes the internal pg.h for state assertions).
 add_executable(test_pg_session test_pg_session.c)

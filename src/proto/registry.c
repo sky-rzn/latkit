@@ -7,11 +7,14 @@
 #include <string.h>
 
 const struct lk_proto_ops *const lk_proto_registry[] = {
-    &lk_proto_pg_ops,   /* index 0 is the default (РМ2: a bare --port N is pg) */
-    &lk_proto_my_ops,   /* MySQL classic (М2): `--port 3306=mysql` */
-    &lk_proto_http_ops, /* HTTP/1.x, stream framing (РH1): `--port 8080=http` */
-    &lk_proto_s3_ops,   /* S3, the same framer and handler behind another dialect
-                           (РS1): `--port 9000=s3` */
+    &lk_proto_pg_ops,    /* index 0 is the default (РМ2: a bare --port N is pg) */
+    &lk_proto_my_ops,    /* MySQL classic (М2): `--port 3306=mysql` */
+    &lk_proto_http_ops,  /* HTTP/1.x, stream framing (РH1): `--port 8080=http` */
+    &lk_proto_s3_ops,    /* S3, the same framer and handler behind another dialect
+                            (РS1): `--port 9000=s3` */
+    &lk_proto_redis_ops, /* Redis/RESP, the second stream framer (РR1):
+                            `--port 6379=redis` — and Valkey, KeyDB, Dragonfly
+                            and Sentinel, which are the same wire */
 };
 const unsigned lk_proto_nregistry = sizeof(lk_proto_registry) / sizeof(lk_proto_registry[0]);
 

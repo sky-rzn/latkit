@@ -69,6 +69,16 @@ exactly three, or a `HELLO 4`.
 | `containers` | 34 container-command calls (`CONFIG\|GET`, `CLIENT\|INFO`, `XINFO\|STREAM`, …), an unknown subcommand, a bare container |
 | `nested` | aggregates inside aggregates: XRANGE, XINFO STREAM FULL, GEOPOS, COMMAND INFO |
 | `torn-bulk` | a client that promises 1 MB, sends 100 bytes and hangs up; and the same on a reply |
+
+`torn-bulk`'s **first** connection turns out to record something else, and МR1
+found it by framing it: the scenario declares `$8` for the seven-byte key
+`lk:torn`, so the server reads the CRLF as payload, answers `-ERR Protocol
+error: expected '$', got '1'` and closes before the torn bulk is ever reached.
+That makes it a length-mismatch trace rather than a truncation one — a useful
+case either way (the framer's `BULK_EOL` note fires at the same byte the server
+complains about), and the second connection does record the intended shape. Left
+as recorded: a trace is what the wire did, and re-recording it would lose the
+agreement between our verdict and the server's.
 | `slow-client` | one byte per syscall, for a whole command |
 | `garbage` | eleven ways to not speak RESP, and what the server does about each |
 | `monitor` | MONITOR + traffic from another connection (with Redis redacting `AUTH` itself) |
@@ -142,6 +152,22 @@ on any malformed record):
 cmake --build build --target lkt_info
 build/tests/replay/lkt_info tests/traces/redis/*/*.lkt
 ```
+
+Frame them (МR1 acceptance — one line per top-level RESP value, plus a per-file
+framer summary; `--hexdump` adds the published body prefix):
+
+```
+cmake --build build --target lkt_messages
+build/tests/replay/lkt_messages --proto redis tests/traces/redis/redis/basic.lkt
+build/tests/replay/lkt_messages --quiet --proto redis tests/traces/redis/*/*.lkt
+```
+
+On the clean traces every counter in the summary is zero. The ones that are not
+are the ones recorded to be: `garbage` has three corrupt lengths, `replica` and
+`server/replication` a `$EOF:` bulk that is not a value (they go
+`LK_CONN_IGNORE` in МR2), `keys-1m` and `memtier-pipe100` resync where a capture
+hole fell inside an aggregate, and `midstream`, `cluster/bus` and the `libs/`
+traces start on a connection nobody saw open.
 
 ## The clients
 
