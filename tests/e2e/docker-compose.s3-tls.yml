@@ -1,0 +1,191 @@
+# S3-over-TLS e2e stand (PLAN-MINIO.md МS3, РS8): **two** MinIO servers, one
+# plaintext and one with certificates, the same load driven against both, and one
+# agent per leg. Drive it with ./verify-s3-tls.sh.
+#
+#   ./verify-s3-tls.sh          # extract the binary, build the agent, up, assert, down
+#   KEEP=1 ./verify-s3-tls.sh   # leave it running
+#
+# Why two legs. МS3 has almost no code of its own — it is the claim that the Go
+# channel of РH13.3, pointed at MinIO, yields *the same observations* an
+# unencrypted run yields. A stand with only the encrypted leg could assert that
+# numbers exist; it could not assert that they are the right numbers. So the
+# plaintext leg is the control: same image, same version, same client, same
+# sequence of operations, and its `latkit_s3_*` families are what the encrypted
+# leg's are compared against once the load stops.
+#
+# The pieces that matter, and why:
+#
+#   - **MinIO terminates TLS in Go** (РS8). There is no libssl in the process, so
+#     the encrypted leg's agent runs `--tls auto --tls-go /srv/minio`: `auto`
+#     alone would find nothing, and it is here to exercise the other half of МS3
+#     — the derived comm set, which is `minio` for an s3 port and gates the
+#     uprobe channel (cfg_tls_comm_filter). If that derivation were wrong, every
+#     decrypted event would be dropped by the kernel filter and this leg would
+#     report zero while the plaintext leg reported normally.
+#   - **The binary is bind-mounted from the host** (`build/minio`, extracted from
+#     the image by the verify script). A uprobe is registered against an *inode*:
+#     mounting the same host file into the servers and the agent is what makes
+#     "the binary latkit hooked" and "the binary MinIO runs" provably the same
+#     file. The official image ships it stripped (`-ldflags "-s -w"`, МS0 recon
+#     item 2), so what resolves crypto/tls here is Go's own function table.
+#   - **Ports 9401/9444, not 9000.** The agent's port filter is kernel-wide: a
+#     stand on 9000 would capture any other MinIO on the host, which is somebody
+#     else's data in our metrics and our assertions.
+#   - **No published server ports.** Traffic stays on the compose bridge for the
+#     usual reason (a localhost hop goes through docker-proxy, which splices past
+#     the capture point).
+
+name: latkit-s3-tls
+
+networks:
+  default:
+    name: latkit-s3-tls-net
+
+services:
+  # Self-signed cert under the names MinIO insists on (public.crt/private.key).
+  # The directory is writable because MinIO creates `CAs/` inside it at startup.
+  cert-init:
+    image: alpine:3.20
+    volumes:
+      - s3certs:/certs
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        apk add --no-cache openssl >/dev/null
+        openssl req -new -x509 -days 365 -nodes \
+          -out /certs/public.crt -keyout /certs/private.key \
+          -subj "/CN=minio-tls" \
+          -addext "subjectAltName=DNS:minio-tls,DNS:localhost,IP:127.0.0.1"
+        chmod 644 /certs/public.crt /certs/private.key
+        echo "cert generated"
+    restart: "no"
+
+  # The control leg: the same server, the same version, no certificates.
+  minio-plain:
+    image: minio/minio:latest
+    volumes:
+      - ../../build/minio:/usr/bin/minio:ro
+    environment:
+      MINIO_ROOT_USER: lkroot
+      MINIO_ROOT_PASSWORD: lkrootpass123
+      MINIO_UPDATE: "off"
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    command: ["server", "/data", "--address", ":9401"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9401/minio/health/live || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+
+  minio-tls:
+    image: minio/minio:latest
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+    volumes:
+      - ../../build/minio:/usr/bin/minio:ro
+      - s3certs:/certs
+    environment:
+      MINIO_ROOT_USER: lkroot
+      MINIO_ROOT_PASSWORD: lkrootpass123
+      MINIO_UPDATE: "off"
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    command: ["server", "/data", "--address", ":9444", "--certs-dir", "/certs"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsSk https://127.0.0.1:9444/minio/health/live || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+
+  # One client, both endpoints, the same six operations against each in the same
+  # order — which is what makes the two legs comparable request for request. `mc`
+  # is MinIO's own client, so the uploads are `aws-chunked` (РS6) and the
+  # listings are gzipped (МS0 recon item 4): the S3-specific paths, not a curl
+  # approximation of them.
+  load:
+    image: minio/mc:latest
+    depends_on:
+      minio-plain:
+        condition: service_healthy
+      minio-tls:
+        condition: service_healthy
+    environment:
+      MC_CONFIG_DIR: /tmp/mc
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        mc() { /usr/bin/mc --insecure --quiet --no-color "$$@"; }
+        mc alias set plain http://minio-plain:9401 lkroot lkrootpass123 >/dev/null
+        mc alias set tls   https://minio-tls:9444  lkroot lkrootpass123 >/dev/null
+        for a in plain tls; do mc mb --ignore-existing $$a/lkbucket >/dev/null; done
+        i=0
+        while true; do
+          i=$$((i + 1))
+          for a in plain tls; do
+            mc cp /etc/os-release $$a/lkbucket/obj-$$i        >/dev/null 2>&1 || true
+            mc cat $$a/lkbucket/obj-$$i                       >/dev/null 2>&1 || true
+            mc stat $$a/lkbucket/obj-$$i                      >/dev/null 2>&1 || true
+            mc ls $$a/lkbucket                                >/dev/null 2>&1 || true
+            mc cat $$a/lkbucket/no-such-object                >/dev/null 2>&1 || true
+            mc rm $$a/lkbucket/obj-$$i                        >/dev/null 2>&1 || true
+          done
+          sleep 0.4
+        done
+    restart: "no"
+
+  latkit-plain:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.latkit
+    depends_on:
+      minio-plain:
+        condition: service_healthy
+    privileged: true
+    pid: host
+    volumes:
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+    command: ["-p", "9401=s3", "--prom-listen", "0.0.0.0:9752"]
+    ports: ["9755:9752"]
+
+  # `--tls auto` *and* `--tls-go`: auto has no libssl to find in a Go server and
+  # is here for its side effect — the derived scan set (`minio` for an s3 port)
+  # becomes the uprobe comm gate. `--tls-go /srv/minio` is the channel itself.
+  latkit-tls:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.latkit
+    depends_on:
+      minio-tls:
+        condition: service_healthy
+    privileged: true
+    pid: host
+    volumes:
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+      - ../../build/minio:/srv/minio:ro
+    command:
+      - "-p"
+      - "9444=s3"
+      - "--tls"
+      - "auto"
+      - "--tls-go"
+      - "/srv/minio"
+      - "--prom-listen"
+      - "0.0.0.0:9752"
+    ports: ["9756:9752"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      - latkit-plain
+      - latkit-tls
+    volumes:
+      - ./prometheus-s3.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=26h"
+    ports: ["19093:9090"]
+
+volumes:
+  s3certs:

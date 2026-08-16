@@ -16,8 +16,10 @@
  * default DB-server set {postgres, mysqld, mariadbd} plus `connection` (MySQL
  * 8.x renames its per-session threads), and РH13.1 added the HTTP set
  * {nginx, httpd, apache2, haproxy} for an http port — a mixed deployment holds
- * both. LK_COMM_LEN mirrors TASK_COMM_LEN. */
-#define LK_COMM_FILTER_MAX 8
+ * both. РS8 (PLAN-MINIO.md МS3) adds `minio` for an s3 port, which is what took
+ * the worst case (all three protocol families on one host) past eight.
+ * LK_COMM_LEN mirrors TASK_COMM_LEN. */
+#define LK_COMM_FILTER_MAX 12
 #define LK_COMM_LEN        16
 
 /* Capacity of the `cgroups` filter map (task 7.1, Р48): a handful of postgres

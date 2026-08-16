@@ -93,6 +93,19 @@ check "dims raised by s3"     "$(get max_session_dims -- -p 9000=s3)"           
 check "dims raised in a mix"  "$(get max_session_dims -- -p 5432 -p 9000=s3)"       "128"
 check "dims unchanged by http" "$(get max_session_dims -- -p 8080=http)"            "32"
 
+# --- the TLS scan/gate comm set follows the ports too (РH13.1, РS8 МS3) ---
+# The one TLS input nobody types: what the libssl scan looks for and what the
+# uprobe gate admits. An s3 port asks for the object store and *not* for the
+# OpenSSL web servers — MinIO is neither, and its channel is --tls-go — while a
+# --tls-comm replaces the whole derivation with the one name given.
+check "scan set default"      "$(get tls_scan_comm)"                    "postgres,mysqld,mariadbd"
+check "scan set for http"     "$(get tls_scan_comm -- -p 8080=http)"    "nginx,httpd,apache2,haproxy"
+check "scan set for s3"       "$(get tls_scan_comm -- -p 9000=s3)"      "minio"
+check "scan set for a mix"    "$(get tls_scan_comm -- -p 5432 -p 9000=s3)" \
+      "postgres,mysqld,mariadbd,minio"
+check "scan set, all three"   "$(get tls_scan_comm -- -p 5432 -p 8080=http -p 9000=s3)" \
+      "postgres,mysqld,mariadbd,nginx,httpd,apache2,haproxy,minio"
+
 # --- the Go TLS channel (РH13.3, М7) ---
 check "tls_go default"        "$(get tls_go)"                                       ""
 check "tls_go flag"           "$(get tls_go -- --tls-go /usr/bin/caddy)"            "/usr/bin/caddy"

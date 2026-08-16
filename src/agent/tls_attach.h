@@ -20,6 +20,8 @@
 #ifndef LATKIT_TLS_ATTACH_H
 #define LATKIT_TLS_ATTACH_H
 
+#include <stdbool.h>
+
 struct latkit_bpf; /* the generated skeleton (latkit.skel.h) */
 struct lk_loop;    /* the event loop (loop.h), for the rescan timer */
 struct lk_tls;
@@ -51,6 +53,9 @@ struct lk_tls_cfg {
                                   * servers, the OpenSSL web servers, or both. NULL
                                   * => lk_tls_default_comms, the DB-only default */
     unsigned rescan_sec;         /* AUTO rescan period for new libssl paths (0 => no rescan) */
+    bool go_channel;             /* a --tls-go binary is attached too (tls_go.h): "no libssl
+                                  * here" is then the expected shape of a Go server, not a
+                                  * blind zone, and the startup log says so (РS8) */
 };
 
 /* The AUTO-scan process-comm sets, NULL-terminated, one per family of server
@@ -59,11 +64,17 @@ struct lk_tls_cfg {
  * lists (plus `connection`, the MySQL 8.x session-thread name).
  *
  * The HTTP set covers the servers that reach OpenSSL through a shared libssl.
- * The Go-based ones (Caddy, Traefik, MinIO) are not here and never will be:
- * they have no libssl to find, and their plaintext comes from the separate Go
- * channel (tls_go.h), attached to the binary by name. */
+ * The Go-based ones (Caddy, Traefik) are not there and never will be: they have
+ * no libssl to find, and their plaintext comes from the separate Go channel
+ * (tls_go.h), attached to the binary by name.
+ *
+ * The S3 set is the one exception to that rule, and only for the second consumer
+ * (РS8): `minio` is in it not so the libssl scan can look for a library MinIO
+ * does not map, but so the *uprobe gate* — derived from the same list — admits
+ * the threads the Go channel's events come from. */
 extern const char *const lk_tls_default_comms[]; /* postgres, mysqld, mariadbd */
 extern const char *const lk_tls_http_comms[];    /* nginx, httpd, apache2, haproxy */
+extern const char *const lk_tls_s3_comms[];      /* minio */
 
 /* Create the handle and decide autoload of the SSL_* programs. MUST be called
  * after latkit_bpf__open() and BEFORE latkit_bpf__load(): when no uprobes will

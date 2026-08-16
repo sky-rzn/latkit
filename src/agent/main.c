@@ -218,10 +218,12 @@ static void usage(FILE *out, const char *argv0)
             "      --tls-comm NAME   with --tls auto, scan only processes with\n"
             "                        this comm (default: postgres, mysqld,\n"
             "                        mariadbd; plus nginx, httpd, apache2,\n"
-            "                        haproxy when an http port is captured)\n"
+            "                        haproxy for an http port, minio for an\n"
+            "                        s3 one; --print-config prints the set)\n"
             "      --tls-go PATH     capture TLS plaintext of a Go server by\n"
-            "                        probing crypto/tls in this binary (x86-64,\n"
-            "                        not stripped); repeatable, up to %d\n"
+            "                        probing crypto/tls in this binary (x86-64;\n"
+            "                        stripped is fine, and is the only TLS\n"
+            "                        channel an s3 port has); repeatable, up to %d\n"
             "      --http-routes FILE\n"
             "                        route map, one `METHOD /users/{id}/orders`\n"
             "                        per line; a matching pattern wins over the\n"
@@ -1099,6 +1101,53 @@ static __u32 port_cap_limit(int i)
     return 0;
 }
 
+/* The comm set the kernel filter and the libssl scan work from, derived from
+ * what is actually being captured (РH13.1). Before М7 there was one list — the
+ * DB servers — because there was one kind of server; an HTTP port brings in the
+ * OpenSSL-linked web servers instead, and an s3 port (РS8, МS3) the object
+ * store. Deriving the set from the configured protocols keeps a PG-only
+ * deployment byte-for-byte as it was (РH15) and keeps a single-protocol host's
+ * filter short: `-p 9000=s3` scans for `minio` and not for four web servers that
+ * are not installed.
+ *
+ * The s3 branch is not a subset of the HTTP one even though an S3 port *is*
+ * HTTP: what these lists select is a *server implementation*, and the two do not
+ * overlap at all — nginx never serves the S3 API, and MinIO has no libssl for
+ * the entry to point at (its half of the channel is `--tls-go`, whose basename
+ * main() adds to the gate separately).
+ *
+ * Fills *out (NULL-terminated, at most `max` entries) and returns the count. */
+static int derive_scan_comms(const char **out, int max)
+{
+    int n = 0;
+    bool want_db = false, want_http = false, want_s3 = false;
+
+    for (int i = 0; i < opt_nports; i++) {
+        const struct lk_proto_ops *ops = opt_port_ops[i];
+
+        if (ops && ops->profile == LK_PROTO_PROF_S3)
+            want_s3 = true;
+        else if (ops && ops->otel_kind == LK_OTEL_KIND_HTTP)
+            want_http = true;
+        else
+            want_db = true;
+    }
+    if (!want_db && !want_http && !want_s3)
+        want_db = true; /* no ports resolved yet: the historical default */
+
+    if (want_db)
+        for (const char *const *c = lk_tls_default_comms; *c && n < max - 1; c++)
+            out[n++] = *c;
+    if (want_http)
+        for (const char *const *c = lk_tls_http_comms; *c && n < max - 1; c++)
+            out[n++] = *c;
+    if (want_s3)
+        for (const char *const *c = lk_tls_s3_comms; *c && n < max - 1; c++)
+            out[n++] = *c;
+    out[n] = NULL;
+    return n;
+}
+
 /* Print the effective configuration after CLI + env resolution and exit:
  * a no-BPF way to confirm flag > LATKIT_* > OTEL_* > default without a running
  * agent. The `0 = default` sentinels are resolved to their concrete values so
@@ -1180,6 +1229,20 @@ static void print_config(void)
     printf("tls=%s\n", opt_tls_mode == LK_TLS_AUTO ? "auto" : "off");
     printf("libssl=%s\n", opt_libssl ? opt_libssl : "");
     printf("tls_comm=%s\n", opt_tls_comm);
+    /* The *derived* scan set (РH13.1/РS8), which `--tls-comm` above replaces
+     * wholesale when given: what the libssl scan will look for and what the
+     * uprobe gate will admit, resolved from the port protocols. Printed because
+     * it is the one TLS input nobody typed — a MinIO deployment that sees
+     * `nginx, httpd, …` here is a deployment whose port is not `=s3`. */
+    printf("tls_scan_comm=");
+    {
+        const char *scan[LK_COMM_FILTER_MAX + 1];
+        int n = derive_scan_comms(scan, LK_COMM_FILTER_MAX + 1);
+
+        for (int i = 0; i < n; i++)
+            printf("%s%s", i ? "," : "", scan[i]);
+    }
+    printf("\n");
     printf("tls_go=");
     for (int i = 0; i < opt_ntls_go; i++)
         printf("%s%s", i ? "," : "", opt_tls_go[i]);
@@ -1286,41 +1349,6 @@ static void tls_comm_filter_add(struct latkit_bpf *skel, const char *name)
     comm_list_add((char (*)[LK_COMM_LEN])skel->rodata->cfg_tls_comm_filter, "TLS comm", name);
 }
 
-/* The comm set the kernel filter and the libssl scan work from, derived from
- * what is actually being captured (РH13.1). Before М7 there was one list — the
- * DB servers — because there was one kind of server; an HTTP port brings in the
- * OpenSSL-linked web servers instead. Deriving the set from the configured
- * protocols keeps a PG-only deployment byte-for-byte as it was (РH15) and keeps
- * the filter inside LK_COMM_FILTER_MAX: the DB three plus the HTTP four plus
- * `connection` is exactly the eight slots there are.
- *
- * Fills *out (NULL-terminated, at most `max` entries) and returns the count. */
-static int derive_scan_comms(const char **out, int max)
-{
-    int n = 0;
-    bool want_db = false, want_http = false;
-
-    for (int i = 0; i < opt_nports; i++) {
-        const struct lk_proto_ops *ops = opt_port_ops[i];
-
-        if (ops && ops->otel_kind == LK_OTEL_KIND_HTTP)
-            want_http = true;
-        else
-            want_db = true;
-    }
-    if (!want_db && !want_http)
-        want_db = true; /* no ports resolved yet: the historical default */
-
-    if (want_db)
-        for (const char *const *c = lk_tls_default_comms; *c && n < max - 1; c++)
-            out[n++] = *c;
-    if (want_http)
-        for (const char *const *c = lk_tls_http_comms; *c && n < max - 1; c++)
-            out[n++] = *c;
-    out[n] = NULL;
-    return n;
-}
-
 /* The comm a Go binary will show up as: its basename, truncated the way the
  * kernel truncates a task comm. Used only to widen an *agent-derived* kernel
  * filter — an explicit --comm stays the user's exact filter. */
@@ -1383,6 +1411,26 @@ int main(int argc, char **argv)
 
     derive_scan_comms(scan_comms, LK_COMM_FILTER_MAX + 1);
 
+    /* An s3 port with the libssl channel asked for and no Go binary named is a
+     * configuration that cannot work, and the failure it produces on its own is
+     * silent: the scan finds no libssl under `minio` (there is none to find),
+     * the gauge reads state="none", and a TLS-only workload reports nothing at
+     * all. Every S3 implementation in scope terminates TLS in Go (РS8), so say
+     * so here rather than let the operator find it in a flat dashboard. */
+    if (tls_enabled && !opt_ntls_go)
+        for (int i = 0; i < opt_nports; i++)
+            if (opt_port_ops[i] && opt_port_ops[i]->profile == LK_PROTO_PROF_S3) {
+                fprintf(stderr,
+                        "warn: port %u=s3 with TLS capture on but no --tls-go: an S3 server\n"
+                        "      terminates TLS inside Go's crypto/tls and maps no libssl, so the\n"
+                        "      scan will find nothing to attach to. Name the server binary\n"
+                        "      (--tls-go /usr/bin/minio; in a container,\n"
+                        "      --tls-go /proc/<pid>/root/usr/bin/minio), or terminate TLS in\n"
+                        "      front of it and capture the plaintext hop.\n",
+                        opt_ports[i]);
+                break;
+            }
+
     /* .rodata and map sizes are frozen at load time. */
     skel->rodata->cfg_capture_limit = opt_capture_limit;
     /* --comm: the operator's exact kernel filter, with or without TLS, on every
@@ -1391,8 +1439,8 @@ int main(int argc, char **argv)
         comm_filter_add(skel, opt_comm);
     if (tls_enabled) {
         /* The uprobe gate (cfg_tls_comm_filter). Go binaries first (РH13.3):
-         * they were named explicitly, so if the eight slots run out it must be
-         * a default that falls off the end, not the target the operator asked
+         * they were named explicitly, so if the slots run out it must be a
+         * default that falls off the end, not the target the operator asked
          * for. Their basename matters because the Go probes attach by path but
          * fire for anything mapping that binary's text.
          *
@@ -1432,6 +1480,7 @@ int main(int argc, char **argv)
         .comm_filter = tls_scan_comm,
         .comms = scan_comms,
         .rescan_sec = tls_enabled && !opt_libssl ? LK_TLS_RESCAN_SEC : 0,
+        .go_channel = opt_ntls_go > 0,
     };
 
     tls = lk_tls_new(skel, &tlscfg);

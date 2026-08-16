@@ -97,6 +97,21 @@ const char *const lk_tls_default_comms[] = {"postgres", "mysqld", "mariadbd", NU
  * `httpd` on RHEL-family distributions, `apache2` on Debian ones. */
 const char *const lk_tls_http_comms[] = {"nginx", "httpd", "apache2", "haproxy", NULL};
 
+/* And the S3 half (РS8, PLAN-MINIO.md МS3). One name, and it is here for the
+ * *other* consumer of these lists: MinIO maps no libssl, so the scan below will
+ * never find anything under this comm — what needs it is the uprobe gate main.c
+ * derives from the same set (cfg_tls_comm_filter), which has to admit MinIO's
+ * threads for the Go channel's decrypted events to survive the kernel filter on
+ * a host that also runs a libssl server.
+ *
+ * `minio` and nothing else: the МS0 reconnaissance measured 29 of 29 threads
+ * named `minio` on a single node and 27 of 27 on a cluster node — no MySQL-style
+ * per-session rename to special-case. Another S3-compatible server (Ceph RGW's
+ * `radosgw`, SeaweedFS's `weed`, Garage) is named by `--tls-comm`, or, when it
+ * is a Go one, by the basename of its `--tls-go` path, which main.c adds to the
+ * gate on its own. */
+const char *const lk_tls_s3_comms[] = {"minio", NULL};
+
 /* An attached libssl, identified by its file so a rescan never double-attaches
  * the same binary (many backends map it; its /proc/<pid>/root path differs per
  * pid but the device+inode do not). */
@@ -386,7 +401,15 @@ int lk_tls_attach(struct lk_tls *t)
         fprintf(stderr, "latkit: TLS uprobes: no libssl found for comm");
         for (const char *const *c = t->comms; *c; c++)
             fprintf(stderr, "%s '%s'", c == t->comms ? "" : " /", *c);
-        fprintf(stderr, ", TLS connections will be dropped\n");
+        /* With a Go binary attached this is not a warning at all — it is what a
+         * Go server looks like from here, and MinIO (РS8) is the case where it
+         * is *guaranteed*. Saying "TLS connections will be dropped" next to a
+         * live decrypted channel sends an operator hunting for a problem that
+         * the log two lines down says does not exist. */
+        if (t->cfg.go_channel)
+            fprintf(stderr, ", as a Go server has none — its plaintext comes from --tls-go\n");
+        else
+            fprintf(stderr, ", TLS connections will be dropped\n");
     }
     return 0;
 }

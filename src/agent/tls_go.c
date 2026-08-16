@@ -65,14 +65,29 @@ static const struct lk_go_target go_targets[] = {
 };
 #define GO_NTARGETS (sizeof(go_targets) / sizeof(go_targets[0]))
 
+/* Why a binary yielded no probes. Naming the cause is the difference between
+ * "latkit refuses to start" and "latkit refuses to start *because this MinIO
+ * build carries no function table, so terminate TLS in front of it" — which is
+ * the whole of the МS3 diagnostic requirement (РS8). Ordered by how early the
+ * attach gives up. */
+enum lk_go_miss {
+    LK_GO_MISS_NONE = 0, /* hooked */
+    LK_GO_MISS_PATH,     /* the path is not there / not readable / not an ELF */
+    LK_GO_MISS_ARCH,     /* an ELF, but not x86-64 */
+    LK_GO_MISS_TABLES,   /* neither a symbol table nor a .gopclntab */
+    LK_GO_MISS_SYMS,     /* tables present, crypto/tls.(*Conn).Read/Write absent */
+    LK_GO_MISS_DECODE    /* found, but the body would not decode */
+};
+
 /* One configured binary and the identity it was attached with, so the re-check
  * timer can tell "same file" from "replaced in place". */
 struct lk_go_file {
     const char *path;
     dev_t dev;
     ino_t ino;
-    bool attached;  /* probes are live on this inode */
-    bool partial;   /* one of the two directions could not be hooked */
+    bool attached; /* probes are live on this inode */
+    bool partial;  /* one of the two directions could not be hooked */
+    enum lk_go_miss miss;
     int first_link; /* index into links[] of its first probe, for re-attach */
     int nlinks;
 };
@@ -183,9 +198,9 @@ static int resolve_func(struct lk_elf *elf, const char *path, const char *symbol
 /* Resolve one target function and hook it: entry probe at its first byte,
  * return probe at every `ret` the decoder finds. Returns 1 when hooked, 0 when
  * the function is absent or undecodable (a counted hole in coverage, reported
- * by the caller), <0 on a hard failure. */
+ * by the caller, with *miss saying which), <0 on a hard failure. */
 static int hook_function(struct lk_tls_go *t, struct lk_elf *elf, const char *path,
-                         const struct lk_go_target *tg)
+                         const struct lk_go_target *tg, enum lk_go_miss *miss)
 {
     uint32_t rets[TLS_GO_MAX_RETS];
     struct lk_elf_func fn;
@@ -194,11 +209,13 @@ static int hook_function(struct lk_tls_go *t, struct lk_elf *elf, const char *pa
 
     if (resolve_func(elf, path, tg->symbol, &fn)) {
         fprintf(stderr, "warn: Go TLS: %s has no %s (not a Go TLS server?)\n", path, tg->symbol);
+        *miss = LK_GO_MISS_SYMS;
         return 0;
     }
     if (fn.size > TLS_GO_MAX_BODY) {
         fprintf(stderr, "warn: Go TLS: %s %s is %llu bytes, not decoding it\n", path, tg->symbol,
                 (unsigned long long)fn.size);
+        *miss = LK_GO_MISS_DECODE;
         return 0;
     }
     body = malloc((size_t)fn.size);
@@ -219,6 +236,7 @@ static int hook_function(struct lk_tls_go *t, struct lk_elf *elf, const char *pa
     if (nrets <= 0) {
         fprintf(stderr, "warn: Go TLS: %s %s did not decode (%s), leaving it unhooked\n", path,
                 tg->symbol, nrets == 0 ? "no return instruction" : "unsupported instruction");
+        *miss = LK_GO_MISS_DECODE;
         return 0;
     }
 
@@ -236,11 +254,21 @@ static int hook_function(struct lk_tls_go *t, struct lk_elf *elf, const char *pa
 static int attach_file(struct lk_tls_go *t, struct lk_go_file *f)
 {
     struct lk_elf *elf = lk_elf_open(f->path);
+    bool no_tables;
     int hooked = 0;
     struct stat st;
 
+    f->miss = LK_GO_MISS_NONE;
     if (!elf) {
-        fprintf(stderr, "latkit: --tls-go %s: not a readable 64-bit ELF binary\n", f->path);
+        /* Two very different mistakes read the same from here, so separate them:
+         * a path that is not there at all (the usual one — the server runs in a
+         * container and its /usr/bin is not the agent's) and a path that is
+         * there and is not an ELF the loader can use. */
+        if (stat(f->path, &st))
+            fprintf(stderr, "latkit: --tls-go %s: %s\n", f->path, strerror(errno));
+        else
+            fprintf(stderr, "latkit: --tls-go %s: not a readable 64-bit ELF binary\n", f->path);
+        f->miss = LK_GO_MISS_PATH;
         return 0;
     }
     if (lk_elf_machine(elf) != EM_X86_64) {
@@ -249,12 +277,14 @@ static int attach_file(struct lk_tls_go *t, struct lk_go_file *f)
          * return probes at offsets computed from the wrong ISA. */
         fprintf(stderr, "latkit: --tls-go %s: only x86-64 binaries are supported in v1\n", f->path);
         lk_elf_close(elf);
+        f->miss = LK_GO_MISS_ARCH;
         return 0;
     }
     /* No symbol table is the normal case for a distributed Go binary (М0), not
      * an error: the function table below answers the same question. Only a
      * binary with neither is dark, and hook_function says so per function. */
-    if (!lk_elf_has_symtab(elf) && lk_elf_section(elf, ".gopclntab", NULL, NULL, NULL))
+    no_tables = !lk_elf_has_symtab(elf) && lk_elf_section(elf, ".gopclntab", NULL, NULL, NULL);
+    if (no_tables)
         fprintf(stderr,
                 "warn: --tls-go %s: neither a symbol table nor a .gopclntab section — "
                 "nothing to resolve crypto/tls through\n",
@@ -262,20 +292,30 @@ static int attach_file(struct lk_tls_go *t, struct lk_go_file *f)
 
     f->first_link = t->nlinks;
     for (size_t i = 0; i < GO_NTARGETS; i++) {
-        int rc = hook_function(t, elf, f->path, &go_targets[i]);
+        enum lk_go_miss miss = LK_GO_MISS_NONE;
+        int rc = hook_function(t, elf, f->path, &go_targets[i], &miss);
 
         if (rc < 0) {
             lk_elf_close(elf);
             return -1;
         }
-        if (rc)
+        if (rc) {
             hooked++;
-        else
+        } else {
             f->partial = true;
+            if (f->miss == LK_GO_MISS_NONE)
+                f->miss = miss;
+        }
     }
     lk_elf_close(elf);
-    if (!hooked)
+    if (!hooked) {
+        /* With no table at all every function is "absent", so the per-function
+         * verdict (SYMS: not a TLS server) would be the wrong advice — the
+         * binary's own emptiness comes first. */
+        if (no_tables)
+            f->miss = LK_GO_MISS_TABLES;
         return 0;
+    }
 
     f->nlinks = t->nlinks - f->first_link;
     f->attached = true;
@@ -315,6 +355,62 @@ struct lk_tls_go *lk_tls_go_new(struct latkit_bpf *skel, const struct lk_tls_go_
     return t;
 }
 
+/* The cause, in the operator's terms, and what to do about it (РS8, МS3). This
+ * runs on the path that ends the process — a binary named on the command line
+ * and not hooked is a configuration error — so it is the last thing anyone sees,
+ * and "nothing attached" on its own is not enough to act on. Each branch ends
+ * with a way forward, because for TLS there is always one: read it elsewhere,
+ * or know that it is unread. */
+static void explain_miss(const struct lk_go_file *f)
+{
+    fprintf(stderr, "latkit: --tls-go %s: nothing attached, this server's TLS would be unread\n",
+            f->path);
+    switch (f->miss) {
+    case LK_GO_MISS_PATH:
+        fprintf(
+            stderr,
+            "  A server in a container has its own filesystem, and this path is resolved in\n"
+            "  the agent's. Name the binary through the host's view of the process:\n"
+            "    --tls-go /proc/$(docker inspect -f '{{.State.Pid}}' <container>)"
+            "/root/usr/bin/minio\n"
+            "  which needs the host pid namespace (hostPID / --pid host) and CAP_SYS_PTRACE.\n");
+        break;
+    case LK_GO_MISS_ARCH:
+        fprintf(stderr,
+                "  The Go channel decodes x86-64 only in v1. Elsewhere the honest options are to\n"
+                "  terminate TLS in front of the server and capture that plaintext hop, or to run\n"
+                "  without TLS capture and treat this port as a blind zone.\n");
+        break;
+    case LK_GO_MISS_TABLES:
+        fprintf(stderr,
+                "  The binary carries neither an ELF symbol table nor a .gopclntab section, so\n"
+                "  there is nothing to resolve crypto/tls through. `go version %s` tells you\n"
+                "  whether it is a Go binary at all. Note that a stripped build is *not* the\n"
+                "  problem: the official MinIO image ships `-ldflags \"-s -w\"` and is hooked\n"
+                "  through Go's own function table, which -s -w cannot remove. A binary without\n"
+                "  even that has been repacked (UPX and friends) or is not Go — terminate TLS in\n"
+                "  front of it, or accept the blind zone.\n",
+                f->path);
+        break;
+    case LK_GO_MISS_SYMS:
+        fprintf(stderr,
+                "  The binary resolves, but contains no crypto/tls.(*Conn).Read/Write: this\n"
+                "  process does not terminate TLS itself. If something in front of it does (a\n"
+                "  load balancer, a service-mesh sidecar), capture there instead; if it serves\n"
+                "  plaintext, drop --tls-go and capture the port directly.\n");
+        break;
+    case LK_GO_MISS_DECODE:
+        fprintf(stderr,
+                "  crypto/tls was found, but its body did not decode end to end — and a uprobe on\n"
+                "  a byte that is not an instruction boundary would corrupt the server, so latkit\n"
+                "  refuses rather than guesses. This is a gap in the instruction decoder: please\n"
+                "  report the binary (`go version -m` on it) with the warning above.\n");
+        break;
+    case LK_GO_MISS_NONE:
+        break;
+    }
+}
+
 int lk_tls_go_attach(struct lk_tls_go *t)
 {
     if (!t || !t->enabled)
@@ -328,7 +424,7 @@ int lk_tls_go_attach(struct lk_tls_go *t)
         if (rc == 0) {
             /* An explicitly named binary that cannot be hooked is a config
              * error, not a soft miss: the operator pointed at this file. */
-            fprintf(stderr, "latkit: --tls-go %s: nothing attached\n", t->files[i].path);
+            explain_miss(&t->files[i]);
             return -1;
         }
     }

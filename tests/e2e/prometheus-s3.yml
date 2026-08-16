@@ -1,0 +1,15 @@
+# Prometheus config for the S3 TLS stand (PLAN-MINIO.md МS3). Two jobs, one per
+# leg: the assertions are comparisons between them, so the job label is the only
+# thing that has to tell them apart.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: latkit-plain
+    static_configs:
+      - targets: ["latkit-plain:9752"]
+
+  - job_name: latkit-tls
+    static_configs:
+      - targets: ["latkit-tls:9752"]

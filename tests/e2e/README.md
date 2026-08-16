@@ -27,6 +27,12 @@ KEEP=1 ./verify.sh   # same, but leave the stand running to poke at it
 ./verify-http.sh         # plaintext HTTP: nginx + a Go backend, both legs (М8)
 ./verify-http-tls.sh     # HTTPS via nginx + libssl uprobes (PLAN-HTTP.md М7)
 ./verify-http-go-tls.sh  # HTTPS via a Go net/http server + --tls-go (М7, РH13.3)
+
+./verify-s3-tls.sh       # S3 over TLS: two MinIOs (one with certificates, one
+                         #   without), mc against both, one agent each, and the
+                         #   two legs compared (PLAN-MINIO.md МS3, РS8)
+SOAK_SEC=86400 ./verify-s3-tls.sh   # + the МS3 soak: a 24 h warp run under the
+                                    #   uprobes, MinIO has to come through it
 ```
 
 The two HTTPS stands are self-contained (their own compose file, their own
@@ -42,6 +48,30 @@ in — and runs the same assertions against the agent's other resolution path,
 Go's own function table. It builds `tests/e2e/gotls` on the host (a Go toolchain
 is required) and bind-mounts the binary into both the server and the agent, so
 the uprobe and the running process provably share an inode.
+
+`verify-s3-tls.sh` is the same idea applied to a real Go server rather than a
+purpose-built one, and it is built as a **comparison** because that is what its
+milestone claims (МS3: "a TLS run gives the same observations a plaintext run of
+the same load gives"). It extracts `minio` from the official image to
+`build/minio`, bind-mounts that one host file into two MinIO containers — one
+with certificates on :9444, one without on :9401 — and into the encrypted leg's
+agent, so the hooked inode and the running binary are provably the same file. A
+single `mc` client drives an identical sequence against both endpoints; the
+script then takes a snapshot of both legs' `latkit_s3_*` families, lets the load
+run, stops it, snapshots again, and compares the *window* operation by
+operation. Comparing windows rather than totals is deliberate: the two agents
+attach at slightly different instants, so the client's one-time bucket bootstrap
+lands on whichever leg was already listening and says nothing about either
+channel.
+
+Besides the comparison it asserts the things that make the comparison mean
+something: the Go channel is the source (`state="go"`, uprobe events, TLS
+connections at the socket, correlation misses ≈ 0), the МS3 comm derivation
+(`--tls auto` on an `s3` port scans for `minio` and nothing else), no object key
+in either exposition, and — the failure path — that a binary latkit cannot hook
+refuses at startup with a cause and a way forward. Ports are 9401/9444 rather
+than 9000 on purpose: the agent's port filter is kernel-wide, and a stand on
+9000 would capture any other MinIO on the host.
 
 `verify.sh` builds `build/latkit` on the host first (the image just wraps that
 binary — the BPF skeleton toolchain is not reproduced in a container), brings the

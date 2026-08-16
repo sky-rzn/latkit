@@ -234,7 +234,11 @@ the comm set is now derived from the protocols on `--port` (РH13.1), so
 |---|---|---|
 | `-p 5432` (pg), `-p 3306=mysql` | `postgres`, `mysqld`, `mariadbd` | + `connection` |
 | `-p 8443=http` | `nginx`, `httpd`, `apache2`, `haproxy` | the same |
-| both | all seven | + `connection` |
+| `-p 9000=s3` | `minio` (РS8, see below) | the same |
+| all of them | all eight | + `connection` |
+
+`--print-config` prints the derived set as `tls_scan_comm`, which is the only
+way to check it without a running agent — it is the one TLS input nobody types.
 
 The third column gates the **uprobe channels only** (М9): the socket path takes
 its filter from `--comm` alone, so a plaintext port served by some other process
@@ -247,7 +251,10 @@ it was before М7 (РH15), which is the point of deriving rather than widening:
 a postgres deployment does not start scanning web servers because HTTP exists.
 
 `LK_COMM_FILTER_MAX` went from 4 to 8 for this — seven comms plus `connection`
-is exactly eight, and the DB four had already filled the old ceiling.
+is exactly eight, and the DB four had already filled the old ceiling. МS3's
+`minio` took the all-protocols case to nine, so the ceiling is 12 now: the entry
+that would have fallen off the end is silently unfiltered traffic or a silently
+missing server, and neither is worth 64 bytes of `.rodata`.
 
 Two operational notes:
 
@@ -344,6 +351,76 @@ old one, so the same 30 s timer that rescans for libssl re-attaches it.
 `latkit_tls_attached{state="go"}` means the Go channel is the live one. When a
 deployment runs both (an nginx front and a Go backend on one host), the gauge
 reports `ok` if everything requested attached and `partial` if anything did not.
+
+### MinIO and the S3 ports: the Go channel is the only one (РS8, PLAN-MINIO.md МS3)
+
+For an `s3` port everything above stops being one of three options and becomes
+the whole story. MinIO links no OpenSSL, so of the three TLS mechanics —
+`--tls auto`, `--libssl PATH`, `--tls-go PATH` — exactly one can ever apply. The
+МS3 delta is therefore small and almost entirely about saying so:
+
+- **`minio` is in the derived comm set** (the table at the top of §4b). Not for
+  the scan — there is no libssl under that comm to find — but for the *gate*:
+  `cfg_tls_comm_filter` is derived from the same list, and on a host that also
+  runs a libssl server (which is what turns the gate on) it is what lets MinIO's
+  decrypted events past the kernel filter. One name suffices: МS0 counted 29 of
+  29 threads named `minio` on a single node and 27 of 27 on a cluster node, with
+  no MySQL-style per-session rename to special-case.
+- **An `s3` port with `--tls auto` and no `--tls-go` warns at startup.** That
+  combination cannot work and fails *silently* on its own — the scan finds
+  nothing, the gauge reads `none`, and a TLS-only workload simply reports
+  nothing. The warning names the binary to point at, including the
+  `/proc/<pid>/root/...` form for a containerised server.
+- **The official image is hooked as shipped.** It is stripped (`-ldflags
+  "-s -w"`, no symbol table at all), so resolution goes through `.gopclntab`;
+  МS0 item 2 attached to the binary the running container executes and got
+  `crypto/tls.(*Conn).Write` (entry + 8 return sites) and `.Read` (entry + 7),
+  and `verify-s3-tls.sh` re-asserts exactly that on every run. A build carrying
+  neither table has been repacked or is not Go, and that is the case the
+  diagnostic below is for.
+
+  Any other build — a distribution package, a self-compiled server, a vendor's
+  image — is checked the same way, by the agent itself, without deploying
+  anything: `latkit -p 9000=s3 --tls-go /path/to/minio` prints one
+  `Go TLS uprobes on … (entry + N return site(s))` line per hooked function, or
+  refuses to start and says why. That is the whole verification procedure, and it
+  is the same one the stand runs.
+- **h2 does not eat the channel.** Go's TLS server picks the first of *its own*
+  `NextProtos` the client also offered, and MinIO's list puts `http/1.1` first:
+  every client in the МS0 corpus — curl (with and without `--http2`), Go's own
+  transport with `ForceAttemptHTTP2`, boto3, mc — ends up on HTTP/1.1. The
+  HTTP-track blind zone is empty here, which is what makes decrypting MinIO's
+  TLS worth doing at all (risk 1 of PLAN-MINIO.md, closed).
+
+**When it cannot be hooked**, `--tls-go` fails at startup — it was named
+explicitly — and says which of five things happened and what to do instead
+(`explain_miss` in `tls_go.c`): the path is not in the agent's mount namespace
+(the container case, answered with the `/proc/<pid>/root` form); the binary is
+not x86-64; it carries neither table; it carries them and has no `crypto/tls`
+(TLS is terminated in front of this process); or its body did not decode, which
+is a decoder gap and a bug report. Every branch ends the same way — read the
+plaintext somewhere else, or know that this port is unread. A blind zone that is
+named is a different thing from a dashboard that is quietly flat.
+
+`tests/e2e/verify-s3-tls.sh` is the stand for all of it, and it is built as a
+*comparison*: the same `mc` sequence against a MinIO with certificates and a
+MinIO without, one agent each, and the two legs' `latkit_s3_*` families compared
+operation by operation once the load stops. "The encrypted run produces the
+plaintext run's observations" is the claim МS3 makes, and it is not checkable
+from one leg. Measured on the first full run: every operation equal request for
+request (82 vs 82 puts, gets, deletes and multi-deletes; 328 vs 328 listings),
+the higher-rate ones within 1 %, and `latkit_tls_correlation_misses_total` at
+exactly 0 over 2663 decrypted events.
+
+The stand also carries the soak МS3 asks for, off by default
+(`SOAK_SEC=86400 ./verify-s3-tls.sh` for the 24-hour version the plan names —
+an operator's run, not a CI one). What has been run so far is its two-minute
+shape: `warp mixed` at ~500 MiB/s and 836 obj/s through the decrypted channel,
+104 k S3 requests observed, **0 ringbuf drops out of 5.1 M events**, MinIO not
+restarted and the channel still attached afterwards. That is also the first real
+data point against risk 2 of PLAN-MINIO.md (ringbuf pressure on an object
+store); the distributed-cluster case the МS4 perf bench has to use is still
+open.
 
 ### Capture budget on the decrypted channel (РH14)
 

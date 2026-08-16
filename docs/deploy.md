@@ -69,11 +69,12 @@ Two MySQL-specific operator traps:
   `mysqld` (MYSQL.md М5).
 - **TLS scan set.** `--tls auto` scans the comms its ports imply (М7):
   `{postgres, mysqld, mariadbd}` for a database port, `{nginx, httpd, apache2,
-  haproxy}` for an HTTP one, both for a mixed deployment; `--tls-comm` narrows
-  it to one name. MariaDB linking bundled wolfSSL/GnuTLS has no `libssl.so` to
-  attach to — TLS is then detected and dropped-and-counted, visible as
-  `latkit_tls_attached{state!="ok"}`.
-- **Go servers** (Caddy, Traefik, any `net/http`) have no libssl to find:
+  haproxy}` for an HTTP one, `{minio}` for an `s3` one, all of them for a mixed
+  deployment; `--tls-comm` narrows it to one name, and `--print-config` prints
+  what was derived (`tls_scan_comm`). MariaDB linking bundled wolfSSL/GnuTLS has
+  no `libssl.so` to attach to — TLS is then detected and dropped-and-counted,
+  visible as `latkit_tls_attached{state!="ok"}`.
+- **Go servers** (Caddy, Traefik, MinIO, any `net/http`) have no libssl to find:
   name the binary with `--tls-go /usr/bin/caddy` and latkit probes `crypto/tls`
   inside it, stripped binaries included. This channel needs no `/proc` scan, so
   it needs neither `CAP_SYS_PTRACE` nor `hostPID` — only the `CAP_SYS_ADMIN`
@@ -81,6 +82,15 @@ Two MySQL-specific operator traps:
   the host's file in a container: the uprobe binds to the inode, so both sides
   must see the same file). x86-64 only; see
   [notes-tls.md](notes-tls.md) §4b.
+- **An `s3` port has this channel and no other** (РS8). MinIO maps no libssl at
+  all, so `--tls auto` on its own finds nothing and the agent says so at startup
+  rather than reporting a flat dashboard: TLS on MinIO means
+  `--tls-go /usr/bin/minio`, or, for a container, `--tls-go
+  /proc/<pid>/root/usr/bin/minio` (which does need `hostPID`, to resolve that
+  path — not for a scan). The official image is stripped and hooks fine. A build
+  that cannot be hooked fails at startup with the cause and the alternatives:
+  terminate TLS in front of MinIO and capture the plaintext hop, or accept the
+  port as a named blind zone.
 
 And four HTTP-specific ones, all of which are **counters rather than silence**
 — the point of each is that the dashboard tells you which case you are in:
