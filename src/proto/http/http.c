@@ -87,6 +87,10 @@ static struct http_conn *http_conn_get(struct lk_proto *p, struct lk_conn *c)
     if (!hc)
         return NULL;
     hc->req_seq = ~0ull;
+    /* The flavour is a property of the port and cannot change under a live
+     * connection, so it is resolved once here rather than at every header line
+     * of every head (РH8). */
+    hc->d = http_dialect(c);
     /* A synthetic or lazily created entry joined an established connection: the
      * first bytes may be the middle of a body, so nothing before the next
      * request head is a trustworthy unit boundary. */
@@ -201,6 +205,7 @@ static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct http_conn *h
         .tracestate = u->tracestate_len ? u->tracestate : NULL,
         .tracestate_len = u->tracestate_len,
         .req_id = u->req_id[0] ? u->req_id : NULL,
+        .obj_version = hc->dr.obj_version[0] ? hc->dr.obj_version : NULL,
         .ctype = u->ctype[0] ? u->ctype : NULL,
         .ts_interim_ns = u->ts_interim_ns,
         .trace_flags = u->tp.valid ? u->tp.flags : 0,
@@ -244,15 +249,22 @@ static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct http_conn *h
      * two that may become a metric label. Computing it here rather than in each
      * sink means the dialect (РH8) is consulted once per observation, by the one
      * component that knows which connection — hence which dialect — this is. */
-    http_route_resolve(c, u, &route);
+    http_route_resolve(hc, u, &route);
     if (route.text_len) {
         o.route = route.text;
         o.route_len = route.text_len;
         o.route_fp = route.fp;
     }
+    /* The dialect's last word: the fields only it knows how to fill (the S3
+     * error code and the logical object size, РS5/РS6). It runs after the common
+     * ones and may not touch them — everything above this line is the same for
+     * every flavour of HTTP, which is what makes the two flavours one handler. */
+    if (hc->d->obs)
+        hc->d->obs(hc, u, &o);
     /* РH10: the host of *this* request, not of the connection — one keep-alive
      * socket can serve several virtual hosts, and the session only remembers
-     * the first. */
+     * the first. For a dialect that puts something else in the slot (S3 puts the
+     * bucket, РS3) this is what carries it into the label. */
     http_copy_cstr(hc->session.database, sizeof(hc->session.database), u->host);
     http_copy_cstr(hc->session.user, sizeof(hc->session.user), u->user);
 
@@ -441,6 +453,15 @@ static void http_on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const str
         break;
     case LK_HTTP_MSG_END:
         body_end(p, c, hc, dir, m);
+        break;
+    case LK_HTTP_MSG_ERRB:
+        /* The one message that carries body bytes, and the framer only produces
+         * it for a dialect that asked (РS5). They are read here and nowhere
+         * else: the prefix contains the object key, so it is handed straight to
+         * the dialect, which extracts a symbolic code out of it and lets the
+         * bytes go. Nothing on the unit ever points into them. */
+        if (dir == LK_DIR_SEND && hc->d->err_body && m->body)
+            hc->d->err_body(hc, (const char *)m->body, m->body_cap);
         break;
     default:
         p->st.unknown_msgs++;

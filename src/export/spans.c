@@ -218,6 +218,8 @@ static bool fill_http(struct lk_spans *s, struct lk_span *sp, const struct lk_co
         snprintf(hs->req_id, sizeof(hs->req_id), "%s", h->req_id);
     if (h->ctype)
         snprintf(hs->ctype, sizeof(hs->ctype), "%s", h->ctype);
+    if (h->obj_version)
+        snprintf(hs->obj_version, sizeof(hs->obj_version), "%s", h->obj_version);
     /* Carried whole or not at all (РH11): the handler already dropped an
      * oversized one, and clipping a list here would undo that decision. */
     if (h->tracestate && h->tracestate_len && h->tracestate_len < sizeof(hs->tstate))

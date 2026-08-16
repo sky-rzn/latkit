@@ -34,11 +34,18 @@ struct resp_fields {
     struct http_span ctype;
 };
 
-static void read_fields(struct http_head *h, struct resp_fields *rf)
+static void read_fields(struct http_conn *hc, struct http_unit *u, struct http_head *h,
+                        struct resp_fields *rf)
 {
     struct http_span name, val;
 
     while (http_head_field(h, &name, &val)) {
+        /* As on the request side, the dialect is shown every field first: S3
+         * takes `x-amz-request-id`, `x-amz-version-id` and MinIO's
+         * `x-minio-error-code` here (РS4/РS5), and the base dialect takes
+         * nothing at all. */
+        if (hc->d->resp_field)
+            hc->d->resp_field(hc, u, name, val);
         if (http_span_eq_ci(name, "content-length")) {
             if (http_parse_content_length(val, &rf->clen))
                 rf->have_cl = true;
@@ -95,7 +102,12 @@ void http_resp_head(struct lk_proto *p, struct http_conn *hc, const struct lk_ms
         return;
     }
 
-    read_fields(&h, &rf);
+    /* The dialect's response scratch belongs to the response now starting, and
+     * to no other: cleared here, filled by resp_field and err_body below, read
+     * once when this unit is emitted. Responses do not overlap (see struct
+     * http_dresp), so there is exactly one owner at a time. */
+    memset(&hc->dr, 0, sizeof(hc->dr));
+    read_fields(hc, u, &h, &rf);
     u->status = code;
     u->resp_minor = minor;
     u->have_resp = true;

@@ -6,7 +6,7 @@
 #   fuzz_pg    bytes -> framer -> lk_msg -> PG parser (harness from task 3.6)
 #   fuzz_my    the same over the MySQL framer + handler (MYSQL.md М7)
 #   fuzz_http  the same over the HTTP/1.x stream framer (PLAN-HTTP.md М2)
-#   fuzz_norm  bytes -> lk_norm_sql / lk_norm_route (harness from task 4.1)
+#   fuzz_norm  bytes -> lk_norm_sql / lk_norm_route / lk_norm_s3 (task 4.1, МS1)
 #   fuzz_pipe  event scenario -> decode + conn_table + framer + parser + norm
 #
 # The dependency sources are compiled INTO each target rather than linked from
@@ -28,6 +28,7 @@ set(FUZZ_SAN -O2 -g -fno-omit-frame-pointer
 set(FUZZ_INC
     ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/pg
     ${CMAKE_SOURCE_DIR}/src/proto/my ${CMAKE_SOURCE_DIR}/src/proto/http
+    ${CMAKE_SOURCE_DIR}/src/proto/s3
     ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf
     ${CMAKE_SOURCE_DIR}/src/norm)
 set(FUZZ_PROTO_SRC
@@ -40,7 +41,8 @@ set(FUZZ_PROTO_SRC
     ${CMAKE_SOURCE_DIR}/src/proto/my/my_query.c ${CMAKE_SOURCE_DIR}/src/proto/my/my_prep.c
     ${CMAKE_SOURCE_DIR}/src/proto/http/http_frame.c ${CMAKE_SOURCE_DIR}/src/proto/http/http.c
     ${CMAKE_SOURCE_DIR}/src/proto/http/http_req.c ${CMAKE_SOURCE_DIR}/src/proto/http/http_resp.c
-    ${CMAKE_SOURCE_DIR}/src/proto/http/http_route.c)
+    ${CMAKE_SOURCE_DIR}/src/proto/http/http_route.c
+    ${CMAKE_SOURCE_DIR}/src/proto/s3/s3_dialect.c)
 set(FUZZ_CORE_SRC
     ${CMAKE_SOURCE_DIR}/src/agent/conn_table.c ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
 # Since М4 the HTTP handler classifies through the route templater, and since М6
@@ -48,7 +50,8 @@ set(FUZZ_CORE_SRC
 # sources needs the normaliser sources too.
 set(FUZZ_NORM_SRC ${CMAKE_SOURCE_DIR}/src/norm/norm_sql.c
                   ${CMAKE_SOURCE_DIR}/src/norm/norm_route.c
-                  ${CMAKE_SOURCE_DIR}/src/norm/norm_redact.c)
+                  ${CMAKE_SOURCE_DIR}/src/norm/norm_redact.c
+                  ${CMAKE_SOURCE_DIR}/src/norm/norm_s3.c)
 
 function(latkit_fuzzer name)
     add_executable(${name} ${ARGN})

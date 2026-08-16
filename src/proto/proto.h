@@ -48,6 +48,7 @@
 
 #include "conn_table.h" /* struct lk_conn, enum lk_dir */
 #include "norm_route.h" /* struct lk_route_cfg / lk_route_out (РH7/РH8, М4) */
+#include "norm_s3.h"    /* struct lk_s3_cfg (РS3/РS4, PLAN-MINIO.md МS1) */
 #include "norm_sql.h"   /* enum lk_sql_dialect (lk_proto_ops.sql_dialect, РМ9/М6) */
 #include "reassembly.h" /* struct lk_msg, struct lk_msg_sink (down contract) */
 
@@ -118,12 +119,19 @@ struct lk_http_obs {
     const __u8 *trace_id;  /* 16 bytes; NULL = no usable `traceparent` */
     const __u8 *parent_id; /* 8 bytes, valid with trace_id */
     const char *tracestate;
-    __u32 tracestate_len; /* verbatim, unparsed, may be 0 */
-    const char *req_id;   /* X-Request-Id / X-Amzn-Trace-Id; NULL = none */
-    const char *ctype;    /* response Content-Type, first token; NULL = none */
-    __u64 ts_interim_ns;  /* first 1xx head (100-continue / early hints); 0 = none */
-    __u8 trace_flags;     /* W3C trace-flags; bit 0 = the caller sampled this trace */
-    __u8 version;         /* HTTP/1.<version> of the response, else of the request */
+    __u32 tracestate_len;    /* verbatim, unparsed, may be 0 */
+    const char *req_id;      /* X-Request-Id / X-Amzn-Trace-Id; NULL = none. The S3
+                                dialect fills it from the response's
+                                `X-Amz-Request-Id` instead (РS4), which is the join
+                                key `mc admin trace` reports and therefore the one
+                                the МS4 accuracy bench matches on */
+    const char *obj_version; /* the version of the object this exchange touched
+                                (S3: `x-amz-version-id`); NULL for a dialect that
+                                has no such thing, which is every one but S3 */
+    const char *ctype;       /* response Content-Type, first token; NULL = none */
+    __u64 ts_interim_ns;     /* first 1xx head (100-continue / early hints); 0 = none */
+    __u8 trace_flags;        /* W3C trace-flags; bit 0 = the caller sampled this trace */
+    __u8 version;            /* HTTP/1.<version> of the response, else of the request */
 };
 
 /* One completed unit of work, whatever the protocol calls it: a query, a COPY,
@@ -161,24 +169,38 @@ struct lk_query_obs {
     __u64 bytes;       /* COPY: summed len of CopyData */
     __u64 bytes_in;    /* HTTP: request body bytes, captured or holed (РH9) */
     __u64 bytes_out;   /* HTTP: response body bytes */
-    const char *op;    /* protocol operation name, borrowed for the callback:
-                          the HTTP method ("GET"), later the S3 operation
-                          (РH8). NULL for the DB protocols, whose operation
-                          lives in `text` */
+    __u64 obj_bytes;   /* S3 (РS6): the *logical* size of the payload this
+                          exchange moved, with the transfer framing discounted —
+                          `x-amz-decoded-content-length` when the upload was
+                          `aws-chunked`, the body size on the wire otherwise. It
+                          is a separate number from bytes_in/bytes_out because a
+                          signed chunk costs ~87 bytes of framing, which is 17 %
+                          at 1 KB chunks: a size histogram built on the wire
+                          count would move with the client's buffer size. 0 =
+                          the dialect has no logical size to report */
+    const char *op;    /* protocol operation name, borrowed for the callback: the
+                          HTTP method ("GET"), for every dialect including S3 —
+                          РS7's `method` label is exactly this. What an S3
+                          request *is* (`PutObject`) is its identity, not its
+                          verb, and travels in `route` */
     const char *route; /* HTTP (РH7, М4): the *templated* request identity —
                           `/orders/{id}` for the base dialect, an operation
-                          name for a dialect that has one (РH8). Borrowed for
-                          the callback like `text`, and never the raw path:
-                          `text` keeps that for the span, this is what may
-                          become a label. NULL for the DB protocols, and for
-                          an HTTP unit whose target never arrived */
+                          name for a dialect that has one (РH8, and РS2 where
+                          the name comes from a closed table rather than a
+                          heuristic). Borrowed for the callback like `text`, and
+                          never the raw path: `text` keeps that for the span,
+                          this is what may become a label. NULL for the DB
+                          protocols, and for an HTTP unit whose target never
+                          arrived */
     __u32 route_len;
     __u64 route_fp;                 /* XXH3-64 of `method NUL route`: the identity the М5
                                        top-K keys on. The method is in it because two
                                        methods on one path are two routes (РH7) */
-    const char *err_name;           /* symbolic error name, borrowed for the callback; the
-                                       S3 dialect's error code (РH8). NULL everywhere in
-                                       v1 — HTTP's error identity is err_code */
+    const char *err_name;           /* symbolic error name, borrowed for the callback: the
+                                       S3 dialect's `<Code>` (РS5), folded to `other`
+                                       outside the known vocabulary. NULL for the base
+                                       HTTP dialect and the DB protocols, whose error
+                                       identity is err_code / sqlstate */
     const struct lk_http_obs *http; /* HTTP span material (РH11, М6), borrowed for
                                        the callback; NULL for the DB protocols */
     char sqlstate[6];               /* on LK_QO_ERROR, C-string */
@@ -315,40 +337,19 @@ enum lk_proto_profile {
 
 /* --- the HTTP dialect seam (РH8) ------------------------------------------ */
 
-/* What a classifier is shown of a request. Spans, borrowed for the call, in the
- * shape the handler already holds them: the method token, the raw request-target
- * minus any absolute-form authority (path plus `?query`), and the host — the
- * base dialect ignores the last, and the S3 one reads a bucket out of it
- * (PLAN-MINIO.md РS3). Passing the pieces rather than the whole head is what
- * keeps a dialect from becoming a second header parser. */
-struct lk_http_req {
-    const char *method;
-    __u32 method_len;
-    const char *target;
-    __u32 target_len;
-    const char *host;
-    __u32 host_len;
-};
-
 /* One flavour of HTTP. The framer, the unit lifecycle and the four timings are
- * the protocol and are shared; what an exchange is *called* is the dialect, and
- * that is the whole difference between `--port 8080=http` (a templated route,
- * РH7) and `--port 9000=s3` (an operation out of a closed table). Two registry
- * entries, one implementation — the alternative was forking the handler, and a
- * fork is where the second copy stops getting the bug fixes.
+ * the protocol and are shared; what an exchange is *called* — and which handful
+ * of headers say it — is the dialect, and that is the whole difference between
+ * `--port 8080=http` (a templated route, РH7) and `--port 9000=s3` (an operation
+ * out of a closed table, РS1). Two registry entries, one implementation: the
+ * alternative was forking the handler, and a fork is where the second copy stops
+ * getting the bug fixes.
  *
- * `classify` is called once per observation, from the handler, with the config
- * the CLI built. It must be pure: same request, same config, same answer, no
- * state between calls. */
-struct lk_http_dialect {
-    const char *name; /* "http", later "s3"; matches lk_proto_ops.name */
-    void (*classify)(const struct lk_http_req *rq, const struct lk_route_cfg *cfg,
-                     struct lk_route_out *out);
-};
-
-/* The base dialect (РH7): heuristic route templating over the explicit map.
- * src/proto/http/http_route.c. */
-extern const struct lk_http_dialect lk_http_dialect_base;
+ * Declared here and *defined* in src/proto/http/http.h, because its hooks speak
+ * in the handler's own types (the unit, the header spans) and the core has no
+ * business knowing those. A pointer to an incomplete type is all lk_proto_ops
+ * needs, so events.c and the sinks include proto.h and learn nothing. */
+struct lk_http_dialect;
 
 /* One wire protocol: its name (the `--port N=<name>` selector), its handler
  * constructor, and the framer knowledge reassembly.c calls out for. The framer
@@ -476,6 +477,12 @@ struct lk_proto *lk_proto_my_new(const struct lk_query_sink *out);
 extern const struct lk_proto_ops lk_proto_http_ops;
 struct lk_proto *lk_proto_http_new(const struct lk_query_sink *out);
 
+/* S3, which is HTTP/1.1 with a particular reading of the path, the query and six
+ * headers (РS1, PLAN-MINIO.md МS1) — `--port 9000=s3`. The same framer, the same
+ * handler and the same constructor as the entry above; everything that differs
+ * hangs off `.dialect`, in src/proto/s3/s3_dialect.c. */
+extern const struct lk_proto_ops lk_proto_s3_ops;
+
 /* Handler-wide HTTP settings (РH10/РH7). Process-wide rather than per-handler
  * because there is exactly one http handler instance per agent and the values
  * are fixed at startup from the CLI; the *dialect* is per port and travels on
@@ -506,6 +513,12 @@ struct lk_http_cfg {
                                   like every other header, so the only thing
                                   protecting cardinality here is the top-K
                                   dictionary downstream (РH7) */
+    struct lk_s3_cfg s3;       /* --s3-domain / --s3-user (РS3/РS4): read only by
+                                  the S3 dialect, and inert for every port that is
+                                  not one. Here rather than on lk_proto_ops for the
+                                  same reason as the rest of this struct — it is a
+                                  startup decision of the operator's, not a
+                                  property of the wire protocol */
 };
 void lk_proto_http_configure(const struct lk_http_cfg *cfg);
 

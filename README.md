@@ -205,7 +205,7 @@ Use it to verify a deployment's env layer.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `-p, --port PORT[=pg\|mysql\|http[:BYTES]]` | `LATKIT_PORT` | `5432` | local (server) port to capture, optionally with its wire protocol (default: `pg`) and a per-port capture budget; repeatable, up to 16 (e.g. `5432,3306=mysql,8080=http`, `443=http:4096`). The budget defaults to `--capture-limit` for a database port and **2048 for an `http` one** — only heads are parsed, so a gigabyte of response body is never copied |
+| `-p, --port PORT[=pg\|mysql\|http\|s3[:BYTES]]` | `LATKIT_PORT` | `5432` | local (server) port to capture, optionally with its wire protocol (default: `pg`) and a per-port capture budget; repeatable, up to 16 (e.g. `5432,3306=mysql,8080=http`, `9000=s3`, `443=http:4096`). `s3` is HTTP/1.1 read as the S3 API — same framer, same timings, operations and buckets instead of routes and hosts. The budget defaults to `--capture-limit` for a database port and **2048 for an `http` or `s3` one** — only heads are parsed, so a gigabyte of response body is never copied |
 | `--comm NAME` | `LATKIT_COMM` | off | only capture send/recv of processes with this exact comm. **MySQL 8.x names its per-session threads `connection`, not `mysqld`** — don't filter on `mysqld` there; the port filter already scopes it |
 | `--cgroup PATTERN` | `LATKIT_CGROUP` | off | only capture cgroups whose path under `/sys/fs/cgroup` matches this glob (`*` stays within a path segment, `**` spans); repeatable, re-resolved every 30 s; requires cgroup v2 |
 
@@ -237,6 +237,8 @@ templating works with no configuration at all):
 | `--http-route-header NAME` | `LATKIT_HTTP_ROUTE_HEADER` | off | trust a route the application sends in this header. Off by default: it is client-controllable input, and only top-K bounds it |
 | `--http-user basic\|none` | `LATKIT_HTTP_USER` | `none` | derive the `user` label from the name half of `Authorization: Basic`; the password is never decoded, Bearer tokens never touched |
 | `--http-redact on\|off` | `LATKIT_HTTP_REDACT` | **on** | replace credential-looking query values (`token`, `sig`, `password`, `key`, `code`, …) with `***` wherever a request target leaves the handler — spans included |
+| `--s3-domain NAME` | `LATKIT_S3_DOMAIN` | none | on an `s3` port, a Host of the form `<bucket>.NAME` is virtual-host addressing and the bucket comes from the Host; repeatable. Without it every request is read path-style, which is also what MinIO does without `MINIO_DOMAIN` |
+| `--s3-user accesskey\|off` | `LATKIT_S3_USER` | `accesskey` | derive the `user` label from the access key in an S3 signature — the public half of the pair. The signature, the chunk signatures and `X-Amz-Security-Token` are never read; the object key is never a label at all |
 
 **Exporters** (both run independently; the OTLP group falls back to the
 standard `OTEL_*` variables, so an agent deployed beside other OTel tooling

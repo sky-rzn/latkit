@@ -103,7 +103,10 @@ static inline void fz_check_msg(const struct lk_msg *m, bool mysql)
  *   'D' / 'E' / '!'  counts and codes, never payload: body is NULL by
  *                    construction (РH12 — bodies are not read, so they cannot
  *                    leak), so a non-NULL one here means the framer handed out
- *                    a pointer it had no business having.
+ *                    a pointer it had no business having;
+ *   'X'              the single exception, and the reason the rule above is
+ *                    stated as a rule: a bounded prefix of a *failing* response
+ *                    body, for the one dialect that asked for it (РS5).
  *
  * A note's code must be a defined one: an out-of-range code would mean the
  * handler tallies a degradation it cannot name. */
@@ -122,6 +125,15 @@ static inline void fz_check_http_msg(const struct lk_msg *m)
         FZ_ASSERT(m->len && m->len <= LK_MSG_BODY_MAX);
         FZ_ASSERT(m->body_cap == m->len);
         FZ_ASSERT(m->body != NULL);
+        fz_read_bytes(m->body, m->body_cap);
+        break;
+    case LK_HTTP_MSG_ERRB:
+        /* The one message that carries payload, and it is bounded twice over:
+         * by LK_HTTP_ERRB_MAX here and by the framer emitting at most one per
+         * response (РS5). If this ever grew past the cap, the "bodies are not
+         * read" claim would have an exception nobody had measured. */
+        FZ_ASSERT(m->len && m->len <= LK_HTTP_ERRB_MAX);
+        FZ_ASSERT(m->body_cap == m->len && m->body != NULL);
         fz_read_bytes(m->body, m->body_cap);
         break;
     case LK_HTTP_MSG_NOTE:

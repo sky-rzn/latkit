@@ -5,9 +5,11 @@
  *
  * `lk_http_dialect_base` is the seam: the classification of a request into the
  * thing a metric may be labelled with. For plain HTTP that is the templated
- * route out of norm_route.c; for the S3 dialect (PLAN-MINIO.md РS2) it will be
- * an operation from a closed table, computed from the same three spans and
- * nothing else. One registry entry per dialect, one implementation underneath.
+ * route out of norm_route.c; for the S3 dialect (PLAN-MINIO.md РS2,
+ * src/proto/s3/s3_dialect.c) it is an operation from a closed table, computed
+ * from the same spans and nothing else. One registry entry per dialect, one
+ * implementation underneath — and the base one below is the measure of what
+ * that costs: one hook filled in, out of the six the struct offers.
  *
  * `http_route_resolve` is the policy *around* the dialect, and it is deliberately
  * not part of it: an app-declared route (`--http-route-header`) wins over any
@@ -19,23 +21,24 @@
  * configuration the CLI installed once at startup. */
 #include "http.h"
 
-static void base_classify(const struct lk_http_req *rq, const struct lk_route_cfg *cfg,
+static void base_classify(const struct lk_http_req *rq, const struct lk_http_cfg *cfg,
                           struct lk_route_out *out)
 {
-    lk_norm_route(rq->method, rq->method_len, rq->target, rq->target_len, cfg, out);
+    lk_norm_route(rq->method, rq->method_len, rq->target, rq->target_len, &cfg->route, out);
 }
 
 const struct lk_http_dialect lk_http_dialect_base = {
     .name = "http",
     .classify = base_classify,
+    /* Every other hook stays NULL, and that is the measure of the seam: plain
+     * HTTP needs nothing off a head that http_req.c does not already read, and
+     * no byte of any body at all. */
 };
 
-void http_route_resolve(const struct lk_conn *c, const struct http_unit *u,
+void http_route_resolve(const struct http_conn *hc, const struct http_unit *u,
                         struct lk_route_out *out)
 {
     const struct lk_http_cfg *cfg = http_cfg();
-    const struct lk_proto_ops *ops = lk_conn_proto(c);
-    const struct lk_http_dialect *d = ops->dialect ? ops->dialect : &lk_http_dialect_base;
     __u32 mlen = (__u32)strlen(u->method);
     struct lk_http_req rq = {
         .method = u->method,
@@ -44,6 +47,7 @@ void http_route_resolve(const struct lk_conn *c, const struct http_unit *u,
         .target_len = u->target_len,
         .host = u->host,
         .host_len = (__u32)strlen(u->host),
+        .dflags = u->dflags,
     };
 
     /* The application's own name for its handler, when the operator asked us to
@@ -67,5 +71,5 @@ void http_route_resolve(const struct lk_conn *c, const struct http_unit *u,
         out->fp = 0;
         return;
     }
-    d->classify(&rq, &cfg->route, out);
+    hc->d->classify(&rq, cfg, out);
 }

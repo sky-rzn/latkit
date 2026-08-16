@@ -316,6 +316,11 @@ static void enc_span_http_attrs(struct pbuf *pb, const struct lk_span *sp,
         enc_str_kv(pb, 9, "http.response.header.content-type", h->ctype);
     if (h->req_id[0])
         enc_str_kv(pb, 9, "http.request.header.x-request-id", h->req_id);
+    /* The S3 dialect's own attribute (РS4): the object version a versioned
+     * bucket answered with. Spelled the way the AWS semantic conventions do,
+     * because a trace viewer that knows S3 should recognise it. */
+    if (h->obj_version[0])
+        enc_str_kv(pb, 9, "aws.s3.version_id", h->obj_version);
     if (h->bytes_in)
         enc_int_kv(pb, 9, "http.request.body.size", h->bytes_in);
     if (h->bytes_out)

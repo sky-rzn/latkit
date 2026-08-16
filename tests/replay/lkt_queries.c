@@ -7,8 +7,9 @@
  * observation / transaction in the events.c --queries format, plus a per-file
  * parser summary.
  *
- *   lkt_queries [--proto pg|mysql|http] [--http-user basic] [--http-redact off]
- *              [--quiet] [--metrics] [--spans RATIO] FILE.lkt...
+ *   lkt_queries [--proto pg|mysql|http|s3] [--http-user basic] [--http-redact off]
+ *              [--s3-domain NAME] [--s3-user off] [--quiet] [--metrics]
+ *              [--spans RATIO] FILE.lkt...
  *
  * --proto sets the protocol every connection frames and parses as (default pg,
  * the registry head). --quiet drops the per-observation lines, leaving the
@@ -94,7 +95,13 @@ static __u64 delta(__u64 from, __u64 to)
 
 /* One HTTP observation (РH5/РH10): method, target, status, the byte counts in
  * both directions, and the three intervals the four stamps define — upload (the
- * client's), ttfb and duration (the server's). */
+ * client's), ttfb and duration (the server's).
+ *
+ * Two fields belong to a dialect rather than to HTTP and print as `-`/`0` for
+ * the base one (PLAN-MINIO.md МS1): `err=` is the symbolic error code a status
+ * cannot express — `404` is `NoSuchKey` or `NoSuchBucket` (РS5) — and `obj=` is
+ * the logical payload size with the `aws-chunked` framing discounted (РS6). The
+ * S3 expectation table checks both. */
 static void on_http_query(const struct lk_conn *c, const struct lk_session *s,
                           const struct lk_query_obs *o)
 {
@@ -105,13 +112,15 @@ static void on_http_query(const struct lk_conn *c, const struct lk_session *s,
      * time (PLAN-HTTP.md М8's accuracy bench). It is a correlation id the
      * client put on the wire for exactly that purpose — nothing РH12 protects. */
     printf("http conn=%llx method=%s status=%u dur=%lluns ttfb=%lluns upload=%lluns "
-           "in=%llu out=%llu host=%s user=%s flags=0x%x reqid=%s route=%s target=%.*s%s\n",
+           "in=%llu out=%llu obj=%llu host=%s user=%s flags=0x%x err=%s reqid=%s route=%s "
+           "target=%.*s%s\n",
            (unsigned long long)c->cookie, o->op ? o->op : "?", o->err_code,
            (unsigned long long)delta(o->ts_req_done_ns, o->ts_complete_ns),
            (unsigned long long)delta(o->ts_req_done_ns, o->ts_first_row_ns),
            (unsigned long long)delta(o->ts_start_ns, o->ts_req_done_ns),
            (unsigned long long)o->bytes_in, (unsigned long long)o->bytes_out,
-           s->database[0] ? s->database : "-", s->user[0] ? s->user : "-", o->flags,
+           (unsigned long long)o->obj_bytes, s->database[0] ? s->database : "-",
+           s->user[0] ? s->user : "-", o->flags, o->err_name ? o->err_name : "-",
            o->http && o->http->req_id ? o->http->req_id : "-", o->route ? o->route : "-", tlen,
            o->text ? o->text : "", o->text_len > TEXT_LOG_MAX ? "..." : "");
 }
@@ -242,6 +251,18 @@ int main(int argc, char **argv)
              * acceptance script has to ask for it explicitly to see a user. */
             hcfg.user_basic = !strcmp(argv[first + 1], "basic");
             first += 2;
+        } else if (!strcmp(argv[first], "--s3-domain") && first + 1 < argc) {
+            /* РS3: without it every request is read path-style, which is what
+             * MinIO itself does without MINIO_DOMAIN — so the `vhost` trace is
+             * the one that needs the flag, exactly as a real stand would. */
+            if (hcfg.s3.ndomains < LK_S3_DOMAIN_MAX)
+                hcfg.s3.domains[hcfg.s3.ndomains++] = argv[first + 1];
+            lk_proto_http_configure(&hcfg);
+            first += 2;
+        } else if (!strcmp(argv[first], "--s3-user") && first + 1 < argc) {
+            hcfg.s3.no_user = !strcmp(argv[first + 1], "off");
+            lk_proto_http_configure(&hcfg);
+            first += 2;
         } else if (!strcmp(argv[first], "--http-redact") && first + 1 < argc) {
             /* РH12, the agent's --http-redact: on by default, here as there. */
             hcfg.no_redact = !strcmp(argv[first + 1], "off");
@@ -259,7 +280,8 @@ int main(int argc, char **argv)
     }
     if (first >= argc) {
         fprintf(stderr,
-                "usage: %s [--proto pg|mysql|http] [--http-user basic] [--quiet]"
+                "usage: %s [--proto pg|mysql|http|s3] [--http-user basic]"
+                " [--s3-domain NAME] [--s3-user off] [--quiet]"
                 " [--metrics] [--spans RATIO] [--http-redact on|off] FILE.lkt...\n",
                 argv[0]);
         return 2;

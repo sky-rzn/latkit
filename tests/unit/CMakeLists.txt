@@ -184,6 +184,28 @@ add_executable(test_norm_route test_norm_route.c)
 target_link_libraries(test_norm_route latkit_norm)
 add_test(NAME norm_route COMMAND test_norm_route)
 
+# S3 classifier (PLAN-MINIO.md МS1, РS2/РS3): the operation table row for row,
+# both addressing forms, the bucket-name rules the server enforces, and the
+# closed-set invariant over a million generated paths — the check that makes the
+# `op` label's cardinality a compile-time fact. Pure, links the normaliser lib.
+add_executable(test_s3_op test_s3_op.c)
+target_link_libraries(test_s3_op latkit_norm)
+add_test(NAME s3_op COMMAND test_s3_op)
+
+# S3 dialect over the real chain (PLAN-MINIO.md МS1): the labels of РS3/РS4, the
+# two byte counts of РS6 and the error codes of РS5, asserted on observations —
+# and, in every one of them, on the absence of any object key. Same harness as
+# the HTTP handler tests, with lk_proto_s3_ops as the port's protocol.
+foreach(t s3_labels s3_error)
+    add_executable(test_${t} test_${t}.c)
+    target_include_directories(test_${t} PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf
+        ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/http
+        ${CMAKE_SOURCE_DIR}/src/proto/s3)
+    target_link_libraries(test_${t} latkit_proto)
+    add_test(NAME ${t} COMMAND test_${t})
+endforeach()
+
 # Query-string redactor (PLAN-HTTP.md М6, РH12): the key table, the bounds, and
 # the invariant the whole privacy claim rests on — no secret survives the copy.
 add_executable(test_norm_redact test_norm_redact.c)

@@ -61,6 +61,14 @@ add_test(NAME http_queries_traces
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/http_queries_traces.sh
                  $<TARGET_FILE:lkt_queries> ${CMAKE_SOURCE_DIR}/tests/traces/http)
 
+# МS1 acceptance (PLAN-MINIO.md): the same over the S3 corpus — the operation,
+# the bucket, the access key, the S3 error code and both byte counts per МS0
+# scenario, plus the two corpus-wide invariants the dialect rests on (every `op`
+# is a table value; no object key is ever a label).
+add_test(NAME s3_queries_traces
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/s3_queries_traces.sh
+                 $<TARGET_FILE:lkt_queries> ${CMAKE_SOURCE_DIR}/tests/traces/s3)
+
 # М6 acceptance (РH12): the corpus traces recorded with deliberately secret URLs
 # and headers, greped across every surface the agent has — observations,
 # exposition, spans and the raw --hexdump view. Without this test the privacy

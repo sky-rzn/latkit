@@ -70,6 +70,9 @@ struct lk_span_http {
     char host[64];                   /* server.address (the request's own Host) */
     char req_id[LK_SPAN_REQID_MAX];  /* X-Request-Id: the accuracy bench's join key */
     char ctype[LK_SPAN_CTYPE_MAX];   /* response Content-Type, first token */
+    char obj_version[48];            /* the version of the object touched, when the
+                                        dialect has one (S3: `x-amz-version-id`,
+                                        PLAN-MINIO.md РS4); "" otherwise */
     char client[LK_SPAN_ADDR_MAX];   /* client.address, from the connection tuple */
     char ua[64];                     /* user_agent.original (session app slot) */
     char tstate[LK_SPAN_TSTATE_MAX]; /* W3C tracestate, verbatim or absent */

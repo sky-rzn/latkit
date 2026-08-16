@@ -1,22 +1,25 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Normaliser libFuzzer target (task 8.3, Р51; harness laid down in 4.1).
  *
- * Both normalisers take untrusted, possibly-truncated bytes — the same input an
- * attacker controls off the wire (Р22, РH7) — and both promise the same two
- * things: bounded output and a fingerprint that is a pure function of the input.
- * lk_norm_fuzz_one / lk_norm_route_fuzz_one (in src/norm/) run the module and
- * read back every output field, so an OOB write into the text buffer or a
- * missing NUL terminator surfaces under ASAN/UBSAN. On top of them,
+ * All three normalisers take untrusted, possibly-truncated bytes — the same
+ * input an attacker controls off the wire (Р22, РH7, РS2) — and all three
+ * promise bounded output and a fingerprint that is a pure function of the input.
+ * lk_norm_fuzz_one / lk_norm_route_fuzz_one / lk_norm_s3_fuzz_one (in src/norm/)
+ * run the module and read back every output field, so an OOB write into the text
+ * buffer or a missing NUL terminator surfaces under ASAN/UBSAN. On top of them,
  * fz_check_norm_stable and fz_check_route_stable assert the Р51 contracts:
  * text_len under the cap, terminated text, two runs agreeing bit-for-bit — and,
  * for the route, that no control byte and no byte of the query string reaches
  * the template.
  *
- * Three inputs share one target, selected by a first byte that cannot begin
- * meaningful input in either dialect (РМ9, М4):
+ * Four inputs share one target, selected by a first byte that cannot begin
+ * meaningful input in any dialect (РМ9, М4, МS1):
  *
  *   0xFF  the rest is SQL in the MySQL dialect
  *   0xFE  the rest is an HTTP route input (`method \n target \n route-map`)
+ *   0xFD  the rest is an S3 classifier input (`host \n method \n target`),
+ *         whose own invariant is the closed-set one of РS2: the operation is a
+ *         pointer into the table, so no input can produce a label outside it
  *   else  the whole input is SQL in the PG dialect
  *
  * so the whole pre-existing corpus keeps exercising the PG branch unshifted and
@@ -31,6 +34,7 @@
 #include "fuzz_invariants.h"
 #include "norm_redact.h"
 #include "norm_route.h"
+#include "norm_s3.h"
 #include "norm_sql.h"
 
 /* The route half of the input, in the layout lk_norm_route_fuzz_one documents:
@@ -77,6 +81,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     if (size > 0 && data[0] == 0xFE) {
         route_input(data + 1, size - 1);
+        return 0;
+    }
+    if (size > 0 && data[0] == 0xFD) {
+        /* The whole contract lives inside the entry point here, because the
+         * invariant is about the *identity* of the returned pointer and not
+         * about the bytes it points at (РS2, PLAN-MINIO.md МS1). */
+        lk_norm_s3_fuzz_one(data + 1, size - 1);
         return 0;
     }
     if (size > 0 && data[0] == 0xFF) {

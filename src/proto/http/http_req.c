@@ -145,6 +145,13 @@ void http_req_head(struct lk_proto *p, struct lk_conn *c, struct http_conn *hc,
      * where the body ends; reading it again to report a different truth is how
      * the two halves of a unit drift apart. */
     while (http_head_field(&h, &name, &val)) {
+        /* The dialect sees every field, and it sees it first: what it reads is
+         * its own business (S3 takes an access key, a copy-source marker and a
+         * decoded length, РS4/РS6), and the closed list below is the base
+         * protocol's. Both lists are short, both are documented, and neither can
+         * quietly grow into "read the whole head" (РH12). */
+        if (hc->d->req_field)
+            hc->d->req_field(u, cfg, name, val);
         if (http_span_eq_ci(name, "host")) {
             host = val;
         } else if (http_span_eq_ci(name, "user-agent")) {
@@ -190,6 +197,25 @@ void http_req_head(struct lk_proto *p, struct lk_conn *c, struct http_conn *hc,
     if (tstate.n && tstate.n <= LK_HTTP_TSTATE_MAX)
         copy_owned(&u->tracestate, &u->tracestate_len, &u->tracestate_cap, tstate,
                    LK_HTTP_TSTATE_MAX);
+
+    /* The dialect's own labels, once the base ones are in place and before the
+     * session is emitted off them. This is where S3 replaces the host slot with
+     * the bucket it just located (РS3) and takes an access key out of a
+     * presigned query (РS4) — both of which need the target and the host
+     * *together*, which is exactly one moment in the life of a head. */
+    if (hc->d->req_head) {
+        struct lk_http_req rq = {
+            .method = u->method,
+            .method_len = (__u32)strlen(u->method),
+            .target = u->target,
+            .target_len = u->target_len,
+            .host = u->host,
+            .host_len = (__u32)strlen(u->host),
+            .dflags = u->dflags,
+        };
+
+        hc->d->req_head(u, cfg, &rq);
+    }
 
     p->st.by_type[LK_DIR_RECV][(__u8)http_method_tag((enum http_method)u->method_id)]++;
     session_emit(p, c, hc, u, ua);

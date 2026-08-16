@@ -30,7 +30,10 @@
  *   - **the body is counted, never scanned.** Once the head names a length the
  *     body is arithmetic, so a 1 GB download costs the framer nothing per byte
  *     and a capture hole inside it is harmless — the plan's central claim about
- *     staying honest under loss (Р9) holds for the common case unchanged.
+ *     staying honest under loss (Р9) holds for the common case unchanged. The
+ *     one exception is deliberate, bounded and asked for: a dialect whose errors
+ *     are named in the body rather than by the status gets a 256-byte prefix of
+ *     a *failing* response and nothing else, ever (РS5, PLAN-MINIO.md МS1).
  *   - **chunked is the exception, and it is the main path.** The sizes live in
  *     the stream, so a hole in a chunked body cannot be skipped over: the
  *     direction resyncs and the unit is dropped, counted, and visible
@@ -110,6 +113,7 @@ static void go_scan(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, stru
     f->st = LK_FR_DIRTY;
     hd->st = HTTP_FR_SCAN;
     hd->anchor_n = 0;
+    hd->err_want = 0;
     hd->body_left = 0;
     hd->body_seen = 0;
     hd->chunk_left = 0;
@@ -121,12 +125,27 @@ static void go_scan(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, stru
 
 /* Body bytes, captured or holed: 'D' carries the count and never the payload
  * (РH12). A hole reports here too — the bytes were on the wire and total_len
- * is honest (Р9), so the accounting is exact under any capture budget. */
+ * is honest (Р9), so the accounting is exact under any capture budget.
+ *
+ * `src` is the captured bytes when there are any and NULL for a hole, and it
+ * exists for exactly one reason: the РS5 error prefix. A dialect that asked for
+ * one gets a single bounded 'X' off the first captured bytes of a failing
+ * response and nothing else ever looks at `src` — which is why the parameter is
+ * spent here rather than handed to the message dictionary at large. A hole
+ * where the error body was simply means no code and a fallback to the status. */
 static void body_add(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, struct http_dir *hd,
-                     __u64 n, __u64 ts)
+                     const __u8 *src, __u64 n, __u64 ts)
 {
     if (!n)
         return;
+    if (hd->err_want) {
+        hd->err_want = 0; /* one prefix per response, whatever follows */
+        if (src) {
+            __u32 k = n > LK_HTTP_ERRB_MAX ? LK_HTTP_ERRB_MAX : (__u32)n;
+
+            emit(r, c, dir, LK_HTTP_MSG_ERRB, k, src, k, 0, ts);
+        }
+    }
     hd->body_seen += n;
     emit(r, c, dir, LK_HTTP_MSG_DATA, n > ~0u ? ~0u : (__u32)n, NULL, 0, 0, ts);
 }
@@ -141,6 +160,7 @@ static void body_end(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, str
          ts);
     hd->body_seen = 0;
     hd->body_left = 0;
+    hd->err_want = 0; /* a body that ended without one carries no code */
     hd->st = HTTP_FR_HEAD;
     hd->atline = 1;
 }
@@ -401,6 +421,13 @@ static void head_complete(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir
     rq = pend_pop(hf);
     emit(r, c, dir, LK_HTTP_MSG_RESP, len, head, len, 0, hd->head_ts);
 
+    /* РS5: this response failed, and for a dialect whose errors are named in the
+     * body rather than by the status, the first captured body bytes are worth a
+     * bounded look. Armed here — where the status is — and spent on the first
+     * 'D' of this message; a response with no body (a HEAD, a 204, a body that
+     * fell into a hole) simply never spends it. */
+    hd->err_want = code >= 400 && (http_dialect(c)->flags & LK_HTTP_D_ERR_BODY);
+
     if ((rq & HTTP_RQ_CONNECT) && code < 300) {
         body_end(r, c, dir, hd, ts);
         go_blind(r, c, dir, LK_HTTP_NOTE_BLIND_CONNECT, ts);
@@ -569,7 +596,7 @@ static __u32 chunk_feed(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir,
             /* 'D' reports *decoded* body bytes, not the chunk framing around
              * them, so a chunked body and a Content-Length one of the same
              * size report the same number of bytes. */
-            body_add(r, c, dir, hd, take, ts);
+            body_add(r, c, dir, hd, p + i, take, ts);
             hd->chunk_left -= take;
             i += (__u32)take;
             if (!hd->chunk_left)
@@ -744,8 +771,8 @@ static bool tls_record_head(enum lk_dir dir, const struct http_dir *hd, const __
     return true;
 }
 
-static void http_stream_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, const __u8 *p,
-                              __u32 n, __u64 ts_ns)
+void http_stream_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, const __u8 *p,
+                       __u32 n, __u64 ts_ns)
 {
     struct http_frame *hf = http_frame_get(c);
     struct http_dir *hd;
@@ -794,7 +821,7 @@ static void http_stream_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir
         case HTTP_FR_BODY: {
             __u64 take = hd->body_left < n ? hd->body_left : n;
 
-            body_add(r, c, dir, hd, take, ts_ns);
+            body_add(r, c, dir, hd, p, take, ts_ns);
             hd->body_left -= take;
             used = (__u32)take;
             if (!hd->body_left)
@@ -805,7 +832,7 @@ static void http_stream_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir
             used = chunk_feed(r, c, dir, hf, p, n, ts_ns);
             break;
         case HTTP_FR_CLOSE:
-            body_add(r, c, dir, hd, n, ts_ns);
+            body_add(r, c, dir, hd, p, n, ts_ns);
             used = n;
             break;
         case HTTP_FR_SCAN:
@@ -826,7 +853,7 @@ static void http_stream_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir
 /* A hole is bytes we will never see: the uncaptured tail of a call (the
  * per-call budget, РH14), a lost ringbuf event, a missing off-interval. What it
  * costs depends entirely on where it lands — the four degradations of РH4. */
-static void http_stream_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64 n)
+void http_stream_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64 n)
 {
     struct http_frame *hf = http_frame_get(c);
     struct lk_frame *f = &c->frame[dir];
@@ -868,7 +895,7 @@ static void http_stream_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir 
          * nothing — the case the whole design is built around. */
         __u64 take = hd->body_left < n ? hd->body_left : n;
 
-        body_add(r, c, dir, hd, take, ts);
+        body_add(r, c, dir, hd, NULL, take, ts);
         hd->body_left -= take;
         n -= take;
         if (!hd->body_left)
@@ -886,7 +913,7 @@ static void http_stream_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir 
         go_scan(r, c, dir, hd);
         break;
     case HTTP_FR_CLOSE:
-        body_add(r, c, dir, hd, n, ts);
+        body_add(r, c, dir, hd, NULL, n, ts);
         break;
     case HTTP_FR_SCAN:
         hd->anchor_n = 0; /* an anchor cannot span a hole */
@@ -947,13 +974,23 @@ static void blank_query(__u8 *base, __u32 n, struct http_span s)
  * silently do nothing. So this runs on the viewer's own copy, at the point where
  * bytes turn into output, which is also the only place where the question "who
  * will read this" has an answer. */
-static void http_mask_body(const struct lk_msg *m, __u8 *p, __u32 n)
+void http_mask_body(const struct lk_msg *m, __u8 *p, __u32 n)
 {
     struct http_head h;
     struct http_span line, name, val;
 
     if (!p || !n)
         return;
+    /* The error prefix (РS5) is the one message with a body, and none of it is
+     * for a viewer: the same few hundred bytes that hold `<Code>` also hold
+     * `<Key>` and `<Resource>`, which is to say the object key. It is read by
+     * the dialect, matched against a dictionary and dropped; showing it in
+     * `--messages --hexdump` would put the most sensitive part of an S3 request
+     * into a terminal and, from there, into a bug report. */
+    if (m->type == LK_HTTP_MSG_ERRB) {
+        memset(p, '*', n);
+        return;
+    }
     if (m->type != LK_HTTP_MSG_REQ && m->type != LK_HTTP_MSG_RESP && m->type != LK_HTTP_MSG_INTER)
         return;
     http_head_init(&h, p, n);

@@ -53,6 +53,11 @@ struct h_obs {
     __u8 trace_id[16], parent_id[8], trace_flags, version;
     __u64 ts_interim;
     char tracestate[LK_HTTP_TSTATE_MAX + 1], req_id[64], ctype[64];
+    /* What a dialect adds on top (РH8): the S3 track's error code, logical
+     * object size and object version (РS5/РS6). Empty/zero for the base
+     * dialect, which is itself worth asserting. */
+    char err_name[LK_HTTP_ERRNAME_MAX], obj_version[LK_HTTP_OBJVER_MAX];
+    __u64 obj_bytes;
 };
 
 struct h_sess {
@@ -88,6 +93,8 @@ static inline void h_on_query(void *ctx, const struct lk_conn *c, const struct l
     r->status = o->err_code;
     r->flags = o->flags;
     r->kind = o->kind;
+    r->obj_bytes = o->obj_bytes;
+    snprintf(r->err_name, sizeof(r->err_name), "%s", o->err_name ? o->err_name : "");
     snprintf(r->method, sizeof(r->method), "%s", o->op ? o->op : "");
     if (o->text && n)
         memcpy(r->target, o->text, n);
@@ -116,6 +123,8 @@ static inline void h_on_query(void *ctx, const struct lk_conn *c, const struct l
             memcpy(r->tracestate, o->http->tracestate, o->http->tracestate_len);
         snprintf(r->req_id, sizeof(r->req_id), "%s", o->http->req_id ? o->http->req_id : "");
         snprintf(r->ctype, sizeof(r->ctype), "%s", o->http->ctype ? o->http->ctype : "");
+        snprintf(r->obj_version, sizeof(r->obj_version), "%s",
+                 o->http->obj_version ? o->http->obj_version : "");
     }
 }
 
@@ -154,15 +163,18 @@ static inline void h_free(void)
     lk_reasm_free(&h_reasm);
 }
 
-/* Start a fresh connection. `flags` seeds lk_conn.flags — LK_CONN_SYNTHETIC is
- * how a test says "we joined this connection mid-stream". */
-static inline void h_reset_flags(__u16 flags)
+/* Start a fresh connection. `ops` is the registry entry the port map would have
+ * assigned — lk_proto_http_ops for the base dialect, lk_proto_s3_ops for S3
+ * (РS1), which is the *only* difference between the two in this harness and
+ * therefore the thing worth being able to vary. `flags` seeds lk_conn.flags —
+ * LK_CONN_SYNTHETIC is how a test says "we joined this connection mid-stream". */
+static inline void h_reset_proto(const struct lk_proto_ops *ops, __u16 flags)
 {
     static const struct lk_query_sink qsink = {.on_query = h_on_query, .on_session = h_on_session};
 
     h_free();
     memset(&h_conn, 0, sizeof(h_conn));
-    h_conn.ops = &lk_proto_http_ops;
+    h_conn.ops = ops;
     h_conn.flags = flags;
     h_conn.cookie = 0x1234;
     if (flags & LK_CONN_SYNTHETIC) {
@@ -173,10 +185,15 @@ static inline void h_reset_flags(__u16 flags)
         h_conn.frame[0].st = LK_FR_DIRTY;
         h_conn.frame[1].st = LK_FR_DIRTY;
     }
-    h_proto = lk_proto_http_new(&qsink);
+    h_proto = ops->proto_new(&qsink);
     lk_reasm_init(&h_reasm, lk_proto_sink(h_proto));
     h_nobs = 0;
     h_nsess = 0;
+}
+
+static inline void h_reset_flags(__u16 flags)
+{
+    h_reset_proto(&lk_proto_http_ops, flags);
 }
 
 static inline void h_reset(void)

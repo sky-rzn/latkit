@@ -18,6 +18,10 @@
  * lk_frame.buf, drawn from the reassembly slab pool, so Р11's memory bound
  * covers it and the connection table frees it on every removal path.
  *
+ * PLAN-MINIO.md МS1 filled in the rest of that dialect seam: the hooks a
+ * flavour of HTTP uses to read its own headers off a head the handler is
+ * already walking, and the one message type that carries body bytes (РS5).
+ *
  * The two never share an understanding of a head. The framer reads a head to
  * decide where the body ends; the handler reads the same bytes again to decide
  * what to report about it. That is a deliberate second parse of a few hundred
@@ -31,7 +35,7 @@
 #include "proto.h"
 
 /* --- the synthetic message dictionary (РH3) ------------------------------- */
-/* HTTP has no messages in the PG/MySQL sense, so the framer invents five and
+/* HTTP has no messages in the PG/MySQL sense, so the framer invents six and
  * publishes them as ordinary lk_msg — that is what keeps --messages, the
  * replay harness, fuzz_pipe and the handler contract unchanged (РH1).
  *
@@ -56,6 +60,18 @@
  *                       every 'R'/'S' is followed by exactly one 'E' unless the
  *                       body runs until the connection closes (rule 6 of the
  *                       decision list), where CONN_CLOSE is the end and М3 owns it
+ *   'X' error prefix    len = body_cap = the bytes carried, body = a bounded
+ *                       prefix of a *failing* response's body — the one message
+ *                       in the dictionary that carries payload, and the one
+ *                       exception to "bodies are never read" (РS5). Emitted at
+ *                       most once per response, only when the connection's
+ *                       dialect asked for it (LK_HTTP_D_ERR_BODY) and only for a
+ *                       status ≥ 400, because an S3 error is a status *and* a
+ *                       code in an XML body and the status alone cannot tell
+ *                       `NoSuchKey` from `NoSuchBucket`. The prefix also holds
+ *                       the object key, so it is bounded, it is masked out of
+ *                       every viewer (http_mask_body), and its lifetime is one
+ *                       call into the dialect
  *   '!' framer note     len = enum lk_http_note; body = NULL. Degradations and
  *                       blind zones the framer recognises, in the message stream
  *                       rather than in a side channel: they are visible in
@@ -66,6 +82,7 @@
 #define LK_HTTP_MSG_INTER 'I'
 #define LK_HTTP_MSG_DATA  'D'
 #define LK_HTTP_MSG_END   'E'
+#define LK_HTTP_MSG_ERRB  'X'
 #define LK_HTTP_MSG_NOTE  '!'
 
 /* Note codes, carried in lk_msg.len of a '!' message. Everything up to
@@ -146,6 +163,11 @@ struct http_dir {
     __u8 chunk_st;                   /* enum http_chunk_st */
     __u8 chunk_dig;                  /* hex digits seen in the current size line */
     __u8 atline;                     /* block scanner: the next byte starts a line */
+    __u8 err_want;                   /* SEND only: this response failed and the dialect
+                                        asked for a prefix of its body (РS5). Armed by the
+                                        status line, spent on the first captured body
+                                        bytes, and never re-armed within one message —
+                                        one 'X' per response or none */
     __u8 anchor_n;                   /* bytes of a candidate resync anchor matched so far */
     __u8 anchor[LK_HTTP_ANCHOR_MAX]; /* ... and the bytes, re-injected on a hit */
     __u64 body_left;                 /* HTTP_FR_BODY: body bytes still unaccounted */
@@ -212,6 +234,20 @@ struct http_frame {
 #define LK_HTTP_REQID_MAX  48   /* X-Request-Id / X-Amzn-Trace-Id (a UUID is 36) */
 #define LK_HTTP_CTYPE_MAX  32   /* Content-Type, first token only */
 #define LK_HTTP_ROUTE_MAX  96   /* --http-route-header value (РH7); "" = none */
+/* The two response values a dialect may keep (РH8). They live on the connection
+ * rather than on the unit — see struct http_conn — so their size is paid once
+ * per socket and not sixteen times. */
+#define LK_HTTP_ERRNAME_MAX 48 /* == LK_S3_CODE_MAX: the S3 `<Code>` (РS5) */
+#define LK_HTTP_OBJVER_MAX  48 /* an object version id; MinIO's are UUIDs */
+
+/* How much of a failing response's body the framer will carry up in an 'X'
+ * (РS5). Two measurements set it: `<Code>` is the first child of `<Error>` in
+ * every response the МS0 corpus contains, and MinIO's whole error bodies are
+ * 300–450 bytes. 256 reaches the code in all of them with the XML declaration
+ * still in front of it, and a body that needs more than that is a body we
+ * decline to hunt through — the fallback is the HTTP status, which is what a
+ * server without an XML error would have left us with anyway. */
+#define LK_HTTP_ERRB_MAX 256
 
 /* W3C trace context lifted off the request (РH11). Kept in its compact binary
  * form — 25 bytes rather than the 55-character header — because it is small
@@ -256,8 +292,17 @@ struct http_unit {
                                           when --http-route-header named a header
                                           (РH7); "" means "classify the target" */
 
+    __u64 obj_bytes; /* the dialect's logical payload size (РS6): what the unit
+                        reports as lk_query_obs.obj_bytes when the wire count is
+                        not the object's own size. 0 = follow the wire */
+
     __u16 status;     /* final response status; 0 = no response head yet */
     __u16 flags;      /* accumulated LK_QO_* */
+    __u16 dflags;     /* the dialect's own bits about this request head (РH8),
+                         opaque to everything but the dialect that set them: for
+                         S3, "the bucket came from the Host" and "there was an
+                         `x-amz-copy-source`" — the two facts the classifier
+                         needs and the head is long gone by the time it runs */
     __u8 method_id;   /* enum http_method */
     __u8 minor;       /* request HTTP/1.<minor> */
     __u8 resp_minor;  /* response HTTP/1.<minor> */
@@ -289,9 +334,29 @@ struct http_unit {
  * carry a message. The two variable-length copies live outside it, in owned
  * buffers reused across a slot's units, so a connection that never meets a
  * trace context never allocates for one. */
+/* What a dialect keeps from a *response*, and why it is one buffer per
+ * connection instead of one per unit (РH8, РS5).
+ *
+ * The in-flight queue is deep because requests pipeline; responses do not. They
+ * come back in order, one at a time, and a unit is retired at the end of its own
+ * response body — so between "a response head arrived" and "its unit was
+ * emitted" there is never a second response in progress. One buffer therefore
+ * suffices, it is cleared at every final response head, and the sixteen-slot
+ * ring stays the size it was for every connection that is not S3. */
+struct http_dresp {
+    char err_name[LK_HTTP_ERRNAME_MAX];   /* the S3 `<Code>` (РS5); "" = none */
+    char obj_version[LK_HTTP_OBJVER_MAX]; /* `x-amz-version-id`; "" = none */
+};
+
 struct http_conn {
     struct lk_session session; /* host -> db, UA -> app, user "-" unless basic (РH10) */
     __u64 msgs;                /* messages dispatched on this connection */
+
+    /* The connection's flavour of HTTP (РH8), resolved once from the port map
+     * rather than at every field of every head. Never NULL: a connection with no
+     * protocol assigned frames as the base dialect, exactly as it frames as PG. */
+    const struct lk_http_dialect *d;
+    struct http_dresp dr;
 
     struct http_unit ring[LK_HTTP_MAX_INFLIGHT];
     __u64 head_seq; /* oldest live unit; the one a response belongs to */
@@ -318,6 +383,86 @@ struct http_conn {
                       no unit may open before the next request head, which is
                       the first boundary the framer can vouch for */
 };
+
+/* --- the dialect (РH8, declared in proto.h) -------------------------------- */
+
+/* What a classifier is shown of a request. Spans, borrowed for the call, in the
+ * shape the handler already holds them: the method token, the raw request-target
+ * minus any absolute-form authority (path plus `?query`), the host, and the bits
+ * the dialect itself set while the head was still there. Passing the pieces
+ * rather than the whole head is what keeps a dialect from becoming a second
+ * header parser.
+ *
+ * `host` is the unit's host *slot*, not necessarily a hostname: a dialect that
+ * puts something else in it (S3 puts the bucket, РS3) sees its own value back
+ * here, which is why the S3 classifier reads the addressing form out of `dflags`
+ * and never re-derives it. */
+struct lk_http_req {
+    const char *method;
+    __u32 method_len;
+    const char *target;
+    __u32 target_len;
+    const char *host;
+    __u32 host_len;
+    __u16 dflags; /* http_unit.dflags, verbatim */
+};
+
+/* lk_http_dialect.flags */
+#define LK_HTTP_D_ERR_BODY                                                                         \
+    (1 << 0) /* the framer must hand up a bounded prefix of a                                      \
+                response body whose status is ≥ 400 (РS5). Off for                              \
+                the base dialect, which reads no body byte at all */
+
+/* One flavour of HTTP. Every hook but `classify` may be NULL, and for the base
+ * dialect all of them are: plain HTTP needs nothing off a head that http_req.c
+ * does not already read, so the cost of the seam on the common path is a handful
+ * of predicted-not-taken branches.
+ *
+ * `classify` is called once per observation, as the unit is emitted. It must be
+ * pure — same request, same config, same answer, no state between calls — which
+ * is what lets a fuzzer state the closed-set invariant about it (РS2) and what
+ * keeps two agents watching the same traffic from disagreeing.
+ *
+ * The rest run while the bytes are still there, and the order is the order of
+ * the exchange: req_field per header line of a request head, req_head once when
+ * that head is complete and the base labels are in place, resp_field per header
+ * line of a final response head, err_body at most once with the failing body's
+ * prefix, obs last, on the way out. Everything they are handed is borrowed for
+ * the call. */
+struct lk_http_dialect {
+    const char *name; /* "http" / "s3"; matches lk_proto_ops.name */
+    __u16 flags;      /* LK_HTTP_D_* */
+
+    void (*classify)(const struct lk_http_req *rq, const struct lk_http_cfg *cfg,
+                     struct lk_route_out *out);
+
+    void (*req_field)(struct http_unit *u, const struct lk_http_cfg *cfg, struct http_span name,
+                      struct http_span val);
+    void (*req_head)(struct http_unit *u, const struct lk_http_cfg *cfg,
+                     const struct lk_http_req *rq);
+    void (*resp_field)(struct http_conn *hc, struct http_unit *u, struct http_span name,
+                       struct http_span val);
+    void (*err_body)(struct http_conn *hc, const char *p, __u32 n);
+    void (*obs)(const struct http_conn *hc, const struct http_unit *u, struct lk_query_obs *o);
+};
+
+/* The base dialect (РH7): heuristic route templating over the explicit map, and
+ * not one header of its own. src/proto/http/http_route.c. */
+extern const struct lk_http_dialect lk_http_dialect_base;
+
+/* The S3 dialect (РS1): an operation out of a closed table, a bucket, an access
+ * key and an error code. src/proto/s3/s3_dialect.c. */
+extern const struct lk_http_dialect lk_http_dialect_s3;
+
+/* A connection's flavour, never NULL: no port map, a lazily created entry or a
+ * bare unit-test lk_conn all mean the base dialect, mirroring lk_conn_proto's
+ * fallback to PG one layer down. */
+static inline const struct lk_http_dialect *http_dialect(const struct lk_conn *c)
+{
+    const struct lk_proto_ops *ops = lk_conn_proto(c);
+
+    return ops->dialect ? ops->dialect : &lk_http_dialect_base;
+}
 
 /* The unit a sequence number refers to, or NULL when it has been emitted (or
  * never existed). Inline because every message dispatch calls it. */
@@ -401,6 +546,16 @@ void http_req_head(struct lk_proto *p, struct lk_conn *c, struct http_conn *hc,
  * it records a timestamp and returns, because a 1xx closes nothing (РH6). */
 void http_resp_head(struct lk_proto *p, struct http_conn *hc, const struct lk_msg *m, bool interim);
 
+/* --- http_frame.c: the framer, shared by every dialect (РS1) ---------------
+ * Not static, because "one framer, two registry entries" is what a dialect
+ * *is*: src/proto/s3/s3_dialect.c builds lk_proto_s3_ops out of these three and
+ * a different lk_http_dialect, and a second copy of the framing rules is
+ * precisely what РH8 exists to avoid. */
+void http_stream_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, const __u8 *p,
+                       __u32 n, __u64 ts_ns);
+void http_stream_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64 n);
+void http_mask_body(const struct lk_msg *m, __u8 *p, __u32 n);
+
 /* --- http_route.c: the dialect seam (РH8) ---------------------------------- */
 
 /* The route this unit is reported under: the header the application declared if
@@ -408,7 +563,7 @@ void http_resp_head(struct lk_proto *p, struct http_conn *hc, const struct lk_ms
  * classifying the raw target (РH7). `out->text_len == 0` means "no route" — a
  * CONNECT, or a request head we never read — and the observation carries none
  * rather than a made-up one. */
-void http_route_resolve(const struct lk_conn *c, const struct http_unit *u,
+void http_route_resolve(const struct http_conn *hc, const struct http_unit *u,
                         struct lk_route_out *out);
 
 /* The active configuration (РH10/РH7), read by http_req.c and http_route.c. */

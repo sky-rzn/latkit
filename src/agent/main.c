@@ -75,6 +75,15 @@ static char opt_http_route_header[32]; /* --http-route-header, folded lowercase 
  * the byte-exact target everywhere, which is a debugging choice and has to be
  * made deliberately. Stored as the opt-out so a zeroed config redacts. */
 static bool opt_http_no_redact;
+/* The two S3 knobs (РS3/РS4, PLAN-MINIO.md МS1), read only by the `s3` dialect
+ * and inert for every other port. `--s3-domain` is repeatable and borrowed from
+ * argv (or from a strdup'd copy when it arrives through the env layer);
+ * `--s3-user off` turns the access-key dimension off entirely, which is the
+ * escape hatch for a deployment whose STS credentials are so short-lived that
+ * even the max_session_dims spill cannot keep up. */
+static const char *opt_s3_domains[LK_S3_DOMAIN_MAX];
+static int opt_s3_ndomains;
+static bool opt_s3_no_user;
 static struct lk_port_proto opt_port_protos[LK_MAX_PORTS];
 static int opt_nports;
 static __u64 opt_ringbuf_bytes = LK_RINGBUF_SZ;
@@ -236,6 +245,14 @@ static void usage(FILE *out, const char *argv0)
             "                        *** wherever a request target leaves the\n"
             "                        handler, and blank credential headers in the\n"
             "                        --messages dump (default: on)\n"
+            "      --s3-domain NAME  on an `s3` port, treat a Host of the form\n"
+            "                        <bucket>.NAME as virtual-host addressing;\n"
+            "                        repeatable, up to %d (default: none, i.e.\n"
+            "                        every request is read path-style)\n"
+            "      --s3-user accesskey|off\n"
+            "                        derive the `user` label from the access key\n"
+            "                        in an S3 signature — the public half of the\n"
+            "                        pair, never the signature (default: accesskey)\n"
             "      --print-config    resolve config (flag > LATKIT_* env > default)\n"
             "                        to stdout and exit; every flag has a LATKIT_*\n"
             "                        env equivalent (see README)\n"
@@ -246,7 +263,8 @@ static void usage(FILE *out, const char *argv0)
             LK_VERSION, argv0, LK_MAX_PORTS, LK_DEFAULT_PORT, LK_RINGBUF_SZ, LK_CAPTURE_LIMIT,
             LK_MAX_CHUNKS * LK_CHUNK_FULL, LK_CAP_HEADERS_LIMIT, LK_MAX_CONNS_DEFAULT,
             LK_CONN_IDLE_TIMEOUT_SEC, LK_TOP_QUERIES_DEFAULT, LK_QUERY_LABEL_LEN_DEFAULT,
-            LK_PROM_LISTEN_DEFAULT, LK_SPAN_TEXT_MAX_DEF, LK_TLS_GO_MAX_PATHS, LK_ROUTE_DEPTH_DEF);
+            LK_PROM_LISTEN_DEFAULT, LK_SPAN_TEXT_MAX_DEF, LK_TLS_GO_MAX_PATHS, LK_ROUTE_DEPTH_DEF,
+            LK_S3_DOMAIN_MAX);
 }
 
 /* Strict decimal parse into [min, max]; -1 on any trailing garbage. */
@@ -296,6 +314,8 @@ enum {
     OPT_HTTP_QUERY_KEYS,
     OPT_HTTP_ROUTE_HEADER,
     OPT_HTTP_REDACT,
+    OPT_S3_DOMAIN,
+    OPT_S3_USER,
     OPT_TLS,
     OPT_LIBSSL,
     OPT_TLS_COMM,
@@ -559,6 +579,50 @@ static int set_option(int c, char *optarg)
             return -1;
         }
         break;
+    case OPT_S3_DOMAIN: {
+        /* РS3: the suffixes under which a leading Host label names a bucket.
+         * There is no way to tell the two addressing forms apart from the
+         * request alone — `GET /x` against `Host: photos.minio` is `photos/x`
+         * or a ListObjects on bucket `x` depending on a server-side setting we
+         * cannot see — so the server's configuration decides and ours has to
+         * as well. With no suffix given every request is read path-style, which
+         * is also what MinIO does without MINIO_DOMAIN. */
+        size_t n = strlen(optarg);
+
+        if (opt_s3_ndomains >= LK_S3_DOMAIN_MAX) {
+            fprintf(stderr, "--s3-domain: at most %d suffixes\n", LK_S3_DOMAIN_MAX);
+            return -1;
+        }
+        if (!n || optarg[0] == '.') {
+            fprintf(stderr, "--s3-domain: expected a bare suffix like 's3.example.com', got '%s'\n",
+                    optarg);
+            return -1;
+        }
+        /* Copied rather than pointed into optarg: the env layer hands this
+         * function a buffer it owns and frees (as --http-query-keys does). */
+        opt_s3_domains[opt_s3_ndomains] = strndup(optarg, n);
+        if (!opt_s3_domains[opt_s3_ndomains]) {
+            fprintf(stderr, "--s3-domain: out of memory\n");
+            return -1;
+        }
+        opt_s3_ndomains++;
+        break;
+    }
+    case OPT_S3_USER:
+        /* РS4: on by default, unlike --http-user, because an S3 request always
+         * carries an access key and the key *is* the tenant — a per-tenant
+         * latency panel is half the reason to watch an object store at all. The
+         * off switch is for a deployment whose STS credentials churn faster than
+         * max_session_dims can spill them into `other`. */
+        if (!strcmp(optarg, "accesskey")) {
+            opt_s3_no_user = false;
+        } else if (!strcmp(optarg, "off")) {
+            opt_s3_no_user = true;
+        } else {
+            fprintf(stderr, "--s3-user: expected 'accesskey' or 'off', got '%s'\n", optarg);
+            return -1;
+        }
+        break;
     case OPT_HTTP_ROUTES:
         /* The file is read after parsing, not here: an option handler that does
          * I/O runs from the env layer too, and "the config was rejected" should
@@ -744,6 +808,8 @@ static const struct env_opt env_opts[] = {
     /* Value-carrying rather than boolean (`on`/`off`) because its default is on:
      * a truthy-word variable could only ever turn on what is already on. */
     {"LATKIT_HTTP_REDACT", OPT_HTTP_REDACT, true, false},
+    {"LATKIT_S3_DOMAIN", OPT_S3_DOMAIN, true, true},
+    {"LATKIT_S3_USER", OPT_S3_USER, true, false},
 };
 
 /* Apply LATKIT_* env variables to flags not given on the CLI (Р34): flag > env
@@ -826,6 +892,8 @@ static int parse_args(int argc, char **argv)
         {"http-query-keys", required_argument, NULL, OPT_HTTP_QUERY_KEYS},
         {"http-route-header", required_argument, NULL, OPT_HTTP_ROUTE_HEADER},
         {"http-redact", required_argument, NULL, OPT_HTTP_REDACT},
+        {"s3-domain", required_argument, NULL, OPT_S3_DOMAIN},
+        {"s3-user", required_argument, NULL, OPT_S3_USER},
         {"tls", required_argument, NULL, OPT_TLS},
         {"libssl", required_argument, NULL, OPT_LIBSSL},
         {"tls-comm", required_argument, NULL, OPT_TLS_COMM},
@@ -980,11 +1048,15 @@ static void configure_http(void)
         .no_redact = opt_http_no_redact,
         .user_basic = opt_http_user_basic,
         .route = {.map = opt_http_route_map, .depth = (uint8_t)opt_http_route_depth},
+        .s3 = {.no_user = opt_s3_no_user},
     };
 
     for (int i = 0; i < opt_http_nquery_keys; i++)
         cfg.route.query_keys[i] = opt_http_query_keys[i];
     cfg.route.nquery_keys = (uint8_t)opt_http_nquery_keys;
+    for (int i = 0; i < opt_s3_ndomains; i++)
+        cfg.s3.domains[i] = opt_s3_domains[i];
+    cfg.s3.ndomains = (uint8_t)opt_s3_ndomains;
     memcpy(cfg.route_header, opt_http_route_header, sizeof(cfg.route_header));
     lk_proto_http_configure(&cfg);
 }
@@ -1066,6 +1138,11 @@ static void print_config(void)
     printf("\n");
     printf("http_route_header=%s\n", opt_http_route_header);
     printf("http_redact=%s\n", opt_http_no_redact ? "off" : "on");
+    printf("s3_domain=");
+    for (int i = 0; i < opt_s3_ndomains; i++)
+        printf("%s%s", i ? "," : "", opt_s3_domains[i]);
+    printf("\n");
+    printf("s3_user=%s\n", opt_s3_no_user ? "off" : "accesskey");
     printf("top_queries=%u\n", opt_top_queries ? opt_top_queries : LK_TOP_QUERIES_DEFAULT);
     printf("query_label_len=%u\n",
            opt_query_label_len ? opt_query_label_len : LK_QUERY_LABEL_LEN_DEFAULT);
