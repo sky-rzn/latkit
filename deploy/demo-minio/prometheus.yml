@@ -1,0 +1,12 @@
+# Prometheus config for the S3 demo stack. Scrapes latkit's /metrics on the
+# compose network every 5s so the dashboards come alive quickly. One agent
+# watches both legs (9000 plaintext, 9443 with the tls profile), so there is one
+# target here whichever profile is up.
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: latkit
+    static_configs:
+      - targets: ["latkit:9752"]

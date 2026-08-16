@@ -1,25 +1,29 @@
 # latkit
 
-**Per-query PostgreSQL and MySQL latency, and per-route HTTP latency, without an extension, a config change, or a restart.**
+**Per-query PostgreSQL and MySQL latency, per-route HTTP latency, per-operation S3 latency — without an extension, a config change, or a restart.**
 
-Latkit is an eBPF agent that watches the PostgreSQL, MySQL/MariaDB and HTTP/1.x
-wire protocols at the socket layer and turns them into latency histograms:
+Latkit is an eBPF agent that watches the PostgreSQL, MySQL/MariaDB, HTTP/1.x and
+S3 wire protocols at the socket layer and turns them into latency histograms:
 normalised query text, database/user labels, row counts, SQLSTATE errors and
 transaction timings for the databases; templated routes, methods, hosts, status
-codes and four separate timings for HTTP. It exports to Prometheus and
-OpenTelemetry, ships with five ready-made Grafana dashboards, runs beside the
+codes and four separate timings for HTTP; operations, buckets, access keys, S3
+error codes and object sizes for an object store. It exports to Prometheus and
+OpenTelemetry, ships with six ready-made Grafana dashboards, runs beside the
 server, and the server never knows it's there.
 
-Every series carries a `proto="pg"|"mysql"|"http"` label; one agent can watch a
-5432, a 3306 and an 8080 at once
-(`--port 5432,3306=mysql,8080=http`).
+Every series carries a `proto="pg"|"mysql"|"http"|"s3"` label; one agent can
+watch a 5432, a 3306, an 8080 and a 9000 at once
+(`--port 5432,3306=mysql,8080=http,9000=s3`).
 
 For HTTP that means p99 per route from a web server with no access log, no
 status module and no instrumentation — and, when the caller sends a W3C
-`traceparent`, a server span **inside the caller's existing trace**. The
-declared blind zones (HTTP/2 and therefore gRPC, HTTP/3, WebSocket, CONNECT)
-are counted rather than guessed at: see [Known
-limitations](#known-limitations).
+`traceparent`, a server span **inside the caller's existing trace**. For **S3**
+it means p99 per operation, per bucket and per access key from a MinIO nobody
+gave you the admin credentials to — with the object key, the most sensitive
+thing an S3 request carries, never becoming a label. The declared blind zones
+(HTTP/2 and therefore gRPC, HTTP/3, WebSocket — which is what MinIO's
+inter-node grid rides on — and CONNECT) are counted rather than guessed at: see
+[Known limitations](#known-limitations).
 
 
 ![latkit Overview dashboard](docs/img/latkit-overview.png)
@@ -44,15 +48,19 @@ live query latency shows up within a minute. TLS profile and troubleshooting:
 [deploy/demo-mysql](deploy/demo-mysql/README.md); for **HTTP** — nginx in front
 of a Go backend, the **latkit — HTTP** dashboard, plus optional HTTPS and
 `traceparent`-into-Jaeger profiles — in
-[deploy/demo-http](deploy/demo-http/README.md).
+[deploy/demo-http](deploy/demo-http/README.md); for **S3** — MinIO driven by its
+own `mc` client through every operation family, the **latkit — S3 / MinIO**
+dashboard and an HTTPS profile — in
+[deploy/demo-minio](deploy/demo-minio/README.md).
 
 ## Why latkit
 
 - **Zero-touch.** You don't need a PostgreSQL extension,
   `shared_preload_libraries` or a restart — nor, for a web server, an access
-  log, a status module or a line of instrumentation. Point the agent at a
-  running server and metrics start flowing. Nothing runs inside it; it doesn't
-  know the agent exists.
+  log, a status module or a line of instrumentation — nor, for an object store,
+  admin credentials, a bucket-metrics level or `mc admin config set`. Point the
+  agent at a running server and metrics start flowing. Nothing runs inside it;
+  it doesn't know the agent exists.
 - **Server-side truth.** Latency is measured network-to-network on the server's
   own host. It's what the server actually took, per query, including everything
   `pg_stat_statements` never sees (parse, protocol round-trips, result
@@ -64,7 +72,10 @@ of a Go backend, the **latkit — HTTP** dashboard, plus optional HTTPS and
   folds into `query="other"`. A URL is unbounded by construction, so the same
   machinery caps the HTTP `route` label — and the templater that turns
   `/users/8213/orders` into `/users/{id}/orders` only decides *which* routes you
-  get, never *how many*. See [Routes](#http-routes-a-url-is-not-a-label).
+  get, never *how many*. An S3 request needs no heuristic at all: its identity
+  is an **operation** from a table of ~45. See
+  [Routes](#http-routes-a-url-is-not-a-label) and
+  [S3](#s3-an-operation-is-not-an-object-key).
 - **Honest under loss.** Ringbuf drops and parser resyncs are counted and
   dashboarded.
 - **TLS without decryption keys.** Encrypted sessions ride the same pipeline
@@ -322,6 +333,12 @@ are reconciled, with numbers, in [docs/accuracy.md](docs/accuracy.md). A 5xx is
 an error; a **4xx is not** (the server correctly saying no), though both are
 counted by exact code in `latkit_http_errors_total`.
 
+An **S3** port uses that same model — an object store is where it matters most,
+since a `PUT` of a gigabyte and a `GET` that streams one are exactly the shapes
+a single duration histogram destroys. Measured against MinIO's own
+`mc admin trace`, the split is exact to a fraction of a millisecond
+([docs/accuracy.md](docs/accuracy.md) §S3).
+
 ## HTTP routes: a URL is not a label
 
 A `query` label is bounded because SQL normalises to a fingerprint. A URL has no
@@ -346,6 +363,53 @@ third, not from the heuristic:
 
 The route's identity includes the method: `GET /orders/{id}` and
 `DELETE /orders/{id}` are two routes, never one histogram.
+
+## S3: an operation is not an object key
+
+`--port 9000=s3` reads the same HTTP/1.1 wire under the object store's nouns.
+Nothing about the framing, the timings or the TLS channel changes; four things
+about the *meaning* do:
+
+- **the identity of a request is an operation, from a table.** `GetObject`,
+  `UploadPart`, `ListObjectsV2`, `DeleteObjects`, `CreateMultipartUpload`, …
+  — derived from (method, path shape, query keys), about 45 values, listed in
+  [docs/notes-s3proto.md](docs/notes-s3proto.md). There is no templating
+  heuristic here and none is wanted: cardinality is bounded by the table itself,
+  an unknown call is `op="other"`, and **the object key never becomes a label**
+  — not truncated, not hashed, not templated. It is the most sensitive part of
+  an S3 request, and the guarantee about it is structural;
+- **the bucket takes the `host` slot**, read path-style (`/bucket/key`) or from
+  the Host with `--s3-domain`, and only after it passes S3's own naming rules —
+  a name arrives from the wire, so it becomes a label after a check, not before.
+  A request that names no bucket (`ListBuckets`) is `bucket="-"`, which is a
+  different fact from a name that was refused (`bucket="other"`);
+- **the access key becomes `user`** — the public half of the pair, out of the
+  SigV4 `Credential=` or a presigned `X-Amz-Credential`. The signature, the
+  per-chunk signatures and `X-Amz-Security-Token` are never read; an anonymous
+  request is `user="-"`. Since STS credentials are ephemeral, the (bucket,user)
+  ceiling is raised automatically for an `s3` port and spills to `user="other"`;
+  `--s3-user off` drops the label;
+- **an error has a name, not just a number.** At status ≥ 400 the agent reads
+  the `<Code>` element from the start of the response body — the one case where
+  any body byte is looked at — so `NoSuchKey`, `NoSuchBucket` and
+  `AccessDenied` are told apart instead of being three `404`/`403`s. Object
+  sizes come from `x-amz-decoded-content-length` when the upload is
+  `aws-chunked`, so the histogram measures objects rather than chunk framing.
+
+**MinIO already exports Prometheus metrics** — including API latencies — so the
+honest case for this is what those do not have: zero touch (no admin
+credentials, no bucket-metric level, no restart), the **access key and the
+bucket in one cut**, TTFB and body-streaming time kept apart, the individual
+slow request as a span, one agent per host for the databases, the web servers
+and the object store, and the same labels on any S3-compatible server, MinIO's
+own metrics endpoint or none at all. It does not replace heal state, drive
+health, capacity or replication lag: run both.
+
+Not the S3 API, and counted as such: MinIO's `/minio/…` surface — health
+probes, the admin API, the metrics endpoint — lands in
+`latkit_s3_internal_requests_total` and in nothing that says "requests" (on a
+distributed pool it is most of the port's traffic), and the inter-node **grid**
+is a binary protocol inside a websocket, which is a declared blind zone.
 
 ## `traceparent`: inside somebody else's trace
 
@@ -383,6 +447,13 @@ method, tables and reproduction script - `tests/bench/run.sh`):
   ~150–200k queries/s per core) the agent **drops and counts** rather
   than degrading silently.
 
+For an object store the cost tracks bytes and calls rather than a query rate,
+and `warp` measures it: **0.010 cores** at 400 operations/s and 240 MiB/s
+against one MinIO, **0.160** for the same client load against a four-node pool
+— because 65 % of what arrives on a pool's S3 port is the cluster talking to
+itself. Uncapped, one node delivers 880 MiB/s (7.4 Gbit/s) with **zero** dropped
+records at the default 2048-byte per-call capture budget.
+
 ## Security
 
 - **The agent sees SQL text; masking is on by default and by construction.**
@@ -403,6 +474,12 @@ method, tables and reproduction script - `tests/bench/run.sh`):
   debug dump, and `Authorization` is decoded no further than a user name — and
   only if you ask for it (`--http-user basic`). A sampled span is the only
   thing that carries a `url.path` (redacted) off the host.
+- **On an S3 port the object key is never a label**, by construction rather than
+  by redaction: the label is the operation, and it comes from a table. From an
+  S3 signature only the access key is read — never the signature itself, the
+  per-chunk signatures or `X-Amz-Security-Token` — and `--s3-user off` removes
+  even that. The one body the agent looks at is the first bytes of an *error*
+  response, for its `<Code>` element.
 - **Own endpoints bind loopback by default** (`--prom-listen
   127.0.0.1:9752`) and speak plain HTTP with no auth. Exposing them
   (`0.0.0.0`) is an explicit choice. Front with a reverse proxy outside a
@@ -446,6 +523,30 @@ method, tables and reproduction script - `tests/bench/run.sh`):
   Outgoing requests (your app calling someone else's API) are not observed in
   v1: the capture filter is on the local port, and a client's local port is
   ephemeral.
+- **S3 scope: the client-facing API of an S3 server over HTTP/1.x.** Everything
+  the HTTP scope above says applies unchanged; on top of it, and out of scope on
+  purpose:
+  - **MinIO's inter-node traffic.** The **grid** multiplexer (`/minio/grid/…`)
+    is binary msgp inside a websocket, so it leaves through the `Upgrade` door
+    (`latkit_ignored_conns_total{reason="upgrade"}`); peer/storage/lock RPC and
+    every other `/minio/…` request on the client port — health probes, the
+    metrics endpoint, the **admin API**, which is never parsed — is counted in
+    `latkit_s3_internal_requests_total` and becomes no observation. Capture the
+    client port, one agent per node;
+  - the **Console/WebUI** is a separate port and is not captured unless you name
+    it;
+  - **`S3 Select`** and other event-framed responses: the body is a frame
+    stream, not an object — timings and status stay right, the payload is never
+    parsed. Request bodies (XML policies, the key list of a `DeleteObjects`)
+    are not parsed either;
+  - **TLS is the Go channel or nothing** (`--tls-go`): MinIO maps no libssl.
+    A binary that cannot be hooked is fatal at startup with the cause, rather
+    than a flat dashboard — see [docs/notes-tls.md](docs/notes-tls.md) §4b;
+  - a **`sendfile`/large-write response body** is where the one measured
+    systematic difference lives: the tail of a body's last capture-budget hole
+    is not credited, so `bytes_out` can be a declared lower bound
+    (`LK_QO_BODY_UNSEEN`, never above the truth). Numbers:
+    [docs/accuracy.md](docs/accuracy.md) §S3.
 - **UDP is counted, never parsed.** QUIC/HTTP-3 does not pass through the TCP
   capture point at all, so an h3 server would look exactly like a broken agent.
   Datagrams on the captured ports are therefore counted
@@ -482,9 +583,9 @@ method, tables and reproduction script - `tests/bench/run.sh`):
 ```
         kernel                             userspace (one process, one epoll loop)
 ┌───────────────────────────┐            ┌──────────────────────────────────────────┐
-│ fentry tcp_sendmsg        │  ringbuf   │ conn table → framer → PG/MySQL/HTTP      │
+│ fentry tcp_sendmsg        │  ringbuf   │ conn table → framer → PG/MySQL/HTTP(+S3) │
 │ fentry/fexit tcp_recvmsg  │ ─────────▶ │   parser → SQL normaliser / route        │
-│ tp_btf inet_sock_set_state│  events    │   templater → top-K registry             │
+│ tp_btf inet_sock_set_state│  events    │   templater / S3 op table → top-K reg.   │
 │ uprobes SSL_read/SSL_write│            │   → /metrics (pull) + OTLP push + spans  │
 │ uprobes Go crypto/tls     │            │                                          │
 │ fentry udp_sendmsg/recvmsg│            │ (UDP: counted only — see limitations)    │
@@ -501,7 +602,8 @@ layer-by-layer write-ups: [docs/notes-iov.md](docs/notes-iov.md) (payload
 capture), [docs/notes-reassembly.md](docs/notes-reassembly.md) (framing),
 [docs/notes-pgproto.md](docs/notes-pgproto.md) /
 [docs/notes-myproto.md](docs/notes-myproto.md) /
-[docs/notes-httpproto.md](docs/notes-httpproto.md) (parsers),
+[docs/notes-httpproto.md](docs/notes-httpproto.md) /
+[docs/notes-s3proto.md](docs/notes-s3proto.md) (parsers),
 [docs/notes-metrics.md](docs/notes-metrics.md) (normalisation, nomenclature,
 cardinality), [docs/notes-export.md](docs/notes-export.md) (exporters),
 [docs/notes-tls.md](docs/notes-tls.md) (TLS).
@@ -545,7 +647,8 @@ sudo ./build/latkit --queries &
 streams one line at a time (`-x` adds hexdumps). `--record file.lkt` dumps
 the raw event stream for offline replay through the same pipeline - that is
 how the deterministic test fixtures work (`tests/replay/`,
-`tests/e2e/verify.sh`, `verify-tls.sh`, `verify-mysql-tls.sh`).
+`tests/e2e/verify.sh`, `verify-tls.sh`, `verify-mysql-tls.sh`,
+`verify-http.sh`, `verify-s3.sh`, `verify-s3-tls.sh`).
 
 ## License
 

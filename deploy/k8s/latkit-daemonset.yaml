@@ -1,6 +1,7 @@
 # latkit DaemonSet (Р47) — one agent per node, capturing every postgres (or
-# MySQL, or HTTP/1.x server) on the node kernel-side. Single file, no Helm (v1
-# scope); configuration is the LATKIT_* env layer (Р34) right in this manifest.
+# MySQL, HTTP/1.x server, or S3/MinIO) on the node kernel-side. Single file, no
+# Helm (v1 scope); configuration is the LATKIT_* env layer (Р34) right in this
+# manifest.
 #
 #   kubectl apply -f latkit-daemonset.yaml
 #
@@ -56,9 +57,10 @@ spec:
               value: "0.0.0.0:9752"
             - name: LATKIT_PORT
               value: "5432"
-            # MySQL/MariaDB or HTTP instead of (or alongside) postgres: name the
-            # port's wire protocol, e.g. "3306=mysql", "5432,3306=mysql" or
-            # "8080=http,8443=http" (a bare number defaults to pg). Do NOT add
+            # MySQL/MariaDB, HTTP or S3 instead of (or alongside) postgres: name
+            # the port's wire protocol, e.g. "3306=mysql", "5432,3306=mysql",
+            # "8080=http,8443=http" or "9000=s3" (a bare number defaults to pg).
+            # Do NOT add
             # LATKIT_COMM=mysqld — that per-thread kernel filter drops every
             # event on MySQL 8.x, whose session threads are named `connection`
             # (MYSQL.md М5); web-server threads are not named after their binary
@@ -75,10 +77,43 @@ spec:
             # Route templating needs no configuration; if it mis-reads your API
             # (watch the route="other" share), mount a route map and set
             # LATKIT_HTTP_ROUTES — see deploy/demo-http/routes.map.
+            #
+            # An s3 port ("9000=s3") reads the same HTTP/1.1 wire as the S3 API:
+            # operation instead of route, bucket instead of Host, the access key
+            # out of the signature as `user`, the symbolic S3 code out of the
+            # error body. The object key is never a label. For a MinIO tenant
+            # (operator or Helm chart) name the S3 port; the pool's own traffic
+            # arrives on it too and is kept apart rather than mixed in: the grid
+            # multiplexer is binary msgp inside a websocket and is
+            # dropped-and-counted whole (ignored_conns_total{reason="upgrade"}),
+            # while the /minio/* requests — peer RPC, kubelet's probes above all
+            # — are counted as latkit_s3_internal_requests_total and become no
+            # observation. On a pool that is most of the port's traffic.
+            # TLS of an S3 port is Go-only (MinIO maps no libssl): see
+            # LATKIT_TLS_GO below — it is the sole channel there.
+            #
             # TLS capture of postgres running with ssl=on (stage 6). Needs the
             # SYS_PTRACE + SYS_ADMIN capabilities below.
             - name: LATKIT_TLS
               value: "auto"
+            # TLS plaintext of a GO server (MinIO, Caddy, Traefik, any
+            # net/http): there is no libssl to scan for, so the binary is named
+            # and crypto/tls is probed inside it. A uprobe binds to an INODE, so
+            # the path must resolve to the very file the server runs. In a
+            # cluster that means one of:
+            #   - the server runs on the node (a DaemonSet MinIO, a host
+            #     install): hostPath-mount the binary read-only and name the
+            #     mount path;
+            #   - the server runs in a pod: the path is
+            #     /proc/<pid>/root/usr/bin/minio, which only exists once the pod
+            #     does — resolve it at start (hostPID: true is already set) or
+            #     accept the port as a named blind zone;
+            #   - or terminate TLS at the ingress and capture the plaintext hop
+            #     behind it, which is the simplest answer in a cluster.
+            # A binary that cannot be hooked is fatal at startup with the cause,
+            # never a dashboard that is quietly flat.
+            #- name: LATKIT_TLS_GO
+            #  value: "/host/usr/local/bin/minio"
             # Capture only the postgres pods you mean, not every 5432 talker on
             # the node (Р48): comma-separated globs over /sys/fs/cgroup — on a
             # systemd-cgroup-driver node a pod lives under

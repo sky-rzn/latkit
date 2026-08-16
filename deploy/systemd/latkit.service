@@ -1,4 +1,5 @@
-# latkit — eBPF PostgreSQL latency agent (Р47).
+# latkit — eBPF latency agent for PostgreSQL, MySQL/MariaDB, HTTP/1.x and S3
+# (Р47).
 #
 # Install:
 #   cmake --build build && sudo cmake --install build     # /usr/local/bin/latkit
@@ -12,7 +13,7 @@
 # latkit.env.example; flags and defaults in `latkit --help`.
 
 [Unit]
-Description=latkit eBPF PostgreSQL latency agent
+Description=latkit eBPF wire-protocol latency agent (PostgreSQL, MySQL, HTTP, S3)
 # Operator documentation: docs/deploy.md in the source tree.
 # BPF needs a fully booted kernel side; network-online is NOT required — the
 # agent's fentry capture is not a network client, and the /metrics listener
@@ -39,6 +40,9 @@ RestartSec=5
 #                    for perf_uprobe_init() (CAP_PERFMON covers fentry only).
 #                    Running plaintext-only (LATKIT_TLS unset)? Delete
 #                    CAP_SYS_PTRACE and CAP_SYS_ADMIN from this line.
+# An s3 port's TLS (LATKIT_TLS_GO, the only channel MinIO has) needs
+# CAP_SYS_ADMIN alone: the binary is named, so there is no /proc scan and
+# CAP_SYS_PTRACE can go.
 CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_SYS_ADMIN
 NoNewPrivileges=yes
 ProtectSystem=strict

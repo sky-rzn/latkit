@@ -131,6 +131,74 @@ label set is called out explicitly.
   per-port value wins outright. `latkit --print-config` prints the resolved
   budget per port as `port_cap=PORT:BYTES`.
 
+- **S3 / MinIO support** (`--port 9000=s3`). latkit now observes an
+  S3-compatible object store — MinIO first, and anything else on the same wire
+  (Ceph RGW, SeaweedFS, Garage) — with no admin credentials, no bucket-metrics
+  level to raise and no restart. S3 is implemented as a **dialect of the HTTP
+  track**, not as a second protocol: the same framer, the same four timings, the
+  same TLS channels and the same per-port budget, with the object store's nouns
+  on top (PLAN-MINIO.md, [docs/notes-s3proto.md](docs/notes-s3proto.md)):
+  - **the operation replaces the route.** `(method, path shape, query keys)` map
+    through a table of ~45 values — `GetObject`, `PutObject`, `UploadPart`,
+    `CompleteMultipartUpload`, `ListObjectsV2`, `DeleteObjects`, `CopyObject`,
+    the sub-resource calls — so cardinality is bounded by the table rather than
+    by a heuristic, and the route templater is off for this dialect. An unknown
+    call is `op="other"`, whose share is a **freshness** signal about the table
+    rather than a cardinality guard. **The object key is never a label**;
+  - **`bucket`** takes the `host` slot, path-style or from the Host with
+    `--s3-domain`, and only after passing S3's naming rules (`bucket="other"` if
+    it does not; `bucket="-"` when the request names none, e.g. `ListBuckets`);
+  - **`user`** is the access key out of the SigV4 `Credential=` or a presigned
+    `X-Amz-Credential` — the public half of the pair. The signature, the
+    per-chunk signatures and `X-Amz-Security-Token` are never read; an anonymous
+    request is `user="-"`; `--s3-user off` drops the label. Because STS
+    credentials are ephemeral, the (bucket,user) dimension ceiling is raised to
+    128 for an `s3` port (32 elsewhere) and spills to `user="other"`;
+  - **the S3 error code** is read from the `<Code>` element at the start of an
+    error response body — the only case in which any response-body byte is
+    parsed — so `NoSuchKey`, `NoSuchBucket` and `AccessDenied` are three
+    different failures instead of two status numbers;
+  - **two byte counts**: the wire's `Content-Length` and the object's logical
+    size from `x-amz-decoded-content-length` when the upload is `aws-chunked`.
+    The size histogram is fed by the logical one, so chunk framing is not
+    reported as part of your objects.
+- **S3 metric families and the `latkit-s3` dashboard** (PLAN-MINIO.md МS2). An
+  `s3` port reports through its own family set:
+  `latkit_s3_requests_total{op,method,bucket,user,proto,status}`,
+  `latkit_s3_request_duration_seconds{…,code}`, `latkit_s3_ttfb_seconds`,
+  `latkit_s3_request_upload_seconds`,
+  `latkit_s3_errors_total{s3code,bucket,user,proto}`,
+  `latkit_s3_bytes_total{…,direction}`, `latkit_s3_object_size_bytes` (an octave
+  grid over the logical size) and `latkit_s3_internal_requests_total` — MinIO's
+  own `/minio/…` surface, counted and present in nothing that says "requests".
+  The `rows`/`txn` families are off in this profile: an object store has no rows
+  and no transactions. `dashboards/latkit-s3.json` is the sixth bundled
+  dashboard.
+- **`proto="s3"`** is a new value of the existing `proto` label, and the
+  dashboards' `$proto` variable selects it.
+- **S3 spans**: a sampled S3 observation is exported with the HTTP semantic
+  conventions plus `aws.s3.bucket` and `url.template` (the operation). A span is
+  the only path by which a `url.path` — object key included — leaves the host,
+  and spans stay off until an OTLP endpoint is configured.
+- **TLS for MinIO** (PLAN-MINIO.md МS3, РS8): MinIO terminates TLS in Go's
+  `crypto/tls` and maps no `libssl`, so of the three mechanics the HTTP track
+  built exactly one applies — `--tls-go /usr/bin/minio`, stripped official image
+  included. `minio` joined the comm set derived from an `s3` port (it gates the
+  uprobe channel), a configuration that cannot work (`--tls auto` with no
+  `--tls-go` on an s3-only agent) now warns at startup instead of reporting a
+  flat dashboard, and a binary that cannot be hooked explains which of five
+  causes it hit. Verified as a comparison: a TLS run and a plaintext run of the
+  same load produce the same observations operation for operation.
+- S3 deploy stacks: [`deploy/demo-minio`](deploy/demo-minio) (the two-minute
+  demo — MinIO driven by `mc` through every operation family, plus a `tls`
+  profile) and [`deploy/existing-minio`](deploy/existing-minio)
+  (monitoring-only, for a MinIO you already run).
+- Accuracy validation extended with an S3 track against `mc admin trace`, joined
+  per request by `x-amz-request-id` ([docs/accuracy.md](docs/accuracy.md) §S3):
+  duration p50 0.17 ms / p90 0.29 ms against MinIO's own `callStats`, status and
+  response bytes exact, and 100 % of operations agreeing with the name MinIO
+  gives the call.
+
 ### Changed
 
 - **Renamed self-metric: `latkit_http_requests_total` →
@@ -150,11 +218,13 @@ label set is called out explicitly.
   bump.
 - `--tls auto` default `/proc` scan set is now `{postgres, mysqld, mariadbd}`
   (was `postgres`), widened by `{nginx, httpd, apache2, haproxy}` when an HTTP
-  port is configured (М7). `--tls-comm` still narrows it to a single comm. A
-  deployment with only database ports scans exactly what it scanned before.
+  port is configured (М7) and by `{minio}` when an `s3` one is (МS3).
+  `--tls-comm` still narrows it to a single comm. A deployment with only
+  database ports scans exactly what it scanned before.
 - Internal, no visible effect: the kernel-side `ports` map value grew from a
   flag to a small struct (the per-port budget above), and the comm-filter
-  capacity from 4 to 8 entries.
+  capacity from 4 to 12 entries (a host running all three protocols with TLS
+  needed nine slots).
 
 ### Fixed
 
@@ -211,3 +281,23 @@ label set is called out explicitly.
   replication streams (`COM_BINLOG_DUMP`). MariaDB builds linking bundled
   wolfSSL/GnuTLS instead of OpenSSL cannot have their TLS decrypted (detected
   and dropped-and-counted). See [README](README.md) "Known limitations".
+- **S3 blind zones and non-goals**, all of them counted rather than guessed at:
+  MinIO's inter-node **grid** (binary msgp inside a websocket — it leaves
+  through `latkit_ignored_conns_total{reason="upgrade"}`), the rest of the
+  `/minio/…` surface on the client port including health probes and the **admin
+  API** (`latkit_s3_internal_requests_total`, which on a distributed pool is
+  most of the port's traffic), the **Console/WebUI** (a separate port, not
+  captured unless named), **S3 Select** and other event-framed responses (the
+  body is not parsed; timings and status stay right), and request bodies (XML
+  policies, the key list of a `DeleteObjects`). MinIO offers `http/1.1` to every
+  real client's ALPN list, so an `s3` port does not fall into the h2 blind zone
+  the way a browser-facing web server does — a proxy in front of it can.
+- **S3: the tail of a large response body can be under-counted** (measured, see
+  [docs/accuracy.md](docs/accuracy.md) §S3). A 1 MiB object leaves in 128 KiB
+  writes, each captured at the port's 2048-byte budget with the remainder
+  reported as a hole — and a hole is detected when the *next* call starts, which
+  for a body's last call never comes. 25 of 880 requests on the accuracy stand
+  therefore reported `bytes_out` short by one call's worth, flagged
+  `LK_QO_BODY_UNSEEN` and left out of the size histogram: a declared lower
+  bound, never above the truth, and bounded by one call regardless of object
+  size.

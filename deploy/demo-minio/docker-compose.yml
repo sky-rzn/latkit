@@ -1,0 +1,263 @@
+# latkit S3 demo stack (PLAN-MINIO.md МS5): MinIO + a load generator + latkit +
+# prometheus + grafana — the object-storage twin of ../demo (postgres),
+# ../demo-mysql and ../demo-http, wired so `docker compose up` on a Linux host
+# gives live Grafana with the bundled dashboards in about a minute after the
+# images are there. See README.md for the requirements and a tour.
+#
+#   docker compose up --build -d
+#   docker compose --profile tls up --build -d     # + an HTTPS MinIO (РS8)
+#   docker compose --profile tls down -v           # tear down either variant
+#
+# What makes this stack an S3 demo rather than another HTTP one: the agent is
+# told `9000=s3`, so the same HTTP/1.1 framer reads the exchange under the object
+# store's nouns — operation instead of route, bucket instead of Host, the access
+# key out of the signature as `user`, and the symbolic S3 error code out of the
+# XML body (РS1–РS6). The object key never becomes a label, which is the one
+# thing about an S3 URL that must not end up in a metric.
+#
+# Capture hygiene (README "Known limitations"): the load talks to MinIO over the
+# compose network by service name — MinIO publishes NO port, so nothing crosses
+# docker-proxy on localhost, which would splice() the payload past the capture
+# point. latkit filters the server ports kernel-wide, which covers the HTTPS
+# MinIO of the tls profile too.
+
+services:
+  # The object store. One node, one drive: this demo is about what the agent
+  # sees on the wire, and the wire is the same S3 API a 16-node pool speaks.
+  # No published port (see the header), and no console — the Console/WebUI is a
+  # separate port and deliberately out of scope (PLAN-MINIO.md §1).
+  minio:
+    image: minio/minio:latest
+    depends_on:
+      bin-init:
+        condition: service_completed_successfully
+    environment:
+      MINIO_ROOT_USER: lkroot
+      MINIO_ROOT_PASSWORD: lkrootpass123
+      MINIO_UPDATE: "off"
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    # Run the copy of the binary from the shared volume rather than the image's
+    # own, so that the file latkit hooks for TLS (below) and the file MinIO
+    # executes are provably one inode. Harmless on this plaintext leg; it is
+    # what makes the tls profile a one-line change.
+    entrypoint: ["/binsrc/minio"]
+    command: ["server", "/data", "--address", ":9000"]
+    volumes:
+      - miniobin:/binsrc:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+
+  # One `cp`, so that the agent and the server(s) share a binary by inode. A
+  # uprobe is registered against an inode, not a path: this is the container
+  # form of "point --tls-go at the binary the server runs" (МS3, docs/notes-tls
+  # .md §4b). It runs in the default profile too — the agent names the path at
+  # startup, and a named binary that is not there is fatal by design.
+  bin-init:
+    image: minio/minio:latest
+    entrypoint: ["sh", "-c"]
+    # Copy only if the volume is empty. Re-copying on a later `up` would give
+    # the file a new inode while the running MinIO kept executing the old one —
+    # the agent would then be hooking a binary nobody runs, and the TLS leg
+    # would go quiet for no visible reason. `down -v` drops the volume, which is
+    # how a new image version gets staged.
+    command:
+      - |
+        set -e
+        if [ ! -s /binsrc/minio ]; then
+          cp /usr/bin/minio /binsrc/minio.tmp
+          mv -f /binsrc/minio.tmp /binsrc/minio
+        fi
+        echo "minio binary staged: $(ls -l /binsrc/minio)"
+    volumes:
+      - miniobin:/binsrc
+    restart: "no"
+
+  # Steady, varied load so every panel is alive: three buckets, two access keys,
+  # every operation family the taxonomy has a row for (single PUT, aws-chunked
+  # PUT, multipart, copy, head, list, delete, multi-delete), three object-size
+  # decades, a slow upload, and deliberate failures that are different S3 codes
+  # behind the same HTTP status. Details and rationale: load/load.sh.
+  load:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MC_CONFIG_DIR: /tmp/mc
+    volumes:
+      - ./load/load.sh:/load.sh:ro
+      - share:/share
+    entrypoint: ["sh", "/load.sh"]
+    restart: unless-stopped
+
+  # The requests no SDK will make, and the two callers that are not a signed
+  # client: anonymous (`user="-"`), presigned (the access key travels in the
+  # query string, not in a header — РS4), and a signature from an access key
+  # that does not exist. busybox wget, because `mc` refuses to configure an
+  # alias whose credentials the server rejects. probe/probe.sh.
+  probe:
+    image: alpine:3.20
+    depends_on:
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./probe/probe.sh:/probe.sh:ro
+      - share:/share:ro
+    entrypoint: ["sh", "/probe.sh"]
+    restart: unless-stopped
+
+  # The agent — the release scratch image (musl static), built from the repo
+  # root so the version stamp sees .git. Configured through the LATKIT_* env
+  # layer, nothing else.
+  latkit:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    depends_on:
+      minio:
+        condition: service_healthy
+      bin-init:
+        condition: service_completed_successfully
+    # Demo simplicity. The measured minimal set instead (docs/deploy.md):
+    #   cap_add: [BPF, PERFMON, SYS_ADMIN]
+    # (SYS_ADMIN only for the Go TLS uprobes; + SYS_RESOURCE on < 5.11. An s3
+    # port needs no SYS_PTRACE: nothing scans /proc for a libssl that MinIO
+    # does not map.)
+    privileged: true
+    pid: host               # uprobes / /proc access need the host PID namespace
+    environment:
+      # The port form carries the wire protocol; a bare number would default to
+      # the postgres parser, and `9000=http` would give routes and Hosts instead
+      # of operations and buckets. 9443 is only used by the tls profile — a port
+      # with no traffic costs nothing.
+      LATKIT_PORT: "9000=s3,9443=s3"
+      LATKIT_PROM_LISTEN: "0.0.0.0:9752"  # default is loopback (Р29); a container must listen out
+      # MinIO terminates TLS inside Go's crypto/tls: there is no libssl to scan
+      # for, so `auto` alone would find nothing and the Go channel is named
+      # explicitly (РS8). `auto` is still on, for the other half of it — the
+      # scan set derived from the ports (`minio` for an s3 port) is what gates
+      # the uprobe channel kernel-side.
+      LATKIT_TLS: auto
+      LATKIT_TLS_GO: /binsrc/minio
+      # The S3 knobs, at their defaults, so the demo shows where they live:
+      #LATKIT_S3_USER: accesskey     # or `off` — no user label at all
+      #LATKIT_S3_DOMAIN: s3.demo     # virtual-host addressing: <bucket>.s3.demo
+      #
+      # OTLP spans (РH11, РS7): off unless you pass an endpoint. A span is the
+      # only path by which a url.path — object key included — leaves the host,
+      # and --http-redact applies to it.
+      LATKIT_OTLP_ENDPOINT: "${LATKIT_OTLP_ENDPOINT:-}"
+      LATKIT_OTLP_SPANS: "${LATKIT_OTLP_SPANS:-}"
+      LATKIT_OTLP_SERVICE_NAME: latkit-demo-s3
+    volumes:
+      - miniobin:/binsrc:ro
+    ports: ["9752:9752"]    # convenience: curl http://localhost:9752/metrics
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on:
+      - latkit
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=2h"
+    ports: ["19090:9090"]   # 19090 to avoid clashing with a host Prometheus
+
+  grafana:
+    image: grafana/grafana:11.4.0    # pinned major 11.x (Р42)
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: "dark"
+    volumes:
+      # Reuse the postgres demo's provisioning (datasource -> prometheus:9090,
+      # dashboard provider) — same Prometheus service name. All bundled
+      # dashboards are provisioned; latkit — S3 is the one with data here.
+      - ../demo/grafana/provisioning:/etc/grafana/provisioning:ro
+      # The dashboards repo dir is the single source (Р43) — mounted read-only.
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+
+  # --- profile tls (additive): a second MinIO serving HTTPS on 9443 from the
+  # --- same binary, and a client that only talks to it. The plaintext pair
+  # --- keeps running, so the dashboards show both kinds of traffic side by side
+  # --- and the TLS ones are not distinguishable by their observations — which is
+  # --- the claim of РS8.
+
+  cert-init:
+    image: alpine:3.20
+    profiles: ["tls"]
+    volumes:
+      - s3certs:/certs
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        [ -s /certs/public.crt ] && exit 0
+        apk add --no-cache openssl >/dev/null
+        # The names MinIO insists on; the directory stays writable because the
+        # server creates CAs/ inside it at startup.
+        openssl req -new -x509 -days 365 -nodes \
+          -out /certs/public.crt -keyout /certs/private.key \
+          -subj "/CN=minio-tls" \
+          -addext "subjectAltName=DNS:minio-tls,DNS:localhost,IP:127.0.0.1"
+        chmod 644 /certs/public.crt /certs/private.key
+    restart: "no"
+
+  minio-tls:
+    image: minio/minio:latest
+    profiles: ["tls"]
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+      bin-init:
+        condition: service_completed_successfully
+    environment:
+      MINIO_ROOT_USER: lkroot
+      MINIO_ROOT_PASSWORD: lkrootpass123
+      MINIO_UPDATE: "off"
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    entrypoint: ["/binsrc/minio"]
+    command: ["server", "/data", "--address", ":9443", "--certs-dir", "/certs"]
+    volumes:
+      - miniobin:/binsrc:ro
+      - s3certs:/certs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsSk https://127.0.0.1:9443/minio/health/live || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 45
+
+  # The same load script against the HTTPS server: every byte on that socket is
+  # ciphertext, and the plaintext on the dashboards comes from the crypto/tls
+  # uprobes inside the very binary this container runs. `--insecure` because the
+  # certificate is self-signed.
+  load-tls:
+    image: minio/mc:latest
+    profiles: ["tls"]
+    depends_on:
+      minio-tls:
+        condition: service_healthy
+    environment:
+      MC_CONFIG_DIR: /tmp/mc
+      S3_ENDPOINT: https://minio-tls:9443
+      MC_EXTRA: "--insecure"
+      PRESIGN: "0"           # one presigned URL producer is enough (plain leg)
+    volumes:
+      - ./load/load.sh:/load.sh:ro
+      - share-tls:/share
+    entrypoint: ["sh", "/load.sh"]
+    restart: unless-stopped
+
+volumes:
+  miniobin:      # the staged minio binary, shared by inode with the agent
+  s3certs:
+  share:         # presigned URL handed from the mc container to the probe
+  share-tls:

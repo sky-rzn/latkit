@@ -1,0 +1,112 @@
+# latkit next to an EXISTING MinIO (or any S3-compatible server on the same
+# wire — Ceph RGW, SeaweedFS, Garage) — monitoring only. Unlike
+# deploy/demo-minio this brings NO object store and NO load generator: the agent
+# captures the real traffic of the host. Capture is kernel-wide fentry on
+# tcp_sendmsg/tcp_recvmsg, so `pid: host` is all it needs to see it — no admin
+# credentials, no `mc admin config set`, no bucket metrics to enable, no
+# restart.
+#
+#   cd deploy/existing-minio
+#   GF_ADMIN_PASSWORD=change-me docker compose up --build -d
+#
+# Prereqs: Linux kernel >= 5.15 with BTF (/sys/kernel/btf/vmlinux), Docker +
+# compose plugin. The traffic must be S3 over HTTP/1.x on TCP — see the README
+# for what is not captured and which counter says so.
+#
+# Grafana + Prometheus bind to 127.0.0.1 only: /metrics and this Grafana have no
+# auth. Reach them over an SSH tunnel (ssh -L 3000:127.0.0.1:3000 host) or your
+# own TLS reverse proxy — do not publish these ports to the internet.
+
+services:
+  latkit:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    pid: host                 # needed to resolve /proc/<pid>/root for --tls-go
+    # Measured minimal set (docs/deploy.md). BPF+PERFMON = plaintext capture;
+    # SYS_ADMIN is only for the Go TLS uprobes below. An s3 port needs no
+    # SYS_PTRACE: nothing scans /proc for a libssl MinIO does not map. On
+    # kernels < 5.11 add SYS_RESOURCE. `privileged: true` is the documented
+    # fallback.
+    cap_add: [BPF, PERFMON, SYS_ADMIN]
+    environment:
+      # The port MinIO accepts S3 on, with its wire protocol. A bare number
+      # would default to the postgres parser, and `9000=http` would give routes
+      # and Hosts instead of operations and buckets.
+      #
+      # Distributed pools: the cluster talks to itself on this very port, and
+      # the two kinds of traffic are separated rather than mixed. The grid
+      # multiplexer (/minio/grid/...) upgrades to a websocket carrying binary
+      # msgp and is dropped-and-counted whole
+      # (latkit_ignored_conns_total{reason="upgrade"}); the ordinary /minio/*
+      # requests — peer RPC, health probes, the admin API — are counted as
+      # `latkit_s3_internal_requests_total` and become no observation. On a
+      # four-node stand that was most of what the port carried.
+      LATKIT_PORT: "9000=s3"
+      LATKIT_PROM_LISTEN: "0.0.0.0:9752"  # a container must listen off-loopback
+      #
+      # TLS. MinIO terminates it inside Go's crypto/tls: there is no libssl to
+      # scan for, so `auto` alone finds nothing and the binary is named instead.
+      # It must be visible to THIS container at the same inode as the one MinIO
+      # runs (a uprobe binds to the inode) — bind-mount it, see volumes below.
+      # For a containerised MinIO seen from here, the path form is
+      # /proc/<pid>/root/usr/bin/minio (that is what pid: host is for).
+      # Stripped binaries — how MinIO is shipped — work: Go's own function table
+      # is used when the ELF symbol table is gone. x86-64.
+      # LATKIT_TLS: auto
+      # LATKIT_TLS_GO: /host/usr/local/bin/minio
+      #
+      # Virtual-host addressing (bucket.s3.example.com/key) instead of
+      # path-style: name the domain(s), the same value MinIO gets in
+      # MINIO_DOMAIN. Without it every request is read path-style, which is what
+      # MinIO itself does without MINIO_DOMAIN.
+      # LATKIT_S3_DOMAIN: s3.example.com
+      #
+      # The `user` label is the access key out of the signature — the public
+      # half of the pair; the signature and X-Amz-Security-Token are never read.
+      # Set to `off` if even that is more than you want in metrics; the
+      # cardinality guard (spill to user="other") is on either way.
+      # LATKIT_S3_USER: accesskey
+      #
+      # Do NOT set LATKIT_COMM unless you mean it: that is the kernel capture
+      # filter and it applies to every captured port. It happens to be safe for
+      # MinIO alone (every MinIO thread is named `minio`, unlike MySQL's or
+      # nginx's), but the port filter already scopes the capture.
+      # LATKIT_COMM: minio
+    #volumes:
+    #  - /usr/local/bin/minio:/host/usr/local/bin/minio:ro   # for LATKIT_TLS_GO
+    # No published port: Prometheus scrapes latkit:9752 over the compose network.
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on: [latkit]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+    ports: ["127.0.0.1:9090:9090"]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0     # pinned major 11.x (Р42)
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GF_ADMIN_PASSWORD:?set GF_ADMIN_PASSWORD}"
+      GF_USERS_DEFAULT_THEME: "dark"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      # Reuse the postgres demo provisioning (datasource -> http://prometheus:9090)
+      # and the bundled dashboards straight from the repo — single source,
+      # read-only. "latkit — S3 / MinIO" is the one to open.
+      - ../demo/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["127.0.0.1:3000:3000"]
+    restart: unless-stopped
+
+volumes:
+  prom-data:
+  grafana-data:
