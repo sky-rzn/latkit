@@ -82,10 +82,22 @@ static void emit(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, char ty
     lk_reasm_emit(r, c, dir, &m);
 }
 
+/* Р19 applies to a note as much as to a unit: it is a message, so one that
+ * follows a hole has to say so. Two notes are emitted before http_stream_bytes
+ * reaches its LK_FR_DIRTY check — the TLS verdict and the no-state blind zone,
+ * both of which answer on the direction's first event and end the connection
+ * where they stand. A direction the conn table dirtied (a seq gap, or a lazily
+ * created entry born dirty) has not resynced at that point and now never will,
+ * so lk_reasm_emit has no pending stamp to hand out and the note would cross
+ * the hole unannounced. Put the stamp on here instead. Deliberately not
+ * lk_reasm_resync: nothing was recovered, and counting every pre-existing TLS
+ * connection as a resync would make that counter measure the wrong thing. */
 static void note(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, enum lk_http_note n,
                  __u64 ts)
 {
-    emit(r, c, dir, LK_HTTP_MSG_NOTE, (__u32)n, NULL, 0, 0, ts);
+    __u16 flags = c->frame[dir].st == LK_FR_DIRTY ? LK_MSG_AFTER_RESYNC : 0;
+
+    emit(r, c, dir, LK_HTTP_MSG_NOTE, (__u32)n, NULL, 0, flags, ts);
 }
 
 /* A recognised blind zone (РH4): the note names the reason, LK_CONN_IGNORE
