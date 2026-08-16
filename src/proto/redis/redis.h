@@ -5,12 +5,13 @@
  * lk_proto_redis_new (proto.h).
  *
  * PLAN-REDIS.md МR1 filled in the framer — the value machine of РR2, the
- * synthetic message dictionary below, the two resync anchors. МR2 adds the
+ * synthetic message dictionary below, the two resync anchors. МR2 added the
  * other half: the in-flight unit queue, the four timings, the pub/sub rule and
  * the service connections that are not a request/response stream at all (РR3,
- * РR8, РR14). The command table and the session labels (РR4–РR6) are МR3's, so
- * an observation here carries timings, sizes and a batch depth — and no
- * identity yet.
+ * РR8, РR14). МR3 gives an observation its identity and its labels — the
+ * command table of РR4, the database of РR5 and the ACL user of РR6, all three
+ * out of src/norm/norm_redis.c, plus the `mask_body` hook that keeps a password
+ * out of every viewer.
  *
  * **Redis is a new protocol, not a dialect.** RESP has no heads, no statuses
  * and no routes, so the `struct lk_http_dialect` seam (РH8) does not apply and
@@ -30,6 +31,7 @@
 #ifndef LATKIT_REDIS_H
 #define LATKIT_REDIS_H
 
+#include "norm_redis.h" /* the identity table and the session rules (РR4–РR6) */
 #include "proto.h"
 #include "redis_wire.h"
 
@@ -219,10 +221,25 @@ struct redis_frame {
 
 /* redis_unit.uflags — what the *handler* knows about a command, as opposed to
  * what the observation carries. Kept apart from the LK_QO_* word so that neither
- * space has to leave room for the other. */
-#define REDIS_U_SUB                                                                                \
-    (1 << 0) /* a (P|S)(UN)SUBSCRIBE: its reply is a confirmation,                                 \
-                and only such a unit may be closed by one (РR8) */
+ * space has to leave room for the other.
+ *
+ * The three session bits are the mechanism behind РR5/РR6's one rule: **a label
+ * moves on the reply, never on the command.** `SELECT 16` is an error and stays
+ * in the previous database, `AUTH lkuser wrongpass` is `-WRONGPASS` and leaves
+ * the user alone (measured, `redis/select-db.lkt` and `redis/auth-forms.lkt`),
+ * so what the command carries is a *candidate* and the unit is what holds it
+ * until the server rules on it. */
+/*   SUB     a (P|S)(UN)SUBSCRIBE: its reply is a confirmation, and only such a
+ *           unit may be closed by one (РR8)
+ *   SELECT  a `SELECT`: on `+OK`, unit.db becomes the label
+ *   AUTH    an `AUTH` / `HELLO … AUTH`: on success, the name parked in
+ *           redis_conn.auth_user becomes the label
+ *   RESET   a `RESET`: on `+RESET`, database 0 and user `default`, whatever
+ *           they were */
+#define REDIS_U_SUB    (1 << 0)
+#define REDIS_U_SELECT (1 << 1)
+#define REDIS_U_AUTH   (1 << 2)
+#define REDIS_U_RESET  (1 << 3)
 
 /* Replies that arrived before the command they answer, which sounds impossible
  * and is not: a command larger than the per-call capture budget (РR13 makes that
@@ -242,13 +259,23 @@ struct redis_frame {
 struct redis_early {
     __u64 end_ns; /* the reply's last byte */
     __u32 bytes;  /* its whole size on the wire */
+    bool err;     /* ... and whether it was a refusal, which is what the session
+                     machine of МR3 needs from it: a held reply is normally the
+                     answer to an over-long command, and an `AUTH` with a long
+                     password is exactly that shape (РR6) */
 };
 
 /* One command in flight. Deliberately small — the ring is 256 slots on every
  * connection that carries a command, and at the table's ceiling of 65536 that
  * is the difference between 6 MB and 400 MB of steady state. Everything that
  * would grow it is either already known when the unit closes (the reply's size,
- * its type) or belongs to the observation and not to the queue. */
+ * its type) or belongs to the observation and not to the queue.
+ *
+ * МR3's identity fits in the two bytes of `cmd` for exactly that reason: the
+ * table is closed, so a command is an *index* into it and not a pointer and a
+ * length. The name, the fingerprint and the bits are expanded from the index
+ * when the unit closes — the whole struct stays at 24 bytes, which is what it
+ * was before this milestone. */
 struct redis_unit {
     __u64 ts_start_ns; /* first byte of the command (Р13) */
     __u32 bytes;       /* the command's whole size on the wire */
@@ -256,6 +283,9 @@ struct redis_unit {
     __u16 depth;       /* commands in this one's batch, frozen when the batch
                           ended; while the batch is still open the live count in
                           redis_conn.batch_n is the answer (РR3) */
+    __u16 cmd;         /* the identity: an id in the norm_redis table (РR4) */
+    __u16 db;          /* REDIS_U_SELECT: the database this command would move the
+                          connection to, applied only if the server accepts it */
     __u8 uflags;       /* REDIS_U_* */
 };
 
@@ -267,13 +297,29 @@ struct redis_unit {
  * instead of a generation counter, and a stale reference cannot be followed into
  * whatever now occupies the slot.
  *
- * Size, since this is per connection: 6.3 KB, of which the 256-slot ring is 6 KB
+ * Size, since this is per connection: 6.4 KB, of which the 256-slot ring is 6 KB
  * — the same order as the HTTP handler's 5.5 KB, and allocated only for
- * connections that actually carry a message. Nothing in it is owned by pointer,
- * so the close hook is one free(). */
+ * connections that actually carry a message. МR3's labels cost 72 bytes of it
+ * and the ring not a byte, because an identity is a table index and not a name
+ * (see struct redis_unit). Nothing in it is owned by pointer, so the close hook
+ * is one free(). */
 struct redis_conn {
-    struct lk_session session; /* db -> database, ACL user -> user (МR3, РR5/РR6) */
+    struct lk_session session; /* the database in `database`, the ACL user in `user`
+                                  (РR5/РR6) — the same two dim slots PG fills from
+                                  its startup packet, filled here by a state machine
+                                  because in RESP both are connection state that
+                                  moves mid-stream */
     __u64 msgs;                /* messages dispatched on this connection */
+
+    /* The name a pending `AUTH` would install, parked here rather than in the
+     * unit: a 64-byte label copy in every one of 256 ring slots would cost 16 KB
+     * per connection to hold a value that at most one command in flight can
+     * have. `auth_seq` says which unit owns it, so a second `AUTH` issued before
+     * the first was answered simply supersedes it — pipelining two logins is not
+     * a thing any client does, and the honest failure if one did is that the
+     * older answer moves no label. */
+    char auth_user[LK_REDIS_USER_MAX];
+    __u64 auth_seq;
 
     struct redis_unit ring[LK_REDIS_MAX_INFLIGHT];
     __u64 head_seq;   /* oldest live unit: the one the next reply answers */
@@ -307,6 +353,46 @@ struct redis_conn {
 void redis_stream_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, const __u8 *p,
                         __u32 n, __u64 ts_ns);
 void redis_stream_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64 n);
+
+/* Unwrap the leading elements of a published value into the (pointer, length)
+ * pairs src/norm/norm_redis.c classifies (РR4). RESP knowledge, so it lives with
+ * the framer, and it is deliberately the *only* thing in the tree that turns a
+ * value's bytes into elements — the handler reading a verb and the viewer hiding
+ * a password have to agree byte for byte about where element 2 begins, and one
+ * reader is how that is guaranteed rather than hoped for.
+ *
+ * `max` is how many elements the caller has a use for, and the two callers want
+ * different numbers: the handler needs LK_REDIS_ARGV_LABELS on every command it
+ * sees, the display mask needs LK_REDIS_ARGV_MAX on the rare message somebody
+ * prints. Bounding the walk at the call site is what keeps the hot path paying
+ * only for what it reads.
+ *
+ * `body`/`cap` are passed in rather than taken from `m` so that the mask can run
+ * over the viewer's own copy and get spans into *it* (proto.h's
+ * lk_msg_body_for_display never touches the framer's buffer). `nelem` receives
+ * the declared element count of the top-level aggregate, or -1 when the value is
+ * not one — the empty command `*0\r\n`, which is complete, answered with nothing
+ * and must open no unit, is `nelem == 0`.
+ *
+ * Reads only what is inside the prefix: under the 512-byte per-port budget of
+ * РR13 that is all of a command's head and none of a large value's tail, and an
+ * element the prefix cuts in half yields no element at all rather than a short
+ * one. Half a verb is not a verb. */
+void redis_read_argv(const struct lk_msg *m, const __u8 *body, __u32 cap, __u32 max,
+                     struct lk_redis_argv *v, __s64 *nelem);
+
+/* The `mask_body` hook of lk_proto_ops (РH3/РR6): blank the password in an
+ * `AUTH` or a `HELLO … AUTH` before a viewer prints the body. Runs on the
+ * viewer's copy — the handler downstream still has to read the very element this
+ * hides, which is why masking at framing time would make `--redis-user acl`
+ * silently do nothing. Redis's own `MONITOR` feed sets the precedent, printing
+ * `"AUTH" "(redacted)" "(redacted)"`.
+ *
+ * This is the first protocol in the tree that needs the hook at all: PG and
+ * MySQL authenticate in an exchange the framer never republishes, and HTTP's
+ * credentials are headers. Here the password is an ordinary array element in an
+ * ordinary command, indistinguishable in shape from a key. */
+void redis_mask_body(const struct lk_msg *m, __u8 *p, __u32 n);
 
 /* --- the framer -> handler side channel (МR2) ------------------------------
  * Two facts a unit needs are properties of the *capture* rather than of the byte

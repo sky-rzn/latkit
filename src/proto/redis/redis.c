@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Redis handler (PLAN-REDIS.md МR2, РR3/РR8/РR14) — the message consumer of the
+/* Redis handler (PLAN-REDIS.md МR2/МR3, РR3–РR8/РR14) — the message consumer of the
  * stream framer in redis_frame.c, in the shape of pg.c / my.c / http.c: it owns
  * the per-connection state behind lk_conn.proto_state, keeps the in-flight
  * command queue, and turns each command/reply pair into one lk_query_obs.
@@ -29,171 +29,41 @@
  * and propagation streams behind it), and `MONITOR`, whose connection turns into
  * a feed of *other clients'* commands.
  *
- * What is *not* here, because it is МR3's and МR4's: the command table, so an
- * observation carries no identity yet (`cmd` becomes a label in МR3); the
- * database and the ACL user, so the session is empty; the symbolic error, the
- * redirects, `MULTI`/`EXEC` and the blocking family. The verb is read here all
- * the same, but only for the four questions this milestone has to answer —
- * is this a subscription, a replication handshake, a `MONITOR` or a `RESET` —
- * and never as an identity.
+ * МR3 adds what an observation is *about*: the identity (РR4) and the two
+ * session labels (РR5, РR6). All three come out of the closed table in
+ * src/norm/norm_redis.c — this file decides *when* they move, which for both
+ * labels is a question RESP answers only in the reply, and never in the command
+ * that asked. That split is the whole of the session machine below.
+ *
+ * What is *not* here, because it is МR4's: the symbolic error and the redirect
+ * counter, `MULTI`/`EXEC`, and the blocking family. An error is currently one
+ * bit — did the server refuse — which is all the session machine needs and none
+ * of what a dashboard does.
  *
  * No I/O, no libbpf: a pure state machine, fed synthetic lk_msg by unit tests
  * and .lkt traces by the replay harness. */
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "redis.h"
 
-/* --- reading the first two elements of a value ----------------------------
- * The handler's questions are all about *words*: the verb of a command, and the
- * kind word that opens a pub/sub value. Both live in the first element, both are
- * bounded, and neither is ever a key — a Redis key is an identifier and becomes
- * no label at any setting (РR4), which is why this reader stops at two elements
- * and refuses to walk further.
+/* --- the handler's two readers ---------------------------------------------
+ * A command's elements are unwrapped by redis_read_argv (redis_frame.c: RESP
+ * knowledge, and one reader so that the handler and the mask cannot disagree
+ * about where an element begins) and classified by src/norm/norm_redis.c. What
+ * is left here is the one word the *server* sends that has to be read: the kind
+ * word of a pub/sub value, which is not a command and is in no table.
  *
  * Everything is read out of the *published prefix*, which under the 512-byte
  * per-port budget of РR13 is all of a command's head and none of a large
  * value's tail. A prefix that ends mid-token yields no token rather than a
  * short one: half a verb is not a verb. */
 
-struct redis_tok {
-    const char *p;
-    __u32 n;
-};
-
-struct redis_view {
-    struct redis_tok a[2]; /* argv[0], argv[1] — as far as anything here looks */
-    __u32 nargs;           /* tokens actually read (0..2) */
-    __s64 nelem;           /* declared elements of the top-level aggregate;
-                              -1 = the value is not an aggregate at all */
-};
-
-struct redis_rd {
-    const __u8 *p;
-    __u32 n, i;
-};
-
-/* The CRLF-terminated line at the cursor: content only, cursor left past the
- * terminator. false = no terminator inside the prefix, which is the honest
- * answer for a truncated body. */
-static bool rd_line(struct redis_rd *rd, const char **start, __u32 *len)
-{
-    for (__u32 i = rd->i; i + 1 < rd->n; i++) {
-        if (rd->p[i] == '\r' && rd->p[i + 1] == '\n') {
-            *start = (const char *)rd->p + rd->i;
-            *len = i - rd->i;
-            rd->i = i + 2;
-            return true;
-        }
-    }
-    return false;
-}
-
-/* The next element, as a text token. Only the two shapes an element that we
- * ever look at can take produce one — a bulk (`$9\r\nsubscribe`, which is what
- * a command's verb and a push's kind word are on the wire) and a line-shaped
- * scalar. Anything else — a nested aggregate, an integer — ends the walk: the
- * questions above have no answer in it, and stepping over a nested value
- * correctly is the framer's job, not a reader's. */
-static bool rd_elem(struct redis_rd *rd, struct redis_tok *t)
-{
-    const char *line;
-    __u32 len;
-
-    if (rd->i >= rd->n)
-        return false;
-    switch (redis_vshape(rd->p[rd->i])) {
-    case REDIS_V_BULK: {
-        __s64 v;
-        __u64 payload;
-        bool null;
-
-        rd->i++;
-        if (!rd_line(rd, &line, &len) || !redis_parse_i64(line, len, &v))
-            return false;
-        if (!redis_bulk_len(v, &payload, &null) || null)
-            return false;
-        if (payload > rd->n - rd->i)
-            return false; /* the prefix ends inside the payload */
-        t->p = (const char *)rd->p + rd->i;
-        t->n = (__u32)payload;
-        rd->i += (__u32)payload;
-        if (rd->n - rd->i < 2)
-            rd->i = rd->n; /* no room for the CRLF: this is the last token */
-        else
-            rd->i += 2;
-        return true;
-    }
-    case REDIS_V_LINE:
-        rd->i++;
-        if (!rd_line(rd, &line, &len))
-            return false;
-        t->p = line;
-        t->n = len;
-        return true;
-    default:
-        return false;
-    }
-}
-
-/* An inline command is not RESP and has no elements: the server splits it on
- * blanks itself, so the reader does too. `PING\r\n` from a healthcheck is the
- * common case and `SELECT 3` from a `nc` session the other one. */
-static void view_inline(const struct lk_msg *m, struct redis_view *v)
-{
-    const char *p = (const char *)m->body;
-    __u32 i = 0, n = m->body_cap;
-
-    while (v->nargs < 2) {
-        __u32 start;
-
-        while (i < n && (p[i] == ' ' || p[i] == '\t'))
-            i++;
-        start = i;
-        while (i < n && p[i] != ' ' && p[i] != '\t' && p[i] != '\r' && p[i] != '\n')
-            i++;
-        if (i == start)
-            return;
-        v->a[v->nargs].p = p + start;
-        v->a[v->nargs].n = i - start;
-        v->nargs++;
-    }
-}
-
-static void redis_view(const struct lk_msg *m, struct redis_view *v)
-{
-    struct redis_rd rd = {.p = m->body, .n = m->body_cap};
-    enum redis_vshape sh;
-    const char *line;
-    __u32 len, elems;
-    __s64 count;
-
-    memset(v, 0, sizeof(*v));
-    v->nelem = -1;
-    if (!m->body || !m->body_cap)
-        return; /* the prefix was lost (no slab): nothing is known, nothing is
-                   guessed — the caller treats the value as an ordinary one */
-    if (m->type == LK_REDIS_MSG_INLINE) {
-        view_inline(m, v);
-        return;
-    }
-    sh = redis_vshape((__u8)m->type);
-    if (sh != REDIS_V_AGG && sh != REDIS_V_AGGPAIR)
-        return;
-    rd.i = 1;
-    if (!rd_line(&rd, &line, &len) || !redis_parse_i64(line, len, &count))
-        return;
-    if (!redis_agg_count(count, sh == REDIS_V_AGGPAIR, &elems))
-        return;
-    v->nelem = elems;
-    while (v->nargs < 2 && v->nargs < elems && rd_elem(&rd, &v->a[v->nargs]))
-        v->nargs++;
-}
-
 /* Command names are case-insensitive on the wire (go-redis sends them in lower
  * case, measured), and the kind words of a push arrive in lower case from the
  * server. One case-folding comparison serves both. */
-static bool tok_is(struct redis_tok t, const char *lit)
+static bool tok_is(struct lk_redis_arg t, const char *lit)
 {
     __u32 i = 0;
 
@@ -217,8 +87,16 @@ static bool tok_is(struct redis_tok t, const char *lit)
  * unit open for ever (notes-redisproto.md §"Subscriptions"). */
 
 /* A confirmation: the server acknowledging a subscribe-family command. One per
- * channel named in the command. */
-static bool kind_is_confirm(struct redis_tok t)
+ * channel named in the command.
+ *
+ * Spelled out rather than looked up in the command table, though the six words
+ * are the six names of LK_REDIS_C_SUBFAM: this is the *server* talking, and a
+ * kind word is not a command. `SUBSCRIBE` in a reply's first element is the
+ * server saying "you are now subscribed"; matching it through the table that
+ * classifies what a client sends would make the two facts one, and they are not
+ * one — a future kind word need not be a command name, and a future command
+ * name need not be a kind word. */
+static bool kind_is_confirm(struct lk_redis_arg t)
 {
     return tok_is(t, "subscribe") || tok_is(t, "unsubscribe") || tok_is(t, "psubscribe") ||
            tok_is(t, "punsubscribe") || tok_is(t, "ssubscribe") || tok_is(t, "sunsubscribe");
@@ -226,16 +104,98 @@ static bool kind_is_confirm(struct redis_tok t)
 
 /* A delivery: somebody else published, or the server is invalidating a key this
  * client cached. Answers no command and must close no unit. */
-static bool kind_is_delivery(struct redis_tok t)
+static bool kind_is_delivery(struct lk_redis_arg t)
 {
     return tok_is(t, "message") || tok_is(t, "pmessage") || tok_is(t, "smessage") ||
            tok_is(t, "invalidate");
 }
 
-static bool verb_is_sub_family(struct redis_tok t)
+/* --- the session labels (РR5, РR6) -----------------------------------------
+ * Two dim slots, the same two PG fills out of its startup packet — and that is
+ * where the resemblance ends. In RESP both are *connection state that moves*:
+ * `SELECT 3` puts everything after it in database 3, `AUTH lkreader …` puts
+ * everything after it under another ACL user, and a connection pool recycles
+ * both several times a second. So the labels are the output of a state machine,
+ * and the machine has one rule that matters: **it moves on the reply, never on
+ * the command.** `SELECT 16` is `-ERR DB index is out of range` and the
+ * connection stays where it was; `AUTH lkuser wrongpass` is `-WRONGPASS` and the
+ * user does not change (both measured, `redis/select-db.lkt` and
+ * `redis/auth-forms.lkt`). A machine that moved on the request would be wrong
+ * about every command that followed, for as long as the connection lived. */
+
+/* Handler-wide settings (РR6), in the shape lk_proto_http_configure set: there
+ * is exactly one redis handler per agent and the value is fixed at startup from
+ * the CLI, so a static is what a per-handler pointer would be with more steps.
+ * A zeroed config is the default — `--redis-user acl`, on. */
+static struct lk_redis_cfg redis_cfg;
+
+void lk_proto_redis_configure(const struct lk_redis_cfg *cfg)
 {
-    return tok_is(t, "subscribe") || tok_is(t, "psubscribe") || tok_is(t, "ssubscribe") ||
-           tok_is(t, "unsubscribe") || tok_is(t, "punsubscribe") || tok_is(t, "sunsubscribe");
+    if (cfg)
+        redis_cfg = *cfg;
+    else
+        memset(&redis_cfg, 0, sizeof(redis_cfg));
+}
+
+/* What a connection whose beginning we watched starts as: database 0, user
+ * `default`. Both are facts about the protocol rather than guesses — a new
+ * connection *is* in database 0 and *is* the `default` user until it says
+ * otherwise.
+ *
+ * With `--redis-user off` the user slot stays empty everywhere and the registry
+ * reports `user="-"`: what is not read cannot leak and cannot multiply series,
+ * which is the РH12 rule applied to the one identity a Redis connection carries
+ * (РR6). */
+static void session_init(struct redis_conn *rc, bool synthetic)
+{
+    if (redis_cfg.no_user)
+        rc->session.user[0] = '\0';
+    if (synthetic) {
+        /* A connection joined mid-stream: its `SELECT` and its `AUTH` happened
+         * before we were watching, so both labels are unknowable and say so
+         * (РR5 — `db="?"`, never `db="0"`, because a wrong `0` is indis-
+         * tinguishable from a right one on a dashboard). `redis/midstream.lkt`
+         * is recorded by starting the client first, precisely so that this path
+         * is exercised by real traffic and not only by a test. */
+        memcpy(rc->session.database, "?", 2);
+        if (!redis_cfg.no_user)
+            memcpy(rc->session.user, "?", 2);
+        return;
+    }
+    memcpy(rc->session.database, "0", 2);
+    if (!redis_cfg.no_user)
+        memcpy(rc->session.user, "default", 8);
+}
+
+static void session_set_db(struct redis_conn *rc, __u16 db)
+{
+    if (db == LK_REDIS_DB_UNKNOWN)
+        memcpy(rc->session.database, "?", 2);
+    else
+        snprintf(rc->session.database, sizeof(rc->session.database), "%u", db);
+}
+
+/* The ACL user, folded to `other` when the name is not one a label may carry.
+ * A user name is chosen by an operator and always passes; what does not is a
+ * client putting arbitrary bytes where a series name goes, and the S3 rule
+ * applies unchanged (РS3) — refuse it, keep the fact that *someone*
+ * authenticated, and do not let the wire name a series. */
+static void session_set_user(struct redis_conn *rc, const char *p, __u32 n)
+{
+    if (redis_cfg.no_user)
+        return;
+    if (!n) {
+        /* `AUTH <password>` names nobody: it authenticates as `default`, which
+         * is a real answer and not an absence (РR6). */
+        memcpy(rc->session.user, "default", 8);
+        return;
+    }
+    if (!lk_redis_user_valid(p, n)) {
+        memcpy(rc->session.user, "other", 6);
+        return;
+    }
+    memcpy(rc->session.user, p, n);
+    rc->session.user[n] = '\0';
 }
 
 /* --- per-connection state -------------------------------------------------- */
@@ -256,6 +216,7 @@ static struct redis_conn *redis_conn_get(struct lk_proto *p, struct lk_conn *c)
      * and user are unknowable (РR5 — `db="?"`, not `db="0"`) and no value on it
      * is a trustworthy unit boundary until the framer vouches for one. */
     rc->degraded = (c->flags & LK_CONN_SYNTHETIC) != 0;
+    session_init(rc, rc->degraded);
     c->proto_state = rc;
     p->st.conns++;
     return rc;
@@ -282,10 +243,23 @@ static struct redis_unit *unit_front(struct redis_conn *rc)
 }
 
 /* Drop every in-flight unit without emitting (Р19: an observation must never
- * span a loss or a disconnect) and add the count to *counter. */
+ * span a loss or a disconnect) and add the count to *counter.
+ *
+ * A dropped unit takes its label with it. If a `SELECT` was in flight when the
+ * stream was lost, the connection is now in a database we cannot name, and the
+ * only two answers are "?" and a number that has a good chance of being wrong —
+ * on a dashboard those are indistinguishable, which is precisely why the first
+ * one is the right one (РR5, and the same reasoning as `db="?"` for a connection
+ * joined mid-stream). */
 static void units_drop_all(struct redis_conn *rc, __u64 *counter)
 {
     while (rc->head_seq < rc->open_seq) {
+        const struct redis_unit *u = &rc->ring[rc->head_seq % LK_REDIS_MAX_INFLIGHT];
+
+        if (u->uflags & (REDIS_U_SELECT | REDIS_U_RESET))
+            session_set_db(rc, LK_REDIS_DB_UNKNOWN);
+        if ((u->uflags & (REDIS_U_AUTH | REDIS_U_RESET)) && !redis_cfg.no_user)
+            memcpy(rc->session.user, "?", 2);
         rc->head_seq++;
         if (counter)
             (*counter)++;
@@ -330,6 +304,11 @@ static struct redis_unit *unit_open(struct lk_proto *p, struct redis_conn *rc, _
     u = &rc->ring[rc->open_seq % LK_REDIS_MAX_INFLIGHT];
     memset(u, 0, sizeof(*u));
     u->ts_start_ns = ts_ns;
+    /* Zero is a valid table id (the first command alphabetically), so the
+     * identity is set to `other` explicitly rather than left to memset: an
+     * observation that lost its classification must say "unknown", not name
+     * whichever command happens to sort first. */
+    u->cmd = lk_redis_cmd_other();
     rc->open_seq++;
     /* Pipelining is "a command went out before the previous one was answered",
      * and every unit in flight carries the mark: the first one's duration is
@@ -375,6 +354,8 @@ static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct redis_conn *
     struct lk_redis_obs rr = {
         .pipeline_depth = seq >= rc->batch_seq0 ? rc->batch_n : u->depth,
     };
+    __u32 cmd_len;
+    const char *cmd = lk_redis_cmd_name(u->cmd, &cmd_len);
     struct lk_query_obs o = {
         .ts_start_ns = u->ts_start_ns,
         /* ts_req_done and ts_first_row stay 0 deliberately: RESP has neither.
@@ -395,15 +376,71 @@ static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct redis_conn *
          * mirrored into metrics.h, so inventing one here would have to be
          * mirrored too, one milestone before the families that read it exist. */
         .kind = LK_Q_SIMPLE,
-        /* No identity yet: the command table is МR3's (РR4), and an observation
-         * that carried the raw command instead would be carrying the key with
-         * it. `other` is the honest label until the table lands. */
+        /* The identity (РR4), in the slot S3 puts an operation name in: a value
+         * from a closed table, so the `cmd` label's cardinality is a
+         * compile-time constant and the top-K dictionary downstream never has to
+         * do any bounding at all (риск 7). `route_fp` keys that dictionary, as
+         * it does for every protocol with a name rather than a statement.
+         *
+         * `text` stays absent, and the flag says so. A Redis command's text is
+         * its verb *and its arguments*, and the arguments are keys and values —
+         * the one thing that never leaves this handler at any setting. МR6 gives
+         * the span a `db.query.text` built out of the identity and a `?` per
+         * argument, which is the only shape of it that is safe to export. */
+        .route = cmd,
+        .route_len = cmd_len,
+        .route_fp = lk_redis_cmd_fp(u->cmd),
         .flags = (__u16)(u->flags | LK_QO_NO_TEXT),
     };
 
     p->st.queries++;
     if (p->out.on_query)
         p->out.on_query(p->out.ctx, c, &rc->session, &o);
+}
+
+/* The server has ruled on a command that would move a label (РR5/РR6). Called
+ * *after* the observation is emitted, which is the deliberate half of the rule:
+ * the `SELECT 3` itself is an observation in the database it was issued from,
+ * and only what comes after it is in database 3. Anything else would report a
+ * command as belonging to a place it had not reached yet.
+ *
+ * `err` is the whole of what the reply has to say. Redis answers `+OK`, `+RESET`
+ * or a `HELLO` map on success and an error on failure, with nothing in between,
+ * so one bit of the reply decides — and taking it from the reply rather than
+ * from the command is what makes `SELECT 16` and `-WRONGPASS` behave (measured,
+ * `redis/select-db.lkt`, `redis/auth-forms.lkt`). */
+static void session_apply(struct redis_conn *rc, const struct redis_unit *u, __u64 seq, bool err)
+{
+    if (!(u->uflags & (REDIS_U_SELECT | REDIS_U_AUTH | REDIS_U_RESET)) || err)
+        return;
+    if (u->uflags & REDIS_U_RESET) {
+        /* `RESET` puts the connection back to database 0 and user `default` —
+         * and out of subscribe mode, out of the transaction and back to RESP2,
+         * the rest of which МR2 and МR4 own. */
+        session_set_db(rc, 0);
+        session_set_user(rc, NULL, 0);
+        return;
+    }
+    if (u->uflags & REDIS_U_SELECT)
+        session_set_db(rc, u->db);
+    if (u->uflags & REDIS_U_AUTH) {
+        /* The name was parked on the connection rather than in the unit (see
+         * redis.h). If a later `AUTH` superseded it before this one was
+         * answered, we know a login succeeded and cannot say whose — which is
+         * `user="?"`, the same answer as for a connection joined mid-stream. */
+        if (seq == rc->auth_seq)
+            session_set_user(rc, rc->auth_user, (__u32)strlen(rc->auth_user));
+        else if (!redis_cfg.no_user)
+            memcpy(rc->session.user, "?", 2);
+    }
+}
+
+/* An error reply, for the session machine's purposes: RESP2 `-ERR …` and RESP3's
+ * blob error are the two shapes a refusal takes. The *symbolic* error of РR7 —
+ * which error it was, and whether a `MOVED` counts as one at all — is МR4's. */
+static bool reply_is_err(const struct lk_msg *m)
+{
+    return m->type == REDIS_T_ERROR || m->type == REDIS_T_BLOBERR;
 }
 
 /* A reply for the oldest unit: emit it, or account for its absence. */
@@ -429,6 +466,7 @@ static void unit_close(struct lk_proto *p, struct lk_conn *c, struct redis_conn 
         if (fe && redis_value_open(fe) && rc->early_n < LK_REDIS_MAX_EARLY) {
             rc->early[rc->early_n].end_ns = end_ns;
             rc->early[rc->early_n].bytes = m->len;
+            rc->early[rc->early_n].err = reply_is_err(m);
             rc->early_n++;
             return;
         }
@@ -439,6 +477,7 @@ static void unit_close(struct lk_proto *p, struct lk_conn *c, struct redis_conn 
         return;
     }
     unit_emit(p, c, rc, u, rc->head_seq, m->len, end_ns);
+    session_apply(rc, u, rc->head_seq, reply_is_err(m));
     rc->head_seq++;
 }
 
@@ -458,6 +497,11 @@ static void early_claim(struct lk_proto *p, struct lk_conn *c, struct redis_conn
     memmove(rc->early, rc->early + 1, sizeof(rc->early[0]) * (__u32)(rc->early_n - 1));
     rc->early_n--;
     unit_emit(p, c, rc, unit_front(rc), rc->head_seq, e.bytes, e.end_ns);
+    /* The held reply's verdict travels with it: an `AUTH` whose password is long
+     * enough to overflow the capture budget is exactly the shape that gets its
+     * reply published first, so the session machine has to hear about it here
+     * too or a password-sized login would move a label it should not. */
+    session_apply(rc, unit_front(rc), rc->head_seq, e.err);
     rc->head_seq++;
 }
 
@@ -474,60 +518,87 @@ static void ignore_conn(struct lk_proto *p, struct lk_conn *c, struct redis_conn
     (*counter)++;
 }
 
+/* Park the name a pending `AUTH` would install (see redis.h for why it lives on
+ * the connection and not in the unit). Nothing but this function ever copies an
+ * identity out of a command, and it copies exactly one element — the *first*
+ * argument of the two-argument form, or the name inside `HELLO … AUTH`. The
+ * element after it is the password and is not read here, in norm_redis.c, or
+ * anywhere else in the tree. */
+static void auth_park(struct redis_conn *rc, __u64 seq, struct lk_redis_arg user)
+{
+    __u32 n = user.n < LK_REDIS_USER_MAX - 1 ? user.n : LK_REDIS_USER_MAX - 1;
+
+    if (user.p)
+        memcpy(rc->auth_user, user.p, n);
+    else
+        n = 0; /* `AUTH <password>`: nobody is named, and `default` is who it is */
+    rc->auth_user[n] = '\0';
+    rc->auth_seq = seq;
+}
+
 static void redis_command(struct lk_proto *p, struct lk_conn *c, struct redis_conn *rc,
                           const struct lk_msg *m, bool batch_first)
 {
-    struct redis_view v;
+    struct lk_redis_argv v;
+    struct lk_redis_arg user;
     struct redis_unit *u;
+    __u16 id, cflags, db;
+    __s64 nelem;
 
     if (batch_first)
         batch_new(rc);
-    redis_view(m, &v);
+    redis_read_argv(m, m->body, m->body_cap, LK_REDIS_ARGV_LABELS, &v, &nelem);
     /* `*0\r\n` and `*-1\r\n` are complete values that the server answers with
      * *nothing at all*. They must not open a unit: the queue would then be one
      * ahead for the rest of the connection, which is the same corruption a
      * missed push causes, from the other side. */
-    if (!v.nelem)
+    if (!nelem)
         return;
 
-    if (v.nargs) {
-        /* The replication handshake (РR14). After it the connection carries an
-         * RDB image and then a stream of write commands *from the server*, none
-         * of which answers anything — parsing that as replies is not a
-         * degradation, it is guaranteed nonsense (notes-redisproto.md §"What is
-         * on the port but is not RESP").
-         *
-         * **Any** `REPLCONF`, not just the `listening-port` of РR14. Only a
-         * replica sends the command at all, and the broader rule is what catches
-         * the case the corpus actually contains: a replication link joined after
-         * its `PSYNC` — the handshake happened before the agent attached, so the
-         * only mark left on the wire is the periodic `REPLCONF ACK <offset>`.
-         * `libs/java-pipeline.lkt` and `libs/memtier-pipe100.lkt` each carry one
-         * beside the traffic they were recorded for, and without this rule the
-         * propagated writes on them read as a hundred unanswerable replies. */
-        if (tok_is(v.a[0], "psync") || tok_is(v.a[0], "sync") || tok_is(v.a[0], "replconf")) {
-            ignore_conn(p, c, rc, &p->st.replication_conns);
-            return;
-        }
-        /* `MONITOR`: `+OK`, and then one simple string per command executed by
-         * every *other* client on the server. Its own reason, because "somebody
-         * is running a replica" and "somebody left a MONITOR open" are different
-         * facts about a deployment — and the second is also a performance
-         * problem worth seeing on the dashboard (МR5). */
-        if (tok_is(v.a[0], "monitor")) {
-            ignore_conn(p, c, rc, &p->st.monitor_conns);
-            return;
-        }
-        /* `RESET` returns the connection to a virgin state — out of subscribe
-         * mode, out of the transaction, back to RESP2, database 0, user
-         * `default`. МR3 and МR4 take the rest of that list; the subscribe bit
-         * is the part this milestone owns. */
-        if (tok_is(v.a[0], "reset"))
-            rc->sub = false;
-        else if (tok_is(v.a[0], "subscribe") || tok_is(v.a[0], "psubscribe") ||
-                 tok_is(v.a[0], "ssubscribe"))
-            rc->sub = true;
+    /* The identity (РR4): a lookup in the closed table of norm_redis.c, over the
+     * verb and — for the fifteen container commands and nowhere else — the
+     * second element. Everything else the command carries is a key, a field, a
+     * value or a password, and the classifier is not shown any of it. */
+    id = lk_redis_cmd(&v);
+    cflags = lk_redis_cmd_flags(id);
+
+    /* The replication handshake (РR14). After it the connection carries an RDB
+     * image and then a stream of write commands *from the server*, none of which
+     * answers anything — parsing that as replies is not a degradation, it is
+     * guaranteed nonsense (notes-redisproto.md §"What is on the port but is not
+     * RESP").
+     *
+     * **Any** `REPLCONF`, not just the `listening-port` of РR14. Only a replica
+     * sends the command at all, and the broader rule is what catches the case the
+     * corpus actually contains: a replication link joined after its `PSYNC` — the
+     * handshake happened before the agent attached, so the only mark left on the
+     * wire is the periodic `REPLCONF ACK <offset>`. `libs/java-pipeline.lkt` and
+     * `libs/memtier-pipe100.lkt` each carry one beside the traffic they were
+     * recorded for, and without this rule the propagated writes on them read as a
+     * hundred unanswerable replies. */
+    if (cflags & LK_REDIS_C_REPL) {
+        ignore_conn(p, c, rc, &p->st.replication_conns);
+        return;
     }
+    /* `MONITOR`: `+OK`, and then one simple string per command executed by every
+     * *other* client on the server. Its own reason, because "somebody is running
+     * a replica" and "somebody left a MONITOR open" are different facts about a
+     * deployment — and the second is also a performance problem worth seeing on
+     * the dashboard (МR5). */
+    if (cflags & LK_REDIS_C_MONITOR) {
+        ignore_conn(p, c, rc, &p->st.monitor_conns);
+        return;
+    }
+    /* `RESET` returns the connection to a virgin state — out of subscribe mode,
+     * out of the transaction, back to RESP2, database 0, user `default`. The
+     * subscribe bit goes now because a subscribe-mode misreading corrupts the
+     * *queue*; the two labels wait for the `+RESET` (session_apply), because a
+     * label that moved before the server agreed would be a lie for as long as
+     * this connection lives. МR4 takes the transaction. */
+    if (cflags & LK_REDIS_C_RESET)
+        rc->sub = false;
+    else if (cflags & LK_REDIS_C_SUBON)
+        rc->sub = true;
 
     rc->batch_n++;
     u = unit_open(p, rc, m->ts_ns);
@@ -537,8 +608,29 @@ static void redis_command(struct lk_proto *p, struct lk_conn *c, struct redis_co
     }
     rc->degraded = false;
     u->bytes = m->len;
-    if (v.nargs && verb_is_sub_family(v.a[0]))
+    u->cmd = id;
+    if (cflags & LK_REDIS_C_SUBFAM)
         u->uflags |= REDIS_U_SUB;
+
+    /* What this command would do to the labels, if the server accepts it
+     * (РR5/РR6). The candidate is recorded on the unit and applied when the
+     * reply arrives — never here. */
+    switch (lk_redis_session(id, &v, &db, &user)) {
+    case LK_REDIS_SESS_DB:
+        u->uflags |= REDIS_U_SELECT;
+        u->db = db;
+        break;
+    case LK_REDIS_SESS_USER:
+        u->uflags |= REDIS_U_AUTH;
+        auth_park(rc, rc->open_seq - 1, user);
+        break;
+    case LK_REDIS_SESS_RESET:
+        u->uflags |= REDIS_U_RESET;
+        break;
+    case LK_REDIS_SESS_NONE:
+        break;
+    }
+
     if (rc->early_n)
         early_claim(p, c, rc);
 }
@@ -554,7 +646,7 @@ enum redis_rkind {
 
 static enum redis_rkind reply_kind(const struct redis_conn *rc, const struct lk_msg *m)
 {
-    struct redis_view v;
+    struct lk_redis_argv v;
 
     /* An attribute is not a reply and never closes a unit — it decorates the
      * value that comes after it. Closing one would answer this command with the
@@ -563,20 +655,20 @@ static enum redis_rkind reply_kind(const struct redis_conn *rc, const struct lk_
     if (m->type == REDIS_T_ATTR)
         return REDIS_R_ATTR;
     if (m->type == REDIS_T_PUSH) {
-        redis_view(m, &v);
+        redis_read_argv(m, m->body, m->body_cap, 1, &v, NULL);
         /* RESP3: the confirmation of a SUBSCRIBE *is* a push, so the type byte
          * alone cannot decide. The kind word can, and it decides for RESP2 too. */
-        return (v.nargs && kind_is_confirm(v.a[0])) ? REDIS_R_CONFIRM : REDIS_R_PUSH;
+        return (v.n && kind_is_confirm(v.a[0])) ? REDIS_R_CONFIRM : REDIS_R_PUSH;
     }
     if (m->type == REDIS_T_ARRAY && rc->sub) {
         /* RESP2: a delivery and an ordinary array are the same type byte, so the
          * kind word is read *only* on a connection known to have subscribed —
          * otherwise a `LRANGE` returning the word "message" would be swallowed
          * as somebody's publication. */
-        redis_view(m, &v);
-        if (v.nargs && kind_is_delivery(v.a[0]))
+        redis_read_argv(m, m->body, m->body_cap, 1, &v, NULL);
+        if (v.n && kind_is_delivery(v.a[0]))
             return REDIS_R_PUSH;
-        if (v.nargs && kind_is_confirm(v.a[0]))
+        if (v.n && kind_is_confirm(v.a[0]))
             return REDIS_R_CONFIRM;
     }
     return REDIS_R_REPLY;

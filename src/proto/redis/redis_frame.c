@@ -53,11 +53,12 @@
  * replayable, visible in --messages and countable by the handler without the
  * framer needing a stats object of its own.
  *
- * МR1 stops here. The unit queue and the pub/sub rule (РR3, РR8) are МR2's, the
- * command table and the session labels (РR4–РR6) МR3's, and the mask_body hook
- * that hides an `AUTH` password from a viewer (РR6) lands with them — until then
- * the hook is NULL and no Redis body is shown by anything but --hexdump, which
- * is off by default. */
+ * Two things joined the framer after МR1, and both are here because they are
+ * questions about *bytes* rather than about traffic: redis_read_argv, which
+ * unwraps the leading elements of a value for the command table of МR3, and
+ * redis_mask_body, which blanks the password of an `AUTH` before a viewer prints
+ * it (РR6). The unit queue, the pub/sub rule and the session state machine live
+ * in redis.c, where the connection does. */
 #include <stdlib.h>
 #include <string.h>
 
@@ -459,6 +460,184 @@ static __u32 inline_feed(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir,
     return i;
 }
 
+/* --- reading a value's elements (МR3) --------------------------------------
+ * Everything above turns bytes into values; this turns a value into the first
+ * few of its elements, which is the form src/norm/norm_redis.c classifies. It
+ * belongs here rather than in the handler because it is RESP knowledge, and it
+ * exists exactly once because two consumers have to agree byte for byte about
+ * where element 2 begins: the handler, which reads a verb and an ACL user, and
+ * the mask below, which hides a password. Two readers would eventually disagree
+ * and the disagreement would be a leak.
+ *
+ * The reader stops at the caller's element bound and refuses to descend into a
+ * nested one. A key, a value, a score and a script body are all *past* the point
+ * where anything is read (РR4), so walking further would buy nothing and would
+ * mean holding a pointer to a secret we have no use for. */
+
+struct redis_rd {
+    const __u8 *p;
+    __u32 n, i;
+};
+
+/* The CRLF-terminated line at the cursor: content only, cursor left past the
+ * terminator. false = no terminator inside the prefix, which is the honest
+ * answer for a truncated body. */
+static bool rd_line(struct redis_rd *rd, const char **start, __u32 *len)
+{
+    for (__u32 i = rd->i; i + 1 < rd->n; i++) {
+        if (rd->p[i] == '\r' && rd->p[i + 1] == '\n') {
+            *start = (const char *)rd->p + rd->i;
+            *len = i - rd->i;
+            rd->i = i + 2;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The next element, as a text token. Only the two shapes an element we ever
+ * look at can take produce one — a bulk (`$3\r\nGET`, which is what a command's
+ * verb, its subcommand and a push's kind word are on the wire) and a
+ * line-shaped scalar. Anything else — a nested aggregate, an integer — ends the
+ * walk: none of the questions asked here has an answer in it, and stepping over
+ * a nested value correctly is the machine's job above, not a reader's. */
+static bool rd_elem(struct redis_rd *rd, struct lk_redis_arg *t)
+{
+    const char *line;
+    __u32 len;
+
+    if (rd->i >= rd->n)
+        return false;
+    switch (redis_vshape(rd->p[rd->i])) {
+    case REDIS_V_BULK: {
+        __s64 v;
+        __u64 payload;
+        bool null;
+
+        rd->i++;
+        if (!rd_line(rd, &line, &len) || !redis_parse_i64(line, len, &v))
+            return false;
+        if (!redis_bulk_len(v, &payload, &null) || null)
+            return false;
+        if (payload > rd->n - rd->i)
+            return false; /* the prefix ends inside the payload */
+        t->p = (const char *)rd->p + rd->i;
+        t->n = (__u32)payload;
+        rd->i += (__u32)payload;
+        if (rd->n - rd->i < 2)
+            rd->i = rd->n; /* no room for the CRLF: this is the last token */
+        else
+            rd->i += 2;
+        return true;
+    }
+    case REDIS_V_LINE:
+        rd->i++;
+        if (!rd_line(rd, &line, &len))
+            return false;
+        t->p = line;
+        t->n = len;
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* An inline command is not RESP and has no elements: the server splits it on
+ * blanks itself, so the reader does too. `PING\r\n` from a healthcheck is the
+ * common case and `SELECT 3` from a `nc` session the other one. Quoting
+ * (`SET "a b" "c d"`, which the server does honour) is *not* interpreted: it
+ * would matter only for reading an argument, and the one argument this reader
+ * exists to find — a password, so that it can be blanked — is safer over-blanked
+ * than parsed cleverly. */
+static void read_inline(const __u8 *body, __u32 cap, __u32 max, struct lk_redis_argv *v)
+{
+    const char *p = (const char *)body;
+    __u32 i = 0;
+
+    while (v->n < max) {
+        __u32 start;
+
+        while (i < cap && (p[i] == ' ' || p[i] == '\t'))
+            i++;
+        start = i;
+        while (i < cap && p[i] != ' ' && p[i] != '\t' && p[i] != '\r' && p[i] != '\n')
+            i++;
+        if (i == start)
+            return;
+        v->a[v->n].p = p + start;
+        v->a[v->n].n = i - start;
+        v->n++;
+    }
+}
+
+void redis_read_argv(const struct lk_msg *m, const __u8 *body, __u32 cap, __u32 max,
+                     struct lk_redis_argv *v, __s64 *nelem)
+{
+    struct redis_rd rd = {.p = body, .n = cap};
+    enum redis_vshape sh;
+    const char *line;
+    __u32 len, elems;
+    __s64 count;
+
+    memset(v, 0, sizeof(*v));
+    if (max > LK_REDIS_ARGV_MAX)
+        max = LK_REDIS_ARGV_MAX;
+    if (nelem)
+        *nelem = -1;
+    if (!body || !cap)
+        return; /* the prefix was lost (no slab): nothing is known, and nothing
+                   is guessed — the caller treats the value as an ordinary one */
+    if (m->type == LK_REDIS_MSG_INLINE) {
+        read_inline(body, cap, max, v);
+        return;
+    }
+    sh = redis_vshape((__u8)m->type);
+    if (sh != REDIS_V_AGG && sh != REDIS_V_AGGPAIR)
+        return;
+    rd.i = 1;
+    if (!rd_line(&rd, &line, &len) || !redis_parse_i64(line, len, &count))
+        return;
+    if (!redis_agg_count(count, sh == REDIS_V_AGGPAIR, &elems))
+        return;
+    if (nelem)
+        *nelem = elems;
+    while (v->n < max && v->n < elems && rd_elem(&rd, &v->a[v->n]))
+        v->n++;
+}
+
+/* --- masking a credential (РR6) -------------------------------------------- */
+
+/* Blank a span of the copy, keeping its length: the bulk header in front of it
+ * says how many bytes follow, so a mask that shortened the payload would produce
+ * a dump that no longer frames — and a `--messages` view whose framing is a
+ * fiction is worse than one with a hidden field. */
+static void blank(__u8 *base, __u32 n, struct lk_redis_arg s)
+{
+    size_t off = (size_t)((const __u8 *)s.p - base);
+
+    if (s.p && off < n && s.n <= n - off)
+        memset(base + off, '*', s.n);
+}
+
+void redis_mask_body(const struct lk_msg *m, __u8 *p, __u32 n)
+{
+    struct lk_redis_argv v;
+    uint32_t mask;
+    uint16_t id;
+
+    if (!p || !n)
+        return;
+    if (m->type != REDIS_T_ARRAY && m->type != LK_REDIS_MSG_INLINE)
+        return; /* a command is an array or an inline line; a *reply* carries no
+                   credential, and `AUTH`'s is `+OK` either way */
+    redis_read_argv(m, p, n, LK_REDIS_ARGV_MAX, &v, NULL);
+    id = lk_redis_cmd(&v);
+    mask = lk_redis_secret_mask(id, &v);
+    for (uint32_t i = 0; i < v.n; i++)
+        if (mask & (1u << i))
+            blank(p, n, v.a[i]);
+}
+
 /* --- the two vtable hooks ------------------------------------------------- */
 
 /* Framing is impossible without state: say so once, count it as a blind zone
@@ -648,8 +827,12 @@ const struct lk_proto_ops lk_proto_redis_ops = {
     .proto_new = lk_proto_redis_new,
     /* The message-framing hooks (hdr_size, parse_hdr, pre_emit, both
      * intercept_ and both resync_) stay NULL: in stream mode the two hooks
-     * above are the machine. mask_body joins them in МR3, when there is an
-     * `AUTH` body to hide (РR6). */
+     * above are the machine. */
     .stream_bytes = redis_stream_bytes,
     .stream_hole = redis_stream_hole,
+    /* The first non-NULL mask_body outside the HTTP family (РR6): a Redis
+     * password is an ordinary element of an ordinary command, so unlike PG's and
+     * MySQL's — which travel in an authentication exchange the framer never
+     * republishes — it is in a body a viewer would otherwise print. */
+    .mask_body = redis_mask_body,
 };

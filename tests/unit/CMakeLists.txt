@@ -135,7 +135,11 @@ add_test(NAME redis_wire COMMAND test_redis_wire)
 # 1/2/100, the ring overflowing, a reply that overtook its own command, the
 # pub/sub rule in both protocol versions, and the three kinds of connection that
 # are not a request/response stream at all.
-foreach(t redis_frame redis_stream redis_unit)
+# Redis labels (МR3): the session state machine on the same chain — the database
+# of РR5 and the ACL user of РR6, both moving on the *reply* and not on the
+# command, plus the privacy invariant asserted per observation (no key, no
+# password, in any label).
+foreach(t redis_frame redis_stream redis_unit redis_labels)
     add_executable(test_${t} test_${t}.c)
     target_include_directories(test_${t} PRIVATE
         ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent
@@ -232,6 +236,24 @@ foreach(t s3_labels s3_error)
     target_link_libraries(test_${t} latkit_proto)
     add_test(NAME ${t} COMMAND test_${t})
 endforeach()
+
+# Redis command table (PLAN-REDIS.md МR3, РR4-РR6): the closed identity table
+# entry by entry, the container rule that is the only place a second element is
+# read, the session parses of `SELECT`/`AUTH`/`HELLO`, the credential mask, and
+# the closed-set invariant over a million random arrays — the check that makes
+# the `cmd` label's cardinality a compile-time fact. Pure, links the normaliser.
+add_executable(test_redis_cmd test_redis_cmd.c)
+target_link_libraries(test_redis_cmd latkit_norm)
+add_test(NAME redis_cmd COMMAND test_redis_cmd)
+
+# ... and the same table against the notes it was generated from (МR3): the
+# compiled entries, dumped by the test binary, must be exactly the table in
+# docs/notes-redisproto.md §"The table" — which cmdtable.py generated from a live
+# server. One source of truth, checked rather than asserted, so a hand-edit of
+# either side turns CI red instead of quietly renaming a metric label.
+add_test(NAME redis_table
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/redis_table.sh $<TARGET_FILE:test_redis_cmd>
+                 ${CMAKE_SOURCE_DIR}/docs/notes-redisproto.md)
 
 # Query-string redactor (PLAN-HTTP.md М6, РH12): the key table, the bounds, and
 # the invariant the whole privacy claim rests on — no secret survives the copy.

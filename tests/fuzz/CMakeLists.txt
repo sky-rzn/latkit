@@ -6,7 +6,8 @@
 #   fuzz_pg    bytes -> framer -> lk_msg -> PG parser (harness from task 3.6)
 #   fuzz_my    the same over the MySQL framer + handler (MYSQL.md М7)
 #   fuzz_http  the same over the HTTP/1.x stream framer (PLAN-HTTP.md М2)
-#   fuzz_norm  bytes -> lk_norm_sql / lk_norm_route / lk_norm_s3 (task 4.1, МS1)
+#   fuzz_norm  bytes -> lk_norm_sql / lk_norm_route / lk_norm_s3 / lk_redis_cmd
+#              (task 4.1, МS1, PLAN-REDIS.md МR3)
 #   fuzz_pipe  event scenario -> decode + conn_table + framer + parser + norm
 #
 # The dependency sources are compiled INTO each target rather than linked from
@@ -51,7 +52,8 @@ set(FUZZ_CORE_SRC
 set(FUZZ_NORM_SRC ${CMAKE_SOURCE_DIR}/src/norm/norm_sql.c
                   ${CMAKE_SOURCE_DIR}/src/norm/norm_route.c
                   ${CMAKE_SOURCE_DIR}/src/norm/norm_redact.c
-                  ${CMAKE_SOURCE_DIR}/src/norm/norm_s3.c)
+                  ${CMAKE_SOURCE_DIR}/src/norm/norm_s3.c
+                  ${CMAKE_SOURCE_DIR}/src/norm/norm_redis.c)
 
 function(latkit_fuzzer name)
     add_executable(${name} ${ARGN})

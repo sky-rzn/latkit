@@ -250,6 +250,7 @@ templating works with no configuration at all):
 | `--http-redact on\|off` | `LATKIT_HTTP_REDACT` | **on** | replace credential-looking query values (`token`, `sig`, `password`, `key`, `code`, …) with `***` wherever a request target leaves the handler — spans included |
 | `--s3-domain NAME` | `LATKIT_S3_DOMAIN` | none | on an `s3` port, a Host of the form `<bucket>.NAME` is virtual-host addressing and the bucket comes from the Host; repeatable. Without it every request is read path-style, which is also what MinIO does without `MINIO_DOMAIN` |
 | `--s3-user accesskey\|off` | `LATKIT_S3_USER` | `accesskey` | derive the `user` label from the access key in an S3 signature — the public half of the pair. The signature, the chunk signatures and `X-Amz-Security-Token` are never read; the object key is never a label at all |
+| `--redis-user acl\|off` | `LATKIT_REDIS_USER` | `acl` | on a `redis` port, derive the `user` label from the ACL user of `AUTH <user> <pass>` / `HELLO … AUTH`. The password is a separate array element and is never read — and never shown: `--messages --hexdump` blanks it. Keys, values and arguments are never labels at any setting |
 
 **Exporters** (both run independently; the OTLP group falls back to the
 standard `OTEL_*` variables, so an agent deployed beside other OTel tooling

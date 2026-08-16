@@ -205,13 +205,14 @@ target_link_libraries(latkit_proto PUBLIC latkit_norm)
 # on nothing but libc and the vendored xxhash (XXH3-64, header-only, BSD) — kept
 # as a SYSTEM include so -Werror does not police third-party code. Four members:
 # the SQL normaliser (Р22), the HTTP route templater (РH7), the query-string
-# redactor (РH12, М6) and the S3 classifier (РS2/РS3, PLAN-MINIO.md МS1) — the
-# first two share the "collapse the volatile part, hash the whole input"
-# contract, the fourth needs no heuristic at all because S3's identities are a
-# closed table, and the third is the privacy rule of the HTTP track in one
-# function so that every path through the agent obeys the same one.
+# redactor (РH12, М6), the S3 classifier (РS2/РS3, PLAN-MINIO.md МS1) and the
+# Redis command table (РR4-РR6, PLAN-REDIS.md МR3) — the first two share the
+# "collapse the volatile part, hash the whole input" contract, the last two need
+# no heuristic at all because their identities are closed tables, and the third
+# is the privacy rule of the HTTP track in one function so that every path
+# through the agent obeys the same one.
 add_library(latkit_norm STATIC src/norm/norm_sql.c src/norm/norm_route.c src/norm/norm_redact.c
-                               src/norm/norm_s3.c)
+                               src/norm/norm_s3.c src/norm/norm_redis.c)
 target_include_directories(latkit_norm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/norm)
 target_include_directories(latkit_norm SYSTEM PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xxhash)

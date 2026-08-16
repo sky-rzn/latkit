@@ -69,6 +69,26 @@ add_test(NAME s3_queries_traces
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/s3_queries_traces.sh
                  $<TARGET_FILE:lkt_queries> ${CMAKE_SOURCE_DIR}/tests/traces/s3)
 
+# МR3 acceptance (PLAN-REDIS.md): the same over the Redis corpus — the command
+# identity, the database and the ACL user per МR0 scenario, plus the corpus-wide
+# invariants of РR4/РR6: every `cmd` a table entry (checked against the compiled
+# table itself, hence the third argument), no key in any label, no password in
+# the view, and the `--redis-user off` switch actually switching it off.
+add_test(NAME redis_queries_traces
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/redis_queries_traces.sh
+                 $<TARGET_FILE:lkt_queries> ${CMAKE_SOURCE_DIR}/tests/traces/redis
+                 $<TARGET_FILE:test_redis_cmd>)
+
+# The redis half of the privacy check (МR3, РR6): the corpus authenticates in
+# every form Redis defines and creates an ACL user with a real password, and
+# none of those passwords may appear on any surface — the raw `--hexdump` view
+# included, which is what the `mask_body` hook exists for. Keys are checked on
+# every *exported* surface, the distinction the script's header argues.
+add_test(NAME redis_privacy
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/redis_privacy.sh
+                 $<TARGET_FILE:lkt_queries> $<TARGET_FILE:lkt_messages>
+                 ${CMAKE_SOURCE_DIR}/tests/traces/redis)
+
 # М6 acceptance (РH12): the corpus traces recorded with deliberately secret URLs
 # and headers, greped across every surface the agent has — observations,
 # exposition, spans and the raw --hexdump view. Without this test the privacy

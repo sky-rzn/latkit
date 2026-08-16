@@ -125,6 +125,28 @@ static void on_http_query(const struct lk_conn *c, const struct lk_session *s,
            o->text ? o->text : "", o->text_len > TEXT_LOG_MAX ? "..." : "");
 }
 
+/* One Redis observation (РR3–РR6, PLAN-REDIS.md МR3). Its own line, like the
+ * HTTP one and for the same reason: its identity is a command from a closed
+ * table rather than a statement, its labels are a database *number* and an ACL
+ * user, and its one protocol-specific fact — how many commands arrived in the
+ * same syscall — has no field in the SQL-shaped line at all.
+ *
+ * What is deliberately absent is the command *text*: a Redis command is a verb
+ * and its arguments, the arguments are keys and values, and the whole of РR4 is
+ * that they never leave the handler. `cmd=` is the identity and there is nothing
+ * else to print. */
+static void on_redis_query(const struct lk_conn *c, const struct lk_session *s,
+                           const struct lk_query_obs *o)
+{
+    printf("redis conn=%llx cmd=%s dur=%lluns db=%s user=%s in=%llu out=%llu depth=%u"
+           " flags=0x%x\n",
+           (unsigned long long)c->cookie, o->route ? o->route : "?",
+           (unsigned long long)delta(o->ts_start_ns, o->ts_complete_ns),
+           s->database[0] ? s->database : "-", s->user[0] ? s->user : "-",
+           (unsigned long long)o->bytes_in, (unsigned long long)o->bytes_out,
+           o->redis ? o->redis->pipeline_depth : 0, o->flags);
+}
+
 static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session *s,
                      const struct lk_query_obs *o)
 {
@@ -140,6 +162,13 @@ static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session
         return;
     if (o->kind == LK_Q_REQUEST) {
         on_http_query(c, s, o);
+        return;
+    }
+    /* Redis shares LK_Q_SIMPLE with PG until МR5 gives it a kind of its own, so
+     * the connection's protocol is what says which view to print — which is also
+     * how metrics.c and spans.c decide everything protocol-shaped (М6). */
+    if (lk_conn_proto(c) == &lk_proto_redis_ops) {
+        on_redis_query(c, s, o);
         return;
     }
     printf("query conn=%llx dur=%lluns kind=%s db=%s user=%s rows=%llu bytes=%llu "
@@ -263,6 +292,13 @@ int main(int argc, char **argv)
             hcfg.s3.no_user = !strcmp(argv[first + 1], "off");
             lk_proto_http_configure(&hcfg);
             first += 2;
+        } else if (!strcmp(argv[first], "--redis-user") && first + 1 < argc) {
+            /* РR6, the agent's --redis-user: on by default here as there, so the
+             * acceptance script has to ask for `off` to see the label go away. */
+            struct lk_redis_cfg rcfg = {.no_user = !strcmp(argv[first + 1], "off")};
+
+            lk_proto_redis_configure(&rcfg);
+            first += 2;
         } else if (!strcmp(argv[first], "--http-redact") && first + 1 < argc) {
             /* РH12, the agent's --http-redact: on by default, here as there. */
             hcfg.no_redact = !strcmp(argv[first + 1], "off");
@@ -280,8 +316,8 @@ int main(int argc, char **argv)
     }
     if (first >= argc) {
         fprintf(stderr,
-                "usage: %s [--proto pg|mysql|http|s3] [--http-user basic]"
-                " [--s3-domain NAME] [--s3-user off] [--quiet]"
+                "usage: %s [--proto pg|mysql|http|s3|redis] [--http-user basic]"
+                " [--s3-domain NAME] [--s3-user off] [--redis-user off] [--quiet]"
                 " [--metrics] [--spans RATIO] [--http-redact on|off] FILE.lkt...\n",
                 argv[0]);
         return 2;

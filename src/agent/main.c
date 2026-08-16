@@ -86,6 +86,13 @@ static bool opt_http_no_redact;
 static const char *opt_s3_domains[LK_S3_DOMAIN_MAX];
 static int opt_s3_ndomains;
 static bool opt_s3_no_user;
+/* The one Redis knob (РR6, PLAN-REDIS.md МR3), read only by the `redis` handler
+ * and inert for every other port. On by default, unlike --http-user and like
+ * --s3-user: the ACL user is its own array element of an `AUTH`, so reading it
+ * decodes nothing and touches no password — and a per-user latency panel is what
+ * a shared Redis is watched for. `off` is for a deployment that rotates ACL
+ * users faster than max_session_dims can spill them into `other`. */
+static bool opt_redis_no_user;
 static struct lk_port_proto opt_port_protos[LK_MAX_PORTS];
 static int opt_nports;
 static __u64 opt_ringbuf_bytes = LK_RINGBUF_SZ;
@@ -260,6 +267,10 @@ static void usage(FILE *out, const char *argv0)
             "                        derive the `user` label from the access key\n"
             "                        in an S3 signature — the public half of the\n"
             "                        pair, never the signature (default: accesskey)\n"
+            "      --redis-user acl|off\n"
+            "                        derive the `user` label from the ACL user of\n"
+            "                        AUTH/HELLO; the password is never read, and\n"
+            "                        no key or argument is ever a label (default: acl)\n"
             "      --print-config    resolve config (flag > LATKIT_* env > default)\n"
             "                        to stdout and exit; every flag has a LATKIT_*\n"
             "                        env equivalent (see README)\n"
@@ -323,6 +334,7 @@ enum {
     OPT_HTTP_REDACT,
     OPT_S3_DOMAIN,
     OPT_S3_USER,
+    OPT_REDIS_USER,
     OPT_TLS,
     OPT_LIBSSL,
     OPT_TLS_COMM,
@@ -630,6 +642,21 @@ static int set_option(int c, char *optarg)
             return -1;
         }
         break;
+    case OPT_REDIS_USER:
+        /* РR6: on by default, like --s3-user and unlike --http-user. The name
+         * sits in its own element of the `AUTH` array, so nothing has to be
+         * decoded to find it and nothing near a password is touched — which is
+         * exactly the argument --http-user could not make about
+         * `Authorization: Basic`. */
+        if (!strcmp(optarg, "acl")) {
+            opt_redis_no_user = false;
+        } else if (!strcmp(optarg, "off")) {
+            opt_redis_no_user = true;
+        } else {
+            fprintf(stderr, "--redis-user: expected 'acl' or 'off', got '%s'\n", optarg);
+            return -1;
+        }
+        break;
     case OPT_HTTP_ROUTES:
         /* The file is read after parsing, not here: an option handler that does
          * I/O runs from the env layer too, and "the config was rejected" should
@@ -817,6 +844,7 @@ static const struct env_opt env_opts[] = {
     {"LATKIT_HTTP_REDACT", OPT_HTTP_REDACT, true, false},
     {"LATKIT_S3_DOMAIN", OPT_S3_DOMAIN, true, true},
     {"LATKIT_S3_USER", OPT_S3_USER, true, false},
+    {"LATKIT_REDIS_USER", OPT_REDIS_USER, true, false},
 };
 
 /* Apply LATKIT_* env variables to flags not given on the CLI (Р34): flag > env
@@ -901,6 +929,7 @@ static int parse_args(int argc, char **argv)
         {"http-redact", required_argument, NULL, OPT_HTTP_REDACT},
         {"s3-domain", required_argument, NULL, OPT_S3_DOMAIN},
         {"s3-user", required_argument, NULL, OPT_S3_USER},
+        {"redis-user", required_argument, NULL, OPT_REDIS_USER},
         {"tls", required_argument, NULL, OPT_TLS},
         {"libssl", required_argument, NULL, OPT_LIBSSL},
         {"tls-comm", required_argument, NULL, OPT_TLS_COMM},
@@ -1080,6 +1109,16 @@ static void configure_http(void)
     lk_proto_http_configure(&cfg);
 }
 
+/* The redis handler's one setting (РR6). Its own call rather than a field on the
+ * http config, because Redis is a protocol and not a dialect: nothing it reads
+ * has an HTTP equivalent, and a shared struct would say otherwise. */
+static void configure_redis(void)
+{
+    struct lk_redis_cfg cfg = {.no_user = opt_redis_no_user};
+
+    lk_proto_redis_configure(&cfg);
+}
+
 /* Capture budget of one configured port, in bytes (РH14). The whole precedence
  * of the three knobs lives here and nowhere else:
  *
@@ -1211,6 +1250,7 @@ static void print_config(void)
         printf("%s%s", i ? "," : "", opt_s3_domains[i]);
     printf("\n");
     printf("s3_user=%s\n", opt_s3_no_user ? "off" : "accesskey");
+    printf("redis_user=%s\n", opt_redis_no_user ? "off" : "acl");
     printf("top_queries=%u\n", opt_top_queries ? opt_top_queries : LK_TOP_QUERIES_DEFAULT);
     printf("max_session_dims=%u\n",
            opt_max_session_dims ? opt_max_session_dims : LK_MAX_SESSION_DIMS_DEFAULT);
@@ -1615,6 +1655,7 @@ int main(int argc, char **argv)
      * the seam — which dialect classifies a request (РH8) — travels on
      * lk_proto_ops instead, chosen by `--port N=<name>`. */
     configure_http();
+    configure_redis();
 
     events = lk_events_new(&ecfg);
     if (!events) {

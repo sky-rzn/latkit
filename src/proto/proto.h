@@ -531,6 +531,23 @@ extern const struct lk_proto_ops lk_proto_s3_ops;
 extern const struct lk_proto_ops lk_proto_redis_ops;
 struct lk_proto *lk_proto_redis_new(const struct lk_query_sink *out);
 
+/* Handler-wide Redis settings (РR6), the lk_http_cfg twin and process-wide for
+ * the same reason: one handler per agent, values fixed at startup. Call before
+ * the first event; NULL restores the defaults, and the default — a zeroed
+ * struct — is `--redis-user acl`.
+ *
+ * One knob, where HTTP has six, because Redis needs no route heuristic and no
+ * query redactor: its identities come from a closed table and its arguments are
+ * never read at all. The one decision an operator still has is whether the ACL
+ * user becomes a label, and unlike `--http-user` it defaults to *on* — the name
+ * is its own array element, so reading it costs nothing and touches no
+ * credential, while `Authorization: Basic` hid the name inside the same base64
+ * blob as the password (РH12 vs РR6). */
+struct lk_redis_cfg {
+    bool no_user; /* `--redis-user off`: never derive a user label from `AUTH` */
+};
+void lk_proto_redis_configure(const struct lk_redis_cfg *cfg);
+
 /* Handler-wide HTTP settings (РH10/РH7). Process-wide rather than per-handler
  * because there is exactly one http handler instance per agent and the values
  * are fixed at startup from the CLI; the *dialect* is per port and travels on
