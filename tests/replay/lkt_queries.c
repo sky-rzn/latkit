@@ -315,7 +315,7 @@ int main(int argc, char **argv)
                 "%s: proto=%s msgs=%llu sessions=%llu queries=%llu errors_sql=%llu"
                 " parse_errors=%llu unknown=%llu resyncs=%llu"
                 " dropped=%llu/%llu/%llu prep_evict=%llu repl=%llu"
-                " blind=%llu orphan=%llu\n",
+                " blind=%llu orphan=%llu push=%llu monitor=%llu\n",
                 argv[i], ops->name, (unsigned long long)ps->msgs, (unsigned long long)ps->sessions,
                 (unsigned long long)ps->queries, (unsigned long long)ps->errors_sql,
                 (unsigned long long)ps->parse_errors, (unsigned long long)ps->unknown_msgs,
@@ -323,7 +323,8 @@ int main(int argc, char **argv)
                 (unsigned long long)ps->units_dropped_close,
                 (unsigned long long)ps->units_dropped_overflow,
                 (unsigned long long)ps->prep_evictions, (unsigned long long)ps->replication_conns,
-                (unsigned long long)ps->blind_conns, (unsigned long long)ps->orphan_msgs);
+                (unsigned long long)ps->blind_conns, (unsigned long long)ps->orphan_msgs,
+                (unsigned long long)ps->pushes, (unsigned long long)ps->monitor_conns);
             /* Drained per file, so a span line sits with the observations it
              * came from — the ring is bounded and a whole corpus would overflow
              * it, which is a property of the collector, not of this tool. */

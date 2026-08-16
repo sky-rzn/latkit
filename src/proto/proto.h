@@ -141,6 +141,23 @@ struct lk_http_obs {
     __u8 version;            /* HTTP/1.<version> of the response, else of the request */
 };
 
+/* What a Redis command carries that neither a query nor an HTTP exchange has an
+ * equivalent of (РR3/РR11, PLAN-REDIS.md МR2). Hung off lk_query_obs by pointer
+ * and NULL for every other protocol, exactly as lk_http_obs is, so the database
+ * path keeps the struct it had.
+ *
+ * One field, and it is the one RESP makes a first-class fact: **how many
+ * commands arrived in the same syscall as this one**. On PG a pipelined batch is
+ * unusual enough to be a flag; on Redis batching is what every client library
+ * does by default, the depth spans 1…100 in the МR0 corpus, and it is the
+ * difference between "the server was slow" and "this command waited behind
+ * ninety-nine of its own". МR5 makes it latkit_redis_pipeline_depth and МR6 the
+ * `redis.pipeline.depth` span attribute; the measurement is here because only
+ * the handler sees the call boundaries the framer marks for it. */
+struct lk_redis_obs {
+    __u32 pipeline_depth; /* commands in this one's batch, >= 1 */
+};
+
 /* One completed unit of work, whatever the protocol calls it: a query, a COPY,
  * or an HTTP request/response exchange. The four timestamps are the reason the
  * struct exists — everything else is labels.
@@ -200,24 +217,26 @@ struct lk_query_obs {
                           protocols, and for an HTTP unit whose target never
                           arrived */
     __u32 route_len;
-    __u64 route_fp;                 /* XXH3-64 of `method NUL route`: the identity the М5
-                                       top-K keys on. The method is in it because two
-                                       methods on one path are two routes (РH7) */
-    const char *err_name;           /* symbolic error name, borrowed for the callback: the
-                                       S3 dialect's `<Code>` (РS5), folded to `other`
-                                       outside the known vocabulary. NULL for the base
-                                       HTTP dialect and the DB protocols, whose error
-                                       identity is err_code / sqlstate */
-    const struct lk_http_obs *http; /* HTTP span material (РH11, М6), borrowed for
-                                       the callback; NULL for the DB protocols */
-    char sqlstate[6];               /* on LK_QO_ERROR, C-string */
-    __u16 err_code;                 /* vendor error code (MySQL errno) on LK_QO_ERROR; 0 =
-                                       none/unknown (PG has no numeric code) — М6 span attr.
-                                       HTTP reuses it for the status code, which is set on
-                                       *every* observation, not only failing ones (РH10) */
-    __u8 kind;                      /* enum lk_query_kind */
-    char txn_status;                /* I/T/E from the closing Z; 0 = unknown (HTTP: none) */
-    __u16 flags;                    /* LK_QO_* */
+    __u64 route_fp;                   /* XXH3-64 of `method NUL route`: the identity the М5
+                                         top-K keys on. The method is in it because two
+                                         methods on one path are two routes (РH7) */
+    const char *err_name;             /* symbolic error name, borrowed for the callback: the
+                                         S3 dialect's `<Code>` (РS5), folded to `other`
+                                         outside the known vocabulary. NULL for the base
+                                         HTTP dialect and the DB protocols, whose error
+                                         identity is err_code / sqlstate */
+    const struct lk_http_obs *http;   /* HTTP span material (РH11, М6), borrowed for
+                                         the callback; NULL for the DB protocols */
+    const struct lk_redis_obs *redis; /* Redis batch material (РR3, МR2), borrowed
+                                         for the callback; NULL everywhere else */
+    char sqlstate[6];                 /* on LK_QO_ERROR, C-string */
+    __u16 err_code;                   /* vendor error code (MySQL errno) on LK_QO_ERROR; 0 =
+                                         none/unknown (PG has no numeric code) — М6 span attr.
+                                         HTTP reuses it for the status code, which is set on
+                                         *every* observation, not only failing ones (РH10) */
+    __u8 kind;                        /* enum lk_query_kind */
+    char txn_status;                  /* I/T/E from the closing Z; 0 = unknown (HTTP: none) */
+    __u16 flags;                      /* LK_QO_* */
 };
 
 struct lk_query_sink {
@@ -252,9 +271,22 @@ struct lk_proto_stats {
                                      mid-stream, or one arriving after its unit was
                                      emitted. Not a parse error — the input was
                                      fine, we simply never saw its request */
+    __u64 pushes;                 /* the deliberate twin of orphan_msgs: server values
+                                     that closed no unit *by construction* (РR8) — a
+                                     pub/sub delivery, a client-side-caching
+                                     invalidation, or the second and later
+                                     confirmations of one multi-channel SUBSCRIBE.
+                                     Nothing was lost; a queue that let them close
+                                     units would mis-time every later command on the
+                                     connection */
     __u64 prep_evictions;         /* prepared-statement cache evictions */
     __u64 sessions;               /* on_session emitted */
-    __u64 replication_conns;      /* CopyBoth / binlog dump -> IGNORE connections */
+    __u64 replication_conns;      /* CopyBoth / binlog dump / PSYNC -> IGNORE conns */
+    __u64 monitor_conns;          /* MONITOR -> IGNORE connections (РR14). Its own
+                                     reason rather than replication's: the connection
+                                     turns into a feed of *other clients'* commands,
+                                     which is a different fact about a deployment and
+                                     a different conversation with its operator */
     __u64 compressed_conns;       /* CLIENT_COMPRESS/_ZSTD -> IGNORE connections (РМ7) */
     __u64 blind_conns;            /* protocol switched away from what we parse ->
                                      IGNORE connections (РH4: the HTTP/2 preface,

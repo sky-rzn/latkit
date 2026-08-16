@@ -130,7 +130,12 @@ add_test(NAME redis_wire COMMAND test_redis_wire)
 # test_redis_stream is the acceptance invariant: the same bytes cut anywhere
 # produce the same messages, which is the only honest way to state that the
 # no-copy path and the slab path agree.
-foreach(t redis_frame redis_stream)
+# Redis handler (МR2): the unit queue and the four timings over the real chain —
+# bytes -> framer -> lk_msg -> handler -> lk_query_obs. Pipelining at depth
+# 1/2/100, the ring overflowing, a reply that overtook its own command, the
+# pub/sub rule in both protocol versions, and the three kinds of connection that
+# are not a request/response stream at all.
+foreach(t redis_frame redis_stream redis_unit)
     add_executable(test_${t} test_${t}.c)
     target_include_directories(test_${t} PRIVATE
         ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent

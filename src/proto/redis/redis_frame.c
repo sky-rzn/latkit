@@ -254,23 +254,6 @@ static void value_done(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, s
         value_emit(r, c, dir, rd, p, end, end_pos);
 }
 
-/* Is a value being assembled right now? Only then does the tail of a chunk
- * have to be kept, and only then does a hole cost anything. */
-static bool value_open(const struct redis_dir *rd)
-{
-    switch (rd->st) {
-    case REDIS_FR_LINE:
-    case REDIS_FR_BULK:
-    case REDIS_FR_BULK_EOL:
-    case REDIS_FR_INLINE:
-        return true;
-    case REDIS_FR_VALUE:
-        return rd->depth != 0;
-    default:
-        return false;
-    }
-}
-
 /* --- the states ----------------------------------------------------------- */
 
 /* At the start of a value. The type byte is the whole classification (RESP has
@@ -296,6 +279,12 @@ static __u32 value_start(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir,
         rd->v_ts = ts;
         rd->vtype = b;
         rd->cur = i;
+        /* This value is the first one to *start* since a syscall boundary, so on
+         * the frontend it opens a batch (РR3, МR2 reads it through
+         * redis_frame). A value torn across two calls belongs to the call it
+         * started in, which is why the mark is taken here and not at the emit. */
+        rd->v_call = rd->call_new;
+        rd->call_new = 0;
     }
 
     sh = redis_vshape(b);
@@ -505,6 +494,8 @@ void redis_stream_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, 
     rd->off += n;
     rd->last_ts = ts_ns;
     rd->cur = 0;
+    if (at_call)
+        rd->call_new = 1; /* the next value to start opens a batch (РR3) */
 
     /* Loss dirties both directions before the bytes ever reach us (the conn
      * table's seq detector; a lazily created or synthetic entry starts that
@@ -563,7 +554,7 @@ void redis_stream_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, 
 
     /* A value that outlives this chunk keeps its prefix — one copy per value
      * that spans events, none for a value that does not. */
-    if (value_open(rd))
+    if (redis_value_open(rd))
         stash(r, c, dir, rd, p, n);
 }
 

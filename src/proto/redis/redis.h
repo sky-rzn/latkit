@@ -4,11 +4,13 @@
  * by the core: the outside world sees only lk_proto_redis_ops and
  * lk_proto_redis_new (proto.h).
  *
- * PLAN-REDIS.md МR1 fills in the framer — the value machine of РR2, the
- * synthetic message dictionary below, the two resync anchors — and leaves the
- * handler at a tally, exactly as PLAN-HTTP.md М1 did: the unit queue, the
- * pub/sub rule (РR3, РR8) are МR2's, the command table and the session labels
- * (РR4–РR6) МR3's.
+ * PLAN-REDIS.md МR1 filled in the framer — the value machine of РR2, the
+ * synthetic message dictionary below, the two resync anchors. МR2 adds the
+ * other half: the in-flight unit queue, the four timings, the pub/sub rule and
+ * the service connections that are not a request/response stream at all (РR3,
+ * РR8, РR14). The command table and the session labels (РR4–РR6) are МR3's, so
+ * an observation here carries timings, sizes and a batch depth — and no
+ * identity yet.
  *
  * **Redis is a new protocol, not a dialect.** RESP has no heads, no statuses
  * and no routes, so the `struct lk_http_dialect` seam (РH8) does not apply and
@@ -140,6 +142,11 @@ struct redis_dir {
     __u8 st;                    /* enum redis_fr_st */
     __u8 shape;                 /* enum redis_vshape of the value whose line is being read */
     __u8 depth;                 /* aggregates open above the current value */
+    __u8 call_new;              /* a syscall boundary has passed and no value has started
+                                   since: the next one to start opens a batch (РR3) */
+    __u8 v_call;                /* ... and that is what the open value did. Read by the
+                                   handler at the emit — see the note on the side channel
+                                   below */
     __u8 saw_cr;                /* LINE: the previous byte was CR */
     __u8 num_n;                 /* digits kept in num[] */
     __u8 num_bad;               /* ... and the line is known not to be a number anyway */
@@ -183,16 +190,116 @@ struct redis_frame {
 
 /* --- handler state (lk_conn.proto_state, Р15) ----------------------------- */
 
-/* МR1 keeps a tally and the one bit МR2 needs from the start: whether this
- * connection was joined mid-stream, in which case no boundary before the next
- * resync can be vouched for. The unit ring, the pub/sub mode, the database and
- * the ACL user land here in МR2/МR3. */
+/* In-flight commands the reply direction matches against (РR3). RESP has no
+ * request id and no sequence number: **order is the only correspondence the
+ * protocol offers**, so a FIFO is not an optimisation here, it is the entire
+ * mechanism — and everything unsolicited on the wire has to be recognised as
+ * such or the queue slides by one and every latency after it is a plausible
+ * lie (РR8).
+ *
+ * 256 because МR0 measured what clients really do: an application with a
+ * connection pool pipelines at depth 1, a batching one at exactly the depth it
+ * asked for, and the deepest measured batch is memtier's 100
+ * (notes-redisproto.md §"Pipelining is the normal mode"). Past the ring the
+ * newest command is dropped into units_dropped_overflow and its reply is
+ * skipped by count, exactly as in HTTP — the units still queued keep pairing
+ * correctly, which is what makes an overflow a degraded stretch rather than a
+ * wrong answer. */
+#define LK_REDIS_MAX_INFLIGHT 256
+
+/* Risk 4 of the plan, second line of defence. Pub/Sub and RESP3 pushes are
+ * recognised, but Redis has other ways to put a value on the wire that answers
+ * nothing (`-UNBLOCKED`, a keyspace notification, an admin's `CLIENT KILL`), and
+ * one unrecognised one would leave the queue permanently one behind. A queue
+ * that has been non-empty for longer than any sane blocking command is therefore
+ * flushed rather than trusted: `BLPOP key 0` blocks for ever and is legal, so
+ * the answer is to drop the units, not the connection (notes-redisproto.md
+ * §"Timeouts"). */
+#define LK_REDIS_UNIT_TIMEOUT_NS (30ull * 1000000000ull)
+
+/* redis_unit.uflags — what the *handler* knows about a command, as opposed to
+ * what the observation carries. Kept apart from the LK_QO_* word so that neither
+ * space has to leave room for the other. */
+#define REDIS_U_SUB                                                                                \
+    (1 << 0) /* a (P|S)(UN)SUBSCRIBE: its reply is a confirmation,                                 \
+                and only such a unit may be closed by one (РR8) */
+
+/* Replies that arrived before the command they answer, which sounds impossible
+ * and is not: a command larger than the per-call capture budget (РR13 makes that
+ * 512 bytes, so a `SET` of a one-kilobyte value qualifies) has an uncaptured
+ * tail, and Р9's chunk layer only learns that tail existed when the *next* call
+ * on that direction starts. The value is therefore published late — after the
+ * reply to it has already gone by. Without a memo the pairing would slip by one
+ * and stay slipped for the life of the connection, which is the one failure mode
+ * this whole file exists to prevent: every later observation would be a
+ * plausible number belonging to the wrong command.
+ *
+ * Four slots because only the *last* value of a call can be left open, so one
+ * is the realistic depth and four is the room for a pipeline of them; past that
+ * the reply is an orphan and says so. */
+#define LK_REDIS_MAX_EARLY 4
+
+struct redis_early {
+    __u64 end_ns; /* the reply's last byte */
+    __u32 bytes;  /* its whole size on the wire */
+};
+
+/* One command in flight. Deliberately small — the ring is 256 slots on every
+ * connection that carries a command, and at the table's ceiling of 65536 that
+ * is the difference between 6 MB and 400 MB of steady state. Everything that
+ * would grow it is either already known when the unit closes (the reply's size,
+ * its type) or belongs to the observation and not to the queue. */
+struct redis_unit {
+    __u64 ts_start_ns; /* first byte of the command (Р13) */
+    __u32 bytes;       /* the command's whole size on the wire */
+    __u16 flags;       /* accumulated LK_QO_* */
+    __u16 depth;       /* commands in this one's batch, frozen when the batch
+                          ended; while the batch is still open the live count in
+                          redis_conn.batch_n is the answer (РR3) */
+    __u8 uflags;       /* REDIS_U_* */
+};
+
+/* Per-connection handler state, allocated lazily on the first message and freed
+ * in on_conn_close (Р15).
+ *
+ * The ring is addressed by a monotonic sequence rather than by index, as in the
+ * HTTP handler: "is this unit still the one I saw" then costs a comparison
+ * instead of a generation counter, and a stale reference cannot be followed into
+ * whatever now occupies the slot.
+ *
+ * Size, since this is per connection: 6.3 KB, of which the 256-slot ring is 6 KB
+ * — the same order as the HTTP handler's 5.5 KB, and allocated only for
+ * connections that actually carry a message. Nothing in it is owned by pointer,
+ * so the close hook is one free(). */
 struct redis_conn {
     struct lk_session session; /* db -> database, ACL user -> user (МR3, РR5/РR6) */
     __u64 msgs;                /* messages dispatched on this connection */
-    bool degraded;             /* joined mid-session (synthetic entry, or after a
-                                  resync): nothing here is a trustworthy boundary
-                                  until the framer vouches for one again */
+
+    struct redis_unit ring[LK_REDIS_MAX_INFLIGHT];
+    __u64 head_seq;   /* oldest live unit: the one the next reply answers */
+    __u64 open_seq;   /* next seq to hand out; live units are [head_seq, open_seq) */
+    __u64 batch_seq0; /* first unit of the batch being filled; units from it read
+                         their depth live out of batch_n, older ones out of the
+                         value frozen into them when their batch ended */
+    __u32 batch_n;    /* commands seen so far in the batch being filled */
+    __u32 owed;       /* replies still owed for commands the ring could not hold.
+                         Replies arrive in command order, so the untracked commands
+                         are the newest and their replies come last — which is what
+                         makes a plain counter sufficient (РR3) */
+
+    struct redis_early early[LK_REDIS_MAX_EARLY]; /* replies that overtook their
+                                                     own command's publication */
+    __u8 early_n;
+
+    bool sub;      /* the connection has subscribed, so an array whose first element
+                      is a pub/sub kind word is a delivery or a confirmation rather
+                      than an ordinary reply (РR8). In RESP3 the `>` type says it
+                      without state; in RESP2 nothing does, and reading kind words
+                      out of *every* array would misread a `LRANGE` that happens to
+                      hold the word "message" */
+    bool degraded; /* joined mid-session (synthetic entry, or after a resync):
+                      nothing here is a trustworthy boundary until the framer
+                      vouches for one again */
 };
 
 /* --- redis_frame.c: the framer -------------------------------------------- */
@@ -200,5 +307,50 @@ struct redis_conn {
 void redis_stream_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, const __u8 *p,
                         __u32 n, __u64 ts_ns);
 void redis_stream_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, __u64 n);
+
+/* --- the framer -> handler side channel (МR2) ------------------------------
+ * Two facts a unit needs are properties of the *capture* rather than of the byte
+ * stream, and neither may travel in lk_msg:
+ *
+ *   - **where the syscall boundaries were.** The batch depth of РR3 is by
+ *     definition "how many commands came out of one recvmsg", so a flag on the
+ *     message would make the message stream depend on where the stream was cut —
+ *     and "the same bytes cut anywhere produce the same messages" is the
+ *     invariant МR1 was accepted on (test_redis_stream.c). The framer keeps the
+ *     mark in its own state, where being call-shaped is the point.
+ *   - **when the value's last byte arrived.** lk_msg.ts_ns is the event of the
+ *     *first* byte (Р13, and every protocol before this one wants it that way),
+ *     but a unit closes when the server has finished writing — a 17 MB `KEYS *`
+ *     reply takes 212 events (`redis/keys-1m.lkt`), and timing it to its first
+ *     one would report the server as faster than it was.
+ *
+ * Both are read straight off redis_dir during the on_msg call, which is
+ * synchronous inside the framer's own emit — the fields are current exactly
+ * then and nowhere else. */
+static inline const struct redis_dir *redis_dir_of(const struct lk_conn *c, enum lk_dir dir)
+{
+    const struct redis_frame *rf = c->frame_state;
+
+    return rf ? &rf->d[dir] : NULL;
+}
+
+/* Is a value being assembled on this direction right now? The framer needs it to
+ * decide whether the tail of a chunk has to be kept; the handler needs it to
+ * recognise a reply that overtook its own command (see redis.c, "the early
+ * reply"). */
+static inline bool redis_value_open(const struct redis_dir *rd)
+{
+    switch (rd->st) {
+    case REDIS_FR_LINE:
+    case REDIS_FR_BULK:
+    case REDIS_FR_BULK_EOL:
+    case REDIS_FR_INLINE:
+        return true;
+    case REDIS_FR_VALUE:
+        return rd->depth != 0;
+    default:
+        return false;
+    }
+}
 
 #endif /* LATKIT_REDIS_H */

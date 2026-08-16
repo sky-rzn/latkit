@@ -237,6 +237,17 @@ sequence of replies:
   connection carries the write-propagation stream: RESP arrays, but *from the
   server*, none of which answers anything. `PSYNC`/`SYNC` → `LK_CONN_IGNORE` (РR14) is not an
   optimisation, it is the only correct reading.
+
+  **Any `REPLCONF` is the marker, not just `listening-port`** — a correction МR2
+  made to РR14, and the corpus is the reason. A replication link is usually
+  joined *mid-stream*: it was established long before the agent attached, so its
+  handshake is not on the tape and the only mark left is the replica's periodic
+  `REPLCONF ACK <offset>`. **39** of the МR0 traces carry such a link beside
+  the traffic they were recorded for (the recording host had a replica attached
+  — `libs/java-pipeline.lkt` is the clearest: a hundred propagated `SET`s from
+  the server on one connection while Lettuce pipelines a hundred commands on
+  another). Only a replica sends `REPLCONF` at all, so the broader rule costs
+  nothing and is the one that catches them.
 - **The `MONITOR` feed.** `+OK` and then an unbounded stream of simple strings,
   one per command executed by *other* clients:
   `+1786889998.990261 [0 127.0.0.1:47914] "SET" "lk:mon" "v"`. Redis redacts
@@ -302,11 +313,23 @@ versions and it is not counting:
 
 The **first element carries the kind** in both versions, and the two sets do not
 overlap: `subscribe`, `unsubscribe`, `psubscribe`, `punsubscribe`, `ssubscribe`,
-`sunsubscribe` are confirmations, one per channel named in the command, and each
-closes one unit; `message`, `pmessage`, `smessage`, `invalidate` are deliveries
-and close nothing. Reading the first element is cheaper and steadier than
-counting channels across a resync — and in RESP3 the naive rule "a push never
-closes a unit" would leave every `SUBSCRIBE` unit open for ever.
+`sunsubscribe` are confirmations; `message`, `pmessage`, `smessage`,
+`invalidate` are deliveries and close nothing. Reading the first element is
+cheaper and steadier than counting channels across a resync — and in RESP3 the
+naive rule "a push never closes a unit" would leave every `SUBSCRIBE` unit open
+for ever.
+
+**A confirmation closes a unit only when the unit it would close is itself a
+subscribe-family command** — the refinement МR2 had to make to the sentence
+above, because one command is not always one confirmation. `SUBSCRIBE c1 c2` is
+one command and **two** confirmations, one per channel (measured,
+`redis/pubsub.lkt`), and a bare `UNSUBSCRIBE` produces one per channel the
+connection happened to hold, a number no observer can know. So the first
+confirmation answers the unit and the rest answer nothing that is still queued.
+Letting them close the units behind it would credit the next command with a
+latency it never had; calling them orphans would report a loss where nothing was
+lost. They are counted with the pushes, which is what they are to the queue: a
+server value that closes nothing.
 
 Three more facts a subscribe-mode connection needs:
 
@@ -321,6 +344,26 @@ Three more facts a subscribe-mode connection needs:
   genuinely interleave.
 - `RESET` leaves subscribe mode (and the transaction, and the ACL user, and the
   database, and RESP3 — everything) and answers `+RESET`.
+
+### A reply can arrive before its own command
+
+Not on the wire — in the *message stream*, and the difference matters because
+the queue is built on the second. A command larger than the per-call capture
+budget (РR13 makes that 512 bytes, so a `SET` of a one-kilobyte value qualifies)
+has an uncaptured tail, and the chunk layer only learns that tail existed when
+the **next call on that direction** starts (Р9's lazy tail: `total_len` is
+honest, so the remainder is a hole of known size, but nothing reveals it until
+the following `off == 0`). The value is therefore published late — after the
+reply to it has already gone by.
+
+Measured on `redis/bigvalue.lkt`: four commands, and framing them naively yields
+three observations, one orphan, and a pairing that stays one behind for the rest
+of the connection — three plausible durations belonging to the wrong commands,
+which is exactly the failure the in-flight queue exists to prevent. So a reply
+that finds an empty queue *while a value is still being assembled on the
+frontend* is held rather than orphaned, and the command claims it when it
+arrives. Only the last value of a call can be left open, so one held reply is
+the realistic depth.
 
 ### Timeouts
 

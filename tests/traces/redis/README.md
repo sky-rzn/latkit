@@ -371,6 +371,28 @@ It is simply not the number anybody is paged about, and no configuration of
 `commandstats`, `SLOWLOG` (which never fires here: execution time was
 microseconds) or `LATENCY HISTORY` will produce it.
 
+## What МR2 found in the corpus
+
+**39 of the 93 traces carry a replication link they were not recorded for.** The
+recording host had a replica attached to the matrix node, so most sessions were
+captured beside a second connection on which the master propagates its writes:
+RESP arrays *from the server*, answering nothing, with a `REPLCONF ACK <offset>`
+back from the replica every second or so. `libs/java-pipeline.lkt` is the
+clearest — a hundred propagated `SET java:p:N` on one connection while Lettuce
+pipelines its hundred commands on another.
+
+Left as recorded, and useful exactly as it is: the link was established long
+before the agent attached, so its `PSYNC` is not on the tape and it is the real
+shape of the problem РR14 has to solve mid-stream. It is what made МR2 widen the
+rule from `REPLCONF listening-port` to any `REPLCONF` — only a replica sends the
+command, and without the broader rule those hundred propagated writes read as a
+hundred unanswerable replies. Every affected trace now reports `repl=1` and no
+orphans.
+
+The one place this shows up as arithmetic: `lkt_messages` counts the frontend
+values of *every* connection, while `lkt_queries` produces no observation for an
+ignored one, so on those traces the two differ by the number of `REPLCONF ACK`s.
+
 ## What is deliberately not here
 
 - **Unix-socket traffic** — it cannot be captured at all (item 1); the empty
