@@ -35,16 +35,21 @@ CO-RE handles the version drift internally (`src/bpf/latkit.bpf.c`,
 resolved at load time — the event format never changes. **arm64** is a v1.1
 target (CO-RE does not stand in the way; it is untested hardware).
 
-## Wire protocols (PostgreSQL, MySQL and HTTP)
+## Wire protocols (PostgreSQL, MySQL, HTTP, S3 and Redis)
 
 A capture port carries its wire protocol: `--port 5432` (or `5432=pg`) is
 PostgreSQL, `--port 3306=mysql` is MySQL/MariaDB, `--port 8080=http` is
-HTTP/1.x, and one agent can watch all of them at once (`--port
-5432,3306=mysql,8080=http`, same spelling in `LATKIT_PORT`). Every metric
-carries `proto` so the protocols never collide — and HTTP reports through
-families of its own (`latkit_http_*{route,method,host,…}`) rather than
-borrowing the database ones, because an HTTP request has no rows, no SQLSTATE
-and no transaction ([notes-metrics.md](notes-metrics.md) §"HTTP metrics").
+HTTP/1.x, `--port 9000=s3` is the S3 API on that same HTTP wire, `--port
+6379=redis` is RESP2/RESP3 — and one agent can watch all of them at once — the flag is repeatable, one port
+per `-p` (`-p 5432 -p 3306=mysql -p 8080=http -p 9000=s3 -p 6379=redis`), and
+`LATKIT_PORT` takes the same list comma-separated in a single value
+(`LATKIT_PORT=5432,3306=mysql,8080=http,9000=s3,6379=redis`), which is the form
+a systemd unit or a container wants. Every metric carries `proto` so the protocols never collide —
+and each non-database one reports through families of its own
+(`latkit_http_*{route,method,host,…}`, `latkit_s3_*{op,bucket,…}`,
+`latkit_redis_*{cmd,db,user,…}`) rather than borrowing the database ones,
+because an HTTP request has no rows and no SQLSTATE, and a Redis command has no
+statement text at all ([notes-metrics.md](notes-metrics.md)).
 
 MySQL support covers the classic protocol (5.7 / 8.x, MariaDB 10.6+); the X
 Protocol, the compressed protocol and replication streams are recognised and
@@ -53,10 +58,33 @@ counted as blind (README "Known limitations",
 
 A port may also carry a capture budget: `--port 8080=http:4096` sets how many
 bytes of each send/recv call are copied for that port. The default is 2048 for
-an `http` port (a head is all the framer reads, and copying gigabytes of
-response body into the ringbuf buys nothing) and `--capture-limit` (8192) for a
-database one. `latkit --print-config` prints the resolved value per port as
-`port_cap=PORT:BYTES`.
+an `http` or `s3` port (a head is all the framer reads, and copying gigabytes of
+response body into the ringbuf buys nothing), **512 for a `redis` one** (a
+command is a verb and a key; a value is never read) and `--capture-limit`
+(8192) for a database one. `latkit --print-config` prints the resolved value per
+port as `port_cap=PORT:BYTES`.
+
+On a `redis` port that default has one visible consequence, and it is the only
+knob of the track worth thinking about before deployment. A **bulk** reply of
+any size is fine at 512 bytes: a bulk announces its length, so the framer skips
+the payload arithmetically and still reports the true size. An **array**
+announces a count and not a size, so a hole inside one cannot be skipped — and a
+command whose reply is an array longer than the budget is therefore **not
+observed at all** (its unit lands in `latkit_queries_dropped_total`). Measured:
+`SCAN 0 COUNT 100`, whose reply is ~2 KB, is invisible at `6379=redis` and
+observed normally at `6379=redis:4096`. Raise it if the workload scans keyspaces
+(`SCAN` with a large `COUNT`, `KEYS`, `LRANGE 0 -1`, `HGETALL` over big hashes);
+the cost is bytes per ringbuf record, which matters at hundreds of thousands of
+commands per second and not at thousands ([perf.md](perf.md) §Redis).
+
+**A Redis reached over a unix socket is invisible**, and completely rather than
+partially: capture is on `tcp_sendmsg`/`tcp_recvmsg` and `AF_UNIX` never goes
+through them. This is a live question for a cache because an application and its
+Redis are often on one host — `redis-cli config get unixsocket` says whether the
+server even offers one (the official images and the Debian/Ubuntu packages ship
+it off; the Alpine package ships it on). A cluster's **bus** (client port +
+10000) is binary gossip rather than RESP and must not be in `--port`; capture
+the client port on each node instead.
 
 Two MySQL-specific operator traps:
 

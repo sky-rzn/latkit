@@ -57,9 +57,12 @@ spec:
               value: "0.0.0.0:9752"
             - name: LATKIT_PORT
               value: "5432"
-            # MySQL/MariaDB, HTTP or S3 instead of (or alongside) postgres: name
-            # the port's wire protocol, e.g. "3306=mysql", "5432,3306=mysql",
-            # "8080=http,8443=http" or "9000=s3" (a bare number defaults to pg).
+            # MySQL/MariaDB, HTTP, S3 or Redis instead of (or alongside)
+            # postgres: name the port's wire protocol, e.g. "3306=mysql",
+            # "5432,3306=mysql", "8080=http,8443=http", "9000=s3" or
+            # "6379=redis" (a bare number defaults to pg). LATKIT_PORT takes the
+            # whole comma-separated list in one value; the CLI flag is
+            # repeatable instead, one port per -p.
             # Do NOT add
             # LATKIT_COMM=mysqld — that per-thread kernel filter drops every
             # event on MySQL 8.x, whose session threads are named `connection`
@@ -91,6 +94,32 @@ spec:
             # observation. On a pool that is most of the port's traffic.
             # TLS of an S3 port is Go-only (MinIO maps no libssl): see
             # LATKIT_TLS_GO below — it is the sole channel there.
+            #
+            # A redis port ("6379=redis") reads RESP2/RESP3 — Redis, Valkey,
+            # KeyDB, Dragonfly and Sentinel (26379) are the same wire. Three
+            # things are worth knowing before pointing it at a cache in a
+            # cluster:
+            #   - THE UNIX SOCKET IS INVISIBLE. Capture is on tcp_sendmsg /
+            #     tcp_recvmsg, so a client that connects over /run/redis.sock —
+            #     which is a real deployment shape when the application and the
+            #     cache share a pod — produces nothing at all, not a degraded
+            #     something. `redis-cli config get unixsocket` says whether the
+            #     server even offers one; the official images and the
+            #     Debian/Ubuntu packages do not, the Alpine package does.
+            #   - a CLUSTER's bus is the client port + 10000 and is binary
+            #     gossip, not RESP: capture the client port only, one agent per
+            #     node. `-MOVED`/`-ASK` on the client port are counted as
+            #     redirects rather than errors, so a resharding cluster does not
+            #     read as an outage.
+            #   - the per-port capture budget defaults to 512 bytes here, which
+            #     holds a command whole. A reply that is a long ARRAY (SCAN with
+            #     a big COUNT, KEYS, LRANGE over a long list) does not fit and
+            #     cannot be skipped arithmetically the way a bulk can, so that
+            #     command is not observed: raise it with "6379=redis:4096" if
+            #     your workload scans keyspaces (deploy/existing-redis).
+            # A tls-port Redis needs only LATKIT_TLS=auto below — every build
+            # measured links libssl dynamically, and the uprobe gate follows the
+            # server's own io threads (io_thd_*) without configuration.
             #
             # TLS capture of postgres running with ssl=on (stage 6). Needs the
             # SYS_PTRACE + SYS_ADMIN capabilities below.

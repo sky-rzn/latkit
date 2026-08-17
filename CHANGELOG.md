@@ -199,6 +199,104 @@ label set is called out explicitly.
   response bytes exact, and 100 % of operations agreeing with the name MinIO
   gives the call.
 
+- **Redis support (RESP2/RESP3)** (`--port 6379=redis`). latkit now observes a
+  cache the way it observes a database — Redis first, and everything on the same
+  wire (Valkey, KeyDB, Dragonfly, Sentinel) — with no password, no `CONFIG SET`,
+  no lowered `slowlog-log-slower-than` and no restart. Unlike S3 this is a
+  **fourth framer** rather than a dialect: RESP has no heads, no statuses and no
+  routes, so it brings its own value machine, its own unit queue and its own
+  profile (PLAN-REDIS.md, [docs/notes-redisproto.md](docs/notes-redisproto.md)):
+  - **the identity is a command from a closed table** — `GET`, `XADD`, and for
+    the fifteen *container* commands the subcommand too (`CONFIG|GET`,
+    `XINFO|STREAM`): ~250 values, so cardinality is a compile-time constant and
+    the top-K dictionary has nothing to bound. An unknown verb (a module
+    command, a fork's own) is `cmd="other"`, whose share is a **freshness**
+    signal about the table. **Keys, values and arguments never become labels**,
+    at any setting: the second element of a non-container command is a key, and
+    it is not read;
+  - **the two dimensions are connection state.** `db` is the `SELECT`ed database
+    number and `user` the ACL user of `AUTH <user> <pass>` / `HELLO … AUTH`,
+    both tracked per connection and both moved **only when the server accepts
+    the command** — a refused `SELECT` or a `-WRONGPASS` changes nothing. A
+    connection joined mid-stream reports `db="?"` rather than a `0` it would be
+    guessing. The password is a separate array element: never read, and blanked
+    in the `--messages --hexdump` view by the protocol's `mask_body` hook;
+  - **the failure is a symbol**, the first token of the error reply
+    (`WRONGTYPE`, `NOSCRIPT`, `NOAUTH`, `NOPERM`, `OOM`, `LOADING`, …), folded
+    to a closed vocabulary. The sentence after it — which names the key that had
+    the wrong type, the slot, the node — reaches nothing. **`-MOVED`/`-ASK` are
+    counted as redirects and not as errors**, or a resharding cluster would read
+    as a permanent outage;
+  - **three kinds of duration, three families.** A command answered `+QUEUED`
+    inside a `MULTI` has no latency worth reporting (it is counted and reaches
+    no histogram); a blocking command's duration is the *client's* own timeout
+    (`BLPOP key 30`) and has a family of its own; the general histogram is left
+    with the server's actual work. The `MULTI`…`EXEC` interval goes to
+    `latkit_txn_duration_seconds`, the same family PostgreSQL and MySQL feed;
+  - **pub/sub and RESP3 pushes close no unit.** Order is the only correspondence
+    RESP offers, so a delivery mistaken for a reply would shift every later
+    latency on that connection plausibly and for ever; they are recognised and
+    counted in `latkit_redis_push_total` instead.
+- **Redis metric families and the `latkit-redis` dashboard** (PLAN-REDIS.md
+  МR5). A `redis` port reports through its own family set:
+  `latkit_redis_commands_total{cmd,db,user,proto,code}`,
+  `latkit_redis_command_duration_seconds{…,code}`,
+  `latkit_redis_blocking_seconds{cmd,db,user,proto}`,
+  `latkit_redis_errors_total{error,db,user,proto}`,
+  `latkit_redis_redirects_total{kind,proto}`,
+  `latkit_redis_bytes_total{…,direction}`, `latkit_redis_value_size_bytes` (an
+  octave grid from 8 B, because half of what a cache holds is smaller than the
+  HTTP grid's first bucket), `latkit_redis_pipeline_depth{proto}` and
+  `latkit_redis_push_total{proto}` — plus `latkit_txn_duration_seconds`
+  unchanged. The `rows`, `ttfb` and `upload` families are off in this profile: a
+  reply is one value, so there is no first row and no separate upload to report.
+  `dashboards/latkit-redis.json` is the seventh bundled dashboard.
+- **`proto="redis"`** is a new value of the existing `proto` label, and the
+  dashboards' `$proto` variable selects it.
+- **Redis spans**: a sampled command is exported with the DB semantic
+  conventions (`db.system.name=redis`, `db.operation.name`, `db.namespace`,
+  `error.type`) plus `redis.pipeline.depth` and, on an `EXEC`,
+  `db.operation.batch.size`. `db.query.text` is **built** from the identity —
+  `GET ?`, one `?` per argument — and never copied from the wire: on a
+  PostgreSQL port a span carries raw SQL, here there is nothing raw to carry.
+- **TLS for Redis** (PLAN-REDIS.md МR7, РR12): a `tls-port` is TLS from the
+  client's first byte, and every Redis, Valkey and KeyDB build measured (Alpine
+  images included) links OpenSSL dynamically — so `--tls auto` is the whole
+  configuration and the existing libssl channel carries it. Two things follow
+  from Redis' own thread model and are handled without configuration: the
+  kernel-side uprobe gate admits the server's io threads by prefix (`io_thd_*`,
+  since `io-threads N` moves the `SSL_read`/`SSL_write` calls there — an
+  operator's own `--comm redis-server` was measured seeing 24 % of the traffic),
+  and a connection that was already open when the agent attached is adopted on
+  its first decrypted byte rather than read as ciphertext for the life of the
+  pool. Verified as a comparison: an encrypted run and a plaintext run of the
+  same load produce the same observations command for command.
+- **A comm filter entry may end in `*`** and match a prefix (`--comm
+  'io_thd_*'`, `LATKIT_COMM`, `--tls-comm`); the wildcard is accepted in the
+  last position only and a filter that puts it elsewhere is refused at startup
+  rather than installed to match nothing. `--print-config` prints the derived
+  uprobe gate as `tls_gate_comm` beside `tls_scan_comm`.
+- **Per-port capture budget of a `redis` port defaults to 512 bytes** (a command
+  is a verb and a key; a value is never read). A *bulk* reply of any size is
+  unaffected — it announces its length and the payload is skipped arithmetically
+  — but an **array** reply longer than the budget cannot be skipped, and that
+  command is not observed at all (its unit is counted in
+  `latkit_queries_dropped_total`). `--port 6379=redis:4096` buys it back for a
+  keyspace-scanning workload; both sides are measured in
+  [docs/perf.md](docs/perf.md) §Redis.
+- Redis deploy stacks: [`deploy/demo-redis`](deploy/demo-redis) (the two-minute
+  demo — every command family, a pipeline, a transaction, a blocking pop, a
+  subscription and three failures that are three different symbols, plus a `tls`
+  profile) and [`deploy/existing-redis`](deploy/existing-redis)
+  (monitoring-only, for a Redis you already run).
+- Accuracy validation extended with a Redis track against three references at
+  once ([docs/accuracy.md](docs/accuracy.md) §Redis): counts exact against
+  `INFO commandstats` (1 621 commands, 0 mismatched), **0 of 1 621** durations
+  below the server's own per-command execution time from `SLOWLOG GET`, and our
+  p50 of 6 µs under `memtier_benchmark`'s 39 µs — the inequality
+  `SLOWLOG ≤ latkit ≤ client`, which is what "measured on the wire rather than
+  inside the server" means as a number.
+
 ### Changed
 
 - **Renamed self-metric: `latkit_http_requests_total` →

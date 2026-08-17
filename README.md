@@ -1,28 +1,36 @@
 # latkit
 
-**Per-query PostgreSQL and MySQL latency, per-route HTTP latency, per-operation S3 latency — without an extension, a config change, or a restart.**
+**Per-query PostgreSQL and MySQL latency, per-route HTTP latency, per-operation S3 latency, per-command Redis latency — without an extension, a config change, or a restart.**
 
-Latkit is an eBPF agent that watches the PostgreSQL, MySQL/MariaDB, HTTP/1.x and
-S3 wire protocols at the socket layer and turns them into latency histograms:
-normalised query text, database/user labels, row counts, SQLSTATE errors and
-transaction timings for the databases; templated routes, methods, hosts, status
-codes and four separate timings for HTTP; operations, buckets, access keys, S3
-error codes and object sizes for an object store. It exports to Prometheus and
-OpenTelemetry, ships with six ready-made Grafana dashboards, runs beside the
-server, and the server never knows it's there.
+Latkit is an eBPF agent that watches the PostgreSQL, MySQL/MariaDB, HTTP/1.x, S3
+and Redis wire protocols at the socket layer and turns them into latency
+histograms: normalised query text, database/user labels, row counts, SQLSTATE
+errors and transaction timings for the databases; templated routes, methods,
+hosts, status codes and four separate timings for HTTP; operations, buckets,
+access keys, S3 error codes and object sizes for an object store; commands,
+database numbers, ACL users and symbolic errors for a cache. It exports to
+Prometheus and OpenTelemetry, ships with seven ready-made Grafana dashboards,
+runs beside the server, and the server never knows it's there.
 
-Every series carries a `proto="pg"|"mysql"|"http"|"s3"` label; one agent can
-watch a 5432, a 3306, an 8080 and a 9000 at once
-(`--port 5432,3306=mysql,8080=http,9000=s3`).
+Every series carries a `proto="pg"|"mysql"|"http"|"s3"|"redis"` label; one agent
+can watch a 5432, a 3306, an 8080, a 9000 and a 6379 at once — the flag is
+repeatable (`-p 5432 -p 3306=mysql -p 8080=http -p 9000=s3 -p 6379=redis`), and
+the environment form takes the same list with commas
+(`LATKIT_PORT=5432,3306=mysql,8080=http,9000=s3,6379=redis`).
 
 For HTTP that means p99 per route from a web server with no access log, no
 status module and no instrumentation — and, when the caller sends a W3C
 `traceparent`, a server span **inside the caller's existing trace**. For **S3**
 it means p99 per operation, per bucket and per access key from a MinIO nobody
 gave you the admin credentials to — with the object key, the most sensitive
-thing an S3 request carries, never becoming a label. The declared blind zones
-(HTTP/2 and therefore gRPC, HTTP/3, WebSocket — which is what MinIO's
-inter-node grid rides on — and CONNECT) are counted rather than guessed at: see
+thing an S3 request carries, never becoming a label. For **Redis** it means the
+p99 `INFO commandstats` structurally cannot give you (it reports a mean), per
+command, per database and per ACL user at once, measured on the wire rather than
+inside the server — so the time a command spent waiting behind somebody else's
+`KEYS *` in a single-threaded event loop is in the number, which is what the
+application felt. The declared blind zones (HTTP/2 and therefore gRPC, HTTP/3,
+WebSocket — which is what MinIO's inter-node grid rides on — CONNECT, and a
+Redis reached over a **unix socket**) are counted rather than guessed at: see
 [Known limitations](#known-limitations).
 
 
@@ -51,7 +59,11 @@ of a Go backend, the **latkit — HTTP** dashboard, plus optional HTTPS and
 [deploy/demo-http](deploy/demo-http/README.md); for **S3** — MinIO driven by its
 own `mc` client through every operation family, the **latkit — S3 / MinIO**
 dashboard and an HTTPS profile — in
-[deploy/demo-minio](deploy/demo-minio/README.md).
+[deploy/demo-minio](deploy/demo-minio/README.md); for **Redis** — a cache driven
+through every command family (a pipeline, a transaction, a blocking pop, a
+subscription and three failures that are three different symbols), the
+**latkit — Redis** dashboard and a TLS profile — in
+[deploy/demo-redis](deploy/demo-redis/README.md).
 
 ## Why latkit
 
@@ -216,7 +228,7 @@ Use it to verify a deployment's env layer.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `-p, --port PORT[=pg\|mysql\|http\|s3\|redis[:BYTES]]` | `LATKIT_PORT` | `5432` | local (server) port to capture, optionally with its wire protocol (default: `pg`) and a per-port capture budget; repeatable, up to 16 (e.g. `5432,3306=mysql,8080=http`, `9000=s3`, `6379=redis`, `443=http:4096`). `s3` is HTTP/1.1 read as the S3 API — same framer, same timings, operations and buckets instead of routes and hosts. `redis` is RESP2/RESP3, and covers Valkey, KeyDB, Dragonfly and Sentinel, which speak the same wire. The budget defaults to `--capture-limit` for a database port, **2048 for an `http` or `s3` one** — only heads are parsed, so a gigabyte of response body is never copied — and **512 for a `redis` one**, where a command is a verb and a key and the value is never read |
+| `-p, --port PORT[=pg\|mysql\|http\|s3\|redis[:BYTES]]` | `LATKIT_PORT` | `5432` | local (server) port to capture, optionally with its wire protocol (default: `pg`) and a per-port capture budget; **repeatable** — one port per flag, up to 16 (`-p 5432 -p 3306=mysql -p 8080=http`), while the environment variable takes them comma-separated in one value (`LATKIT_PORT=5432,3306=mysql`). Examples of one spec: `9000=s3`, `6379=redis`, `443=http:4096`. `s3` is HTTP/1.1 read as the S3 API — same framer, same timings, operations and buckets instead of routes and hosts. `redis` is RESP2/RESP3, and covers Valkey, KeyDB, Dragonfly and Sentinel, which speak the same wire. The budget defaults to `--capture-limit` for a database port, **2048 for an `http` or `s3` one** — only heads are parsed, so a gigabyte of response body is never copied — and **512 for a `redis` one**, where a command is a verb and a key and the value is never read |
 | `--comm NAME` | `LATKIT_COMM` | off | only capture send/recv of threads with this comm; a trailing `*` matches a prefix (`io_thd_*`). It matches the **thread** name, and servers rename their threads: **MySQL 8.x calls its per-session threads `connection`, not `mysqld`**, and a Redis with `io-threads N` does most of its socket work on `io_thd_1…N` (a filter of `redis-server` alone saw 28 % of the traffic on a 100-connection load). The port filter already scopes capture, so the usual answer is not to set this at all |
 | `--cgroup PATTERN` | `LATKIT_CGROUP` | off | only capture cgroups whose path under `/sys/fs/cgroup` matches this glob (`*` stays within a path segment, `**` spans); repeatable, re-resolved every 30 s; requires cgroup v2 |
 
@@ -613,6 +625,36 @@ records at the default 2048-byte per-call capture budget.
     is not credited, so `bytes_out` can be a declared lower bound
     (`LK_QO_BODY_UNSEEN`, never above the truth). Numbers:
     [docs/accuracy.md](docs/accuracy.md) §S3.
+- **Redis scope: RESP2/RESP3 on TCP, server side.** Every reply type of both
+  versions, inline commands, pipelining of any depth, `MULTI`/`EXEC`, pub/sub
+  and RESP3 pushes are parsed; Valkey, KeyDB, Dragonfly and Sentinel are the
+  same wire. Out of scope, and each one *counted* rather than guessed at:
+  - **the unix socket** — and on this protocol that is not a footnote. Capture
+    is on `tcp_sendmsg`/`tcp_recvmsg`, so a client connected over
+    `/run/redis.sock` produces **nothing at all**, not a degraded something, and
+    an application colocated with its cache is a normal deployment. Check with
+    `redis-cli config get unixsocket`: the official images and the
+    Debian/Ubuntu packages ship it off, the **Alpine package ships it on**;
+  - **the cluster bus** (client port + 10000) is binary gossip, not RESP — do
+    not put it in `--port`. Capture the client port on each node; `-MOVED` and
+    `-ASK` there are counted as *redirects* rather than errors, so a resharding
+    cluster does not read as an outage;
+  - **replication links** (`PSYNC`/`SYNC`/`REPLCONF`) and **`MONITOR`
+    connections** become
+    `latkit_ignored_conns_total{reason="replication"|"monitor"}` — after either,
+    the connection is not a request/response stream and parsing it as one would
+    corrupt the pairing;
+  - **the contents of values** are never parsed, only their lengths; keys,
+    values and arguments never become labels, at any setting;
+  - **module commands** (RedisJSON, RediSearch, a fork's own admin verbs) are
+    `cmd="other"`, whose share is a freshness signal about the command table;
+  - **a reply that is a long array** — `SCAN` with a large `COUNT`, `KEYS`,
+    `LRANGE 0 -1` — larger than the port's capture budget (512 bytes by
+    default) is not observed at all: an array announces a count and not a size,
+    so a hole inside one cannot be skipped the way a bulk's payload can. The
+    command's unit is dropped and counted; `--port 6379=redis:4096` buys it
+    back, at more bytes per ringbuf record
+    ([docs/perf.md](docs/perf.md) §Redis).
 - **UDP is counted, never parsed.** QUIC/HTTP-3 does not pass through the TCP
   capture point at all, so an h3 server would look exactly like a broken agent.
   Datagrams on the captured ports are therefore counted

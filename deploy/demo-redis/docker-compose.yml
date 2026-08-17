@@ -1,0 +1,287 @@
+# latkit Redis demo stack (PLAN-REDIS.md МR9): Redis + a load generator +
+# latkit + prometheus + grafana — the cache twin of ../demo (postgres),
+# ../demo-mysql, ../demo-http and ../demo-minio, wired so `docker compose up` on
+# a Linux host gives live Grafana with the bundled dashboards about a minute
+# after the images are there. See README.md for the requirements and a tour.
+#
+#   docker compose up --build -d
+#   docker compose --profile tls up --build -d     # + a TLS-only Redis (РR12)
+#   docker compose --profile tls down -v           # tear down either variant
+#
+# What makes this a Redis demo rather than another database one: the agent is
+# told `6379=redis`, so a *fourth* framer reads RESP2/RESP3 under the cache's
+# nouns — a command from a closed table instead of normalised SQL, the `SELECT`ed
+# database number and the ACL user as the two dimensions, a symbolic error
+# instead of a SQLSTATE, and three separate duration families because a `BLPOP`,
+# a `+QUEUED` and a `GET` are not the same kind of number (РR4–РR11). Keys,
+# values and arguments never become labels, which on this protocol is the whole
+# privacy question: a Redis key is `user:42:session`.
+#
+# Capture hygiene (README "Known limitations"): every client talks to Redis over
+# the compose network by service name — Redis publishes NO port, so nothing
+# crosses docker-proxy on localhost, which would splice() the payload past the
+# capture point. latkit filters the server port kernel-wide, which covers the
+# TLS Redis of the tls profile too.
+#
+# ONE HOST-LEVEL CAVEAT, and it is the first thing to check if the numbers look
+# strange: the port filter is kernel-wide, so if this host already runs a Redis
+# on 6379 — an application's cache, another compose stack — its traffic lands in
+# these metrics too, and the labels are not meant to tell the two apart. Set
+# REDIS_PORT to something free instead:
+#
+#   REDIS_PORT=6399 docker compose up --build -d
+
+services:
+  # The cache. No persistence: an RDB fork or an AOF rewrite would show up in
+  # these latencies as the agent's fault, and this demo is about what the wire
+  # says. `requirepass` plus one ACL user, because the `user` label is only
+  # interesting when it has more than one value — and because the two
+  # authentication failures are two different symbols (РR7).
+  redis:
+    image: redis:7.4
+    command:
+      - redis-server
+      - --port
+      - "${REDIS_PORT:-6379}"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --requirepass
+      - lkrootpass
+      - --user
+      - demoapp
+      - "on"
+      - ">demoapppass"
+      - "~*"
+      - "&*"
+      - +@all
+      # Twice the default, so `SELECT 9` in the load is a database that exists
+      # and `SELECT 42` is one that does not (РR5: the label moves only when the
+      # server accepts the command).
+      - --databases
+      - "16"
+    healthcheck:
+      test: ["CMD-SHELL",
+             "redis-cli -p ${REDIS_PORT:-6379} -a lkrootpass --no-auth-warning ping | grep -q PONG"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Steady, varied load so every panel is alive: every command family the
+  # dashboard has a row for, two databases, two ACL users, a pipeline, a
+  # transaction, a blocking pop, a subscription, a megabyte value and three
+  # deliberate failures that are three different symbols. Details and rationale:
+  # load/load.sh.
+  load:
+    image: redis:7.4
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "${REDIS_PORT:-6379}"
+    volumes:
+      - ./load/load.sh:/load.sh:ro
+    entrypoint: ["bash", "/load.sh"]
+    restart: unless-stopped
+
+  # The traffic a client library does not generate: an inline `PING` from a load
+  # balancer's TCP probe (not RESP at all — a bare line, and still a command,
+  # РR15), and a client that never authenticates, which is what a misconfigured
+  # sidecar looks like on the wire. busybox `nc` would do; the redis image has
+  # bash's /dev/tcp, which needs no extra image.
+  probe:
+    image: redis:7.4
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: "${REDIS_PORT:-6379}"
+    volumes:
+      - ./probe/probe.sh:/probe.sh:ro
+    entrypoint: ["bash", "/probe.sh"]
+    restart: unless-stopped
+
+  # The agent — the release scratch image (musl static), built from the repo
+  # root so the version stamp sees .git. Configured through the LATKIT_* env
+  # layer, nothing else.
+  latkit:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Demo simplicity. The measured minimal set instead (docs/deploy.md):
+    #   cap_add: [BPF, PERFMON, SYS_PTRACE]
+    # (SYS_PTRACE only for the libssl scan of the tls profile; + SYS_RESOURCE on
+    # kernels < 5.11.)
+    privileged: true
+    pid: host               # uprobes / /proc access need the host PID namespace
+    environment:
+      # The port form carries the wire protocol; a bare number would default to
+      # the postgres parser. 6380 is only used by the tls profile; a port with
+      # no traffic costs nothing.
+      #
+      # `:4096` is the per-port capture budget, and this demo sets it on purpose
+      # rather than taking the default. The default for a redis port is **512
+      # bytes** (РR13): a command is a verb and a key, so 512 holds all of it,
+      # and a value is never read — a 64 KiB reply then costs one 512-byte
+      # record instead of 64 KiB of ringbuf. What 512 does not hold is a reply
+      # that is a long *array*, and an array cannot be skipped arithmetically
+      # the way a bulk can (it announces a count, not a size) — so the reply is
+      # unframeable and its command is not observed at all. The demo's load runs
+      # `SCAN … COUNT 100`, whose reply is ~2 KB of array; measured on this
+      # stack, at 512 that command appears **nowhere** and its unit lands in
+      # `latkit_queries_dropped_total{reason="disconnect"}`, and at 4096 it is
+      # observed normally. README.md §"What you will not see" has the numbers.
+      LATKIT_PORT: "${REDIS_PORT:-6379}=redis:4096,6380=redis:4096"
+      LATKIT_PROM_LISTEN: "0.0.0.0:9752"  # default is loopback (Р29); a container must listen out
+      # Redis links OpenSSL dynamically in every build measured — Alpine images
+      # included — so the existing libssl channel carries a `tls-port` Redis and
+      # `auto` is the whole configuration. The scan set derived from a redis
+      # port is {redis-server, valkey-server, keydb-server}, and the uprobe gate
+      # is that set plus `io_thd_*`, because with `io-threads N` the server does
+      # its socket work on threads with those names (РR12).
+      LATKIT_TLS: auto
+      # The one Redis knob, at its default, so the demo shows where it lives:
+      #LATKIT_REDIS_USER: acl        # or `off` — no user label at all
+      #
+      # OTLP spans (РR11): off unless you pass an endpoint. A Redis span's
+      # `db.query.text` is *built* from the identity — `GET ?`, one `?` per
+      # argument — so unlike a PG span it carries no wire bytes at all.
+      LATKIT_OTLP_ENDPOINT: "${LATKIT_OTLP_ENDPOINT:-}"
+      LATKIT_OTLP_SPANS: "${LATKIT_OTLP_SPANS:-}"
+      LATKIT_OTLP_SERVICE_NAME: latkit-demo-redis
+    # Host ports are overridable for the same reason REDIS_PORT is: a developer
+    # machine usually has something on 3000 already. The defaults are what the
+    # README and every other demo in this tree use.
+    ports: ["${METRICS_PORT:-9752}:9752"]   # curl http://localhost:9752/metrics
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on:
+      - latkit
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=2h"
+    ports: ["${PROM_PORT:-19090}:9090"]     # 19090: a host Prometheus keeps 9090
+
+  grafana:
+    image: grafana/grafana:11.4.0    # pinned major 11.x (Р42)
+    depends_on:
+      - prometheus
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_USERS_DEFAULT_THEME: "dark"
+    volumes:
+      # Reuse the postgres demo's provisioning (datasource -> prometheus:9090,
+      # dashboard provider) — same Prometheus service name. All bundled
+      # dashboards are provisioned; latkit — Redis is the one with data here.
+      - ../demo/grafana/provisioning:/etc/grafana/provisioning:ro
+      # The dashboards repo dir is the single source (Р43) — mounted read-only.
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["${GRAFANA_PORT:-3000}:3000"]
+
+  # --- profile tls (additive): a TLS-only Redis on 6380 and a client that only
+  # --- talks to it. The plaintext pair keeps running, so the dashboards show
+  # --- both kinds of traffic side by side and the encrypted one's observations
+  # --- are not distinguishable from the plaintext one's — which is the claim of
+  # --- РR12, measured command for command by tests/e2e/verify-redis-tls.sh.
+
+  cert-init:
+    image: alpine:3.20
+    profiles: ["tls"]
+    volumes:
+      - rediscerts:/certs
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        [ -s /certs/server.crt ] && exit 0
+        apk add --no-cache openssl >/dev/null
+        cd /certs
+        openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+          -keyout ca.key -out ca.crt -subj "/CN=lkdemo-ca" 2>/dev/null
+        openssl req -newkey rsa:2048 -nodes \
+          -keyout server.key -out server.csr -subj "/CN=redis-tls" 2>/dev/null
+        printf 'subjectAltName=DNS:redis-tls,DNS:localhost,IP:127.0.0.1\n' > ext.cnf
+        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+          -days 365 -out server.crt -extfile ext.cnf 2>/dev/null
+        chmod 644 ca.crt server.crt server.key
+    restart: "no"
+
+  # `--port 0`: TLS only, so there is no plaintext fallback to observe by
+  # accident and an observation on 6380 can only have come through the uprobes.
+  # `io-threads 4` because that is the configuration РR12 is about — the reads
+  # and writes of one connection are made by different threads.
+  redis-tls:
+    image: redis:7.4
+    profiles: ["tls"]
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+    volumes:
+      - rediscerts:/certs:ro
+    command:
+      - redis-server
+      - --port
+      - "0"
+      - --tls-port
+      - "6380"
+      - --tls-cert-file
+      - /certs/server.crt
+      - --tls-key-file
+      - /certs/server.key
+      - --tls-ca-cert-file
+      - /certs/ca.crt
+      - --tls-auth-clients
+      - "no"
+      - --io-threads
+      - "4"
+      - --io-threads-do-reads
+      - "yes"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --requirepass
+      - lkrootpass
+      - --user
+      - demoapp
+      - "on"
+      - ">demoapppass"
+      - "~*"
+      - "&*"
+      - +@all
+    healthcheck:
+      test: ["CMD-SHELL",
+             "redis-cli --tls --cacert /certs/ca.crt -p 6380 -a lkrootpass --no-auth-warning ping | grep -q PONG"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  load-tls:
+    image: redis:7.4
+    profiles: ["tls"]
+    depends_on:
+      redis-tls:
+        condition: service_healthy
+    environment:
+      REDIS_HOST: redis-tls
+      REDIS_PORT: "6380"
+      REDIS_TLS: "1"
+    volumes:
+      - ./load/load.sh:/load.sh:ro
+      - rediscerts:/certs:ro
+    entrypoint: ["bash", "/load.sh"]
+    restart: unless-stopped
+
+volumes:
+  rediscerts:

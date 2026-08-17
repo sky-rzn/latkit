@@ -1,0 +1,115 @@
+# latkit next to an EXISTING Redis (or Valkey, KeyDB, Dragonfly, Sentinel — the
+# same wire) — monitoring only. Unlike deploy/demo-redis this brings NO server
+# and NO load generator: the agent captures the real traffic of the host.
+# Capture is kernel-wide fentry on tcp_sendmsg/tcp_recvmsg, so `pid: host` is
+# all it needs to see it — no password, no `CONFIG SET`, no `SLOWLOG` threshold
+# to lower, no restart, and nothing asked of the server at all.
+#
+#   cd deploy/existing-redis
+#   GF_ADMIN_PASSWORD=change-me docker compose up --build -d
+#
+# Prereqs: Linux kernel >= 5.15 with BTF (/sys/kernel/btf/vmlinux), Docker +
+# compose plugin. The traffic must be RESP over **TCP** — see the README for the
+# unix-socket blind zone, which is the first thing to check if the dashboards
+# stay empty, and for which counter names each of the others.
+#
+# Grafana + Prometheus bind to 127.0.0.1 only: /metrics and this Grafana have no
+# auth. Reach them over an SSH tunnel (ssh -L 3000:127.0.0.1:3000 host) or your
+# own TLS reverse proxy — do not publish these ports to the internet.
+
+services:
+  latkit:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    pid: host                 # /proc access for the libssl scan of a tls-port
+    # Measured minimal set (docs/deploy.md). BPF+PERFMON = plaintext capture;
+    # SYS_PTRACE only for the libssl scan a `tls-port` Redis needs. On kernels
+    # < 5.11 add SYS_RESOURCE. `privileged: true` is the documented fallback.
+    cap_add: [BPF, PERFMON, SYS_PTRACE]
+    environment:
+      # The port Redis accepts clients on, with its wire protocol. A bare number
+      # would default to the postgres parser. Sentinel is the same protocol on
+      # 26379; a replica's own port is one more entry if you want that node's
+      # client traffic too.
+      #
+      #   LATKIT_PORT: "6379=redis,26379=redis"      # cache + sentinel
+      #   LATKIT_PORT: "6379=redis,6380=redis"       # plaintext + tls-port
+      #
+      # The optional `:BYTES` suffix is the per-call capture budget, and on this
+      # protocol it is the one knob with a visible trade-off. The default is
+      # **512**: a command is a verb and a key, so 512 holds all of it, and a
+      # value is never read — a 1 MB reply costs one 512-byte record. What 512
+      # does not hold is a reply that is a long *array*, and an array announces a
+      # count rather than a size, so a hole inside one cannot be skipped: that
+      # command is not observed at all (it lands in
+      # latkit_queries_dropped_total{reason="disconnect"} when the connection
+      # ends). If your application runs `SCAN` with a large `COUNT`, `KEYS`,
+      # `LRANGE 0 -1` over long lists or `HGETALL` over big hashes and you want
+      # those commands on the dashboard, raise it:
+      #
+      #   LATKIT_PORT: "6379=redis:4096"
+      #
+      # The cost is bytes per ringbuf record, which matters at hundreds of
+      # thousands of commands per second (docs/perf.md §Redis) and not at
+      # thousands.
+      LATKIT_PORT: "6379=redis"
+      LATKIT_PROM_LISTEN: "0.0.0.0:9752"  # a container must listen off-loopback
+      #
+      # TLS. A `tls-port` Redis is TLS from the client's first byte — there is
+      # no in-band negotiation to watch for, as with PG or MySQL — and every
+      # Redis, Valkey and KeyDB build measured (Alpine images included) links
+      # OpenSSL dynamically, so `auto` is the whole configuration: the derived
+      # scan set for a redis port is {redis-server, valkey-server, keydb-server}
+      # and the uprobe gate is that set plus `io_thd_*`, because with
+      # `io-threads N` the server makes its SSL calls from those threads.
+      # LATKIT_TLS: auto
+      #
+      # The `user` label is the ACL user of `AUTH <user> <pass>` / `HELLO … AUTH`
+      # — the name only. The password is a separate element of the same array
+      # and is never read, and never shown: the `--messages --hexdump` view
+      # blanks it. Set to `off` if even the user name is more than you want in
+      # metrics; keys, values and arguments are never labels at any setting.
+      # LATKIT_REDIS_USER: acl
+      #
+      # Do NOT set LATKIT_COMM unless you mean it: that is the kernel capture
+      # filter and it applies to every captured port. For Redis specifically it
+      # is also a trap — with `io-threads N` most of the socket work happens on
+      # threads named `io_thd_1…N`, and a filter of `redis-server` alone was
+      # measured seeing 28 % of the traffic. If you must, include the wildcard:
+      # LATKIT_COMM: "redis-server,io_thd_*"
+    # No published port: Prometheus scrapes latkit:9752 over the compose network.
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    depends_on: [latkit]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+    ports: ["127.0.0.1:9090:9090"]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0     # pinned major 11.x (Р42)
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GF_ADMIN_PASSWORD:?set GF_ADMIN_PASSWORD}"
+      GF_USERS_DEFAULT_THEME: "dark"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      # Reuse the postgres demo provisioning (datasource -> http://prometheus:9090)
+      # and the bundled dashboards straight from the repo — single source,
+      # read-only. "latkit — Redis" is the one to open.
+      - ../demo/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports: ["127.0.0.1:3000:3000"]
+    restart: unless-stopped
+
+volumes:
+  prom-data:
+  grafana-data:
