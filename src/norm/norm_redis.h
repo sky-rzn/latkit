@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/* Redis command classification and session labels (РR4–РR6, PLAN-REDIS.md МR3)
- * — the norm_s3.h of the Redis track, and for the same reason.
+/* Redis command classification, session labels and error names (РR4–РR7, РR10;
+ * PLAN-REDIS.md МR3 and МR4) — the norm_s3.h of the Redis track, and for the
+ * same reason.
  *
  * norm_route.h exists because a URL has no bounded identity and one has to be
  * *reconstructed* by a heuristic, then bounded again by a top-K dictionary.
@@ -18,7 +19,7 @@
  * (values, fields, scores, script bodies, channel names, passwords) is read by
  * nothing here and reaches no output.
  *
- * Four things live in this file, and all four are the same kind of thing: a
+ * Five things live in this file, and all five are the same kind of thing: a
  * value that arrives from the wire and may become a label only after it has
  * been checked against a closed set or a bounded rule.
  *
@@ -41,6 +42,10 @@
  *      viewer has to blank before printing, which is the `mask_body` hook of
  *      РR6 expressed as data. Redis sets the precedent itself: its own `MONITOR`
  *      feed prints `"AUTH" "(redacted)" "(redacted)"`.
+ *   5. **the error's name** (lk_redis_err, МR4/РR7): the first token of an
+ *      error reply, folded to the same kind of closed vocabulary — and with the
+ *      one distinction that decides whether a healthy cluster looks broken, since
+ *      `MOVED` and `ASK` are errors in syntax and ordinary operation in fact.
  *
  * Pure, like the rest of src/norm: no I/O, no allocation, no globals. Every
  * accessor takes explicit (pointer, length) pairs — nothing here is
@@ -107,9 +112,13 @@
  *
  *   WRITE      the server's `write` flag
  *   BLOCKING   its `blocking` flag (РR10). `XREAD` and `XREADGROUP` carry it
- *              unconditionally and block only with a `BLOCK` argument, which is
- *              МR4's refinement: the bit here is the server's answer, not the
+ *              unconditionally and block only with a `BLOCK` argument: the bit
+ *              here is the server's answer and lk_redis_cmd_blocking is the
  *              final one
+ *   ARGBLOCK   ... and these are the two commands where that is so. Its own bit
+ *              because it is what tells the handler that this command — and only
+ *              this command — is worth reading past LK_REDIS_ARGV_LABELS
+ *              elements for (МR4)
  *   CONTAINER  the second word is a subcommand and is therefore part of the
  *              identity — the fifteen commands where argv[1] is not a key (РR4)
  *   SUBFAM     a (P|S)(UN)SUBSCRIBE: its reply is a confirmation, and only such
@@ -123,6 +132,12 @@
  *   REPL       `PSYNC`/`SYNC`/`REPLCONF`: after this the connection is a
  *              replication link and not a request/response stream at all (РR14)
  *   MONITOR    ... and this one turns it into a feed of other clients' commands
+ *   MULTI      opens a transaction, and the three below close one (РR9). Three
+ *              bits rather than one "transaction" bit and a name comparison: the
+ *              handler acts differently on each, and the table is where the
+ *              question "which command is this" is already answered
+ *   EXEC       ... runs it
+ *   DISCARD    ... throws it away
  *
  * The last three mark the commands besides `AUTH`/`HELLO` that carry a
  * credential in an argument — РR6 widened by what the МR0 corpus actually
@@ -150,6 +165,10 @@
 #define LK_REDIS_C_SEC_RULE  (1u << 11)
 #define LK_REDIS_C_SEC_PARAM (1u << 12)
 #define LK_REDIS_C_SEC_KW    (1u << 13)
+#define LK_REDIS_C_ARGBLOCK  (1u << 14)
+#define LK_REDIS_C_MULTI     (1u << 15)
+#define LK_REDIS_C_EXEC      (1u << 16)
+#define LK_REDIS_C_DISCARD   (1u << 17)
 
 /* One element of a command, borrowed from the caller's buffer. */
 struct lk_redis_arg {
@@ -190,7 +209,25 @@ const char *lk_redis_cmd_name(uint16_t id, uint32_t *len);
 /* The LK_REDIS_C_* bits of a table id; 0 for `other`, which is the right answer
  * — nothing is known about a command the table does not have, and guessing that
  * an unknown module command is a read would be a guess. */
-uint16_t lk_redis_cmd_flags(uint16_t id);
+uint32_t lk_redis_cmd_flags(uint16_t id);
+
+/* Does this command make the client wait on an *event* rather than on the server
+ * (РR10)? The server's own blocking flag, refined by the one thing an argument
+ * is ever inspected for: `XREAD`/`XREADGROUP` carry the flag unconditionally and
+ * return at once unless a `BLOCK` keyword is present (`redis/blocking.lkt`).
+ *
+ * `v` needs to be as deep as LK_REDIS_ARGV_MAX for those two — the keyword sits
+ * behind `GROUP g c` and an optional `COUNT n` — and the LABELS-deep read is
+ * enough for every other command, which is why lk_redis_cmd_flags exposes
+ * LK_REDIS_C_ARGBLOCK: the caller pays for the deep read exactly where it buys
+ * something. A `v` that is too shallow can only lose the keyword, and losing it
+ * calls a blocking command ordinary — an honest failure, and the same one a
+ * capture budget that cut the command short already produces.
+ *
+ * The scan stops at `STREAMS`, after which every element is a key or an id: a
+ * stream *named* `BLOCK` is a legal key and must not turn its reader into a
+ * blocking command. The value of the keyword is not read, only its presence. */
+bool lk_redis_cmd_blocking(uint16_t id, const struct lk_redis_argv *v);
 
 /* XXH3-64 of the identity: the fingerprint the top-K series dictionary keys on,
  * in the same role as lk_route_out.fp. Computed rather than stored — the hash of
@@ -237,6 +274,50 @@ enum lk_redis_sess lk_redis_session(uint16_t id, const struct lk_redis_argv *v, 
  * arbitrary bytes into a series and folds to `other` upstream — the same rule
  * and the same reason as lk_s3_bucket_valid (РS3). */
 bool lk_redis_user_valid(const char *p, uint32_t n);
+
+/* --- the error's name (РR7, МR4) -------------------------------------------
+ * An error reply names its own failure in its first token: `-WRONGTYPE
+ * Operation against a key holding the wrong kind of value`. That token is the
+ * label, and the rest of the line is a sentence written for a human — it holds
+ * key names, slot numbers and node addresses, and it reaches no output.
+ *
+ * The same closed-set discipline as the command table, for the same reason: a
+ * Lua script may answer `redis.error_reply('CUSTOMERR …')` and a module may
+ * invent anything at all, so an unfolded token is a client-chosen series name.
+ * The vocabulary is what a real server produces (notes-redisproto.md §"Errors"),
+ * everything else is `other`, and the answer is always a pointer into the
+ * table. */
+
+/* Two of them are not failures. `-MOVED` and `-ASK` are how a cluster tells a
+ * client where a slot lives; a resharding cluster produces them continuously and
+ * every client retries and carries on. Counted as errors they would paint a
+ * healthy cluster red for ever, so they carry `LK_QO_CLIENT_ERR` — the flag a
+ * 4xx carries in HTTP — and their own counter (РR7). `-MISCONF` and `-LOADING`
+ * are the opposite case and stay errors: they are the server refusing to work. */
+enum lk_redis_redirect {
+    LK_REDIS_RD_NONE = 0,
+    LK_REDIS_RD_MOVED, /* the slot lives elsewhere, permanently */
+    LK_REDIS_RD_ASK,   /* ... and this one is mid-migration: for this command only */
+};
+
+struct lk_redis_err {
+    const char *name; /* borrowed table pointer, never NULL, never the input */
+    uint32_t len;
+    uint8_t redirect; /* enum lk_redis_redirect */
+};
+
+/* Fold the first token of an error reply. Case-sensitive on purpose: a Redis
+ * error symbol is upper-case by protocol convention, and a lower-case token is a
+ * script's invention rather than one of the server's — which is exactly the
+ * difference `other` is there to record. */
+struct lk_redis_err lk_redis_err(const char *p, uint32_t n);
+
+/* Enumerate the vocabulary: 0 … lk_redis_err_count() - 1, `other` included.
+ * What lets a test state the closed-set invariant against the table itself
+ * rather than against a copy of it that can drift (the lk_redis_cmd_count
+ * rule). */
+uint32_t lk_redis_err_count(void);
+const char *lk_redis_err_at(uint32_t i, uint32_t *len);
 
 /* --- what a viewer must not print (РR6) ------------------------------------ */
 

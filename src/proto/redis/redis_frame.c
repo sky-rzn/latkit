@@ -605,6 +605,45 @@ void redis_read_argv(const struct lk_msg *m, const __u8 *body, __u32 cap, __u32 
         v->n++;
 }
 
+struct lk_redis_arg redis_read_word(const struct lk_msg *m, const __u8 *body, __u32 cap)
+{
+    struct lk_redis_arg t = {0};
+    struct redis_rd rd = {.p = body, .n = cap};
+    const char *line;
+    __u32 len, i;
+
+    if (!body || !cap)
+        return t;
+    rd.i = 1; /* past the type byte */
+    switch (redis_vshape((__u8)m->type)) {
+    case REDIS_V_LINE:
+        break; /* `-WRONGTYPE …`, `+QUEUED`: the line *is* the text */
+    case REDIS_V_BULK:
+        /* `!21\r\nWRONGPASS …`: the length line first, and the declared length
+         * is not read at all — the prefix is the bound here, as everywhere in
+         * this file, because the capture budget may have ended the value long
+         * before its length says it does. */
+        if (!rd_line(&rd, &line, &len))
+            return t;
+        break;
+    default:
+        return t; /* an aggregate has no text of its own; its elements are
+                     redis_read_argv's business */
+    }
+    for (i = rd.i; i < cap; i++)
+        if (body[i] == ' ' || body[i] == '\r' || body[i] == '\n')
+            break;
+    /* A token is whole only if something *ended* it inside the prefix. A
+     * `-NOPERM …` cut by the budget at the fourth byte yields nothing rather
+     * than `NOPE`, which would be a symbol the vocabulary happens not to have
+     * and would fold to `other` — the same answer, arrived at by luck. */
+    if (i == cap || i == rd.i)
+        return t;
+    t.p = (const char *)body + rd.i;
+    t.n = i - rd.i;
+    return t;
+}
+
 /* --- masking a credential (РR6) -------------------------------------------- */
 
 /* Blank a span of the copy, keeping its length: the bulk header in front of it

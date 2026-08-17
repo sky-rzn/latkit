@@ -35,10 +35,22 @@
  * labels is a question RESP answers only in the reply, and never in the command
  * that asked. That split is the whole of the session machine below.
  *
- * What is *not* here, because it is МR4's: the symbolic error and the redirect
- * counter, `MULTI`/`EXEC`, and the blocking family. An error is currently one
- * bit — did the server refuse — which is all the session machine needs and none
- * of what a dashboard does.
+ * МR4 adds what an observation's *outcome* is, and all three of its rules exist
+ * to keep a number out of a place where it would be plausible and wrong:
+ *
+ *   - **the error is symbolic, and two errors are not failures** (РR7). The
+ *     first token of `-WRONGTYPE Operation against…` is the label; the sentence
+ *     after it is written for a human and holds a key. `-MOVED` and `-ASK` are
+ *     how a cluster routes, so they get a counter of their own and
+ *     LK_QO_CLIENT_ERR — in `errors_total` they would paint a healthy resharding
+ *     cluster red for ever.
+ *   - **`+QUEUED` is not a latency** (РR9). Inside a `MULTI` the server writes a
+ *     command down in microseconds and runs it at `EXEC`; the interval that
+ *     means something is `MULTI` → the reply to `EXEC`, and it goes to the
+ *     transaction family every database protocol here already feeds.
+ *   - **a blocking command measures the client's own patience** (РR10). `BLPOP
+ *     key 30` is a thirty-second observation about nothing, and one of them in
+ *     the general histogram decides its p99.
  *
  * No I/O, no libbpf: a pure state machine, fed synthetic lk_msg by unit tests
  * and .lkt traces by the replay harness. */
@@ -264,6 +276,11 @@ static void units_drop_all(struct redis_conn *rc, __u64 *counter)
         if (counter)
             (*counter)++;
     }
+    /* An open transaction goes with them (РR9). Its interval would span the loss
+     * — the `EXEC` that ends it may already have gone past unseen — and Р19 is
+     * the same rule for a transaction as for a unit: an observation that survived
+     * a gap is a plausible number about an unknown stretch of time. */
+    rc->txn_start_ns = 0;
     rc->owed = 0;
     rc->early_n = 0;
     rc->batch_seq0 = rc->open_seq;
@@ -345,7 +362,7 @@ static void units_expire(struct lk_proto *p, struct redis_conn *rc, __u64 now)
 /* --- emitting -------------------------------------------------------------- */
 
 static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct redis_conn *rc,
-                      const struct redis_unit *u, __u64 seq, __u32 reply_bytes, __u64 end_ns)
+                      const struct redis_unit *u, __u64 seq, const struct redis_reply *r)
 {
     /* The batch this command arrived in is normally still open when its reply
      * comes back — the whole batch is read out of one syscall before the server
@@ -365,10 +382,10 @@ static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct redis_conn *
          * Reporting an invented TTFB here would put a family on the dashboard
          * that always equals the duration (РR11 switches it off for that
          * reason). */
-        .ts_complete_ns = end_ns,
-        .ts_ready_ns = end_ns, /* no separate ready point, as in HTTP */
+        .ts_complete_ns = r->end_ns,
+        .ts_ready_ns = r->end_ns, /* no separate ready point, as in HTTP */
         .bytes_in = u->bytes,
-        .bytes_out = reply_bytes,
+        .bytes_out = r->bytes,
         .redis = &rr,
         /* МR5 gives Redis LK_Q_COMMAND and a profile of its own (РR11). Until
          * then a command is the closest thing the enum already has — one
@@ -390,12 +407,71 @@ static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct redis_conn *
         .route = cmd,
         .route_len = cmd_len,
         .route_fp = lk_redis_cmd_fp(u->cmd),
-        .flags = (__u16)(u->flags | LK_QO_NO_TEXT),
+        /* The failure's name (РR7), in the slot the S3 dialect puts an
+         * `<Code>` in: a pointer into the static vocabulary of norm_redis.c, so
+         * the `error` label is as bounded as the `cmd` one and no part of the
+         * server's sentence — which names the key, the slot or the node — can
+         * reach a series. NULL when nothing failed. */
+        .err_name = r->err_name,
+        .flags = (__u16)(u->flags | r->flags | LK_QO_NO_TEXT),
     };
 
     p->st.queries++;
+    if (o.flags & LK_QO_ERROR)
+        p->st.errors_sql++;
+    if (r->redirect)
+        p->st.redirects++;
     if (p->out.on_query)
         p->out.on_query(p->out.ctx, c, &rc->session, &o);
+}
+
+/* The transaction interval (РR9). Called with the same reply that closed the
+ * unit, straight after the observation, and it is one rule in three lines: a
+ * `MULTI` the server accepted opens the interval at the command's first byte,
+ * an `EXEC` or a `DISCARD` closes it at the reply's last one.
+ *
+ * The interval is `MULTI` … the answer to `EXEC` rather than `EXEC` alone
+ * because that is the transaction — what the application waited for, and what
+ * `latkit_txn_duration_seconds` means for PG and MySQL, where it is likewise the
+ * span from the statement that opened one to the status that closed it. That
+ * this fits an existing family exactly is the pleasant surprise of the track: a
+ * cache with transactions is still a database here.
+ *
+ * The three endings that are *not* a commit are the reason a bit of the reply is
+ * read at all: `-EXECABORT` (a command failed at queue time), `DISCARD`, and a
+ * null `EXEC` — a broken `WATCH`, which is a null and not an error, and would
+ * otherwise be counted as the one thing it is not (notes-redisproto.md
+ * §"Transactions", `redis/watch-abort.lkt`). */
+static void txn_apply(struct lk_proto *p, struct lk_conn *c, struct redis_conn *rc,
+                      const struct redis_unit *u, const struct redis_reply *r)
+{
+    bool aborted;
+
+    if (u->uflags & REDIS_U_MULTI) {
+        /* Only on success, which is what makes a nested `MULTI` harmless: the
+         * server answers `-ERR MULTI calls can not be nested` and the first
+         * transaction goes on — so the stamp must not move, or the interval
+         * would start at the wrong command (measured, `redis/multi.lkt`). */
+        if (!r->err && !rc->txn_start_ns)
+            rc->txn_start_ns = u->ts_start_ns;
+        return;
+    }
+    /* `RESET` closes one too, and closes it as thrown away: it returns the
+     * connection to a virgin state, transaction included (РR5's twin rule, and
+     * the same `+RESET` the session machine waits for). */
+    if (!(u->uflags & (REDIS_U_EXEC | REDIS_U_DISCARD | REDIS_U_RESET)))
+        return;
+    /* `EXEC` with no transaction open is `-ERR EXEC without MULTI`, and a
+     * `DISCARD` outside one the same: a real observation, and no interval to
+     * report. Also the shape a connection joined mid-stream has, where the
+     * `MULTI` happened before we were watching and the honest answer is one
+     * transaction missing rather than one measured from an invented start. */
+    if (!rc->txn_start_ns || (r->err && !(u->uflags & REDIS_U_EXEC)))
+        return;
+    aborted = !(u->uflags & REDIS_U_EXEC) || r->err || r->null;
+    if (p->out.on_txn)
+        p->out.on_txn(p->out.ctx, c, rc->txn_start_ns, r->end_ns, aborted ? 'E' : 'I');
+    rc->txn_start_ns = 0;
 }
 
 /* The server has ruled on a command that would move a label (РR5/РR6). Called
@@ -415,8 +491,8 @@ static void session_apply(struct redis_conn *rc, const struct redis_unit *u, __u
         return;
     if (u->uflags & REDIS_U_RESET) {
         /* `RESET` puts the connection back to database 0 and user `default` —
-         * and out of subscribe mode, out of the transaction and back to RESP2,
-         * the rest of which МR2 and МR4 own. */
+         * and out of subscribe mode (redis_command), out of the transaction
+         * (txn_apply) and back to RESP2, which needs no state of ours. */
         session_set_db(rc, 0);
         session_set_user(rc, NULL, 0);
         return;
@@ -435,18 +511,68 @@ static void session_apply(struct redis_conn *rc, const struct redis_unit *u, __u
     }
 }
 
-/* An error reply, for the session machine's purposes: RESP2 `-ERR …` and RESP3's
- * blob error are the two shapes a refusal takes. The *symbolic* error of РR7 —
- * which error it was, and whether a `MOVED` counts as one at all — is МR4's. */
-static bool reply_is_err(const struct lk_msg *m)
+/* --- what a reply says (РR7, РR9) ------------------------------------------
+ * Everything the observation and the two state machines take from a server
+ * value, read once, at the moment it arrives. One function because the three
+ * questions share the same three bytes of it — the type and the first word —
+ * and because a reply that overtook its own command is kept in exactly this
+ * shape until the command arrives (see early_claim). */
+static struct redis_reply reply_verdict(const struct lk_msg *m, __u64 end_ns)
 {
-    return m->type == REDIS_T_ERROR || m->type == REDIS_T_BLOBERR;
+    struct redis_reply r = {.end_ns = end_ns, .bytes = m->len};
+    struct lk_redis_arg w;
+    struct lk_redis_err e;
+
+    switch (m->type) {
+    case REDIS_T_ERROR:
+    case REDIS_T_BLOBERR:
+        /* RESP2's `-ERR …` and RESP3's blob error are the two shapes a refusal
+         * takes; the symbol is in the same place in both. */
+        r.err = true;
+        w = redis_read_word(m, m->body, m->body_cap);
+        e = lk_redis_err(w.p, w.n);
+        r.err_name = e.name;
+        r.redirect = e.redirect;
+        /* A redirect is a *routing* answer, and the flag it carries is the one
+         * HTTP gives a 4xx: the request was refused, the server is healthy, and
+         * the two facts belong in different counters (РR7). */
+        r.flags |= r.redirect ? LK_QO_CLIENT_ERR : LK_QO_ERROR;
+        break;
+    case REDIS_T_SIMPLE:
+        /* `+QUEUED`, and nothing else on the wire looks like it: no command
+         * outside a transaction is answered with that word. Read from the reply
+         * rather than deduced from a `MULTI` we may not have seen, which is what
+         * makes it right on a connection joined mid-stream — and what keeps a
+         * queue-time error (`-ERR unknown command`, answered *instead* of
+         * `+QUEUED`) an honest error with an honest duration (РR9). */
+        w = redis_read_word(m, m->body, m->body_cap);
+        if (w.n == 6 && !memcmp(w.p, "QUEUED", 6))
+            r.flags |= LK_QO_QUEUED;
+        break;
+    case REDIS_T_NULL:
+        r.null = true;
+        break;
+    case REDIS_T_ARRAY:
+        /* RESP2 spells null `*-1`, and to the framer that is simply an array of
+         * no elements — the same thing `*0` is, and rightly so: both are values
+         * complete where they stand. Here the difference is the whole answer,
+         * because `*-1` from an `EXEC` is a transaction a broken `WATCH` refused
+         * and `*0` is one that ran no commands and committed (`redis/multi.lkt`
+         * has both). The sign is the only place the two differ, so the sign is
+         * what is read. */
+        r.null = m->body && m->body_cap > 1 && m->body[1] == '-';
+        break;
+    default:
+        break;
+    }
+    return r;
 }
 
 /* A reply for the oldest unit: emit it, or account for its absence. */
 static void unit_close(struct lk_proto *p, struct lk_conn *c, struct redis_conn *rc,
                        const struct lk_msg *m, __u64 end_ns)
 {
+    struct redis_reply r = reply_verdict(m, end_ns);
     struct redis_unit *u = unit_front(rc);
     const struct redis_dir *fe;
 
@@ -464,10 +590,7 @@ static void unit_close(struct lk_proto *p, struct lk_conn *c, struct redis_conn 
          * command it belongs to claims it the moment it arrives. */
         fe = redis_dir_of(c, LK_DIR_RECV);
         if (fe && redis_value_open(fe) && rc->early_n < LK_REDIS_MAX_EARLY) {
-            rc->early[rc->early_n].end_ns = end_ns;
-            rc->early[rc->early_n].bytes = m->len;
-            rc->early[rc->early_n].err = reply_is_err(m);
-            rc->early_n++;
+            rc->early[rc->early_n++] = r;
             return;
         }
         /* Otherwise: a connection joined mid-stream, or a reply arriving after
@@ -476,8 +599,9 @@ static void unit_close(struct lk_proto *p, struct lk_conn *c, struct redis_conn 
         redis_orphan(p, rc);
         return;
     }
-    unit_emit(p, c, rc, u, rc->head_seq, m->len, end_ns);
-    session_apply(rc, u, rc->head_seq, reply_is_err(m));
+    unit_emit(p, c, rc, u, rc->head_seq, &r);
+    session_apply(rc, u, rc->head_seq, r.err);
+    txn_apply(p, c, rc, u, &r);
     rc->head_seq++;
 }
 
@@ -487,7 +611,7 @@ static void unit_close(struct lk_proto *p, struct lk_conn *c, struct redis_conn 
  * "usually". */
 static void early_claim(struct lk_proto *p, struct lk_conn *c, struct redis_conn *rc)
 {
-    struct redis_early e = rc->early[0];
+    struct redis_reply r = rc->early[0];
 
     if (rc->head_seq + 1 != rc->open_seq) {
         rc->early_n = 0;
@@ -496,12 +620,14 @@ static void early_claim(struct lk_proto *p, struct lk_conn *c, struct redis_conn
     }
     memmove(rc->early, rc->early + 1, sizeof(rc->early[0]) * (__u32)(rc->early_n - 1));
     rc->early_n--;
-    unit_emit(p, c, rc, unit_front(rc), rc->head_seq, e.bytes, e.end_ns);
-    /* The held reply's verdict travels with it: an `AUTH` whose password is long
-     * enough to overflow the capture budget is exactly the shape that gets its
-     * reply published first, so the session machine has to hear about it here
-     * too or a password-sized login would move a label it should not. */
-    session_apply(rc, unit_front(rc), rc->head_seq, e.err);
+    unit_emit(p, c, rc, unit_front(rc), rc->head_seq, &r);
+    /* The held reply's verdict travels with it, whole: an `AUTH` whose password
+     * is long enough to overflow the capture budget is exactly the shape that
+     * gets its reply published first, so the session machine has to hear about it
+     * here or a password-sized login would move a label it should not — and the
+     * same goes for a transaction whose `EXEC` outran a large queued command. */
+    session_apply(rc, unit_front(rc), rc->head_seq, r.err);
+    txn_apply(p, c, rc, unit_front(rc), &r);
     rc->head_seq++;
 }
 
@@ -542,7 +668,8 @@ static void redis_command(struct lk_proto *p, struct lk_conn *c, struct redis_co
     struct lk_redis_argv v;
     struct lk_redis_arg user;
     struct redis_unit *u;
-    __u16 id, cflags, db;
+    __u32 cflags;
+    __u16 id, db;
     __s64 nelem;
 
     if (batch_first)
@@ -592,9 +719,9 @@ static void redis_command(struct lk_proto *p, struct lk_conn *c, struct redis_co
     /* `RESET` returns the connection to a virgin state — out of subscribe mode,
      * out of the transaction, back to RESP2, database 0, user `default`. The
      * subscribe bit goes now because a subscribe-mode misreading corrupts the
-     * *queue*; the two labels wait for the `+RESET` (session_apply), because a
-     * label that moved before the server agreed would be a lie for as long as
-     * this connection lives. МR4 takes the transaction. */
+     * *queue*; the two labels and the transaction wait for the `+RESET`
+     * (session_apply, txn_apply), because a label that moved before the server
+     * agreed would be a lie for as long as this connection lives. */
     if (cflags & LK_REDIS_C_RESET)
         rc->sub = false;
     else if (cflags & LK_REDIS_C_SUBON)
@@ -611,6 +738,34 @@ static void redis_command(struct lk_proto *p, struct lk_conn *c, struct redis_co
     u->cmd = id;
     if (cflags & LK_REDIS_C_SUBFAM)
         u->uflags |= REDIS_U_SUB;
+    /* The transaction (РR9). Recorded on the unit for the same reason the labels
+     * are: whether a `MULTI` opened anything is the server's answer, not the
+     * client's request — a nested one is refused and the transaction already
+     * running is untouched. */
+    if (cflags & LK_REDIS_C_MULTI)
+        u->uflags |= REDIS_U_MULTI;
+    else if (cflags & LK_REDIS_C_EXEC)
+        u->uflags |= REDIS_U_EXEC;
+    else if (cflags & LK_REDIS_C_DISCARD)
+        u->uflags |= REDIS_U_DISCARD;
+
+    /* Blocking (РR10), decided from the command because that is where the answer
+     * is: `BLPOP key 30` is a thirty-second observation the moment it is sent,
+     * whatever it returns. `XREAD`/`XREADGROUP` are the two the server's own flag
+     * gets wrong — they block only with a `BLOCK` keyword — and the deeper read
+     * is done for them alone, since the keyword sits behind `GROUP g c` and an
+     * optional `COUNT n`. That read is the *only* place in the tree an argument
+     * past the identity is looked at, it looks for a keyword and never at a
+     * value, and it stops at `STREAMS` so that a stream named `BLOCK` stays a
+     * key. */
+    if (cflags & LK_REDIS_C_BLOCKING) {
+        struct lk_redis_argv deep;
+
+        if (cflags & LK_REDIS_C_ARGBLOCK)
+            redis_read_argv(m, m->body, m->body_cap, LK_REDIS_ARGV_MAX, &deep, NULL);
+        if (lk_redis_cmd_blocking(id, (cflags & LK_REDIS_C_ARGBLOCK) ? &deep : &v))
+            u->flags |= LK_QO_BLOCKING;
+    }
 
     /* What this command would do to the labels, if the server accepts it
      * (РR5/РR6). The candidate is recorded on the unit and applied when the

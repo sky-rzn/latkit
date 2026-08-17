@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
-/* Redis command classification and session labels (РR4–РR6, PLAN-REDIS.md МR3).
- * See norm_redis.h for the contract; this file is one table and four short
- * walks over it.
+/* Redis command classification, session labels and error names (РR4–РR7, РR10;
+ * PLAN-REDIS.md МR3 and МR4). See norm_redis.h for the contract; this file is
+ * two closed tables and a handful of short walks over them.
  *
  * Shape of one classification:
  *
@@ -33,6 +33,11 @@
  *     the second so a viewer can blank it. Nothing in this file compares,
  *     copies or hashes a credential.
  *
+ * The error vocabulary of МR4 is the same three properties again, over a much
+ * smaller table: an error's symbol is folded to a pointer this file owns, the
+ * sentence after it — which quotes keys, slots and node addresses — is read by
+ * nothing, and `MOVED`/`ASK` are marked as what they are, which is not failures.
+ *
  * The table itself is generated — the notes are the source of truth and the
  * server is the source of the notes (see norm_redis_table.h, and the ctest
  * `redis_table` that fails when the two drift). */
@@ -50,7 +55,7 @@
  * a subcommand — so one array holds both and one comparison serves both. */
 struct redis_ent {
     const char *name;
-    uint16_t flags;
+    uint32_t flags;
     uint16_t sub_first; /* container: its first subcommand entry */
     uint16_t sub_n;     /* container: how many */
     uint16_t sub_other; /* container: its `<name>|other` entry */
@@ -81,6 +86,25 @@ static bool upper(const struct lk_redis_arg *t, char *out, uint32_t *out_n)
     }
     *out_n = t->n;
     return true;
+}
+
+/* Case-insensitive compare of one element against a lower-case literal — the
+ * same fold, spelled out separately because these are *keywords inside* a
+ * command (`BLOCK`, `STREAMS`, `AUTH`, `requirepass`) rather than command names,
+ * and they are compared one at a time instead of searched for. */
+static bool arg_is(const struct lk_redis_arg *t, const char *lit)
+{
+    uint32_t i = 0;
+
+    for (; i < t->n && lit[i]; i++) {
+        char c = t->p[i];
+
+        if (c >= 'A' && c <= 'Z')
+            c = (char)(c - 'A' + 'a');
+        if (c != lit[i])
+            return false;
+    }
+    return i == t->n && !lit[i];
 }
 
 /* strcmp order over an explicit length, which is the order LC_ALL=C sort gives
@@ -151,9 +175,31 @@ const char *lk_redis_cmd_name(uint16_t id, uint32_t *len)
     return e->name;
 }
 
-uint16_t lk_redis_cmd_flags(uint16_t id)
+uint32_t lk_redis_cmd_flags(uint16_t id)
 {
     return id < REDIS_NENT ? redis_tab[id].flags : 0;
+}
+
+bool lk_redis_cmd_blocking(uint16_t id, const struct lk_redis_argv *v)
+{
+    uint32_t flags = lk_redis_cmd_flags(id);
+
+    if (!(flags & LK_REDIS_C_BLOCKING))
+        return false;
+    if (!(flags & LK_REDIS_C_ARGBLOCK))
+        return true;
+    /* `XREAD [COUNT n] [BLOCK ms] STREAMS key… id…` — the keyword may only
+     * appear before `STREAMS`, so the walk ends there and a stream called
+     * `BLOCK` stays a key. Nothing reads the millisecond value: whether the
+     * client asked to wait is the whole question, and how long it was willing to
+     * is its own business (РR10). */
+    for (uint32_t i = 1; i < (v ? v->n : 0); i++) {
+        if (arg_is(&v->a[i], "streams"))
+            return false;
+        if (arg_is(&v->a[i], "block"))
+            return true;
+    }
+    return false;
 }
 
 uint64_t lk_redis_cmd_fp(uint16_t id)
@@ -216,7 +262,7 @@ static uint32_t hello_auth(const struct lk_redis_argv *v)
 enum lk_redis_sess lk_redis_session(uint16_t id, const struct lk_redis_argv *v, uint16_t *db,
                                     struct lk_redis_arg *user)
 {
-    uint16_t flags = lk_redis_cmd_flags(id);
+    uint32_t flags = lk_redis_cmd_flags(id);
     uint32_t i;
 
     if (db)
@@ -269,25 +315,103 @@ bool lk_redis_user_valid(const char *p, uint32_t n)
     return true;
 }
 
-/* --- masking --------------------------------------------------------------- */
+/* --- the error's name (РR7) ------------------------------------------------ */
 
-/* Case-insensitive compare of one element against a literal — the same fold the
- * lookup does, spelled out here because these are keywords inside a command
- * rather than command names. */
-static bool arg_is(const struct lk_redis_arg *t, const char *lit)
+/* The vocabulary a real server produces, measured over the corpus and completed
+ * from the plan's list (notes-redisproto.md §"Errors"). C-sorted, so the same
+ * binary search as the command table serves it — and, like that table, the
+ * answer is a pointer *into this array* and never into the wire. An error
+ * message is a sentence written for a human: it holds the key that had the wrong
+ * type, the slot and node a `MOVED` points at, the ACL rule that refused. None
+ * of that may become a label, and folding to a table pointer is how "none of it"
+ * is a property of the code rather than a promise. */
+static const struct {
+    const char *name;
+    uint8_t len;
+    uint8_t redirect; /* enum lk_redis_redirect */
+} redis_errs[] = {
+    {"ASK", 3, LK_REDIS_RD_ASK},
+    {"BUSY", 4, 0},      /* a script is running and will not be interrupted */
+    {"BUSYGROUP", 9, 0}, /* `XGROUP CREATE` of a group that exists */
+    {"CLUSTERDOWN", 11, 0},
+    {"CROSSSLOT", 9, 0}, /* `MGET foo bar` on a cluster: two slots, one command */
+    {"ERR", 3, 0},       /* the catch-all the server itself uses: unknown command,
+                            wrong arity, `DB index is out of range`, a protocol error */
+    {"EXECABORT", 9, 0}, /* `EXEC` after a command that failed at queue time (РR9) */
+    {"LOADING", 7, 0},   /* the dataset is still being read from disk */
+    {"MASTERDOWN", 10, 0},
+    {"MISCONF", 7, 0}, /* persistence is failing and writes are refused. A failure
+                          of the server, so it stays an error where a redirect does
+                          not — this is precisely the distinction РR7 draws */
+    {"MOVED", 5, LK_REDIS_RD_MOVED},
+    {"NOAUTH", 6, 0},
+    {"NOGOODSLAVE", 11, 0},
+    {"NOPERM", 6, 0},  /* an ACL user without the command, or without the key */
+    {"NOPROTO", 7, 0}, /* `HELLO 4`: a version the server does not speak */
+    {"NOREPLICAS", 10, 0},
+    {"NOSCRIPT", 8, 0}, /* an `EVALSHA` of a sha this server does not hold — the
+                           normal first half of the EVALSHA/EVAL fallback */
+    {"NOTBUSY", 7, 0},
+    {"OOM", 3, 0},
+    {"READONLY", 8, 0},
+    {"TRYAGAIN", 8, 0},
+    {"UNBLOCKED", 9, 0}, /* a blocking command killed by `CLIENT UNBLOCK` */
+    {"WRONGPASS", 9, 0},
+    {"WRONGTYPE", 9, 0},
+    /* Everything else: a module's own symbol, a Lua script's
+     * `redis.error_reply('CUSTOMERR …')` (measured, `redis/eval-scripts.lkt`), a
+     * fork's invention, or an error line with no symbol at all. */
+    {"other", 5, 0},
+};
+
+#define REDIS_NERR ((uint32_t)(sizeof(redis_errs) / sizeof(redis_errs[0])))
+
+struct lk_redis_err lk_redis_err(const char *p, uint32_t n)
 {
-    uint32_t i = 0;
+    struct lk_redis_err out = {redis_errs[REDIS_NERR - 1].name, 5, LK_REDIS_RD_NONE};
+    uint32_t lo = 0, hi = REDIS_NERR - 1; /* `other` is not searched: it sorts
+                                             below every upper-case symbol and is
+                                             the answer to a miss, not a match */
 
-    for (; i < t->n && lit[i]; i++) {
-        char c = t->p[i];
+    if (!p || !n)
+        return out;
+    while (lo < hi) {
+        uint32_t mid = lo + (hi - lo) / 2;
+        uint32_t en = redis_errs[mid].len;
+        uint32_t m = en < n ? en : n;
+        int c = memcmp(redis_errs[mid].name, p, m);
 
-        if (c >= 'A' && c <= 'Z')
-            c = (char)(c - 'A' + 'a');
-        if (c != lit[i])
-            return false;
+        if (!c)
+            c = en < n ? -1 : (en > n ? 1 : 0);
+        if (!c) {
+            out.name = redis_errs[mid].name;
+            out.len = en;
+            out.redirect = redis_errs[mid].redirect;
+            return out;
+        }
+        if (c < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
     }
-    return i == t->n && !lit[i];
+    return out;
 }
+
+uint32_t lk_redis_err_count(void)
+{
+    return REDIS_NERR;
+}
+
+const char *lk_redis_err_at(uint32_t i, uint32_t *len)
+{
+    const uint32_t k = i < REDIS_NERR ? i : REDIS_NERR - 1;
+
+    if (len)
+        *len = redis_errs[k].len;
+    return redis_errs[k].name;
+}
+
+/* --- masking --------------------------------------------------------------- */
 
 /* The `CONFIG SET` parameters whose *value* is a credential. Everything else the
  * command sets is a number or a policy word, and hiding those would make a
@@ -301,7 +425,7 @@ static bool param_is_secret(const struct lk_redis_arg *t)
 
 uint32_t lk_redis_secret_mask(uint16_t id, const struct lk_redis_argv *v)
 {
-    uint16_t flags = lk_redis_cmd_flags(id);
+    uint32_t flags = lk_redis_cmd_flags(id);
     uint32_t mask = 0, i;
 
     if (!v || !v->n)
@@ -375,6 +499,7 @@ int lk_norm_redis_fuzz_one(const uint8_t *data, size_t n)
     static volatile uint64_t sink;
     struct lk_redis_argv v = {0};
     struct lk_redis_arg user;
+    struct lk_redis_err e;
     const char *s = (const char *)data;
     uint32_t start = 0, len;
     uint16_t id, db;
@@ -402,11 +527,28 @@ int lk_norm_redis_fuzz_one(const uint8_t *data, size_t n)
     if (n && name >= s && name < s + n)
         __builtin_trap();
 
+    /* 3. ... and the same for the error's name (РR7). The first element doubles
+     *    as an error token here, which is the point: whatever the wire says, the
+     *    label is one of the two dozen symbols in this file. */
+    e = lk_redis_err(v.a[0].p, v.a[0].n);
+    if (n && e.name >= s && e.name < s + n)
+        __builtin_trap();
+    if (e.name != lk_redis_err_at(lk_redis_err_count() - 1, NULL)) {
+        bool found = false;
+
+        for (uint32_t i = 0; i < lk_redis_err_count() && !found; i++)
+            found = e.name == lk_redis_err_at(i, NULL);
+        if (!found)
+            __builtin_trap();
+    }
+
     acc = (uint64_t)id ^ lk_redis_cmd_fp(id) ^ lk_redis_cmd_flags(id) ^ len;
     acc += lk_redis_session(id, &v, &db, &user);
     acc += db;
     acc += user.n && lk_redis_user_valid(user.p, user.n);
     acc += lk_redis_secret_mask(id, &v);
+    acc += lk_redis_cmd_blocking(id, &v);
+    acc += e.len + e.redirect;
     for (uint32_t i = 0; i < len; i++)
         acc += (unsigned char)name[i];
     sink += acc;

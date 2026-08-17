@@ -1,7 +1,7 @@
 #!/bin/sh
-# РR4/РR6 acceptance (PLAN-REDIS.md МR3) — the redis half of the privacy check
-# РH12 established for HTTP (http_privacy.sh), against a corpus that plants what
-# it is looking for.
+# РR4/РR6/РR7 acceptance (PLAN-REDIS.md МR3, МR4) — the redis half of the
+# privacy check РH12 established for HTTP (http_privacy.sh), against a corpus
+# that plants what it is looking for.
 #
 #   redis_privacy.sh <lkt_queries> <lkt_messages> <tests/traces/redis dir>
 #
@@ -61,9 +61,15 @@ dump_text() {
     "$M" --proto redis --hexdump "$1" 2>&1 | sed -n 's/^  [0-9a-f]*: //p' | cut -c42- | tr -d '\n'
 }
 
+# `redis/errors.lkt` and `cluster/moved.lkt` are here for МR4's surface (РR7):
+# an error *message* is a sentence written for a human and it quotes the input —
+# `-ERR unknown command 'X', with args beginning with: 'lk:…'` names a key, and
+# `-MOVED 12182 127.0.0.1:6392` names a node. Only the first token of it ever
+# becomes a label, and this is where that is checked against traffic rather than
+# against the code.
 for trace in "$DIR"/redis/auth-forms.lkt "$DIR"/redis/acl-errors.lkt \
     "$DIR"/valkey/auth-forms.lkt "$DIR"/libs/py-auth.lkt "$DIR"/redis/basic.lkt \
-    "$DIR"/redis/monitor.lkt; do
+    "$DIR"/redis/errors.lkt "$DIR"/cluster/moved.lkt "$DIR"/redis/monitor.lkt; do
     [ -f "$trace" ] || continue
     name=$(basename "$trace" .lkt)
 

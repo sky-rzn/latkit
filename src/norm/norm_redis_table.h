@@ -20,8 +20,8 @@
  *
  * The write and blocking bits are the *server's*, quoted; the container bit is
  * the server's too. LK_REDIS_C_SUBFAM/SUBON/SELECT/AUTH/HELLO/RESET/REPL/
- * MONITOR are ours — the semantic groups the handler acts on (РR6, РR8, РR14),
- * which no server flag names. */
+ * MONITOR/MULTI/EXEC/DISCARD/ARGBLOCK are ours — the semantic groups the handler
+ * acts on (РR6, РR8, РR9, РR10, РR14), which no server flag names. */
 
 #define LK_REDIS_NCMD 250 /* top-level commands: entries [0, NCMD) */
 #define LK_REDIS_NSUB 144 /* subcommand entries, the `|other` ones included */
@@ -63,14 +63,14 @@ static const struct redis_ent redis_tab[] = {
     {"DECR", LK_REDIS_C_WRITE, 0, 0, 0, 4, 0},
     {"DECRBY", LK_REDIS_C_WRITE, 0, 0, 0, 6, 0},
     {"DEL", LK_REDIS_C_WRITE, 0, 0, 0, 3, 0},
-    {"DISCARD", 0, 0, 0, 0, 7, 0},
+    {"DISCARD", LK_REDIS_C_DISCARD, 0, 0, 0, 7, 0},
     {"DUMP", 0, 0, 0, 0, 4, 0},
     {"ECHO", 0, 0, 0, 0, 4, 0},
     {"EVAL", 0, 0, 0, 0, 4, 0},
     {"EVALSHA", 0, 0, 0, 0, 7, 0},
     {"EVALSHA_RO", 0, 0, 0, 0, 10, 0},
     {"EVAL_RO", 0, 0, 0, 0, 7, 0},
-    {"EXEC", 0, 0, 0, 0, 4, 0},
+    {"EXEC", LK_REDIS_C_EXEC, 0, 0, 0, 4, 0},
     {"EXISTS", 0, 0, 0, 0, 6, 0},
     {"EXPIRE", LK_REDIS_C_WRITE, 0, 0, 0, 6, 0},
     {"EXPIREAT", LK_REDIS_C_WRITE, 0, 0, 0, 8, 0},
@@ -153,7 +153,7 @@ static const struct redis_ent redis_tab[] = {
     {"MOVE", LK_REDIS_C_WRITE, 0, 0, 0, 4, 0},
     {"MSET", LK_REDIS_C_WRITE, 0, 0, 0, 4, 0},
     {"MSETNX", LK_REDIS_C_WRITE, 0, 0, 0, 6, 0},
-    {"MULTI", 0, 0, 0, 0, 5, 0},
+    {"MULTI", LK_REDIS_C_MULTI, 0, 0, 0, 5, 0},
     {"OBJECT", LK_REDIS_C_CONTAINER, 357, 5, 362, 6, 0},
     {"PERSIST", LK_REDIS_C_WRITE, 0, 0, 0, 7, 0},
     {"PEXPIRE", LK_REDIS_C_WRITE, 0, 0, 0, 7, 0},
@@ -247,8 +247,8 @@ static const struct redis_ent redis_tab[] = {
     {"XLEN", 0, 0, 0, 0, 4, 0},
     {"XPENDING", 0, 0, 0, 0, 8, 0},
     {"XRANGE", 0, 0, 0, 0, 6, 0},
-    {"XREAD", LK_REDIS_C_BLOCKING, 0, 0, 0, 5, 0},
-    {"XREADGROUP", LK_REDIS_C_WRITE | LK_REDIS_C_BLOCKING, 0, 0, 0, 10, 0},
+    {"XREAD", LK_REDIS_C_BLOCKING | LK_REDIS_C_ARGBLOCK, 0, 0, 0, 5, 0},
+    {"XREADGROUP", LK_REDIS_C_WRITE | LK_REDIS_C_BLOCKING | LK_REDIS_C_ARGBLOCK, 0, 0, 0, 10, 0},
     {"XREVRANGE", 0, 0, 0, 0, 9, 0},
     {"XSETID", LK_REDIS_C_WRITE, 0, 0, 0, 6, 0},
     {"XTRIM", LK_REDIS_C_WRITE, 0, 0, 0, 5, 0},

@@ -134,17 +134,24 @@ static void on_http_query(const struct lk_conn *c, const struct lk_session *s,
  * What is deliberately absent is the command *text*: a Redis command is a verb
  * and its arguments, the arguments are keys and values, and the whole of РR4 is
  * that they never leave the handler. `cmd=` is the identity and there is nothing
- * else to print. */
+ * else to print.
+ *
+ * `err=` is the symbolic failure of МR4 (РR7) and, like the S3 `<Code>` it sits
+ * beside in the observation, it is a value from a closed vocabulary and never a
+ * word off the wire — the sentence after `-WRONGTYPE` names a key. Whether a
+ * failure was counted as one at all is in `flags`: a `-MOVED` carries
+ * LK_QO_CLIENT_ERR (0x100) and not LK_QO_ERROR, which is what keeps a resharding
+ * cluster out of the error rate. */
 static void on_redis_query(const struct lk_conn *c, const struct lk_session *s,
                            const struct lk_query_obs *o)
 {
     printf("redis conn=%llx cmd=%s dur=%lluns db=%s user=%s in=%llu out=%llu depth=%u"
-           " flags=0x%x\n",
+           " err=%s flags=0x%x\n",
            (unsigned long long)c->cookie, o->route ? o->route : "?",
            (unsigned long long)delta(o->ts_start_ns, o->ts_complete_ns),
            s->database[0] ? s->database : "-", s->user[0] ? s->user : "-",
            (unsigned long long)o->bytes_in, (unsigned long long)o->bytes_out,
-           o->redis ? o->redis->pipeline_depth : 0, o->flags);
+           o->redis ? o->redis->pipeline_depth : 0, o->err_name ? o->err_name : "-", o->flags);
 }
 
 static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session *s,
@@ -347,20 +354,21 @@ int main(int argc, char **argv)
             lk_pipeline_fini(&pipe);
             const struct lk_proto_stats *ps = lk_proto_stats(proto);
 
-            printf(
-                "%s: proto=%s msgs=%llu sessions=%llu queries=%llu errors_sql=%llu"
-                " parse_errors=%llu unknown=%llu resyncs=%llu"
-                " dropped=%llu/%llu/%llu prep_evict=%llu repl=%llu"
-                " blind=%llu orphan=%llu push=%llu monitor=%llu\n",
-                argv[i], ops->name, (unsigned long long)ps->msgs, (unsigned long long)ps->sessions,
-                (unsigned long long)ps->queries, (unsigned long long)ps->errors_sql,
-                (unsigned long long)ps->parse_errors, (unsigned long long)ps->unknown_msgs,
-                (unsigned long long)ps->resyncs, (unsigned long long)ps->units_dropped_resync,
-                (unsigned long long)ps->units_dropped_close,
-                (unsigned long long)ps->units_dropped_overflow,
-                (unsigned long long)ps->prep_evictions, (unsigned long long)ps->replication_conns,
-                (unsigned long long)ps->blind_conns, (unsigned long long)ps->orphan_msgs,
-                (unsigned long long)ps->pushes, (unsigned long long)ps->monitor_conns);
+            printf("%s: proto=%s msgs=%llu sessions=%llu queries=%llu errors_sql=%llu"
+                   " parse_errors=%llu unknown=%llu resyncs=%llu"
+                   " dropped=%llu/%llu/%llu prep_evict=%llu repl=%llu"
+                   " blind=%llu orphan=%llu push=%llu monitor=%llu redirects=%llu\n",
+                   argv[i], ops->name, (unsigned long long)ps->msgs,
+                   (unsigned long long)ps->sessions, (unsigned long long)ps->queries,
+                   (unsigned long long)ps->errors_sql, (unsigned long long)ps->parse_errors,
+                   (unsigned long long)ps->unknown_msgs, (unsigned long long)ps->resyncs,
+                   (unsigned long long)ps->units_dropped_resync,
+                   (unsigned long long)ps->units_dropped_close,
+                   (unsigned long long)ps->units_dropped_overflow,
+                   (unsigned long long)ps->prep_evictions,
+                   (unsigned long long)ps->replication_conns, (unsigned long long)ps->blind_conns,
+                   (unsigned long long)ps->orphan_msgs, (unsigned long long)ps->pushes,
+                   (unsigned long long)ps->monitor_conns, (unsigned long long)ps->redirects);
             /* Drained per file, so a span line sits with the observations it
              * came from — the ring is bounded and a whole corpus would overflow
              * it, which is a property of the collector, not of this tool. */

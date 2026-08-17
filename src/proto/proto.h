@@ -94,6 +94,20 @@ enum lk_query_kind {
  * (МS2). Set by the dialect, which is the only component that knows the
  * server's own surface when it sees one. */
 #define LK_QO_INTERNAL (1 << 11)
+/* Redis (РR9): the command was answered `+QUEUED` — it is inside a `MULTI` and
+ * the server did nothing but write it down, in microseconds. The observation is
+ * real (the command was sent, and `commands_total` counts it) and its *duration*
+ * is not: it measures how fast the server can say "noted", and in a histogram
+ * beside real work it drags every percentile down. The work happens at `EXEC`,
+ * and the interval that means something is the transaction's, which goes to
+ * latkit_txn_duration_seconds. */
+#define LK_QO_QUEUED (1 << 12)
+/* Redis (РR10): a blocking command — `BLPOP key 30`, `XREAD BLOCK`, `WAIT`. Its
+ * latency is the wait the *client* asked for, not the server's service time, so
+ * it is measured (in a family of its own, МR5) and kept out of the general
+ * duration histogram: with a 30-second `BLPOP` in the same series as `GET`, the
+ * p99 of a Redis is whatever its longest poll happened to be. */
+#define LK_QO_BLOCKING (1 << 13)
 #define LK_QO_BODY_UNSEEN                                                                          \
     (1 << 9) /* РH4: the response body was promised and did not                                   \
                 arrive in full — an old-kernel sendfile that                                     \
@@ -271,6 +285,12 @@ struct lk_proto_stats {
                                      mid-stream, or one arriving after its unit was
                                      emitted. Not a parse error — the input was
                                      fine, we simply never saw its request */
+    __u64 redirects;              /* `-MOVED` / `-ASK` replies (РR7): errors in syntax
+                                     and ordinary cluster operation in fact. Counted
+                                     here and *not* in errors_sql, because a resharding
+                                     cluster produces them continuously and an agent
+                                     that called them failures would report every
+                                     healthy cluster as broken */
     __u64 pushes;                 /* the deliberate twin of orphan_msgs: server values
                                      that closed no unit *by construction* (РR8) — a
                                      pub/sub delivery, a client-side-caching

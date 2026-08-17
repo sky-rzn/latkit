@@ -461,7 +461,7 @@ static int test_closed_set(void)
 static void dump(void)
 {
     for (uint32_t id = 0; id < lk_redis_cmd_count(); id++) {
-        uint16_t f = lk_redis_cmd_flags(id);
+        uint32_t f = lk_redis_cmd_flags(id);
         uint32_t len;
         const char *name = lk_redis_cmd_name(id, &len);
         char bits[4];

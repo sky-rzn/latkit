@@ -286,6 +286,20 @@ static void mx_on_query(void *ctx, const struct lk_conn *c, const struct lk_sess
         ro.has_duration = true;
     }
 
+    /* Two Redis outcomes whose *duration* is not a measurement of the server
+     * (РR9/РR10), counted like any other observation and left out of the
+     * latency distribution: a `+QUEUED` inside a `MULTI` measures how fast the
+     * server can write a command down, and a `BLPOP key 30` measures how long
+     * the client said it was willing to wait. Either one in the general
+     * histogram decides its p99 and describes nothing.
+     *
+     * Here rather than in the handler because "which family does this belong
+     * to" is the facade's question — and here rather than in a redis branch
+     * because there is not one yet: МR5 gives Redis a profile with a blocking
+     * family of its own, and this is where that branch will be. */
+    if (fl & (LK_QO_QUEUED | LK_QO_BLOCKING))
+        ro.has_duration = false;
+
     if (ro.has_duration) {
         /* Duration model (Р25): pipelined units share one Z, so their honest
          * per-query span is ts_complete - ts_start; a standalone unit uses

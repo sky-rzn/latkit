@@ -22,11 +22,13 @@
 #
 #   * / blocking / container   the *server's*, quoted through the notes;
 #   sub / session / ignore     *ours* — the semantic groups the handler acts on
-#                              (РR6, РR8, РR14). They are listed below because
-#                              no server flag names them: `SUBSCRIBE` and
+#   txn / argblock             (РR6, РR8, РR9, РR10, РR14). They are listed below
+#                              because no server flag names them: `SUBSCRIBE` and
 #                              `UNSUBSCRIBE` share the pubsub flag with
-#                              `PUBLISH`, and nothing on the wire marks `AUTH`
-#                              as the command that moves a label.
+#                              `PUBLISH`, nothing on the wire marks `AUTH` as the
+#                              command that moves a label, and the server's
+#                              blocking flag says `XREAD` blocks when in truth
+#                              only `XREAD BLOCK` does.
 set -eu
 
 NOTES_DEF="$(dirname "$0")/../../docs/notes-redisproto.md"
@@ -52,6 +54,11 @@ MONITOR MONITOR
 MIGRATE SEC_KW
 ACL|SETUSER SEC_RULE
 CONFIG|SET SEC_PARAM
+MULTI MULTI
+EXEC EXEC
+DISCARD DISCARD
+XREAD ARGBLOCK
+XREADGROUP ARGBLOCK
 EOF
 }
 
@@ -151,8 +158,8 @@ emit() {
  *
  * The write and blocking bits are the *server's*, quoted; the container bit is
  * the server's too. LK_REDIS_C_SUBFAM/SUBON/SELECT/AUTH/HELLO/RESET/REPL/
- * MONITOR are ours — the semantic groups the handler acts on (РR6, РR8, РR14),
- * which no server flag names. */
+ * MONITOR/MULTI/EXEC/DISCARD/ARGBLOCK are ours — the semantic groups the handler
+ * acts on (РR6, РR8, РR9, РR10, РR14), which no server flag names. */
 EOF
     echo
     echo "#define LK_REDIS_NCMD $ncmd /* top-level commands: entries [0, NCMD) */"

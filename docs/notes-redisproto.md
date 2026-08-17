@@ -686,6 +686,26 @@ Two properties decide how they are counted:
   one command.
 - **`MISCONF` and `LOADING` stay errors**: they are the server refusing to work.
 
+Two rules the МR4 implementation adds, both about what may become a label:
+
+- **the symbol is folded to the table, and the answer is a pointer into it.**
+  Not "the token, if we recognise it": an unfolded token is a series name chosen
+  by whoever is talking to the server, and a script really does invent them
+  (`redis.error_reply('CUSTOMERR …')`, measured in `redis/eval-scripts.lkt`).
+  Case is not folded either — an error symbol is upper-case by convention, and a
+  lower-case one is somebody's invention.
+- **the sentence after the symbol reaches nothing.** It is written for a human
+  and it names the key that had the wrong type, the slot and node a `MOVED`
+  points at, the command an ACL refused. `MOVED 12182 127.0.0.1:6392` as a label
+  would be one series per slot per node.
+
+A symbol the capture budget cut in half is not a symbol: the reader takes a token
+only when something ended it inside the published prefix, so a `-NOPERM …` cut at
+its fourth byte yields nothing rather than `NOPE` — which would fold to `other`
+anyway, by luck rather than by rule. A capture *hole* inside an error line is a
+different thing again: a line has no length to step over, the direction resyncs
+and the in-flight units are dropped (risk 1).
+
 ## Transactions (РR9)
 
 ```
@@ -712,6 +732,26 @@ duration; the transaction's interval is `MULTI` → the reply to `EXEC` and goes
 to `lk_reg_observe_txn`; `DISCARD`, `-EXECABORT` and a null `EXEC` are all
 `aborted`.
 
+Three details МR4 had to settle, none of which is visible from the table above:
+
+- **`*0` and `*-1` are one byte apart and opposite.** An `EXEC` that ran no
+  commands answers `*0` and committed; one a broken `WATCH` refused answers
+  `*-1` and did not. To the framer both are "an aggregate of no elements" —
+  rightly, since both are complete where they stand — so the handler reads the
+  sign out of the published prefix rather than the element count.
+- **Valkey 8 ends a nested `MULTI` differently from Redis 7.4** (measured,
+  `redis/multi.lkt` against `valkey/multi.lkt`): Redis keeps the transaction and
+  answers the following `EXEC` with `*0`, Valkey treats the refusal as a
+  queue-time error and answers `-EXECABORT`. Both are read correctly because the
+  verdict comes from the reply and not from a model of what a server ought to
+  do — the same reason the session labels of РR5/РR6 move on the reply.
+- **`+QUEUED` is recognised from the reply, not from a `MULTI` we saw.** It costs
+  nothing (no command outside a transaction is answered with that word) and it is
+  what makes a connection joined mid-stream right: the transaction started before
+  we were watching, and its commands are still not latencies. It also keeps a
+  queue-time error honest — the offending command is answered *instead* of
+  `+QUEUED`, so it keeps its duration and its symbol.
+
 ## Blocking commands (РR10)
 
 ```
@@ -723,6 +763,26 @@ Measured in `redis/blocking.lkt`. Neither number says anything about the server,
 which is why they belong in their own histogram: with a 30-second `BLPOP` in the
 same series as `GET`, the p99 of a Redis is whatever its longest poll is. `WAIT`
 and `WAITAOF` block on replication rather than on a key and belong there too.
+
+The `BLOCK` keyword of `XREAD`/`XREADGROUP` is **the only argument anything in
+this tree reads past the identity**, so it is worth stating exactly how far the
+read goes:
+
+- only for those two commands, which carry their own table bit
+  (`LK_REDIS_C_ARGBLOCK`) precisely so that every other command pays nothing;
+- for its *presence*, never its value — how many milliseconds the client was
+  willing to wait is its own business;
+- and only **before `STREAMS`**, after which every element is a key or an id. A
+  stream named `BLOCK` is a legal key (`XREAD COUNT 2 STREAMS BLOCK 0`), and a
+  key that decided the family would be the same mistake as a key that decided a
+  label.
+
+The read is LK_REDIS_ARGV_MAX elements deep for those two commands and
+LK_REDIS_ARGV_LABELS for the rest: `XREADGROUP GROUP g c COUNT 10 BLOCK 0` puts
+the keyword at element 6, which the label-depth read would not reach. A keyword
+past even that bound — or cut off by the capture budget — reads as an ordinary
+command, which is the same honest failure a command whose verb was cut off
+already has.
 
 ## Sizes, and why the budget is 512 bytes (РR13)
 

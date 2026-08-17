@@ -139,7 +139,12 @@ add_test(NAME redis_wire COMMAND test_redis_wire)
 # of РR5 and the ACL user of РR6, both moving on the *reply* and not on the
 # command, plus the privacy invariant asserted per observation (no key, no
 # password, in any label).
-foreach(t redis_frame redis_stream redis_unit redis_labels)
+# Redis outcomes (МR4): what a reply *says*. redis_error is the symbolic
+# vocabulary of РR7 and the two redirects that are not failures; redis_txn is the
+# `MULTI`/`EXEC` interval of РR9 in all five endings, `+QUEUED` included; and
+# redis_block is РR10 — the wait the client chose, and the one keyword that is
+# the only argument this tree ever reads.
+foreach(t redis_frame redis_stream redis_unit redis_labels redis_error redis_txn redis_block)
     add_executable(test_${t} test_${t}.c)
     target_include_directories(test_${t} PRIVATE
         ${CMAKE_SOURCE_DIR}/src/bpf ${CMAKE_SOURCE_DIR}/src/agent

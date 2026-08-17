@@ -212,13 +212,13 @@ static void print_proto_stats(const char *name, const struct lk_proto_stats *ps)
     fprintf(stderr,
             "latkit: %s sessions=%llu queries=%llu errors_sql=%llu "
             "parse_errors=%llu unknown=%llu replication=%llu compressed=%llu blind=%llu "
-            "monitor=%llu orphan=%llu push=%llu\n",
+            "monitor=%llu orphan=%llu push=%llu redirects=%llu\n",
             name, (unsigned long long)ps->sessions, (unsigned long long)ps->queries,
             (unsigned long long)ps->errors_sql, (unsigned long long)ps->parse_errors,
             (unsigned long long)ps->unknown_msgs, (unsigned long long)ps->replication_conns,
             (unsigned long long)ps->compressed_conns, (unsigned long long)ps->blind_conns,
             (unsigned long long)ps->monitor_conns, (unsigned long long)ps->orphan_msgs,
-            (unsigned long long)ps->pushes);
+            (unsigned long long)ps->pushes, (unsigned long long)ps->redirects);
     fprintf(stderr,
             "latkit: %s units_dropped resync=%llu close=%llu overflow=%llu prep_evictions=%llu\n",
             name, (unsigned long long)ps->units_dropped_resync,

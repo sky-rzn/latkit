@@ -29,7 +29,7 @@ set(FUZZ_SAN -O2 -g -fno-omit-frame-pointer
 set(FUZZ_INC
     ${CMAKE_SOURCE_DIR}/src/proto ${CMAKE_SOURCE_DIR}/src/proto/pg
     ${CMAKE_SOURCE_DIR}/src/proto/my ${CMAKE_SOURCE_DIR}/src/proto/http
-    ${CMAKE_SOURCE_DIR}/src/proto/s3
+    ${CMAKE_SOURCE_DIR}/src/proto/s3 ${CMAKE_SOURCE_DIR}/src/proto/redis
     ${CMAKE_SOURCE_DIR}/src/agent ${CMAKE_SOURCE_DIR}/src/bpf
     ${CMAKE_SOURCE_DIR}/src/norm)
 set(FUZZ_PROTO_SRC
@@ -43,7 +43,12 @@ set(FUZZ_PROTO_SRC
     ${CMAKE_SOURCE_DIR}/src/proto/http/http_frame.c ${CMAKE_SOURCE_DIR}/src/proto/http/http.c
     ${CMAKE_SOURCE_DIR}/src/proto/http/http_req.c ${CMAKE_SOURCE_DIR}/src/proto/http/http_resp.c
     ${CMAKE_SOURCE_DIR}/src/proto/http/http_route.c
-    ${CMAKE_SOURCE_DIR}/src/proto/s3/s3_dialect.c)
+    ${CMAKE_SOURCE_DIR}/src/proto/s3/s3_dialect.c
+    # The registry has held a fifth entry since PLAN-REDIS.md МR1, and every
+    # target that compiles registry.c needs the handler behind it. `fuzz_redis`
+    # — the framer's own target — is МR8's.
+    ${CMAKE_SOURCE_DIR}/src/proto/redis/redis_frame.c
+    ${CMAKE_SOURCE_DIR}/src/proto/redis/redis.c)
 set(FUZZ_CORE_SRC
     ${CMAKE_SOURCE_DIR}/src/agent/conn_table.c ${CMAKE_SOURCE_DIR}/src/agent/reassembly.c)
 # Since М4 the HTTP handler classifies through the route templater, and since М6

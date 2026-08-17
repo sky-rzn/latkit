@@ -11,7 +11,9 @@
  * РR8, РR14). МR3 gives an observation its identity and its labels — the
  * command table of РR4, the database of РR5 and the ACL user of РR6, all three
  * out of src/norm/norm_redis.c, plus the `mask_body` hook that keeps a password
- * out of every viewer.
+ * out of every viewer. МR4 adds what an observation's *outcome* is: the symbolic
+ * error and the redirect that is not one (РR7), the transaction interval (РR9),
+ * and the commands whose latency is the client's own choice (РR10).
  *
  * **Redis is a new protocol, not a dialect.** RESP has no heads, no statuses
  * and no routes, so the `struct lk_http_dialect` seam (РH8) does not apply and
@@ -235,11 +237,50 @@ struct redis_frame {
  *   AUTH    an `AUTH` / `HELLO … AUTH`: on success, the name parked in
  *           redis_conn.auth_user becomes the label
  *   RESET   a `RESET`: on `+RESET`, database 0 and user `default`, whatever
- *           they were */
-#define REDIS_U_SUB    (1 << 0)
-#define REDIS_U_SELECT (1 << 1)
-#define REDIS_U_AUTH   (1 << 2)
-#define REDIS_U_RESET  (1 << 3)
+ *           they were
+ *
+ * The three transaction bits are the same shape of rule for РR9's interval: a
+ * `MULTI` opens one only if the server says `+OK` (a nested `MULTI` is
+ * `-ERR MULTI calls can not be nested` and the first transaction survives
+ * untouched), and an `EXEC` closes one whatever it answers — the array it
+ * committed, an `-EXECABORT`, or the null that says a `WATCH` was broken.
+ *
+ *   MULTI   opens the interval at this command's first byte
+ *   EXEC    closes it at this reply's last byte
+ *   DISCARD ... and so does this, as `aborted` */
+#define REDIS_U_SUB     (1 << 0)
+#define REDIS_U_SELECT  (1 << 1)
+#define REDIS_U_AUTH    (1 << 2)
+#define REDIS_U_RESET   (1 << 3)
+#define REDIS_U_MULTI   (1 << 4)
+#define REDIS_U_EXEC    (1 << 5)
+#define REDIS_U_DISCARD (1 << 6)
+
+/* What a reply says about the command it closes — everything the observation and
+ * the two state machines need out of it, read once at the moment the value
+ * arrives (МR4). One struct rather than five out-parameters because a reply is
+ * sometimes read long before it is used: a value that overtook its own command
+ * (see below) is held in exactly this shape until the command shows up.
+ *
+ * `err_name` is a pointer into the static vocabulary of norm_redis.c and never
+ * into the wire, which is what makes "an error message never becomes a label" a
+ * property of the type rather than a promise: the sentence after the symbol
+ * holds the key that had the wrong type and the node a `MOVED` points at, and
+ * there is nowhere for it to be copied to. */
+struct redis_reply {
+    const char *err_name; /* the symbolic error (РR7); NULL = not a refusal */
+    __u64 end_ns;         /* the reply's last byte (Р13, and not its first: a
+                             17 MB `KEYS *` takes 212 events) */
+    __u32 bytes;          /* its whole size on the wire */
+    __u16 flags;          /* LK_QO_ERROR / LK_QO_CLIENT_ERR / LK_QO_QUEUED */
+    __u8 redirect;        /* enum lk_redis_redirect (РR7) */
+    bool err;             /* a refusal, which is what the session machine of МR3
+                             needs: `-WRONGPASS` moves no label */
+    bool null;            /* a null value — the one thing an `EXEC` says with no
+                             error at all: a broken `WATCH` answers `*-1` (RESP2)
+                             or `_` (RESP3), and that is an aborted transaction
+                             rather than a failed command (РR9) */
+};
 
 /* Replies that arrived before the command they answer, which sounds impossible
  * and is not: a command larger than the per-call capture budget (РR13 makes that
@@ -255,15 +296,6 @@ struct redis_frame {
  * is the realistic depth and four is the room for a pipeline of them; past that
  * the reply is an orphan and says so. */
 #define LK_REDIS_MAX_EARLY 4
-
-struct redis_early {
-    __u64 end_ns; /* the reply's last byte */
-    __u32 bytes;  /* its whole size on the wire */
-    bool err;     /* ... and whether it was a refusal, which is what the session
-                     machine of МR3 needs from it: a held reply is normally the
-                     answer to an over-long command, and an `AUTH` with a long
-                     password is exactly that shape (РR6) */
-};
 
 /* One command in flight. Deliberately small — the ring is 256 slots on every
  * connection that carries a command, and at the table's ceiling of 65536 that
@@ -333,9 +365,20 @@ struct redis_conn {
                          are the newest and their replies come last — which is what
                          makes a plain counter sufficient (РR3) */
 
-    struct redis_early early[LK_REDIS_MAX_EARLY]; /* replies that overtook their
+    struct redis_reply early[LK_REDIS_MAX_EARLY]; /* replies that overtook their
                                                      own command's publication */
     __u8 early_n;
+
+    /* The open transaction's first byte — the `MULTI`, not the first command
+     * inside it — or 0 for no transaction (РR9). What `latkit_txn_duration_
+     * seconds` measures on a Redis is `MULTI` … the reply to `EXEC`, which is
+     * the interval the application waited and the one a database's transaction
+     * family already means everywhere else in the agent.
+     *
+     * One stamp and no queue: `MULTI` inside `MULTI` is refused by the server, so
+     * a connection has at most one transaction open, and the commands in between
+     * are ordinary units that happen to be answered `+QUEUED`. */
+    __u64 txn_start_ns;
 
     bool sub;      /* the connection has subscribed, so an array whose first element
                       is a pub/sub kind word is a delivery or a confirmation rather
@@ -380,6 +423,23 @@ void redis_stream_hole(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, _
  * one. Half a verb is not a verb. */
 void redis_read_argv(const struct lk_msg *m, const __u8 *body, __u32 cap, __u32 max,
                      struct lk_redis_argv *v, __s64 *nelem);
+
+/* The first blank-delimited word of a *scalar* value's text (МR4). Two questions
+ * in one reader, because on the wire they are one shape:
+ *
+ *   - the **symbol** of an error, which is its identity (РR7): `-WRONGTYPE
+ *     Operation against…` and RESP3's `!21\r\nWRONGPASS invalid…` both yield the
+ *     first word and nothing after it. What follows is a sentence for a human
+ *     and holds a key, a slot, a node address — none of which may become a label.
+ *   - the **word** of a status, which is how a `+QUEUED` is told from an `+OK`
+ *     (РR9): a command inside a transaction is answered in microseconds and its
+ *     duration means nothing, and that answer is the only place on the wire that
+ *     says so.
+ *
+ * An empty token when the value is not scalar or the prefix does not hold a
+ * complete one — half a symbol is not a symbol, exactly as half a verb is not a
+ * verb in redis_read_argv. */
+struct lk_redis_arg redis_read_word(const struct lk_msg *m, const __u8 *body, __u32 cap);
 
 /* The `mask_body` hook of lk_proto_ops (РH3/РR6): blank the password in an
  * `AUTH` or a `HELLO … AUTH` before a viewer prints the body. Runs on the
