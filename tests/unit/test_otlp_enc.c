@@ -363,6 +363,53 @@ static void test_bhist_object_grid(void)
     pb_free(&pb);
 }
 
+/* The redis value grid (РR11) is the third one through the same encoder, and
+ * the check is the same one for the same reason — a distribution exported
+ * against somebody else's boundaries is silently wrong. Its bottom is where the
+ * point is: 8 B, four octaves below the default grid's first bound. */
+static void test_bhist_value_grid(void)
+{
+    struct lk_bhist h = {0};
+    struct lk_label lbl[1] = {{"cmd", "GET"}};
+    struct lk_metric_view v = {
+        .name = "latkit_redis_value_size_bytes",
+        .type = LK_MT_HIST_BYTES,
+        .labels = lbl,
+        .nlabels = 1,
+        .created_ns = CREATED,
+    };
+    struct pbuf pb;
+    struct field metric, hi, dp, counts, bounds;
+
+    lk_bhist_init(&h, LK_VHIST_MIN_LOG2, LK_VHIST_NBUCKETS);
+    lk_bhist_observe(&h, 4);            /* `:1\r\n`: the first cell */
+    lk_bhist_observe(&h, 512ull << 20); /* proto-max-bulk-len: overflow */
+
+    v.bhist = &h;
+    encode_one(&pb, &v);
+    EXPECT(find(pb.buf, pb.len, 2, &metric), "vhist: metric present");
+    EXPECT(find(metric.data, metric.len, 9, &hi), "vhist: Histogram (field 9) present");
+    EXPECT(find(hi.data, hi.len, 1, &dp), "vhist: data point present");
+    EXPECT(find(dp.data, dp.len, 6, &counts), "vhist: bucket_counts present");
+    EXPECT(counts.len == 8 * (LK_VHIST_NBUCKETS + 1), "vhist: 22 packed fixed64 counts");
+    EXPECT(find(dp.data, dp.len, 7, &bounds), "vhist: explicit_bounds present");
+    EXPECT(bounds.len == 8 * LK_VHIST_NBUCKETS, "vhist: 21 packed bounds");
+    {
+        const uint8_t *c = counts.data, *b = bounds.data;
+        uint64_t c0 = 0, clast = 0, b0 = 0, blast = 0;
+
+        memcpy(&c0, c, 8);
+        memcpy(&clast, c + 8 * LK_VHIST_NBUCKETS, 8);
+        memcpy(&b0, b, 8);
+        memcpy(&blast, b + 8 * (LK_VHIST_NBUCKETS - 1), 8);
+        EXPECT(c0 == 1, "vhist: bucket_counts[0]=1 (a 4-byte reply)");
+        EXPECT(clast == 1, "vhist: overflow cell=1 (512 MiB)");
+        EXPECT(as_double(b0) == 8.0, "vhist: first bound = 8 B");
+        EXPECT(as_double(blast) == 8388608.0, "vhist: last bound = 8 MiB");
+    }
+    pb_free(&pb);
+}
+
 /* --- span encoder (task 5.3, and the HTTP shape РH11 / М6) ---------------- */
 
 /* Decode one Span out of a freshly encoded pbuf. */
@@ -537,6 +584,7 @@ int main(void)
     test_hist();
     test_bhist();
     test_bhist_object_grid();
+    test_bhist_value_grid();
     test_span_db();
     test_span_http();
     printf(failures ? "\n%d FAILURES\n" : "\nall otlp encoder tests passed\n", failures);

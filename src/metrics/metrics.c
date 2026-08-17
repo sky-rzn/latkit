@@ -246,6 +246,98 @@ static void mx_http_obs(struct lk_metrics *m, const struct lk_proto_ops *ops,
     lk_reg_observe(m->reg, &ro);
 }
 
+/* One Redis command -> the redis profile's families (РR11, PLAN-REDIS.md МR5).
+ * Its own function for the reason mx_http_obs is: it shares almost nothing with
+ * either of the others. The identity is a command from a closed table rather
+ * than normalised text (so there is no normaliser call at all — риск 7's
+ * "cardinality is a gift here" made concrete), the outcome is a symbolic error
+ * rather than a SQLSTATE or a status, and the timings are two of the four.
+ *
+ * What the function is really about is three routings, and each one exists to
+ * keep a real number out of a place where it would be plausible and wrong:
+ *
+ *   - a `+QUEUED` inside a `MULTI` is counted and not timed (РR9). The server
+ *     wrote the command down in microseconds; the work happens at `EXEC`, and
+ *     the interval that means anything goes to latkit_txn_duration_seconds
+ *     through on_txn below;
+ *   - a blocking command's wait is timed *elsewhere* (РR10). `BLPOP key 30` is
+ *     an observation about the client's own patience, and one of them in the
+ *     general histogram decides the p99 of the whole instance;
+ *   - a `-MOVED` is counted as a redirect and not as an error (РR7). A
+ *     resharding cluster answers them continuously and every client follows
+ *     them; in errors_total they would report a healthy cluster as broken.
+ *
+ * The two labels come from lk_session, filled by the handler's state machine
+ * rather than by a startup packet, because in RESP both the database number and
+ * the ACL user are connection state that moves mid-stream (РR5/РR6). */
+static void mx_redis_obs(struct lk_metrics *m, const struct lk_proto_ops *ops,
+                         const struct lk_session *s, const struct lk_query_obs *o)
+{
+    struct lk_reg_obs ro = {0};
+    uint16_t fl = o->flags;
+    double dur = span_seconds(o->ts_start_ns, o->ts_complete_ns);
+
+    ro.profile = LK_PROF_REDIS;
+    ro.proto = ops->name;
+    ro.kind = o->kind;
+    /* "-" rather than "" for the same reason the http profile does it: an empty
+     * label value means "absent" to Prometheus, and these are present. The
+     * database is `?` until a `SELECT` says otherwise on a connection joined
+     * mid-stream (РR5) — the handler's word, printed as it stands. */
+    ro.db = s->database[0] ? s->database : "-";
+    ro.user = s->user[0] ? s->user : "-";
+    ro.qcode = (fl & LK_QO_ERROR) ? LK_QCODE_ERROR : LK_QCODE_OK;
+    ro.dcode = (fl & LK_QO_ERROR) ? LK_CODE_ERROR : LK_CODE_OK;
+    /* The symbolic failure (РR7), already folded to the closed vocabulary by the
+     * handler — so it is a bounded label and no byte of the server's sentence,
+     * which names the key or the node, can reach a series. A redirect is an
+     * error reply and is not a failure: it carries LK_QO_CLIENT_ERR, has its own
+     * counter, and is absent from this one. */
+    if ((fl & LK_QO_ERROR) && o->err_name)
+        ro.err_code = o->err_name;
+    if (o->redis) {
+        ro.redirect = o->redis->redirect;
+        ro.has_depth = o->redis->pipeline_depth > 0;
+        ro.depth = o->redis->pipeline_depth;
+    }
+
+    if (fl & LK_QO_BLOCKING) {
+        ro.has_block = true;
+        ro.block_seconds = dur;
+    } else if (!(fl & LK_QO_QUEUED)) {
+        ro.has_duration = true;
+        ro.dur_seconds = dur;
+    }
+
+    ro.bytes_in = o->bytes_in;
+    ro.bytes_out = o->bytes_out;
+    /* The size distribution is of the *reply*: what the command shipped back is
+     * the number an operator plots, and it is also where a `KEYS *` or an
+     * unbounded `LRANGE` shows up. A reply of zero bytes cannot happen — the
+     * shortest RESP value is three — so there is no "empty" case to exclude,
+     * unlike S3's; a zero here means the reply was never seen, and that unit
+     * carries no size rather than a wrong one.
+     *
+     * A `+QUEUED` is excluded for the same reason its duration is (РR9): those
+     * nine bytes are the server's acknowledgement, not the value the command
+     * returned — that arrives later, inside the array the `EXEC` answers, and
+     * counting the receipt as the value would fill the first bucket with every
+     * transaction ever run. */
+    ro.has_size = o->bytes_out > 0 && !(fl & LK_QO_QUEUED);
+    ro.size_bytes = o->bytes_out;
+
+    /* The identity (РR4): a value from a closed table, in the dictionary slot.
+     * No `op` — the command *is* the operation, subcommand included. A unit that
+     * lost its command (a resync, a connection joined mid-batch) folds into
+     * cmd="other" rather than inventing a name. */
+    if (o->route && o->route_len)
+        ro.label = o->route, ro.fp = o->route_fp;
+    else
+        ro.force_other = true;
+
+    lk_reg_observe(m->reg, &ro);
+}
+
 /* One observation -> the registry families. The flag mapping (Р23/Р25/Р28):
  *   - CANCEL         -> code=canceled, no latency, query="other";
  *   - ABORTED        -> code=aborted, no latency (killed by an earlier error);
@@ -263,6 +355,10 @@ static void mx_on_query(void *ctx, const struct lk_conn *c, const struct lk_sess
     sess_store(m, c->cookie, s->database, s->user, ops->name);
     if (ops->profile == LK_PROTO_PROF_HTTP || ops->profile == LK_PROTO_PROF_S3) {
         mx_http_obs(m, ops, s, o);
+        return;
+    }
+    if (ops->profile == LK_PROTO_PROF_REDIS) {
+        mx_redis_obs(m, ops, s, o);
         return;
     }
 
@@ -285,20 +381,6 @@ static void mx_on_query(void *ctx, const struct lk_conn *c, const struct lk_sess
         ro.dcode = LK_CODE_OK;
         ro.has_duration = true;
     }
-
-    /* Two Redis outcomes whose *duration* is not a measurement of the server
-     * (РR9/РR10), counted like any other observation and left out of the
-     * latency distribution: a `+QUEUED` inside a `MULTI` measures how fast the
-     * server can write a command down, and a `BLPOP key 30` measures how long
-     * the client said it was willing to wait. Either one in the general
-     * histogram decides its p99 and describes nothing.
-     *
-     * Here rather than in the handler because "which family does this belong
-     * to" is the facade's question — and here rather than in a redis branch
-     * because there is not one yet: МR5 gives Redis a profile with a blocking
-     * family of its own, and this is where that branch will be. */
-    if (fl & (LK_QO_QUEUED | LK_QO_BLOCKING))
-        ro.has_duration = false;
 
     if (ro.has_duration) {
         /* Duration model (Р25): pipelined units share one Z, so their honest
@@ -342,7 +424,13 @@ static void mx_on_txn(void *ctx, const struct lk_conn *c, __u64 start_ns, __u64 
      * own ops if the txn fired before any session/query was cached. */
     const char *proto = (e && e->proto) ? e->proto : lk_conn_proto(c)->name;
 
-    lk_reg_observe_txn(m->reg, e ? e->db : "", e ? e->user : "", proto, final_status == 'E', dur);
+    /* The profile travels with the name because it is what the name is interned
+     * under (РR9): a Redis connection whose very first observation is a
+     * `MULTI`…`EXEC` — a script that opens one before doing anything else — would
+     * otherwise pin proto="redis" to the query profile, and every latkit_redis_*
+     * family on that agent would print under the SQL names instead. */
+    lk_reg_observe_txn(m->reg, e ? e->db : "", e ? e->user : "", proto,
+                       (uint8_t)lk_conn_proto(c)->profile, final_status == 'E', dur);
 }
 
 const struct lk_query_sink *lk_metrics_query_sink(struct lk_metrics *m)

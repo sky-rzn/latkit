@@ -66,6 +66,11 @@ enum lk_query_kind {
                       body. Kept in the same enum rather than given a parallel one
                       because every consumer downstream already switches on it —
                       enum lk_qkind in metrics.h mirrors it value for value. */
+    LK_Q_COMMAND,  /* one Redis command and the value that answered it (РR3/РR11,
+                      PLAN-REDIS.md МR5). A command is neither a statement nor an
+                      exchange: it has no text, no rows and no status, and the
+                      profile it reports under says so by leaving those families
+                      out. Mirrored as LK_QK_COMMAND. */
 };
 
 /* lk_query_obs.flags */
@@ -160,16 +165,25 @@ struct lk_http_obs {
  * and NULL for every other protocol, exactly as lk_http_obs is, so the database
  * path keeps the struct it had.
  *
- * One field, and it is the one RESP makes a first-class fact: **how many
- * commands arrived in the same syscall as this one**. On PG a pipelined batch is
- * unusual enough to be a flag; on Redis batching is what every client library
- * does by default, the depth spans 1…100 in the МR0 corpus, and it is the
- * difference between "the server was slow" and "this command waited behind
- * ninety-nine of its own". МR5 makes it latkit_redis_pipeline_depth and МR6 the
+ * The first field is the one RESP makes a first-class fact: **how many commands
+ * arrived in the same syscall as this one**. On PG a pipelined batch is unusual
+ * enough to be a flag; on Redis batching is what every client library does by
+ * default, the depth spans 1…100 in the МR0 corpus, and it is the difference
+ * between "the server was slow" and "this command waited behind ninety-nine of
+ * its own". МR5 makes it latkit_redis_pipeline_depth and МR6 the
  * `redis.pipeline.depth` span attribute; the measurement is here because only
- * the handler sees the call boundaries the framer marks for it. */
+ * the handler sees the call boundaries the framer marks for it.
+ *
+ * The second is the answer that is an error in syntax and routine cluster
+ * operation in fact (РR7): it travels beside `err_name` rather than inside it
+ * because a `-MOVED` must be counted *somewhere* — an operator wants to see a
+ * resharding cluster — and that somewhere may not be the error rate, or every
+ * healthy cluster reports as broken. Hence its own family with its own label,
+ * and no entry in latkit_redis_errors_total. */
 struct lk_redis_obs {
     __u32 pipeline_depth; /* commands in this one's batch, >= 1 */
+    __u8 redirect;        /* enum lk_redis_redirect (norm_redis.h), mirrored by
+                             enum lk_redirect in metrics.h; 0 = not a redirect */
 };
 
 /* One completed unit of work, whatever the protocol calls it: a query, a COPY,
@@ -393,6 +407,7 @@ enum lk_proto_profile {
     LK_PROTO_PROF_QUERY = 0, /* latkit_query_*{query,db,user} */
     LK_PROTO_PROF_HTTP,      /* latkit_http_*{route,method,host,user} */
     LK_PROTO_PROF_S3,        /* latkit_s3_*{op,method,bucket,user} (РS7, МS2) */
+    LK_PROTO_PROF_REDIS,     /* latkit_redis_*{cmd,db,user} (РR11, МR5) */
 };
 
 /* --- the HTTP dialect seam (РH8) ------------------------------------------ */

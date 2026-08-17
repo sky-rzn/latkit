@@ -370,6 +370,10 @@ static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct redis_conn *
      * only for a unit whose batch has since been superseded (РR3). */
     struct lk_redis_obs rr = {
         .pipeline_depth = seq >= rc->batch_seq0 ? rc->batch_n : u->depth,
+        /* The redirect travels to the facade as well as to the stats line
+         * (МR5): it has a family of its own, and the whole of РR7 is that it is
+         * counted *somewhere* and nowhere near the error rate. */
+        .redirect = r->redirect,
     };
     __u32 cmd_len;
     const char *cmd = lk_redis_cmd_name(u->cmd, &cmd_len);
@@ -387,12 +391,12 @@ static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct redis_conn *
         .bytes_in = u->bytes,
         .bytes_out = r->bytes,
         .redis = &rr,
-        /* МR5 gives Redis LK_Q_COMMAND and a profile of its own (РR11). Until
-         * then a command is the closest thing the enum already has — one
-         * statement, one round trip, no prepare and no cursor — and the value is
-         * mirrored into metrics.h, so inventing one here would have to be
-         * mirrored too, one milestone before the families that read it exist. */
-        .kind = LK_Q_SIMPLE,
+        /* A command is its own kind of work (РR11, МR5): not a statement, not
+         * an exchange. The value is mirrored into metrics.h as LK_QK_COMMAND,
+         * and the redis profile has no `kind` axis to print it on — RESP has
+         * one shape of work and the label would be a constant. What reads it is
+         * every consumer that switches on the observation's shape. */
+        .kind = LK_Q_COMMAND,
         /* The identity (РR4), in the slot S3 puts an operation name in: a value
          * from a closed table, so the `cmd` label's cardinality is a
          * compile-time constant and the top-K dictionary downstream never has to

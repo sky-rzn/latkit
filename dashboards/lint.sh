@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# dashboards/lint.sh — structural + nomenclature lint for the six latkit
-# dashboards (Р42, РH9). Runs in CI (job dashboards-lint) with only jq installed:
-# no build, no root, no BPF.
+# dashboards/lint.sh — structural + nomenclature lint for the seven latkit
+# dashboards (Р42, РH9, РR11). Runs in CI (job dashboards-lint) with only jq
+# installed: no build, no root, no BPF.
 #
 # Checks, per dashboards/latkit-*.json:
 #   1. valid JSON;
@@ -12,10 +12,13 @@
 #      datasource template var exists, and every panel/target/annotation that
 #      names a datasource points at ${datasource} (no hardcoded uid);
 #   5. every rate()/_bucket window is $__rate_interval, never a literal [30s];
-#   6. no unbounded fan-out: an expr that groups `by (... query ...)` or
-#      `by (... route ...)` must be bounded by topk(...) or filtered to a single
-#      query=~"$query" / route=~"$route". Both labels come from the same top-K
-#      dictionary and both are unbounded in a dashboard that graphs them all;
+#   6. no unbounded fan-out: an expr that groups `by (... query ...)`,
+#      `by (... route ...)` or `by (... cmd ...)` must be bounded by topk(...) or
+#      filtered to a single query=~"$query" / route=~"$route" / cmd=~"$cmd".
+#      The three come from the same top-K dictionary; `query` and `route` are
+#      unbounded in a dashboard that graphs them all, and `cmd` is bounded by a
+#      closed table of ~250 values (РR4), which is not a cardinality risk and is
+#      still an unreadable graph;
 #   7. every metric named in any PromQL expr (targets, annotations, template
 #      label_values) exists in the agent's metric nomenclature — the set of
 #      metric-name string literals in src/. Rename a metric in the code and
@@ -59,7 +62,7 @@ JQ_DS='.. | objects | select(has("datasource")) | .datasource'
 
 shopt -s nullglob
 files=("$here"/latkit-*.json)
-[ ${#files[@]} -eq 6 ] || err "expected 6 dashboards, found ${#files[@]}"
+[ ${#files[@]} -eq 7 ] || err "expected 7 dashboards, found ${#files[@]}"
 
 for f in "${files[@]}"; do
     base="$(basename "$f" .json)"
@@ -108,7 +111,7 @@ for f in "${files[@]}"; do
         fi
 
         # 6. unbounded fan-out over a top-K label
-        for lbl in query route; do
+        for lbl in query route cmd; do
             if grep -qE "by \\([^)]*$lbl" <<<"$expr"; then
                 if ! grep -qE "topk\\(|$lbl=~" <<<"$expr"; then
                     err "$base: 'by ($lbl)' not bounded by topk()/$lbl=~: $expr"

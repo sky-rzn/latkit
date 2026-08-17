@@ -87,6 +87,28 @@ void lk_reg_free(struct lk_registry *r);
  *   - latkit_s3_object_size_bytes{op,method,bucket,user,proto}   (if has_size)
  *   - latkit_s3_internal_requests_total                          (if internal)
  *
+ *   LK_PROF_REDIS (redis, PLAN-REDIS.md МR5/РR11) — the same engine again under
+ *   the cache's nouns: the dictionary slot is the command from a closed table
+ *   (РR4), the dim slots the database number and the ACL user (РR5/РR6), the
+ *   error label the symbolic error (РR7). Three families exist nowhere else,
+ *   and each of them keeps a number out of a place where it would be wrong:
+ *   - latkit_redis_commands_total{cmd,db,user,proto,code}        (always)
+ *   - latkit_redis_command_duration_seconds{cmd,db,user,proto,code} (if has_duration)
+ *   - latkit_redis_blocking_seconds{cmd,db,user,proto}           (if has_block)
+ *   - latkit_redis_errors_total{error,db,user,proto}             (if err_code != NULL)
+ *   - latkit_redis_redirects_total{kind,proto}                   (if redirect)
+ *   - latkit_redis_bytes_total{cmd,db,user,proto,direction}
+ *   - latkit_redis_value_size_bytes{cmd,db,user,proto}           (if has_size)
+ *   - latkit_redis_pipeline_depth{proto}                         (if has_depth)
+ *
+ *   `code` on the first two is the *outcome* (ok|error|aborted|canceled) rather
+ *   than a status class: RESP has no statuses, and a command that was never
+ *   answered is a fact the counter has to be able to state. A profile keyed this
+ *   way counts every observation, including the ones with no duration — a
+ *   `+QUEUED` inside a `MULTI` and a `BLPOP` that waited for the client's own
+ *   thirty seconds are both commands and neither is a latency (РR9/РR10).
+ *
+
  * РH9 lists the http label sets without `user`, and РS7 the s3 ones without
  * `user` and `method`; they are here because the series identity must stay
  * unique whatever `--http-user basic` / `--s3-user off` does — a family printed
@@ -133,6 +155,17 @@ struct lk_reg_obs {
     bool truncated;           /* text was a capture-budget/label prefix */
     const char *err_code;     /* SQLSTATE / HTTP status >= 400; non-NULL -> the
                                  profile's error counter */
+    /* --- redis (РR7/РR10/РR3, МR5) — three facts no other profile has ------
+     * Separate fields rather than reuses, because each of them is precisely a
+     * number that must *not* go where the obvious existing field would put it:
+     * a redirect is not an error, a blocking wait is not a latency, and a batch
+     * depth is not a property of any one command's series. */
+    uint8_t redirect;    /* enum lk_redirect; non-zero -> the redirect counter and
+                            no entry in the error one */
+    bool has_block;      /* the unit's duration is a wait the client asked for */
+    double block_seconds;
+    bool has_depth;      /* the observation knows its batch depth */
+    uint32_t depth;      /* ... commands that arrived in one syscall with it */
 };
 
 /* Fan one observation into all the families above, applying cardinality control. */
@@ -140,9 +173,17 @@ void lk_reg_observe(struct lk_registry *r, const struct lk_reg_obs *o);
 
 /* Record one transaction span into latkit_txn_duration_seconds{db,user,proto,
  * status} (status ok = T->I, aborted = E->I, Р16). db/user are the session
- * labels; proto as in lk_reg_obs (NULL -> "pg"). */
+ * labels; proto as in lk_reg_obs (NULL -> "pg").
+ *
+ * The family is the one place where two profiles share a name (РR9): a `MULTI`
+ * … `EXEC` is a transaction in exactly the sense PG's is, so Redis reports it
+ * here unchanged rather than under a fourth name that would mean the same thing.
+ * `profile` is therefore taken as well as `proto` — it is what the protocol name
+ * is interned *under*, and a connection whose first observation is a transaction
+ * would otherwise pin `redis` to the query profile and print its whole block
+ * with SQL family names. */
 void lk_reg_observe_txn(struct lk_registry *r, const char *db, const char *user, const char *proto,
-                        bool aborted, double dur_seconds);
+                        uint8_t profile, bool aborted, double dur_seconds);
 
 /* Prometheus text exposition of every registry-owned family, each as a
  * HELP/TYPE block followed by its series in a stable (sorted) order — a valid

@@ -33,7 +33,7 @@ carry the `_total` suffix, per Prometheus convention.
 | `latkit_query_errors_total` | counter | `sqlstate, db, user, proto` — **no** `query` label (Р23) |
 | `latkit_queries_truncated_total` | counter | — observations whose SQL was a budget-truncated prefix |
 | `latkit_queries_other_total` | counter | — observations folded into `query="other"` (top-K honesty) |
-| `latkit_txn_duration_seconds` | histogram | `db, user, proto, status` — `status`=`ok\|aborted` (PG: `T→I` vs `E→I` at `ReadyForQuery`; MySQL: the `SERVER_STATUS_IN_TRANS` edge) |
+| `latkit_txn_duration_seconds` | histogram | `db, user, proto, status` — `status`=`ok\|aborted` (PG: `T→I` vs `E→I` at `ReadyForQuery`; MySQL: the `SERVER_STATUS_IN_TRANS` edge; Redis: `MULTI` … the reply to `EXEC`, РR9) |
 
 `code="error"` in the duration histogram is deliberately just `ok|error`, not
 the raw SQLSTATE: a SQLSTATE label in the `query × db × user` product would
@@ -189,6 +189,92 @@ document are payload too, and none of them is an object. `CopyObject` and
 both this histogram and `latkit_s3_bytes_total`, which is the same documented
 blind spot.
 
+### Redis metrics (РR11, PLAN-REDIS.md МR5)
+
+A Redis port (`--port 6379=redis`) reports under a fourth profile. The engine is
+the same one again — one dictionary, one doorkeeper, one dimension limit — but
+this profile is not the http shape under other nouns: RESP has no statuses, no
+rows and no request body, and a command's *duration* means three different
+things depending on how the server answered it.
+
+| Series | Type | Labels |
+|---|---|---|
+| `latkit_redis_commands_total` | counter | `cmd, db, user, proto, code` — `code`=`ok\|error\|aborted\|canceled` |
+| `latkit_redis_command_duration_seconds` | histogram | `cmd, db, user, proto, code` — `code`=`ok\|error` |
+| `latkit_redis_blocking_seconds` | histogram | `cmd, db, user, proto` |
+| `latkit_redis_errors_total` | counter | `error, db, user, proto` — the symbolic token, **no** `cmd` |
+| `latkit_redis_redirects_total` | counter | `kind, proto` — `kind`=`moved\|ask` |
+| `latkit_redis_bytes_total` | counter | `cmd, db, user, proto, direction` |
+| `latkit_redis_value_size_bytes` | histogram | `cmd, db, user, proto` — the value grid below |
+| `latkit_redis_pipeline_depth` | histogram | `proto` |
+| `latkit_redis_push_total` | counter | `proto` — a parser counter (see below) |
+| `latkit_txn_duration_seconds` | histogram | `db, user, proto, status` — **the existing family**, unchanged |
+
+Six things are worth knowing, and each is a decision rather than a convention:
+
+- **`cmd` is a table lookup, and the identity includes the subcommand** (РR4).
+  `CONFIG|GET`, `XINFO|STREAM`, `CLIENT|LIST` are single labels; for every other
+  command the second array element is a *key* and never reaches a label at any
+  setting. Cardinality is a compile-time constant (~250 values plus `other`), so
+  unlike `route` this label needs no top-K reasoning to stay bounded — the
+  dictionary is underneath it and simply never fills. `cmd="other"` therefore
+  reads like `op="other"` on S3: not "the classifier lost" but "the table has
+  aged" — a module command, a fork's own admin verb, or a new Redis release.
+- **`db` and `user` are connection state, not a startup packet** (РR5/РR6).
+  Both take the dimension slots PG fills from its startup message, and both are
+  filled here by a state machine that moves a label only when the *server*
+  accepts the command: `SELECT 16` is an error and changes nothing,
+  `AUTH u wrongpass` is `-WRONGPASS` and changes nothing. A connection joined
+  mid-stream carries `db="?"` until a `SELECT` says otherwise — `"0"` would be a
+  guess, and the whole family would be quietly wrong on a synthetic connection.
+  The password half of `AUTH` is never read, and `--redis-user off` makes `user`
+  the constant `-`. `max_session_dims` stays at its default 32: databases are
+  ≤ 16 and ACL users are a handful (risk 7 of the plan).
+- **Three durations, three homes.** `latkit_redis_command_duration_seconds` is
+  work the server did. `latkit_redis_blocking_seconds` is the timeout the
+  *client* chose — `BLPOP key 30` is a thirty-second observation about somebody
+  else's traffic (РR10) — and one of those in the general histogram decides the
+  p99 of the instance. A command answered `+QUEUED` inside a `MULTI` has no
+  duration at all (РR9): it is counted in `commands_total` and appears in no
+  histogram, because what it measures is how fast the server can write a command
+  down. The interval that *does* mean something there is `MULTI` … the reply to
+  `EXEC`, and it goes to `latkit_txn_duration_seconds` — the one family two
+  profiles feed, printed once, keyed by `proto`, because a Redis transaction is a
+  transaction in exactly the sense PG's is.
+- **The failure has a symbol and the redirect is not one** (РR7). `error` is the
+  first token of the reply (`WRONGTYPE`, `NOSCRIPT`, `NOAUTH`, `OOM`, `LOADING`,
+  …) folded to a closed vocabulary; the sentence after it holds the key that had
+  the wrong type and the node a `MOVED` points at, and it reaches no output.
+  `-MOVED` and `-ASK` are error replies on the wire and ordinary cluster
+  operation in fact, so they carry `LK_QO_CLIENT_ERR` (the flag a 4xx carries in
+  HTTP), land in `latkit_redis_redirects_total{kind}` and appear in no error
+  family — in one, a resharding cluster would be permanently red. `-MISCONF` and
+  `-LOADING` are the opposite case and stay errors: that is a server refusing to
+  work.
+- **Values get a third octave grid**: `le` = 8 B … 8 MiB (21 buckets), against
+  the HTTP grid's 64 B … 1 GiB and the object grid's 1 KiB … 1 TiB. Half of what
+  a Redis holds is smaller than the HTTP grid's *first* bucket — a counter, a
+  flag, a session id — so on that grid the median of every real workload is
+  cell 0 and the distribution says nothing. The sample is the reply's size on the
+  wire, minus the `+QUEUED` receipts, which are not values.
+  `latkit_redis_pipeline_depth` reuses the same machine for something that is not
+  a size at all: octaves 1 … 256 commands per syscall, sampled **per command**,
+  so `le="1"` is "this command travelled alone" and the p50 answers "did the
+  median command wait behind its own batch" (РR3).
+- **`latkit_redis_push_total` is a parser counter, not a profile family.** A
+  pub/sub delivery, a RESP3 push and a client-side-caching invalidation answer no
+  command (РR8), so there is no observation to hang them on; they are published
+  by the same provider as `latkit_parse_errors_total` and the rest of the
+  per-protocol parser counters. Nothing was lost when one is counted — the
+  opposite: a queue that let a push close a unit would mis-time every later
+  command on that connection.
+
+Deliberately absent, and each absence is a family that would have been noise:
+no `rows` (a reply is one value), no TTFB (a reply has no first row to arrive
+early — the family would always equal the duration), no upload interval (there
+is no request body separate from the command), no `status` class, and no
+`method` beside `cmd`.
+
 ### Connection and self metrics (Р27)
 
 | Series | Type | Source |
@@ -297,14 +383,26 @@ live `lk_query_obs` during the `on_query` callback (it dangles afterwards).
 
 ## Observation profiles (РH10)
 
-One registry, three vocabularies. The cardinality machinery — the top-K
+One registry, four vocabularies. The cardinality machinery — the top-K
 dictionary, the doorkeeper, the `(db,user)` limit, the fold into `other`, the
 OTLP iterator — is written once and is protocol-blind; what a profile supplies
 is a family-name set, a label-key set and a mask of which families an
 observation touches (`src/metrics/registry.c`, `struct reg_profile`). `pg` and
-`mysql` use the `query` profile, `http` the `http` one, and `s3` the third
+`mysql` use the `query` profile, `http` the `http` one, `s3` the third
 (РS7) — which was added by adding a table row, one grid constant and a counter,
-and touched no part of the engine at all.
+and touched no part of the engine at all — and `redis` the fourth (РR11).
+
+The redis row is the one that made the engine grow, and it is worth naming what
+by: **an observation that is counted and deliberately not timed.** Until it,
+every profile's total counter was reached only through the duration path, so
+"how many" and "how long" were the same walk. A `+QUEUED` command and a `BLPOP`
+are neither aborted nor canceled — they happened, they have bytes and an outcome
+— and their duration is not the server's (РR9/РR10). So the slot-keyed counter
+now resolves its dictionary slot before the duration branch, and the duration
+histogram skips a series that never recorded one, which no other profile can
+produce. Two families are keyed by the protocol alone for the first time as
+well (`_redirects_total`, `_pipeline_depth`): what they measure is a fact about
+the cluster and about a syscall, not about any one command's series.
 
 Two properties fall out of that and are worth stating, because both are tested:
 

@@ -68,8 +68,13 @@ struct series {
      * per-class request tally, the two byte counters and the second and third
      * histograms. A PG series pays 56 bytes of zeroes for them next to its own
      * ~700 — the alternative was a second series type and a second hash table,
-     * which is a lot of machinery to save a cache line. */
-    uint64_t cls[LK_N_SCLASSES]; /* latkit_http_requests_total, summed over code */
+     * which is a lot of machinery to save a cache line.
+     *
+     * `tally` is the profile's total counter split along its own outcome axis:
+     * the status class for http/s3, the outcome code for redis (МR5). One array
+     * because the two axes are the same shape — a small closed set of values,
+     * one series each — and the profile row says which vocabulary reads it. */
+    uint64_t tally[LK_N_SCLASSES]; /* f_total, summed over the duration code */
     uint64_t bytes_in, bytes_out;
     struct lk_hist *upload; /* latkit_http_request_upload_seconds */
     struct lk_bhist *size;  /* latkit_http_response_size_bytes */
@@ -95,7 +100,11 @@ struct dim {
  * the escaping, the OTLP views — is written once and reads the table. */
 enum {
     RF_QTOTAL = 1u << 0,    /* latkit_queries_total{db,user,proto,kind,code} */
-    RF_RTOTAL = 1u << 1,    /* latkit_http_requests_total{...,status}: slot-keyed */
+    RF_TOTAL = 1u << 1,     /* the slot-keyed total counter, split along the
+                               profile's own outcome axis: latkit_http_requests_
+                               total{...,status} / latkit_redis_commands_total
+                               {...,code}. Unlike RF_QTOTAL it is recorded for
+                               observations that carry no duration too (МR5) */
     RF_DURATION = 1u << 2,  /* the latency histogram (every profile has one) */
     RF_ROWS = 1u << 3,      /* latkit_query_rows_total */
     RF_FIRST_ROW = 1u << 4, /* second histogram, opt-in (cfg.first_row_hist) */
@@ -103,11 +112,20 @@ enum {
     RF_ERRORS = 1u << 6,    /* the error-code counter */
     RF_TRUNCATED = 1u << 7, /* latkit_queries_truncated_total */
     RF_OTHER = 1u << 8,     /* latkit_queries_other_total */
-    RF_TXN = 1u << 9,       /* latkit_txn_duration_seconds */
+    RF_TXN = 1u << 9,       /* latkit_txn_duration_seconds — printed by the profile
+                               that owns the family, for every protocol that fed
+                               it: one name, one HELP/TYPE block (РR9) */
     RF_UPLOAD = 1u << 10,   /* latkit_http_request_upload_seconds */
     RF_BYTES = 1u << 11,    /* latkit_http_bytes_total{direction} */
-    RF_SIZE = 1u << 12,     /* latkit_http_response_size_bytes / _s3_object_size_bytes */
+    RF_SIZE = 1u << 12,     /* latkit_http_response_size_bytes / _s3_object_size_bytes
+                               / _redis_value_size_bytes */
     RF_INTERNAL = 1u << 13, /* latkit_s3_internal_requests_total (РS2) */
+    RF_BLOCKING = 1u << 14, /* latkit_redis_blocking_seconds (РR10) — the second
+                               histogram's storage again, holding the one duration
+                               that is the client's choice rather than the
+                               server's work */
+    RF_REDIRECT = 1u << 15, /* latkit_redis_redirects_total{kind} (РR7) */
+    RF_DEPTH = 1u << 16,    /* latkit_redis_pipeline_depth (РR3) */
 };
 
 struct reg_family {
@@ -124,13 +142,37 @@ struct reg_profile {
      * still the HTTP verb (`method="PUT"`), because the fingerprint covers both
      * exactly as it does for a route. */
     const char *k_slot, *k_op, *k_db, *k_user, *k_err;
+    /* f_total's outcome axis (МR5): the label key, and which of the two closed
+     * vocabularies its values come from. `status="2xx"` for an exchange whose
+     * outcome the protocol states as a number, `code="ok"` for a command whose
+     * outcome is the four states an observation can end in. */
+    const char *k_total;
+    bool total_qcode; /* true: index by enum lk_qcode, print qcode_str */
     /* The octave grid of f_size (hist.h): which one is a property of what the
-     * family measures — an HTTP response body and an S3 object are different
-     * questions with different extents. 0 = the default (РH9) grid. */
+     * family measures — an HTTP response body, an S3 object and a Redis value
+     * are three questions with three extents. 0 = the default (РH9) grid. */
     uint8_t size_min_log2, size_nbuckets;
     struct reg_family f_total, f_dur, f_rows, f_second, f_err, f_upload, f_bytes, f_size;
-    struct reg_family f_internal;
+    struct reg_family f_internal, f_redirect, f_depth;
 };
+
+/* The tally array serves both axes, so the wider one has to be the storage. */
+_Static_assert((int)LK_N_QCODES <= (int)LK_N_SCLASSES,
+               "series.tally must hold either outcome axis");
+
+/* The values of f_total's axis, and how many there are. */
+static const char *sclass_str(uint32_t c);
+static const char *qcode_str(uint32_t c);
+
+static inline uint32_t total_axis_n(const struct reg_profile *pf)
+{
+    return pf->total_qcode ? LK_N_QCODES : LK_N_SCLASSES;
+}
+
+static inline const char *total_axis_str(const struct reg_profile *pf, uint32_t i)
+{
+    return pf->total_qcode ? qcode_str(i) : sclass_str(i);
+}
 
 static const struct reg_profile profiles[LK_N_PROFILES] = {
     [LK_PROF_QUERY] =
@@ -151,12 +193,13 @@ static const struct reg_profile profiles[LK_N_PROFILES] = {
     [LK_PROF_HTTP] =
         {
             .families =
-                RF_RTOTAL | RF_DURATION | RF_TTFB | RF_ERRORS | RF_UPLOAD | RF_BYTES | RF_SIZE,
+                RF_TOTAL | RF_DURATION | RF_TTFB | RF_ERRORS | RF_UPLOAD | RF_BYTES | RF_SIZE,
             .k_slot = "route",
             .k_op = "method",
             .k_db = "host",
             .k_user = "user",
             .k_err = "code",
+            .k_total = "status",
             .f_total = {"latkit_http_requests_total",
                         "HTTP exchanges observed, by route and status class."},
             .f_dur = {"latkit_http_request_duration_seconds",
@@ -192,13 +235,14 @@ static const struct reg_profile profiles[LK_N_PROFILES] = {
      * `rows` and `txn` are off: an object store has neither. */
     [LK_PROF_S3] =
         {
-            .families = RF_RTOTAL | RF_DURATION | RF_TTFB | RF_ERRORS | RF_UPLOAD | RF_BYTES |
+            .families = RF_TOTAL | RF_DURATION | RF_TTFB | RF_ERRORS | RF_UPLOAD | RF_BYTES |
                         RF_SIZE | RF_INTERNAL,
             .k_slot = "op",
             .k_op = "method",
             .k_db = "bucket",
             .k_user = "user",
             .k_err = "s3code",
+            .k_total = "status",
             .size_min_log2 = LK_OHIST_MIN_LOG2,
             .size_nbuckets = LK_OHIST_NBUCKETS,
             .f_total = {"latkit_s3_requests_total",
@@ -221,6 +265,71 @@ static const struct reg_profile profiles[LK_N_PROFILES] = {
             .f_internal = {"latkit_s3_internal_requests_total",
                            "Requests to the server's own API (/minio/...): counted here and "
                            "reported in no other family (РS2)."},
+        },
+    /* The Redis profile (РR11, PLAN-REDIS.md МR5). A fourth row, and the engine
+     * below it is again untouched — but this one is not the http shape under
+     * different nouns, because a cache is not a request/response service with a
+     * status line. What it does *not* have is as much of the design as what it
+     * does: no `rows` (a reply is one value), no TTFB (a reply has no first row
+     * to arrive early — reporting one would put a family on the dashboard that
+     * always equals the duration), no upload (there is no request body separate
+     * from the command), no status class (RESP has no statuses), and no `method`
+     * beside the slot (the command *is* the identity; РR4's subcommand is part
+     * of it, so `CONFIG|GET` is one slot and not `CONFIG` split by a verb).
+     *
+     * What it has instead is four decisions, each of them a number kept out of a
+     * place where it would be plausible and wrong:
+     *
+     *   - **the total counter is keyed by outcome, and counts the untimed.** A
+     *     `+QUEUED` inside a `MULTI` (РR9) and a `BLPOP` that waited out the
+     *     client's own timeout (РR10) are commands and are counted as such; what
+     *     they are not is latencies, and the duration histogram never sees them;
+     *   - **the blocking wait has a family of its own** (РR10). It is measured —
+     *     an application waiting 30 s on an empty list is a fact about that
+     *     application — in a place where it cannot decide the p99 of a `GET`;
+     *   - **the redirect has a family of its own** (РR7): `-MOVED` and `-ASK`
+     *     are error replies that mean the cluster is working, and in
+     *     `errors_total` they would paint a resharding cluster red for ever;
+     *   - **the value size gets a third octave grid** (hist.h): half of what a
+     *     Redis holds is smaller than the HTTP grid's first bucket.
+     *
+     * `txn` is off here and *on* in the query profile, which is where the
+     * `MULTI`…`EXEC` interval is printed from: one family, one HELP block, keyed
+     * by proto like every other (РR9 — the one place where a cache fits an
+     * existing database family exactly). */
+    [LK_PROF_REDIS] =
+        {
+            .families = RF_TOTAL | RF_DURATION | RF_ERRORS | RF_BYTES | RF_SIZE | RF_BLOCKING |
+                        RF_REDIRECT | RF_DEPTH,
+            .k_slot = "cmd",
+            .k_op = NULL,
+            .k_db = "db",
+            .k_user = "user",
+            .k_err = "error",
+            .k_total = "code",
+            .total_qcode = true,
+            .size_min_log2 = LK_VHIST_MIN_LOG2,
+            .size_nbuckets = LK_VHIST_NBUCKETS,
+            .f_total = {"latkit_redis_commands_total",
+                        "Redis commands observed, by command and outcome."},
+            .f_dur = {"latkit_redis_command_duration_seconds",
+                      "Command latency in seconds: last byte of the reply minus first byte of "
+                      "the command. Excludes blocking commands and queued MULTI members, whose "
+                      "duration is not the server's work (РR9/РR10)."},
+            .f_second = {"latkit_redis_blocking_seconds",
+                         "Time a blocking command (BLPOP, XREAD BLOCK, WAIT) waited — the "
+                         "client's own timeout, not the server's service time."},
+            .f_err = {"latkit_redis_errors_total",
+                      "Failed commands by symbolic error (WRONGTYPE, NOSCRIPT, ...), "
+                      "command-independent. MOVED/ASK are redirects and are not here."},
+            .f_bytes = {"latkit_redis_bytes_total", "RESP bytes on the wire, by direction."},
+            .f_size = {"latkit_redis_value_size_bytes", "Size in bytes of the reply value."},
+            .f_redirect = {"latkit_redis_redirects_total",
+                           "Cluster redirects (-MOVED / -ASK): ordinary cluster operation, "
+                           "counted apart from the errors (РR7)."},
+            .f_depth = {"latkit_redis_pipeline_depth",
+                        "Commands that arrived in the same syscall as this one, sampled per "
+                        "command: le=\"1\" is a client that does not pipeline."},
         },
 };
 
@@ -287,6 +396,18 @@ struct lk_registry {
         char code[48];
     } err_codes[LK_N_PROFILES][LK_MAX_ERR_CODES];
     uint32_t n_err_codes[LK_N_PROFILES];
+
+    /* The two families keyed by the protocol alone (РR7/РR3): neither belongs to
+     * a command's series — a redirect is an answer about the *cluster* and a
+     * batch depth is a property of a syscall — and both are bounded by the proto
+     * axis, so they are flat arrays rather than anything the dictionary sees.
+     * The depth histograms are allocated with the registry (nprotos * ~280 B =
+     * 2.5 KB) rather than per use: an allocation on the hot path of the fastest
+     * protocol the agent watches would be the wrong trade for two kilobytes.
+     * Only their *grid* is set on first sight, since it belongs to the family
+     * and a zeroed lk_bhist means the default one (hist.h). */
+    uint64_t redirects[LK_N_REDIRECTS][LK_MAX_PROTOS + 1];
+    struct lk_bhist *depth; /* [nprotos] */
 
     uint64_t truncated_obs[LK_N_PROFILES]; /* latkit_queries_truncated_total */
     uint64_t total_obs[LK_N_PROFILES];
@@ -615,7 +736,7 @@ static void evict_lru(struct lk_registry *r)
             dst->bytes_in += s->bytes_in;
             dst->bytes_out += s->bytes_out;
             for (uint32_t i = 0; i < LK_N_SCLASSES; i++)
-                dst->cls[i] += s->cls[i];
+                dst->tally[i] += s->tally[i];
             if (s->first_row) {
                 struct lk_hist *dfr = series_first_row(dst);
 
@@ -704,7 +825,7 @@ void lk_reg_observe(struct lk_registry *r, const struct lk_reg_obs *o)
     proto = intern_proto(r, o->proto, prof);
     /* latkit_queries_total{db,user,proto,kind,code} — every observation of a
      * profile that has the family. The http profile does not: its exchange
-     * counter is keyed by route and lives on the series (RF_RTOTAL below), and
+     * counter is keyed by route and lives on the series (RF_TOTAL below), and
      * an HTTP request in latkit_queries_total{kind="request"} was only ever a
      * placeholder for this milestone (РH9). */
     if (pf->families & RF_QTOTAL)
@@ -713,30 +834,76 @@ void lk_reg_observe(struct lk_registry *r, const struct lk_reg_obs *o)
         r->truncated_obs[prof]++;
     if (o->err_code && (pf->families & RF_ERRORS))
         r->err_total[(intern_err_code(r, prof, o->err_code) * ndims + dim) * nprotos + proto]++;
+    /* The answer that is an error in syntax and cluster routine in fact (РR7).
+     * Keyed by the protocol alone: `-MOVED 3999 10.0.0.2:6379` is a statement
+     * about the cluster's slot map, not about the key it was asked for, and the
+     * node address in it is exactly the kind of thing that never becomes a
+     * label. */
+    if (o->redirect && (pf->families & RF_REDIRECT))
+        r->redirects[o->redirect < LK_N_REDIRECTS ? o->redirect : LK_REDIR_NONE][proto]++;
+    /* How deep the batch this observation arrived in was (РR3). Sampled per
+     * command rather than per syscall, which is the weighting that answers the
+     * question it is asked for: "did the median *command* wait behind others of
+     * its own", not "how often does a client batch at all". */
+    if (o->has_depth && (pf->families & RF_DEPTH) && r->depth) {
+        struct lk_bhist *h = &r->depth[proto];
 
-    /* Aborted / canceled observations carry no latency: counters only (Р25). */
-    if (!o->has_duration)
-        return;
+        if (!h->nbuckets)
+            lk_bhist_init(h, LK_DHIST_MIN_LOG2, LK_DHIST_NBUCKETS);
+        lk_bhist_observe(h, o->depth);
+    }
 
-    /* Slot-keyed families: forced "other" (NO_TEXT / CANCEL, Р28; a request
-     * whose target never arrived, РH7) skips the dictionary so ad-hoc text never
-     * churns the top-K; otherwise resolve. */
+    /* Slot-keyed families. A profile whose total counter is keyed by the slot
+     * needs one for *every* observation and not only the timed ones (МR5): a
+     * Redis command answered `+QUEUED`, or one whose reply never came, is a
+     * command that happened, and a counter that skipped it would disagree with
+     * the server's own `INFO commandstats` — which is what the МR8 accuracy
+     * bench compares it against. Everything that is not a duration is recorded
+     * before the early return below for the same reason: the bytes were on the
+     * wire and the reply had a size whatever the clock says.
+     *
+     * Forced "other" (NO_TEXT / CANCEL, Р28; a request whose target never
+     * arrived, РH7) skips the dictionary so ad-hoc text never churns the top-K;
+     * otherwise resolve. */
+    if (!o->has_duration && !(pf->families & RF_TOTAL))
+        return; /* aborted / canceled: counters only (Р25) */
     qslot = (o->force_other || !o->label) ? r->k : resolve_query(r, o->fp, o->label, o->op);
     s = series_get(r, qslot, dim, proto, (uint8_t)o->dcode);
-
-    r->total_obs[prof]++;
-    if (qslot == r->k)
-        r->other_obs[prof]++;
     if (!s)
         return;
-    lk_hist_observe(&s->dur, o->dur_seconds);
-    s->rows += o->rows;
-    if (pf->families & RF_RTOTAL)
-        s->cls[o->sclass < LK_N_SCLASSES ? o->sclass : LK_SCLASS_OTHER]++;
+    if (pf->families & RF_TOTAL) {
+        uint32_t ax = pf->total_qcode ? qc : o->sclass;
+
+        s->tally[ax < total_axis_n(pf) ? ax : 0]++;
+    }
     if (pf->families & RF_BYTES) {
         s->bytes_in += o->bytes_in;
         s->bytes_out += o->bytes_out;
     }
+    if (o->has_size && (pf->families & RF_SIZE)) {
+        struct lk_bhist *sz = series_size(s, pf);
+
+        if (sz)
+            lk_bhist_observe(sz, o->size_bytes);
+    }
+    /* The wait that belongs to the client (РR10). Same storage as the second
+     * histogram above, and deliberately the same *place* in the code as the
+     * duration below: the two are alternatives, and a unit that lands here is
+     * one the general distribution must never see. */
+    if (o->has_block && (pf->families & RF_BLOCKING)) {
+        struct lk_hist *bl = series_first_row(s);
+
+        if (bl)
+            lk_hist_observe(bl, o->block_seconds);
+    }
+    if (!o->has_duration)
+        return;
+
+    r->total_obs[prof]++;
+    if (qslot == r->k)
+        r->other_obs[prof]++;
+    lk_hist_observe(&s->dur, o->dur_seconds);
+    s->rows += o->rows;
     /* One storage field, two families: the query profile's first-row histogram
      * is opt-in (Р24 — most deployments never look at it), the http profile's
      * TTFB is not (РH9 — "how long until the client saw anything" is half of
@@ -754,19 +921,13 @@ void lk_reg_observe(struct lk_registry *r, const struct lk_reg_obs *o)
         if (up)
             lk_hist_observe(up, o->upload_seconds);
     }
-    if (o->has_size && (pf->families & RF_SIZE)) {
-        struct lk_bhist *sz = series_size(s, pf);
-
-        if (sz)
-            lk_bhist_observe(sz, o->size_bytes);
-    }
 }
 
 void lk_reg_observe_txn(struct lk_registry *r, const char *db, const char *user, const char *proto,
-                        bool aborted, double dur_seconds)
+                        uint8_t profile, bool aborted, double dur_seconds)
 {
     uint32_t dim = intern_dim(r, db ? db : "", user ? user : "");
-    uint32_t pr = intern_proto(r, proto, LK_PROF_QUERY); /* only a database has one */
+    uint32_t pr = intern_proto(r, proto, profile < LK_N_PROFILES ? profile : LK_PROF_QUERY);
     uint32_t nprotos = reg_nprotos();
 
     lk_hist_observe(&r->txn[(dim * nprotos + pr) * 2 + (aborted ? 1u : 0u)], dur_seconds);
@@ -815,8 +976,9 @@ struct lk_registry *lk_reg_new(const struct lk_metrics_cfg *cfg)
     r->q_total = calloc((size_t)ndims * nprotos * LK_N_QKINDS * LK_N_QCODES, sizeof(*r->q_total));
     r->err_total = calloc((size_t)(LK_MAX_ERR_CODES + 1) * ndims * nprotos, sizeof(*r->err_total));
     r->txn = calloc((size_t)ndims * nprotos * 2, sizeof(*r->txn));
+    r->depth = calloc(nprotos, sizeof(*r->depth));
     if (!r->entries || !r->fp_hash || !r->free_slots || !r->door || !r->dims || !r->sbuckets ||
-        !r->q_total || !r->err_total || !r->txn) {
+        !r->q_total || !r->err_total || !r->txn || !r->depth) {
         lk_reg_free(r);
         return NULL;
     }
@@ -848,6 +1010,7 @@ void lk_reg_free(struct lk_registry *r)
                 free(s);
             }
         }
+    free(r->depth);
     free(r->txn);
     free(r->err_total);
     free(r->q_total);
@@ -960,11 +1123,13 @@ static void esc(const char *s, char *out)
 static const char *qkind_str(uint8_t k)
 {
     static const char *const s[LK_N_QKINDS] = {"simple",   "extended", "function", "copy_in",
-                                               "copy_out", "cancel",   "request"};
+                                               "copy_out", "cancel",   "request",  "command"};
     return k < LK_N_QKINDS ? s[k] : "?";
 }
 
-static const char *qcode_str(uint8_t c)
+/* The `code` label of latkit_queries_total (Р23) and of the redis profile's
+ * command counter (МR5): the four states an observation can end in. */
+static const char *qcode_str(uint32_t c)
 {
     static const char *const s[LK_N_QCODES] = {"ok", "error", "aborted", "canceled"};
     return c < LK_N_QCODES ? s[c] : "?";
@@ -976,6 +1141,13 @@ static const char *sclass_str(uint32_t c)
 {
     static const char *const s[LK_N_SCLASSES] = {"other", "1xx", "2xx", "3xx", "4xx", "5xx"};
     return c < LK_N_SCLASSES ? s[c] : "other";
+}
+
+/* The `kind` label of latkit_redis_redirects_total (РR7). */
+static const char *redirect_str(uint32_t k)
+{
+    static const char *const s[LK_N_REDIRECTS] = {"none", "moved", "ask"};
+    return k < LK_N_REDIRECTS ? s[k] : "none";
 }
 
 /* Order interned dimensions by (db,user) so the dump is stable regardless of
@@ -1088,11 +1260,16 @@ static void write_qkeyed(const struct lk_registry *r, FILE *f, const struct reg_
 {
     char base[LK_LABELSET_MAX], labelset[LK_LABELSET_MAX + 32];
 
-    /* The exchange counter (http): one series per (identity, status class),
-     * summed over the duration code within the group. Keyed by route, unlike
+    /* The slot-keyed total counter: one series per (identity, outcome), summed
+     * over the duration code within the group. Keyed by route / command, unlike
      * the query profile's latkit_queries_total, because "requests per second by
-     * route" is the first panel anybody opens (РH9). */
-    if (pf->families & RF_RTOTAL) {
+     * route" — and "commands per second by command" — is the first panel
+     * anybody opens (РH9/РR11). The outcome axis is the profile's own: a status
+     * class where the protocol has statuses, the observation's own code where it
+     * has none. */
+    if (pf->families & RF_TOTAL) {
+        uint32_t nax = total_axis_n(pf);
+
         fprintf(f, "# HELP %s %s\n", pf->f_total.name, pf->f_total.help);
         fprintf(f, "# TYPE %s counter\n", pf->f_total.name);
         for (uint32_t i = 0; i < n;) {
@@ -1100,21 +1277,29 @@ static void write_qkeyed(const struct lk_registry *r, FILE *f, const struct reg_
             uint32_t j = i;
 
             for (; j < n && same_qseries(&rows[i], &rows[j]); j++)
-                for (uint32_t c = 0; c < LK_N_SCLASSES; c++)
-                    sum[c] += rows[j].s->cls[c];
+                for (uint32_t c = 0; c < nax; c++)
+                    sum[c] += rows[j].s->tally[c];
             row_labelset(&rows[i], base, sizeof(base));
-            for (uint32_t c = 0; c < LK_N_SCLASSES; c++)
+            for (uint32_t c = 0; c < nax; c++)
                 if (sum[c])
-                    fprintf(f, "%s{%s,status=\"%s\"} %llu\n", pf->f_total.name, base, sclass_str(c),
-                            (unsigned long long)sum[c]);
+                    fprintf(f, "%s{%s,%s=\"%s\"} %llu\n", pf->f_total.name, base, pf->k_total,
+                            total_axis_str(pf, c), (unsigned long long)sum[c]);
             i = j;
         }
     }
 
-    /* duration: one histogram per (identity, code). */
+    /* duration: one histogram per (identity, code). A series with no timed
+     * observation prints nothing: for every profile but the redis one that
+     * cannot happen (a series exists because something was timed into it), and
+     * for that one it is the whole point — a command that was only ever answered
+     * `+QUEUED`, or only ever blocked, is counted and has no latency (РR9/РR10),
+     * and twenty empty buckets saying so would be twenty lies about a
+     * distribution. */
     fprintf(f, "# HELP %s %s\n", pf->f_dur.name, pf->f_dur.help);
     fprintf(f, "# TYPE %s histogram\n", pf->f_dur.name);
     for (uint32_t i = 0; i < n; i++) {
+        if (!rows[i].s->dur.count)
+            continue;
         row_labelset(&rows[i], base, sizeof(base));
         snprintf(labelset, sizeof(labelset), "%s,code=\"%s\"", base,
                  rows[i].code == LK_CODE_ERROR ? "error" : "ok");
@@ -1137,9 +1322,13 @@ static void write_qkeyed(const struct lk_registry *r, FILE *f, const struct reg_
         }
     }
 
-    /* The second histogram — first row (opt-in) or TTFB — merging the code
-     * series within each group. */
-    if ((pf->families & RF_TTFB) || (r->first_row && (pf->families & RF_FIRST_ROW))) {
+    /* The second histogram — first row (opt-in), TTFB, or the blocking wait of
+     * РR10 — merging the code series within each group. Three families, one
+     * storage field: no protocol has two of them, because the question "what
+     * else about this unit's time is worth a distribution" has exactly one
+     * answer per protocol. */
+    if ((pf->families & (RF_TTFB | RF_BLOCKING)) ||
+        (r->first_row && (pf->families & RF_FIRST_ROW))) {
         fprintf(f, "# HELP %s %s\n", pf->f_second.name, pf->f_second.help);
         fprintf(f, "# TYPE %s histogram\n", pf->f_second.name);
         for (uint32_t i = 0; i < n;) {
@@ -1310,6 +1499,33 @@ static void write_profile(const struct lk_registry *r, FILE *f, uint8_t prof,
         }
     }
 
+    /* --- the two families keyed by the protocol alone (РR7/РR3) ---------- */
+    if (pf->families & RF_REDIRECT) {
+        fprintf(f, "# HELP %s %s\n", pf->f_redirect.name, pf->f_redirect.help);
+        fprintf(f, "# TYPE %s counter\n", pf->f_redirect.name);
+        for (uint32_t k = LK_REDIR_NONE + 1; k < LK_N_REDIRECTS; k++)
+            for (uint32_t pr = 0; pr < nprotos; pr++) {
+                uint64_t v = r->redirects[k][pr];
+
+                if (!v || proto_profile(r, pr) != pf)
+                    continue;
+                fprintf(f, "%s{kind=\"%s\",proto=\"%s\"} %llu\n", pf->f_redirect.name,
+                        redirect_str(k), proto_str(r, pr), (unsigned long long)v);
+            }
+    }
+    if ((pf->families & RF_DEPTH) && r->depth) {
+        fprintf(f, "# HELP %s %s\n", pf->f_depth.name, pf->f_depth.help);
+        fprintf(f, "# TYPE %s histogram\n", pf->f_depth.name);
+        for (uint32_t pr = 0; pr < nprotos; pr++) {
+            char labelset[32];
+
+            if (!r->depth[pr].count || proto_profile(r, pr) != pf)
+                continue;
+            snprintf(labelset, sizeof(labelset), "proto=\"%s\"", proto_str(r, pr));
+            lk_bhist_write(&r->depth[pr], f, pf->f_depth.name, labelset);
+        }
+    }
+
     /* --- label-free counters -------------------------------------------- */
     if (pf->families & RF_TRUNCATED) {
         fprintf(f, "# HELP latkit_queries_truncated_total Observations with truncated SQL text.\n");
@@ -1328,7 +1544,16 @@ static void write_profile(const struct lk_registry *r, FILE *f, uint8_t prof,
         fprintf(f, "%s %llu\n", pf->f_internal.name, (unsigned long long)r->internal_obs[prof]);
     }
 
-    /* --- latkit_txn_duration_seconds{db,user,proto,status} -------------- */
+    /* --- latkit_txn_duration_seconds{db,user,proto,status} --------------
+     * The one family two profiles feed (РR9): a `MULTI`…`EXEC` is a transaction
+     * in the sense PG's is, and giving Redis a second name for the same measure
+     * would be a worse answer than sharing this one. Printed by whichever
+     * profile owns the family — the query one — for *every* protocol that has
+     * recorded an interval, because a metric name may carry exactly one
+     * HELP/TYPE block in an exposition, and two blocks is a scrape error rather
+     * than a duplicate line. The `if (!h->count)` below is what keeps a
+     * PG-only dump byte-identical: a protocol with no transactions prints
+     * nothing whatever its profile. */
     if (pf->families & RF_TXN) {
         fprintf(f, "# HELP " LK_TXN_METRIC " Transaction duration in seconds.\n");
         fprintf(f, "# TYPE " LK_TXN_METRIC " histogram\n");
@@ -1339,8 +1564,6 @@ static void write_profile(const struct lk_registry *r, FILE *f, uint8_t prof,
             esc(r->dims[d].db, dbe);
             esc(r->dims[d].user, ue);
             for (uint32_t pr = 0; pr < nprotos; pr++) {
-                if (proto_profile(r, pr) != pf)
-                    continue;
                 for (uint32_t st = 0; st < 2; st++) {
                     const struct lk_hist *h = &r->txn[(d * nprotos + pr) * 2 + st];
                     char labelset[3 * ESC64 + 64];
@@ -1447,16 +1670,17 @@ static void iter_qkeyed(const struct lk_registry *r, const struct reg_profile *p
     struct lk_label lbl[6];
     uint32_t nl;
 
-    if (pf->families & RF_RTOTAL)
+    if (pf->families & RF_TOTAL)
         for (uint32_t i = 0; i < n;) {
             uint64_t sum[LK_N_SCLASSES] = {0};
+            uint32_t nax = total_axis_n(pf);
             uint32_t j = i;
 
             for (; j < n && same_qseries(&rows[i], &rows[j]); j++)
-                for (uint32_t c = 0; c < LK_N_SCLASSES; c++)
-                    sum[c] += rows[j].s->cls[c];
+                for (uint32_t c = 0; c < nax; c++)
+                    sum[c] += rows[j].s->tally[c];
             nl = row_label_views(&rows[i], lbl);
-            for (uint32_t c = 0; c < LK_N_SCLASSES; c++) {
+            for (uint32_t c = 0; c < nax; c++) {
                 struct lk_metric_view v = {
                     .name = pf->f_total.name,
                     .help = pf->f_total.help,
@@ -1469,13 +1693,14 @@ static void iter_qkeyed(const struct lk_registry *r, const struct reg_profile *p
 
                 if (!sum[c])
                     continue;
-                lbl[nl] = (struct lk_label){"status", sclass_str(c)};
+                lbl[nl] = (struct lk_label){pf->k_total, total_axis_str(pf, c)};
                 fn(ctx, &v);
             }
             i = j;
         }
 
-    /* duration: one histogram view per (identity, code). */
+    /* duration: one histogram view per (identity, code), skipping the untimed
+     * exactly as the text dump does. */
     for (uint32_t i = 0; i < n; i++) {
         struct lk_metric_view v = {
             .name = pf->f_dur.name,
@@ -1486,6 +1711,8 @@ static void iter_qkeyed(const struct lk_registry *r, const struct reg_profile *p
             .hist = &rows[i].s->dur,
         };
 
+        if (!rows[i].s->dur.count)
+            continue;
         nl = row_label_views(&rows[i], lbl);
         lbl[nl] = (struct lk_label){"code", rows[i].code == LK_CODE_ERROR ? "error" : "ok"};
         v.nlabels = nl + 1;
@@ -1513,8 +1740,9 @@ static void iter_qkeyed(const struct lk_registry *r, const struct reg_profile *p
             i = j;
         }
 
-    /* first row / TTFB: merge the code series' histograms within each group. */
-    if ((pf->families & RF_TTFB) || (r->first_row && (pf->families & RF_FIRST_ROW)))
+    /* first row / TTFB / blocking wait: merge the code series' histograms
+     * within each group (one storage field, three families — see write_qkeyed). */
+    if ((pf->families & (RF_TTFB | RF_BLOCKING)) || (r->first_row && (pf->families & RF_FIRST_ROW)))
         for (uint32_t i = 0; i < n;) {
             uint32_t j = i;
             struct lk_hist acc = {0};
@@ -1709,6 +1937,43 @@ static void iter_profile(const struct lk_registry *r, uint8_t prof, lk_metrics_i
         }
     }
 
+    /* The two proto-keyed families (РR7/РR3), in the dump's order. */
+    if (pf->families & RF_REDIRECT)
+        for (uint32_t k = LK_REDIR_NONE + 1; k < LK_N_REDIRECTS; k++)
+            for (uint32_t pr = 0; pr < nprotos; pr++) {
+                struct lk_label lbl[2] = {{"kind", redirect_str(k)}, {"proto", proto_str(r, pr)}};
+                struct lk_metric_view v = {
+                    .name = pf->f_redirect.name,
+                    .help = pf->f_redirect.help,
+                    .type = LK_MT_COUNTER,
+                    .labels = lbl,
+                    .nlabels = 2,
+                    .created_ns = r->created_ns,
+                    .val = (double)r->redirects[k][pr],
+                };
+
+                if (!r->redirects[k][pr] || proto_profile(r, pr) != pf)
+                    continue;
+                fn(ctx, &v);
+            }
+    if ((pf->families & RF_DEPTH) && r->depth)
+        for (uint32_t pr = 0; pr < nprotos; pr++) {
+            struct lk_label lbl[1] = {{"proto", proto_str(r, pr)}};
+            struct lk_metric_view v = {
+                .name = pf->f_depth.name,
+                .help = pf->f_depth.help,
+                .type = LK_MT_HIST_BYTES,
+                .labels = lbl,
+                .nlabels = 1,
+                .created_ns = r->created_ns,
+                .bhist = &r->depth[pr],
+            };
+
+            if (!r->depth[pr].count || proto_profile(r, pr) != pf)
+                continue;
+            fn(ctx, &v);
+        }
+
     /* Label-free counters. */
     if (pf->families & RF_TRUNCATED) {
         struct lk_metric_view v = {
@@ -1744,14 +2009,13 @@ static void iter_profile(const struct lk_registry *r, uint8_t prof, lk_metrics_i
         fn(ctx, &v);
     }
 
-    /* latkit_txn_duration_seconds{db,user,proto,status}. */
+    /* latkit_txn_duration_seconds{db,user,proto,status} — one family, every
+     * protocol that fed it (РR9), exactly as the text dump prints it. */
     if (pf->families & RF_TXN)
         for (uint32_t oi = 0; oi < ndims; oi++) {
             uint32_t d = ord[oi];
 
             for (uint32_t pr = 0; pr < nprotos; pr++) {
-                if (proto_profile(r, pr) != pf)
-                    continue;
                 for (uint32_t st = 0; st < 2; st++) {
                     const struct lk_hist *h = &r->txn[(d * nprotos + pr) * 2 + st];
                     struct lk_label lbl[4] = {{"db", r->dims[d].db},

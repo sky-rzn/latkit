@@ -251,11 +251,47 @@ static int test_ohist_grid(void)
     return 0;
 }
 
+/* The value grid and the depth grid (РR11, PLAN-REDIS.md МR5): the third and
+ * fourth users of the same machine, and both of them exist because the extent is
+ * a property of the question. A Redis value is small — a counter, a session id,
+ * a flag — where an HTTP body is a page and an S3 object is a file; a pipeline
+ * depth is not a size at all, and octaves are still the right shape for it
+ * because "1, or more than 1" is the whole first question. */
+static int test_vhist_dhist_grids(void)
+{
+    struct lk_bhist v = {0}, d = {0};
+
+    lk_bhist_init(&v, LK_VHIST_MIN_LOG2, LK_VHIST_NBUCKETS);
+    CHECK(lk_bhist_nbuckets(&v) == LK_VHIST_NBUCKETS);
+    CHECK(lk_bhist_bound(&v, 0) == 8.0);
+    CHECK(lk_bhist_bound(&v, LK_VHIST_NBUCKETS - 1) == 8388608.0); /* 8 MiB */
+
+    lk_bhist_observe(&v, 4);              /* `:1\r\n` — an integer reply */
+    lk_bhist_observe(&v, 40);             /* a session blob */
+    lk_bhist_observe(&v, 1ull << 20);     /* a megabyte value: still a cell */
+    lk_bhist_observe(&v, 512ull << 20);   /* proto-max-bulk-len: overflow, and
+                                             "impossibly large" is the answer */
+    CHECK(v.bucket[0] == 1);              /* (0, 8] — where the default grid is blind */
+    CHECK(v.bucket[3] == 1);              /* le = 2^6 = 64 */
+    CHECK(v.bucket[LK_VHIST_NBUCKETS - 4] == 1); /* le = 1 MiB */
+    CHECK(v.overflow == 1);
+    CHECK(v.count == 4);
+
+    lk_bhist_init(&d, LK_DHIST_MIN_LOG2, LK_DHIST_NBUCKETS);
+    CHECK(lk_bhist_bound(&d, 0) == 1.0);
+    CHECK(lk_bhist_bound(&d, LK_DHIST_NBUCKETS - 1) == 256.0); /* LK_REDIS_MAX_INFLIGHT */
+    lk_bhist_observe(&d, 1);
+    lk_bhist_observe(&d, 100);
+    CHECK(d.bucket[0] == 1); /* the client that does not pipeline */
+    CHECK(d.bucket[7] == 1); /* memtier's 100, in (64, 128] */
+    return 0;
+}
+
 int main(void)
 {
     if (test_index_inverse() || test_observe() || test_clamp() || test_merge() ||
         test_classic_dump() || test_bhist_buckets() || test_bhist_merge() || test_bhist_dump() ||
-        test_ohist_grid())
+        test_ohist_grid() || test_vhist_dhist_grids())
         return 1;
     printf("test_hist: all passed\n");
     return 0;

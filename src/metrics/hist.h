@@ -113,6 +113,28 @@ void lk_hist_write(const struct lk_hist *h, FILE *f, const char *metric, const c
 #define LK_OHIST_MAX_LOG2 40                                          /* last le = 1 TiB */
 #define LK_OHIST_NBUCKETS (LK_OHIST_MAX_LOG2 - LK_OHIST_MIN_LOG2 + 1) /* 31 */
 
+/* The Redis value grid (РR11, PLAN-REDIS.md МR5): 8 B … 8 MiB. The third grid,
+ * and the reason there is a third one is the same as for the second: a cache
+ * measures something else again. Half of what a Redis holds is smaller than the
+ * HTTP grid's *first* bucket — a counter, a session id, a flag — so on that grid
+ * the median of every real workload lands in cell 0 and the distribution says
+ * nothing. The top is 8 MiB because `proto-max-bulk-len` defaults to 512 MB but
+ * a value anywhere near it is already a design problem the overflow cell
+ * reports perfectly well, while the octaves below it are where the answers are. */
+#define LK_VHIST_MIN_LOG2 3                                           /* first le = 8 B */
+#define LK_VHIST_MAX_LOG2 23                                          /* last le = 8 MiB */
+#define LK_VHIST_NBUCKETS (LK_VHIST_MAX_LOG2 - LK_VHIST_MIN_LOG2 + 1) /* 21 */
+
+/* The pipeline-depth grid (РR3/РR11): 1 … 256 commands per syscall. Not a size
+ * at all — the only histogram in the agent whose domain is a *count* — but the
+ * shape of the question is identical (how many orders of magnitude, not how many
+ * per cent), and octaves put the answer that matters most in a cell of its own:
+ * `le="1"` is "this client does not pipeline". The top matches
+ * LK_REDIS_MAX_INFLIGHT, past which the queue drops units and says so. */
+#define LK_DHIST_MIN_LOG2 0                                           /* first le = 1 */
+#define LK_DHIST_MAX_LOG2 8                                           /* last le = 256 */
+#define LK_DHIST_NBUCKETS (LK_DHIST_MAX_LOG2 - LK_DHIST_MIN_LOG2 + 1) /* 9 */
+
 /* The widest grid, i.e. the storage every byte histogram carries. */
 #define LK_BHIST_MAX_NBUCKETS LK_OHIST_NBUCKETS
 

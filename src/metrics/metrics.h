@@ -72,7 +72,24 @@ enum lk_qkind {
                       observation is reported by the `http` profile below and no
                       longer touches latkit_queries_total, so this value is the
                       mirror of enum lk_query_kind and nothing else */
+    LK_QK_COMMAND, /* Redis command/reply (РR11, МR5) — likewise a mirror: the
+                      redis profile has no `kind` axis, because a command is the
+                      only shape of work RESP has */
     LK_N_QKINDS,
+};
+
+/* `kind` label of latkit_redis_redirects_total (РR7, PLAN-REDIS.md МR5): a
+ * cluster telling a client where a slot lives. Syntactically an error reply and
+ * semantically the cluster working as designed — a resharding one produces them
+ * continuously and every client follows them — so they are counted here and in
+ * no family that says "errors". Mirrors enum lk_redis_redirect (norm_redis.h)
+ * value for value, as lk_qkind mirrors lk_query_kind, so the metrics library
+ * needs no protocol header. */
+enum lk_redirect {
+    LK_REDIR_NONE = 0,
+    LK_REDIR_MOVED, /* the slot has moved: follow and remember */
+    LK_REDIR_ASK,   /* ... it is migrating: follow for this command only */
+    LK_N_REDIRECTS,
 };
 
 /* Observation profile (РH10, PLAN-HTTP.md М5): *which families* an observation
@@ -89,6 +106,7 @@ enum lk_profile {
     LK_PROF_QUERY = 0, /* pg / mysql: latkit_query_* keyed by (query,db,user) */
     LK_PROF_HTTP,      /* http: latkit_http_* keyed by (route,method,host,user) */
     LK_PROF_S3,        /* s3: latkit_s3_* keyed by (op,method,bucket,user) — РS7 */
+    LK_PROF_REDIS,     /* redis: latkit_redis_* keyed by (cmd,db,user) — РR11 */
     LK_N_PROFILES,
 };
 

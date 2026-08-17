@@ -102,9 +102,14 @@ static void reset(void)
 /* One data event: a chunk of a call, modelled by off/total like the agent's. */
 static void feed(enum lk_dir dir, __u32 total, __u32 off, const void *p, __u32 cap, __u64 ts)
 {
+    /* Room for the largest single event any case here feeds, which is the
+     * over-long line of test_line_too_big: LK_REDIS_LINE_MAX *plus* the bytes
+     * that carry it past the bound. A union sized exactly 64 KiB was 16 bytes
+     * short of it — invisible under the sanitizers, an abort under
+     * _FORTIFY_SOURCE in the release build, which is where it was found. */
     static union {
         struct lk_ev_data d;
-        __u8 raw[sizeof(struct lk_ev_data) + 65536];
+        __u8 raw[sizeof(struct lk_ev_data) + LK_REDIS_LINE_MAX + 4096];
     } u;
 
     memset(&u.d, 0, sizeof(u.d));

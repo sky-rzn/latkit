@@ -844,11 +844,12 @@ const struct lk_proto_ops lk_proto_redis_ops = {
      * commands) МR3 folds them into cmd="other" (РR1). */
     .db_system = "redis",
     .otel_kind = LK_OTEL_KIND_DB,
-    /* .profile stays at LK_PROTO_PROF_QUERY, the zero value, and is *not* the
-     * final answer: РR11 gives Redis a profile of its own (latkit_redis_*) in
-     * МR5. Nothing reads it before then — this handler emits no observation at
-     * all — so the enum grows where its families do, and not one milestone
-     * earlier. */
+    /* latkit_redis_* rather than latkit_query_* (РR11, МR5): a command has no
+     * rows, no SQLSTATE and no statement text, and reporting one under the
+     * database names would have meant three empty labels and a `query` that is
+     * a verb. The profile is a row in registry.c's table, as the http and s3
+     * ones are — the engine underneath is shared and untouched. */
+    .profile = LK_PROTO_PROF_REDIS,
     .role = LK_ROLE_SERVER, /* v1 observes servers only (РH2) */
     .flags = LK_PROTO_F_STREAM,
     .sql_dialect = LK_SQL_PG, /* unused: nothing here reaches the SQL normaliser */

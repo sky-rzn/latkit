@@ -70,6 +70,17 @@ static int has(const char *hay, const char *needle)
     return strstr(hay, needle) != NULL;
 }
 
+/* How many times `needle` appears — for the families a metric name may carry
+ * exactly one HELP/TYPE block of, whatever the profiles do (МR5). */
+static int count(const char *hay, const char *needle)
+{
+    int n = 0;
+
+    for (const char *p = strstr(hay, needle); p; p = strstr(p + 1, needle))
+        n++;
+    return n;
+}
+
 /* A plain successful simple query -> queries_total(ok) + a duration + rows. */
 static int test_ok_query(void)
 {
@@ -604,6 +615,123 @@ static int test_s3_profile(void)
     return 0;
 }
 
+/* A Redis connection reports through the redis profile (РR11, PLAN-REDIS.md
+ * МR5), and this is the milestone's central claim in one function: the three
+ * observations below are all commands, all counted, and each of their durations
+ * goes somewhere different. `GET` is work and is timed; `SET` inside a `MULTI`
+ * was answered `+QUEUED` and is counted only; `BLPOP` waited the thirty seconds
+ * the client asked for and is timed in a family that cannot touch the p99 of the
+ * other two. */
+static int test_redis_profile(void)
+{
+    struct lk_metrics *m = lk_metrics_new(NULL);
+    struct lk_conn rconn = {.cookie = 0x6379, .ops = &lk_proto_redis_ops};
+    struct lk_redis_obs rr = {.pipeline_depth = 4};
+    char buf[65536];
+    struct lk_query_obs o = {
+        .ts_start_ns = 0,
+        .ts_complete_ns = NS_250MS,
+        .ts_ready_ns = NS_250MS,
+        .bytes_in = 31,
+        .bytes_out = 1200,
+        .route = "GET",
+        .route_len = 3,
+        .route_fp = 0x6301,
+        .redis = &rr,
+        .kind = LK_Q_COMMAND,
+        .flags = LK_QO_NO_TEXT,
+    };
+
+    CHECK(m);
+    set_session("3", "lkuser"); /* the database *number* and the ACL user */
+    g_sink = lk_metrics_query_sink(m);
+    g_sink->on_query(g_sink->ctx, &rconn, &g_sess, &o);
+    dump(m, buf, sizeof(buf));
+
+#define ID(m) m "cmd=\"GET\",db=\"3\",user=\"lkuser\",proto=\"redis\""
+    CHECK(has(buf, ID("latkit_redis_commands_total{") ",code=\"ok\"} 1\n"));
+    CHECK(has(buf, ID("latkit_redis_command_duration_seconds_sum{") ",code=\"ok\"} 0.25\n"));
+    CHECK(has(buf, ID("latkit_redis_bytes_total{") ",direction=\"out\"} 1200\n"));
+    /* the value grid, not the http one: a 1200-byte reply sits at 2 KiB and the
+     * first cell is 8 B, where half a real Redis's values live (hist.h) */
+    CHECK(has(buf, ID("latkit_redis_value_size_bytes_bucket{") ",le=\"8\"} 0\n"));
+    CHECK(has(buf, ID("latkit_redis_value_size_bytes_bucket{") ",le=\"2048\"} 1\n"));
+    CHECK(!has(buf, "latkit_redis_value_size_bytes_bucket{cmd=\"GET\",db=\"3\",user=\"lkuser\","
+                    "proto=\"redis\",le=\"1073741824\"}"));
+#undef ID
+    /* the batch depth is per protocol and not per command (РR3) */
+    CHECK(has(buf, "latkit_redis_pipeline_depth_bucket{proto=\"redis\",le=\"4\"} 1\n"));
+    CHECK(has(buf, "latkit_redis_pipeline_depth_bucket{proto=\"redis\",le=\"2\"} 0\n"));
+    /* no rows, no TTFB, no upload, no status: RESP has none of them */
+    CHECK(!has(buf, "latkit_redis_rows"));
+    CHECK(!has(buf, "latkit_redis_ttfb"));
+    CHECK(!has(buf, ",status=\""));
+    CHECK(!has(buf, "latkit_query_duration_seconds{"));
+
+    /* `+QUEUED` (РR9): a command, counted, with no latency and no value size —
+     * those nine bytes are a receipt and the value comes back at `EXEC`. */
+    o.route = "SET";
+    o.route_fp = 0x6302;
+    o.bytes_out = 9;
+    o.flags = LK_QO_NO_TEXT | LK_QO_QUEUED;
+    g_sink->on_query(g_sink->ctx, &rconn, &g_sess, &o);
+    /* a blocking wait (РR10): timed, in its own family */
+    o.route = "BLPOP";
+    o.route_len = 5;
+    o.route_fp = 0x6303;
+    o.bytes_out = 40;
+    o.flags = LK_QO_NO_TEXT | LK_QO_BLOCKING;
+    g_sink->on_query(g_sink->ctx, &rconn, &g_sess, &o);
+    dump(m, buf, sizeof(buf));
+
+    CHECK(has(buf, "latkit_redis_commands_total{cmd=\"SET\",db=\"3\",user=\"lkuser\","
+                   "proto=\"redis\",code=\"ok\"} 1\n"));
+    CHECK(!has(buf, "latkit_redis_command_duration_seconds_count{cmd=\"SET\""));
+    CHECK(!has(buf, "latkit_redis_value_size_bytes_count{cmd=\"SET\""));
+    CHECK(has(buf, "latkit_redis_blocking_seconds_sum{cmd=\"BLPOP\",db=\"3\",user=\"lkuser\","
+                   "proto=\"redis\"} 0.25\n"));
+    CHECK(!has(buf, "latkit_redis_command_duration_seconds_count{cmd=\"BLPOP\""));
+    /* three commands, one duration between them */
+    CHECK(has(buf, "latkit_redis_command_duration_seconds_count{cmd=\"GET\",db=\"3\","
+                   "user=\"lkuser\",proto=\"redis\",code=\"ok\"} 1\n"));
+
+    /* The failure has a name and the redirect is not one (РR7). */
+    o.route = "MGET";
+    o.route_len = 4;
+    o.route_fp = 0x6304;
+    o.err_name = "WRONGTYPE";
+    o.flags = LK_QO_NO_TEXT | LK_QO_ERROR;
+    g_sink->on_query(g_sink->ctx, &rconn, &g_sess, &o);
+    o.err_name = "MOVED";
+    o.flags = LK_QO_NO_TEXT | LK_QO_CLIENT_ERR;
+    rr.redirect = LK_REDIR_MOVED;
+    g_sink->on_query(g_sink->ctx, &rconn, &g_sess, &o);
+    dump(m, buf, sizeof(buf));
+
+    CHECK(has(buf, "latkit_redis_errors_total{error=\"WRONGTYPE\",db=\"3\",user=\"lkuser\","
+                   "proto=\"redis\"} 1\n"));
+    CHECK(has(buf, "latkit_redis_redirects_total{kind=\"moved\",proto=\"redis\"} 1\n"));
+    CHECK(!has(buf, "latkit_redis_errors_total{error=\"MOVED\""));
+    /* the redirect is still an observation: counted, timed, code=ok — a client
+     * that follows it got its answer, and a resharding cluster is not an outage */
+    CHECK(has(buf, "latkit_redis_commands_total{cmd=\"MGET\",db=\"3\",user=\"lkuser\","
+                   "proto=\"redis\",code=\"ok\"} 1\n"));
+    CHECK(has(buf, "latkit_redis_commands_total{cmd=\"MGET\",db=\"3\",user=\"lkuser\","
+                   "proto=\"redis\",code=\"error\"} 1\n"));
+
+    /* The one family two profiles share (РR9): a MULTI…EXEC is a transaction,
+     * and it reports under the database name with proto="redis" — one family,
+     * one HELP block. */
+    lk_metrics_query_sink(m)->on_txn(g_sink->ctx, &rconn, 0, NS_500MS, 'I');
+    dump(m, buf, sizeof(buf));
+    CHECK(has(buf, "latkit_txn_duration_seconds_sum{db=\"3\",user=\"lkuser\",proto=\"redis\","
+                   "status=\"ok\"} 0.5\n"));
+    /* one block, not one per profile — two would be a scrape error */
+    CHECK(count(buf, "# TYPE latkit_txn_duration_seconds ") == 1);
+    lk_metrics_free(m);
+    return 0;
+}
+
 /* The selfstats provider (task 4.4) emits the standard process_* series. */
 static int test_selfstats_provider(void)
 {
@@ -630,7 +758,7 @@ int main(void)
         test_truncated() || test_pipelined_duration() || test_txn() || test_first_row_flag() ||
         test_scalars() || test_labeled_scalars() || test_providers() || test_selfstats_provider() ||
         test_mysql_proto_label() || test_http_profile() || test_http_status_split() ||
-        test_s3_profile())
+        test_s3_profile() || test_redis_profile())
         return 1;
     printf("test_metrics: all passed\n");
     return 0;

@@ -1,7 +1,7 @@
 # Grafana dashboards
 
-Six provisioned dashboards for latkit (Р42, РH9, РS7). Fixed `uid`s — cross-links
-and provisioning depend on them, so don't change them:
+Seven provisioned dashboards for latkit (Р42, РH9, РS7, РR11). Fixed `uid`s —
+cross-links and provisioning depend on them, so don't change them:
 
 | file | uid | what |
 |---|---|---|
@@ -11,6 +11,7 @@ and provisioning depend on them, so don't change them:
 | `latkit-health.json` | `latkit-health` | every agent self-metric: losses, cardinality, OTLP, TLS, cgroup, `process_*`, pipeline overhead |
 | `latkit-http.json` | `latkit-http` | HTTP ports (`--port 8080=http`): RPS and duration/TTFB by route, status classes, sizes and throughput, blind zones, `route="other"` share |
 | `latkit-s3.json` | `latkit-s3` | S3 ports (`--port 9000=s3`): operations/s and duration/TTFB by operation, top buckets and access keys, errors by S3 code, throughput, object sizes, and the traffic that is not an S3 API |
+| `latkit-redis.json` | `latkit-redis` | Redis ports (`--port 6379=redis`): commands/s and duration by command, `PING` on its own, pipeline depth, database and ACL user, symbolic errors, cluster redirects, blocking waits, reply sizes, pushes |
 
 ## Design rules (enforced by `lint.sh`)
 
@@ -23,9 +24,12 @@ and provisioning depend on them, so don't change them:
   literal window:
   `histogram_quantile(0.95, sum by (le) (rate(latkit_query_duration_seconds_bucket[$__rate_interval])))`.
 - **Bounded cardinality.** Nothing graphs an unbounded set of `query` — or, on
-  the HTTP dashboard, `route` — series. Top-N panels are instant tables over
-  `topk($topk, ...)`; the only per-`query` timeseries is the single selected
-  `$query`. `$topk` is 5/10/20 (default 10).
+  the HTTP dashboard, `route`, or on the Redis one, `cmd` — series. Top-N panels
+  are instant tables over `topk($topk, ...)`; the only per-`query` timeseries is
+  the single selected `$query`. `$topk` is 5/10/20 (default 10). `cmd` is the one
+  of the three that is bounded by construction (a closed table, РR4), and it is
+  still graphed through `topk`: 250 series is not a cardinality incident, it is
+  an unreadable panel.
 - **Data honesty on the overview.** A `capture degraded` annotation fires from
   `latkit_ringbuf_dropped_total` / `latkit_resync_total`, and a dedicated panel
   plots them — when capture is lossy, the operator sees it (Р5/Р27).
@@ -46,6 +50,19 @@ counterpart honesty number: `latkit_s3_internal_requests_total` (MinIO's own
 blind connections, because on a distributed pool most of the traffic on port
 9000 is the cluster talking to itself and a dashboard that hid that would be
 lying about the port.
+
+The Redis dashboard is the one that splits its latency into three panels rather
+than one, and that is the whole design: `latkit_redis_command_duration_seconds`
+is work, `latkit_redis_blocking_seconds` is the timeout a client chose (РR10),
+and a `+QUEUED` inside a `MULTI` has no duration at all (РR9) — one histogram
+holding all three would have a p99 of "whatever the longest `BLPOP` was". `PING`
+gets a panel to itself for the opposite reason (РR15): it does no work, so on a
+single-threaded server its p99 *is* the event loop's queueing delay, and folding
+it into the general rate would hide the best signal on the page. The last row
+carries the honesty numbers: pushes that closed no unit (РR8), the dropped units
+of a capture hole inside an array (risk 1 of the plan), the deliberately ignored
+replication and `MONITOR` connections (РR14) — and a reminder in the panel text
+that a **unix socket** carries no traffic past this agent at all.
 
 Note: the drilldown's *time to first row* panel needs the agent's
 `--first-row-hist` (`LATKIT_FIRST_ROW_HIST=1`); without it that histogram family

@@ -481,6 +481,18 @@ static void ev_provide_stats(void *ctx, struct lk_metrics *m)
                                   "proto", proto, (double)ps->blind_upgrade);
         lk_metrics_set_counter_l2(m, "latkit_ignored_conns_total", NULL, "reason", "connect",
                                   "proto", proto, (double)ps->blind_connect);
+        /* РR8, and the one latkit_redis_* family that is not a row in the metric
+         * profile: a push closes no unit, so there is no observation to hang it
+         * on — it is a *parser* fact, like the counters around it, and this is
+         * where the parser's facts are published. It matters on a dashboard for
+         * one reason: a subscribed connection carries values nobody asked for,
+         * and their number beside the command rate is what says whether an
+         * instance is a cache or a message bus. */
+        if (lk_proto_registry[i]->profile == LK_PROTO_PROF_REDIS)
+            lk_metrics_set_counter_l(m, "latkit_redis_push_total",
+                                     "Server values that answered no command: pub/sub deliveries, "
+                                     "RESP3 pushes, cache invalidations (РR8).",
+                                     "proto", proto, (double)ps->pushes);
     }
 
     const struct lk_conn_table_stats *cs = lk_conn_table_stats(e->pipe.conns);

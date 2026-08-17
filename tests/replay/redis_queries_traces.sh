@@ -1,10 +1,12 @@
 #!/bin/sh
-# МR3 and МR4 acceptance (PLAN-REDIS.md): the --queries view over the МR0 corpus
-# must yield the expected observations per scenario — the identity (РR4), the
-# database (РR5) and the ACL user (РR6), and then what the *outcome* of each one
-# was: the symbolic error and the redirect that is not one (РR7), the
+# МR3, МR4 and МR5 acceptance (PLAN-REDIS.md): the --queries view over the МR0
+# corpus must yield the expected observations per scenario — the identity (РR4),
+# the database (РR5) and the ACL user (РR6), and then what the *outcome* of each
+# one was: the symbolic error and the redirect that is not one (РR7), the
 # transaction interval (РR9), the blocking family (РR10) — with parse_errors == 0
-# on every clean trace.
+# on every clean trace. The last section (`--metrics`) runs the real aggregator
+# over the same traces and checks the `latkit_redis_*` families of РR11: which
+# family each of those facts ends up in, and which it does not.
 #
 #   redis_queries_traces.sh <lkt_queries> <tests/traces/redis dir> [test_redis_cmd]
 #
@@ -406,39 +408,138 @@ if [ -n "$TABLE" ]; then
     [ "$n" -gt 60 ] || fail "only $n distinct commands in the corpus — did the view break?"
 fi
 
-# --- РR9/РR10: and what all of it does to the families ---------------------
-# The other half of the МR4 acceptance, one level down: the flags are only worth
-# setting if something downstream acts on them, so the check is on the real
-# aggregator over the same traces. (The families are still the query profile's —
-# МR5 gives Redis its own, and `latkit_redis_blocking_seconds` with it.)
+# --- МR5 (РR11): and what all of it does to the families -------------------
+# The other half of the acceptance, one level down: an identity, a label and a
+# flag are only worth deriving if something downstream reports them, so these
+# checks run the real aggregator over the same traces and read the real
+# Prometheus exposition. Everything above is about what an observation *says*;
+# this is about which family says it, and every assertion below is a number that
+# would be plausible in the wrong place.
 #
-# hist_count <metric> — the observations that reached a duration histogram
+# hist_count <metric> — the observations that reached a histogram
 hist_count() {
     printf '%s\n' "$out" | awk -v m="$1" '
         index($1, m "_count{") == 1 { n += $2 } END { print n + 0 }'
 }
 
+# ctotal <metric> — the sum of a counter family's series
+ctotal() {
+    printf '%s\n' "$out" | awk -v m="$1" '
+        index($1, m "{") == 1 { n += $2 } END { print n + 0 }'
+}
+
 trace="multi(--metrics)"
 out=$("$LKT" --proto redis --quiet --metrics "$DIR/redis/multi.lkt" 2>&1)
-# 26 observations, and the nine answered `+QUEUED` are not among the timed ones:
-# a transaction's commands are written down in microseconds, and in the same
-# histogram as real work they would drag every percentile down with them (РR9).
-[ "$(hist_count latkit_query_duration_seconds)" = 17 ] ||
+# 26 commands, all counted — including the nine answered `+QUEUED`, which are
+# commands that happened and would be missing from anything compared against the
+# server's own `INFO commandstats`.
+[ "$(ctotal latkit_redis_commands_total)" = 26 ] ||
+    fail "expected 26 in latkit_redis_commands_total, got $(ctotal latkit_redis_commands_total)"
+# ... and 17 timed: a transaction's commands are written down in microseconds,
+# and in the same histogram as real work they drag every percentile down (РR9).
+[ "$(hist_count latkit_redis_command_duration_seconds)" = 17 ] ||
     fail 'a +QUEUED unit reached the duration histogram'
+# A `+QUEUED` is not a value, either: those nine bytes are a receipt, and the
+# value the command returns arrives inside the array the `EXEC` is answered with.
+[ "$(hist_count latkit_redis_value_size_bytes)" = 17 ] ||
+    fail 'a +QUEUED reply was counted as a value size'
 # The interval that *does* mean something is the transaction's, and it lands in
 # the family every database protocol here already feeds — six of them, one per
-# transaction that ended (РR9).
+# transaction that ended (РR9). One family, one HELP block, keyed by proto: a
+# second name for the same measurement would have been the worse answer.
 [ "$(hist_count latkit_txn_duration_seconds)" = 6 ] ||
     fail "expected 6 transactions in latkit_txn_duration_seconds"
+nmatch 1 '^# TYPE latkit_txn_duration_seconds histogram$'
+has 'latkit_txn_duration_seconds_count\{db="0",user="default",proto="redis",status="aborted"\} 2'
+# The database families are not borrowed for any of it (РR11): a command has no
+# rows, no SQLSTATE and no statement text, so no latkit_query_* series is
+# printed and no redis observation appears on the `kind` axis. (The two
+# label-free `latkit_queries_*_total` counters are in every exposition and
+# always have been — РH15 is about families *appearing*, not about those.)
+lacks '^latkit_query_'
+lacks 'proto="redis",kind='
+lacks '^latkit_redis_(rows|ttfb|first_row|upload)'
+# ... and no family a cache has no use for was invented for it either.
+lacks 'latkit_redis_[a-z_]*\{[^}]*(host|bucket|route|method|status)='
 
 trace="blocking(--metrics)"
 out=$("$LKT" --proto redis --quiet --metrics "$DIR/redis/blocking.lkt" 2>&1)
-# The general histogram does not shift: of eight observations, the five that
-# waited on an event the client named are counted and not timed. One 30-second
-# `BLPOP` in the same series as `GET` decides the p99 of the whole server (РR10).
-[ "$(hist_count latkit_query_duration_seconds)" = 3 ] ||
+# The general histogram does not shift: of eight commands, the five that waited
+# on an event the client named are counted, timed in a family of their own, and
+# absent from this one. One 30-second `BLPOP` in the same series as `GET` decides
+# the p99 of the whole server (РR10).
+[ "$(ctotal latkit_redis_commands_total)" = 8 ] ||
+    fail "expected 8 in latkit_redis_commands_total"
+[ "$(hist_count latkit_redis_command_duration_seconds)" = 3 ] ||
     fail "a blocking command reached the general duration histogram"
-has 'latkit_queries_total.*proto="redis".*} 8'
+[ "$(hist_count latkit_redis_blocking_seconds)" = 5 ] ||
+    fail "expected 5 waits in latkit_redis_blocking_seconds"
+# `XREAD` is the one command that is both, and the bit follows the arguments
+# rather than the name (РR10): with `BLOCK` it waits, without it does not.
+has 'latkit_redis_blocking_seconds_count\{cmd="XREAD",[^}]*\} 1'
+has 'latkit_redis_command_duration_seconds_count\{cmd="XREAD",[^}]*\} 1'
+
+trace="moved(--metrics)"
+out=$("$LKT" --proto redis --quiet --metrics "$DIR/cluster/moved.lkt" 2>&1)
+# The redirect has a counter and is in no error family; the one real cluster
+# error is the other way round (РR7). A resharding cluster answers `-MOVED`
+# continuously, and in errors_total it would be permanently red.
+has 'latkit_redis_redirects_total\{kind="moved",proto="redis"\} 3'
+[ "$(ctotal latkit_redis_errors_total)" = 1 ] ||
+    fail "a redirect was counted as an error"
+has 'latkit_redis_errors_total\{error="CROSSSLOT",'
+
+trace="pipeline-depths(--metrics)"
+out=$("$LKT" --proto redis --quiet --metrics "$DIR/redis/pipeline-depths.lkt" 2>&1)
+# Batches of 1, 2, 3, 10 and 50 commands, sampled per command: 66 samples, and
+# the cumulative octaves are the batch sizes back again (РR3). `le="1"` — the
+# one bucket an operator reads first — holds exactly the command that travelled
+# alone.
+[ "$(hist_count latkit_redis_pipeline_depth)" = 66 ] ||
+    fail "expected 66 pipeline-depth samples"
+has 'latkit_redis_pipeline_depth_bucket\{proto="redis",le="1"\} 1'
+has 'latkit_redis_pipeline_depth_bucket\{proto="redis",le="4"\} 6'
+has 'latkit_redis_pipeline_depth_bucket\{proto="redis",le="16"\} 16'
+has 'latkit_redis_pipeline_depth_bucket\{proto="redis",le="64"\} 66'
+
+trace="bigvalue(--metrics)"
+out=$("$LKT" --proto redis --quiet --metrics "$DIR/redis/bigvalue.lkt" 2>&1)
+# The value grid is the redis one, 8 B … 8 MiB (hist.h): a 1 MB reply is in a
+# cell of its own, where on the HTTP grid's 64 B floor half of a real Redis's
+# values would share bucket zero.
+has 'latkit_redis_value_size_bytes_bucket\{cmd="GET",[^}]*le="8"\}'
+has 'latkit_redis_value_size_bytes_bucket\{cmd="GET",[^}]*le="8388608"\}'
+lacks 'latkit_redis_value_size_bytes_bucket\{[^}]*le="1073741824"\}'
+
+trace="select-db(--metrics)"
+out=$("$LKT" --proto redis --quiet --metrics "$DIR/redis/select-db.lkt" 2>&1)
+# The two dimension slots hold what РR5/РR6 put in them, in the families and not
+# only in the view: a database number and an ACL user, and `?` where the
+# connection was joined mid-stream rather than a `0` that would be a guess.
+has 'latkit_redis_commands_total\{cmd="SELECT",db="[0-9]+",user="default",proto="redis",code="ok"\}'
+has 'latkit_redis_commands_total\{[^}]*db="3",'
+
+# --- corpus-wide, over the families this time ------------------------------
+# Every label the aggregator prints for a redis port is one of the four keys of
+# the profile plus the outcome — nothing that could be a key, a value or an
+# argument. The privacy invariant of МR3, restated where it ends up in
+# Prometheus (the same check s3_queries_traces.sh runs over its own nouns).
+trace="corpus(--metrics)"
+out=$("$LKT" --proto redis --quiet --metrics "$DIR"/*/*.lkt 2>&1)
+bad=$(printf '%s\n' "$out" | sed -n 's/^latkit_redis_[a-z_]*[{]\([^}]*\)[}].*/\1/p' |
+    tr ',' '\n' | sed -n 's/^\([a-z_0-9]*\)=.*/\1/p' | sort -u |
+    grep -Ev '^(cmd|db|user|proto|code|error|kind|direction|le)$' | head -3 | tr '\n' ' ')
+[ -z "$bad" ] || fail "unexpected label keys in the redis families: $bad"
+bad=$(printf '%s\n' "$out" | grep -E "^latkit_redis" | grep -E "$SECRETS" | head -1)
+[ -z "$bad" ] || fail "a planted password reached a metric label: $bad"
+bad=$(printf '%s\n' "$out" | sed -n 's/^latkit_redis_[a-z_]*[{]cmd="\([^"]*\)".*/\1/p' |
+    grep -Ev '^([A-Z][A-Z0-9_.-]*(\|([A-Z][A-Z0-9_.-]*|other))?|other)$' | head -1)
+[ -z "$bad" ] || fail "cmd label is not a table value: '$bad'"
+# No series printed twice: a duplicate label set is a rejected scrape, not a
+# cosmetic defect, and it is exactly what dropping a key from a family's
+# identity would produce.
+dup=$(printf '%s\n' "$out" | grep -E '^latkit_' | sed 's/ [^ ]*$//' | sort | uniq -d | head -1)
+[ -z "$dup" ] || fail "series printed twice: $dup"
 
 # --- РR6: the switch that turns the dimension off --------------------------
 trace="auth-forms(--redis-user off)"

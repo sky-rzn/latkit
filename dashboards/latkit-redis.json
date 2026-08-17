@@ -1,0 +1,1336 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "graphTooltip": 1,
+  "links": null,
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Commands/s",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_redis_commands_total{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "value"
+        }
+      ],
+      "description": "Every command the agent saw on the watched port, including the ones with no latency of their own: a `+QUEUED` inside a `MULTI` and a `BLPOP` that waited are commands that happened (РR9/РR10). This is the number to compare against the server's own `INFO commandstats`."
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "p99 duration",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 6,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_redis_command_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "value"
+        }
+      ],
+      "description": "First byte of the command to the last byte of the reply, measured on the server's host. Blocking commands and queued transaction members are *not* in it — a thirty-second `BLPOP` in here would be the p99 of the instance. This is the number `INFO commandstats` cannot give you: it reports a mean of execution time, and this is the tail as the network saw it."
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Error share",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "(sum(rate(latkit_redis_errors_total{proto=~\"$proto\"}[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(latkit_redis_commands_total{proto=~\"$proto\"}[$__rate_interval])), 0.001)",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "value"
+        }
+      ],
+      "description": "Failed commands over all commands. Cluster redirects are deliberately not errors (РR7) — a resharding cluster answers `-MOVED` continuously and every client follows them; they have their own panel below."
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "cmd=\"other\" share",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto",
+        "justifyMode": "auto"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "(sum(rate(latkit_redis_commands_total{proto=~\"$proto\",cmd=\"other\"}[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(latkit_redis_commands_total{proto=~\"$proto\"}[$__rate_interval])), 0.001)",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "value"
+        }
+      ],
+      "description": "Commands outside the closed table of docs/notes-redisproto.md. Unlike `route=\"other\"` on the HTTP dashboard this is not a cardinality warning — `cmd` is bounded by construction — it is an *ageing* one: a module (RedisJSON, RediSearch), a fork's own admin command, or a table that has not kept up with a new Redis release. A steady few per cent of `EVAL`-heavy traffic is normal; a step change is a version upgrade."
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Command duration",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(latkit_redis_command_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_redis_command_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_redis_command_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "C",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p99"
+        }
+      ],
+      "description": "The distribution `INFO commandstats` cannot produce: it holds a mean per command (`usec_per_call`) and nothing about the tail, and it measures execution *inside* the server. This is network-to-network on the server's host, so it includes the wait behind somebody else's slow command in the single-threaded event loop — which is exactly what an application feels and what the server cannot see."
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Commands/s by command",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk($topk, sum by (cmd) (rate(latkit_redis_commands_total{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{cmd}}"
+        }
+      ],
+      "description": "Top commands by rate. `cmd` is a value from a closed table — the command and, for a container command, its subcommand (`CONFIG|GET`, `XINFO|STREAM`) — never a key and never an argument (РR4)."
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "PING",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_redis_commands_total{proto=~\"$proto\",cmd=\"PING\"}[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "PING/s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_redis_command_duration_seconds_bucket{proto=~\"$proto\",cmd=\"PING\"}[$__rate_interval])))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p99"
+        }
+      ],
+      "description": "`PING` has a panel of its own rather than being folded into an `internal` bucket (РR15). In a typical deployment sidecars and connection pools make it up to half of all commands, and it is the single most useful measurement on this page: it does no work, so its p99 *is* the event loop's queueing delay. A `PING` p99 that rises while the command rate does not means one client's `KEYS *` is holding the server."
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Pipeline depth",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 12
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(latkit_redis_pipeline_depth_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_redis_pipeline_depth_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_redis_pipeline_depth_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "C",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p99"
+        }
+      ],
+      "description": "How many commands arrived in the same syscall as this one, sampled per command (РR3). p50 = 1 means the clients do not batch and every command pays a round trip; a high p50 means a command's latency includes waiting behind its own batch, which is the client's choice and not the server's fault. The grid is octaves 1 … 256, the depth past which the in-flight queue drops units."
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Commands/s by database",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (db) (rate(latkit_redis_commands_total{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "db {{db}}"
+        }
+      ],
+      "description": "The `SELECT`ed database number, tracked per connection by a state machine (РR5) — `INFO commandstats` is global for the instance and cannot split this. `db=\"?\"` is a connection the agent joined mid-stream, before any `SELECT` said which database it was on: an honest unknown rather than a `0` that would be a guess."
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Commands/s by ACL user",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 20
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (user) (rate(latkit_redis_commands_total{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{user}}"
+        }
+      ],
+      "description": "The ACL user from `AUTH <user> <pass>` / `HELLO … AUTH` (РR6). The password is a separate array element and is never read, never stored and never shown. `--redis-user off` turns the label into a constant `-`. Together with the database panel this is the split an instance-wide `INFO` cannot give at all."
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Errors by symbolic code",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 28
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (error) (rate(latkit_redis_errors_total{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{error}}"
+        }
+      ],
+      "description": "The first token of the error reply (РR7): `WRONGTYPE` is a bug in the application, `NOSCRIPT` is a cache miss on `EVALSHA` and normal, `OOM` and `MISCONF` are the server refusing to work, `NOAUTH`/`NOPERM`/`WRONGPASS` are an ACL problem. The sentence after the symbol names the key and never leaves the agent; a symbol the vocabulary does not know is `other` — usually a Lua script's `redis.error_reply`."
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Cluster redirects",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 28
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (kind) (rate(latkit_redis_redirects_total{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "{{kind}}"
+        }
+      ],
+      "description": "`-MOVED` (the slot has moved) and `-ASK` (it is migrating). Error replies on the wire and routine cluster operation in fact, so they are counted here and in no error family (РR7). A steady rate means clients with a stale slot map — every redirect is a second round trip — and a burst means a resharding is in progress."
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Blocking commands",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 28
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(latkit_redis_blocking_seconds_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p50 wait"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_redis_blocking_seconds_count{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "blocking/s"
+        }
+      ],
+      "description": "`BLPOP`, `BRPOPLPUSH`, `BLMPOP`, `XREAD BLOCK`, `WAIT` — commands whose duration is the timeout the *client* chose, not the server's service time (РR10). Kept out of the duration panel entirely, and measured here because the number still means something: a worker pool that always waits its full timeout is a queue with nothing in it."
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Throughput",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 36
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "Bps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_redis_bytes_total{proto=~\"$proto\",direction=\"in\"}[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "commands in"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_redis_bytes_total{proto=~\"$proto\",direction=\"out\"}[$__rate_interval]))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "replies out"
+        }
+      ],
+      "description": "RESP bytes on the wire in both directions. Asymmetry is the normal state — a `GET` is thirty bytes and its answer can be a megabyte — and a sudden rise in `replies out` with a flat command rate is somebody's unbounded `LRANGE`."
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Reply value size",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 36
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(latkit_redis_value_size_bytes_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(latkit_redis_value_size_bytes_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p95"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(latkit_redis_value_size_bytes_bucket{proto=~\"$proto\"}[$__rate_interval])))",
+          "refId": "C",
+          "range": true,
+          "instant": false,
+          "legendFormat": "p99"
+        }
+      ],
+      "description": "The size of what came back, on an octave grid of 8 B … 8 MiB (РR11) — four octaves below the HTTP grid, because half of what a Redis holds is smaller than that grid's first bucket. The p99 is where an unbounded collection shows up before it becomes a latency problem: a single-threaded server serialising a megabyte holds every other client while it does."
+    },
+    {
+      "id": 16,
+      "type": "table",
+      "title": "Slowest commands (p99)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 44
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [
+          {
+            "displayName": "Value",
+            "desc": true
+          }
+        ]
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "topk($topk, histogram_quantile(0.99, sum by (le, cmd) (rate(latkit_redis_command_duration_seconds_bucket{proto=~\"$proto\"}[$__rate_interval]))))",
+          "refId": "A",
+          "range": false,
+          "instant": true,
+          "format": "table",
+          "legendFormat": null
+        }
+      ],
+      "description": "Where the latency is, by command rather than by key — which is what a closed identity table is for. On a single-threaded server the interesting reading is not only the slow command itself but everything queued behind it: compare with the `PING` panel above.",
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "__name__": true,
+              "db": true,
+              "user": true,
+              "proto": true,
+              "code": true
+            },
+            "renameByName": {}
+          }
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "timeseries",
+      "title": "Pub/Sub and pushes",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 44
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_redis_push_total{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "pushes/s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_redis_commands_total{proto=~\"$proto\",cmd=~\"(P|S)?SUBSCRIBE\"}[$__rate_interval]))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "subscribes/s"
+        }
+      ],
+      "description": "Server values that answered no command (РR8): pub/sub deliveries, RESP3 pushes, client-side-caching invalidations. They are counted and they close no unit — a queue that let them would mis-time every later command on the connection. Beside the command rate this is what says whether the instance is being used as a cache or as a message bus."
+    },
+    {
+      "id": 18,
+      "type": "timeseries",
+      "title": "Capture health",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 44
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_resync_total[$__rate_interval]))",
+          "refId": "A",
+          "range": true,
+          "instant": false,
+          "legendFormat": "resyncs/s"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(latkit_queries_dropped_total{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "B",
+          "range": true,
+          "instant": false,
+          "legendFormat": "dropped {{reason}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(latkit_ignored_conns_total{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "C",
+          "range": true,
+          "instant": false,
+          "legendFormat": "ignored {{reason}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(latkit_parse_errors_total{proto=~\"$proto\"}[$__rate_interval]))",
+          "refId": "D",
+          "range": true,
+          "instant": false,
+          "legendFormat": "parse errors/s"
+        }
+      ],
+      "description": "What the agent knows it did not see. `dropped resync` is risk 1 of the plan on a live server: a capture hole inside a RESP array cannot be skipped arithmetically — an array declares an element count, not a length — so the units in flight are lost rather than mispaired. `ignored replication` and `ignored monitor` are deliberate blind zones (РR14). Not visible anywhere: traffic over a **unix socket**, which this agent does not capture at all — check with `redis-cli config get unixsocket`."
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "latkit",
+    "redis"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data source",
+        "multi": false,
+        "name": "datasource",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "type": "datasource"
+      },
+      {
+        "current": {},
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "definition": "label_values(latkit_redis_commands_total, proto)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "proto",
+        "multi": true,
+        "name": "proto",
+        "options": [],
+        "query": {
+          "query": "label_values(latkit_redis_commands_total, proto)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "text": "10",
+          "value": "10"
+        },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Top-N",
+        "multi": false,
+        "name": "topk",
+        "options": [],
+        "query": "5,10,20",
+        "skipUrlSync": false,
+        "type": "custom"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": null,
+  "timezone": "browser",
+  "title": "latkit — Redis",
+  "uid": "latkit-redis",
+  "version": 1
+}

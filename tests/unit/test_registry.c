@@ -12,11 +12,13 @@
  *   - the (db,user) dimension limit spills to (other,other);
  *   - the dump is valid text format with stable, escaped labels.
  *
- * Since М5 it also covers the observation profiles (РH10, РS7): the http and s3
- * families and their label keys, the fact that a PG-only registry prints none of
- * them, that the profiles share the dictionary and nothing else — including the
- * two size grids, which must not borrow each other's boundaries — and that the
- * structured (OTLP) walk emits the same families the text dump does. */
+ * Since М5 it also covers the observation profiles (РH10, РS7, РR11): the http,
+ * s3 and redis families and their label keys, the fact that a PG-only registry
+ * prints none of them, that the profiles share the dictionary and nothing else —
+ * including the three size grids, which must not borrow each other's boundaries
+ * — and that the structured (OTLP) walk emits the same families the text dump
+ * does. The redis row adds the one case the engine had not seen before: an
+ * observation that is counted and deliberately not timed (РR9/РR10). */
 #include <stdio.h>
 #include <string.h>
 
@@ -438,6 +440,161 @@ static int test_s3_profile(void)
     return 0;
 }
 
+/* --- the redis profile (РR11, PLAN-REDIS.md МR5) --------------------------- */
+
+static void redis_obs(struct lk_registry *r, uint64_t fp, const char *cmd, const char *db,
+                      uint8_t qcode, const char *err, uint64_t out, uint32_t depth)
+{
+    struct lk_reg_obs o = {
+        .fp = fp,
+        .label = cmd,
+        .db = db,
+        .user = "default",
+        .proto = "redis",
+        .profile = LK_PROF_REDIS,
+        .kind = LK_QK_COMMAND,
+        .qcode = qcode,
+        .has_duration = true,
+        .dcode = qcode == LK_QCODE_ERROR ? LK_CODE_ERROR : LK_CODE_OK,
+        .dur_seconds = 0.002,
+        .has_size = out > 0,
+        .size_bytes = out,
+        .bytes_in = 24,
+        .bytes_out = out,
+        .err_code = err,
+        .has_depth = depth > 0,
+        .depth = depth,
+    };
+
+    lk_reg_observe(r, &o);
+}
+
+/* The fourth profile row, and the three families no other one has. Everything
+ * the МR5 acceptance rests on is here in one dump: a command is counted whether
+ * or not it was timed, its wait is timed where it cannot move a percentile, and
+ * its redirect is counted where it cannot look like an outage. */
+static int test_redis_profile(void)
+{
+    struct lk_registry *r = reg(8, 8);
+    static char buf[1 << 17];
+
+    CHECK(r);
+    redis_obs(r, 1, "GET", "0", LK_QCODE_OK, NULL, 12, 1);
+    redis_obs(r, 1, "GET", "0", LK_QCODE_OK, NULL, 4096, 8);
+    redis_obs(r, 2, "HGETALL", "0", LK_QCODE_ERROR, "WRONGTYPE", 0, 1);
+
+#define ID(m) m "cmd=\"GET\",db=\"0\",user=\"default\",proto=\"redis\""
+    dump(r, buf, sizeof(buf));
+    CHECK(contains(buf, ID("latkit_redis_commands_total{") ",code=\"ok\"} 2\n"));
+    CHECK(contains(buf, ID("latkit_redis_command_duration_seconds_count{") ",code=\"ok\"} 2\n"));
+    CHECK(contains(buf, ID("latkit_redis_bytes_total{") ",direction=\"out\"} 4108\n"));
+    /* the value grid: 8 B … 8 MiB, so a 12-byte reply is in the second cell and
+     * nothing lands where the http grid's 64 B floor would put it */
+    CHECK(contains(buf, ID("latkit_redis_value_size_bytes_bucket{") ",le=\"8\"} 0\n"));
+    CHECK(contains(buf, ID("latkit_redis_value_size_bytes_bucket{") ",le=\"16\"} 1\n"));
+    CHECK(contains(buf, ID("latkit_redis_value_size_bytes_bucket{") ",le=\"4096\"} 2\n"));
+    CHECK(contains(buf, ID("latkit_redis_value_size_bytes_bucket{") ",le=\"8388608\"} 2\n"));
+#undef ID
+    /* the depth histogram is keyed by the protocol alone, and per command */
+    CHECK(contains(buf, "latkit_redis_pipeline_depth_bucket{proto=\"redis\",le=\"1\"} 2\n"));
+    CHECK(contains(buf, "latkit_redis_pipeline_depth_bucket{proto=\"redis\",le=\"8\"} 3\n"));
+    CHECK(contains(buf, "latkit_redis_pipeline_depth_count{proto=\"redis\"} 3\n"));
+    /* the failure is symbolic and command-free (РR7) */
+    CHECK(contains(buf, "latkit_redis_errors_total{error=\"WRONGTYPE\",db=\"0\",user=\"default\","
+                        "proto=\"redis\"} 1\n"));
+    /* the families a cache has no use for stay out of its block */
+    CHECK(!contains(buf, "latkit_redis_rows"));
+    CHECK(!contains(buf, "latkit_redis_ttfb"));
+    CHECK(!contains(buf, "latkit_redis_request_upload"));
+    CHECK(!contains(buf, "proto=\"redis\",kind="));
+    CHECK(!contains(buf, "latkit_http_"));
+    CHECK(!contains(buf, "latkit_s3_"));
+
+    /* A `+QUEUED` and a `BLPOP`: counted, and neither of them timed here. The
+     * duration family prints nothing at all for a command that only ever
+     * queued, rather than an empty histogram claiming a distribution. */
+    struct lk_reg_obs queued = {
+        .fp = 3,
+        .label = "SET",
+        .db = "0",
+        .user = "default",
+        .proto = "redis",
+        .profile = LK_PROF_REDIS,
+        .kind = LK_QK_COMMAND,
+        .qcode = LK_QCODE_OK,
+        .bytes_in = 30,
+        .bytes_out = 9,
+    };
+    struct lk_reg_obs blocked = {
+        .fp = 4,
+        .label = "BLPOP",
+        .db = "0",
+        .user = "default",
+        .proto = "redis",
+        .profile = LK_PROF_REDIS,
+        .kind = LK_QK_COMMAND,
+        .qcode = LK_QCODE_OK,
+        .has_block = true,
+        .block_seconds = 30.0,
+        .has_size = true,
+        .size_bytes = 40,
+        .redirect = LK_REDIR_ASK,
+    };
+
+    lk_reg_observe(r, &queued);
+    lk_reg_observe(r, &blocked);
+    dump(r, buf, sizeof(buf));
+    CHECK(contains(buf, "latkit_redis_commands_total{cmd=\"SET\",db=\"0\",user=\"default\","
+                        "proto=\"redis\",code=\"ok\"} 1\n"));
+    CHECK(contains(buf, "latkit_redis_bytes_total{cmd=\"SET\",db=\"0\",user=\"default\","
+                        "proto=\"redis\",direction=\"in\"} 30\n"));
+    CHECK(!contains(buf, "latkit_redis_command_duration_seconds_count{cmd=\"SET\""));
+    CHECK(!contains(buf, "latkit_redis_command_duration_seconds_count{cmd=\"BLPOP\""));
+    CHECK(contains(buf, "latkit_redis_blocking_seconds_sum{cmd=\"BLPOP\",db=\"0\",user=\"default\","
+                        "proto=\"redis\"} 30\n"));
+    CHECK(contains(buf, "latkit_redis_redirects_total{kind=\"ask\",proto=\"redis\"} 1\n"));
+    CHECK(!contains(buf, "kind=\"none\""));
+    /* the invariant the whole registry is checked by still holds: three timed
+     * observations, three histogram samples, and the two untimed in neither */
+    CHECK(lk_reg_series_count_sum(r) == lk_reg_total_obs(r));
+    CHECK(lk_reg_total_obs(r) == 3);
+    lk_reg_free(r);
+    return 0;
+}
+
+/* The one family two profiles feed (РR9): a metric name may carry exactly one
+ * HELP/TYPE block, so the transaction family is printed once for every protocol
+ * that recorded an interval — not once per profile. */
+static int test_txn_shared(void)
+{
+    struct lk_registry *r = reg(8, 8);
+    char buf[65536];
+    const char *p;
+    int blocks = 0;
+
+    CHECK(r);
+    obs(r, 1, "select ?", "app", "alice", LK_CODE_OK);
+    redis_obs(r, 2, "EXEC", "0", LK_QCODE_OK, NULL, 20, 1);
+    lk_reg_observe_txn(r, "app", "alice", "pg", LK_PROF_QUERY, false, 0.4);
+    lk_reg_observe_txn(r, "0", "default", "redis", LK_PROF_REDIS, true, 0.002);
+
+    dump(r, buf, sizeof(buf));
+    for (p = strstr(buf, "# TYPE latkit_txn_duration_seconds "); p;
+         p = strstr(p + 1, "# TYPE latkit_txn_duration_seconds "))
+        blocks++;
+    CHECK(blocks == 1);
+    CHECK(contains(buf, "latkit_txn_duration_seconds_count{db=\"app\",user=\"alice\",proto=\"pg\","
+                        "status=\"ok\"} 1\n"));
+    CHECK(contains(buf, "latkit_txn_duration_seconds_count{db=\"0\",user=\"default\","
+                        "proto=\"redis\",status=\"aborted\"} 1\n"));
+    /* ... and the transaction did not drag the protocol into the wrong profile:
+     * `redis` is still printing latkit_redis_* families */
+    CHECK(contains(buf, "latkit_redis_commands_total{cmd=\"EXEC\""));
+    CHECK(!contains(buf, "proto=\"redis\",kind="));
+    lk_reg_free(r);
+    return 0;
+}
+
 /* The three profiles share one dictionary and one dimension table and nothing
  * else: an S3 operation and an HTTP route never land in each other's labels,
  * and the two size histograms keep their own grids in one dump. */
@@ -556,13 +713,39 @@ static int test_iter_matches_dump(void)
         "latkit_s3_bytes_total",
         "latkit_s3_object_size_bytes",
         "latkit_s3_internal_requests_total",
+        "latkit_redis_commands_total",
+        "latkit_redis_command_duration_seconds",
+        "latkit_redis_blocking_seconds",
+        "latkit_redis_errors_total",
+        "latkit_redis_redirects_total",
+        "latkit_redis_bytes_total",
+        "latkit_redis_value_size_bytes",
+        "latkit_redis_pipeline_depth",
     };
 
     CHECK(r);
     obs(r, 1, "select ?", "app", "alice", LK_CODE_OK);
-    lk_reg_observe_txn(r, "app", "alice", "pg", false, 0.4);
+    lk_reg_observe_txn(r, "app", "alice", "pg", LK_PROF_QUERY, false, 0.4);
     http_obs(r, 2, "/orders/{id}", "GET", "shop", 500, 10, 900);
     s3_obs(r, 3, "PutObject", "PUT", "photos", 403, "SignatureDoesNotMatch", 8192);
+    redis_obs(r, 4, "GET", "0", LK_QCODE_OK, NULL, 64, 2);
+    redis_obs(r, 5, "BLPOP", "0", LK_QCODE_ERROR, "WRONGTYPE", 12, 1);
+    /* the blocking family has no observation of its own above: give it one, or
+     * the "every family the dump prints is also a view" check cannot see it */
+    struct lk_reg_obs blocked = {
+        .fp = 6,
+        .label = "BRPOP",
+        .db = "0",
+        .user = "default",
+        .proto = "redis",
+        .profile = LK_PROF_REDIS,
+        .kind = LK_QK_COMMAND,
+        .has_block = true,
+        .block_seconds = 5.0,
+        .redirect = LK_REDIR_MOVED,
+    };
+
+    lk_reg_observe(r, &blocked);
 
     lk_reg_iter(r, iter_cb, &seen);
     dump(r, buf, sizeof(buf));
@@ -589,8 +772,9 @@ int main(void)
 {
     if (test_overflow_to_other() || test_evict_reset() || test_doorkeeper() ||
         test_cardinality_ceiling() || test_dim_limit() || test_dump_format() ||
-        test_proto_split() || test_http_profile() || test_s3_profile() || test_s3_http_split() ||
-        test_http_absent_without_traffic() || test_profile_mix() || test_iter_matches_dump())
+        test_proto_split() || test_http_profile() || test_s3_profile() || test_redis_profile() ||
+        test_txn_shared() || test_s3_http_split() || test_http_absent_without_traffic() ||
+        test_profile_mix() || test_iter_matches_dump())
         return 1;
     printf("test_registry: all passed\n");
     return 0;

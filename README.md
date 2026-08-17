@@ -412,6 +412,53 @@ probes, the admin API, the metrics endpoint — lands in
 distributed pool it is most of the port's traffic), and the inter-node **grid**
 is a binary protocol inside a websocket, which is a declared blind zone.
 
+## Redis: a command is not a key
+
+`--port 6379=redis` reads RESP2/RESP3 — Redis, Valkey, KeyDB, Dragonfly and
+Sentinel are the same wire. Three things about a cache differ from everything
+above, and each one is a number that would be wrong if it were reported the
+obvious way:
+
+- **the identity is a command, from a closed table** — `GET`, `XADD`, and for a
+  container command its subcommand too: `CONFIG|GET`, `XINFO|STREAM`. About 250
+  values, listed in [docs/notes-redisproto.md](docs/notes-redisproto.md), so
+  cardinality is a compile-time constant and an unknown command is `cmd="other"`.
+  **Keys, values and arguments never become labels**, at any setting: the second
+  element of a non-container command is a key, and it is not read;
+- **the labels are connection state.** `db` is the `SELECT`ed database number
+  and `user` the ACL user from `AUTH <user> <pass>` / `HELLO … AUTH` — both
+  tracked per connection, and both moved only when the *server* accepts the
+  command (`SELECT 16` is an error and changes nothing). The password is a
+  separate array element, never read and never shown: `--messages --hexdump`
+  blanks it. A connection the agent joined mid-stream reports `db="?"` rather
+  than a `0` it would be guessing;
+- **three kinds of duration, three families.**
+  `latkit_redis_command_duration_seconds` is the server's work.
+  `latkit_redis_blocking_seconds` is `BLPOP key 30` — the timeout the *client*
+  chose, which in the general histogram would be the p99 of the whole instance.
+  A command answered `+QUEUED` inside a `MULTI` has no duration at all: it is
+  counted, and the interval that means something — `MULTI` to the reply to
+  `EXEC` — goes to `latkit_txn_duration_seconds`, the same family PostgreSQL
+  uses. Cluster `-MOVED`/`-ASK` are counted as redirects and not as errors, or a
+  resharding cluster reads as an outage.
+
+**Redis has `INFO commandstats`**, and it is good, so the honest case is what it
+cannot do: it reports a *mean* per command and nothing about the tail, and it
+measures execution inside the server. latkit measures network-to-network on the
+server's host, so it includes the wait behind somebody else's slow command in
+the single-threaded event loop — which is what the application feels and what
+`commandstats` structurally cannot see (one `KEYS *` delays everyone, and
+`GET` still reports as fast). It also splits by database *and* ACL user at once
+where `INFO` is global for the instance, needs no credentials and no
+`CONFIG SET`, and gives you the individual slow command as a span. `PING` is
+kept as an ordinary command with its own latency and its own dashboard panel: it
+does no work, so its p99 is the event loop's queueing delay.
+
+Blind by design: the **unix socket** — check with `redis-cli config get
+unixsocket`, and if that is how your application connects, this agent sees
+nothing at all — the cluster bus, replication and `MONITOR` connections (both
+counted in `latkit_ignored_conns_total{reason}`), and the contents of values.
+
 ## `traceparent`: inside somebody else's trace
 
 If a request carries a W3C `traceparent`, the sampled span latkit exports takes
@@ -629,7 +676,16 @@ symbolic code, because `NoSuchKey` and `NoSuchBucket` are both `404`),
 `latkit_s3_bytes_total{…,direction}`, `latkit_s3_object_size_bytes` (the logical
 object size, chunk framing discounted) and
 `latkit_s3_internal_requests_total` (MinIO's own `/minio/…` surface, counted and
-in nothing that says "requests"). One registry, three label profiles
+in nothing that says "requests"). A Redis port reports under the cache's:
+`latkit_redis_command_duration_seconds{cmd,db,user,proto,code}`,
+`latkit_redis_commands_total{…,code}`, `latkit_redis_errors_total{error,…}` (the
+symbolic token — `WRONGTYPE`, `NOSCRIPT`, `OOM`),
+`latkit_redis_redirects_total{kind}` (`-MOVED`/`-ASK`, which are not failures),
+`latkit_redis_blocking_seconds` (the wait the client asked for, kept out of the
+duration histogram), `latkit_redis_bytes_total{…,direction}`,
+`latkit_redis_value_size_bytes`, `latkit_redis_pipeline_depth` and
+`latkit_redis_push_total` — plus `latkit_txn_duration_seconds` unchanged, since
+`MULTI`…`EXEC` is a transaction. One registry, four label profiles
 ([docs/notes-metrics.md](docs/notes-metrics.md)).
 For a valid exposition use `latkit --dump-metrics` + `kill -USR1`.
 

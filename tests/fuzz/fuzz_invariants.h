@@ -155,7 +155,7 @@ static inline void fz_check_http_msg(const struct lk_msg *m)
  * surfaces at emit time, not only at parse time. */
 static inline void fz_check_obs(const struct lk_query_obs *o)
 {
-    FZ_ASSERT(o->kind <= LK_Q_REQUEST);
+    FZ_ASSERT(o->kind <= LK_Q_COMMAND);
     FZ_ASSERT(memchr(o->sqlstate, '\0', sizeof(o->sqlstate)) != NULL);
     if (o->flags & LK_QO_NO_TEXT)
         FZ_ASSERT(!o->text && !o->text_len);

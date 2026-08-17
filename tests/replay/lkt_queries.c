@@ -67,6 +67,8 @@ static const char *kind_str(__u8 kind)
         return "cancel";
     case LK_Q_REQUEST:
         return "request";
+    case LK_Q_COMMAND:
+        return "command";
     default:
         return "?";
     }
@@ -171,9 +173,10 @@ static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session
         on_http_query(c, s, o);
         return;
     }
-    /* Redis shares LK_Q_SIMPLE with PG until МR5 gives it a kind of its own, so
-     * the connection's protocol is what says which view to print — which is also
-     * how metrics.c and spans.c decide everything protocol-shaped (М6). */
+    /* The connection's protocol is what says which view to print, as it is how
+     * metrics.c and spans.c decide everything protocol-shaped (М6) — the kind
+     * (LK_Q_COMMAND since МR5) agrees, and asking the protocol keeps one rule
+     * rather than two that can disagree. */
     if (lk_conn_proto(c) == &lk_proto_redis_ops) {
         on_redis_query(c, s, o);
         return;
