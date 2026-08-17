@@ -6,7 +6,7 @@
 #
 #   tests/fuzz/campaign.sh [seconds-per-target] [workers]
 #
-# Defaults: 1800 s/target, nproc-1 workers => 3 * 1800 * 21 / 3600 = 31.5
+# Defaults: 1800 s/target, nproc-1 workers => 6 * 1800 * 21 / 3600 = 63
 # CPU-hours on the 22-core stand. Per target it:
 #   1. seeds a working corpus from tests/fuzz/corpus/<t> + fresh gen_seeds;
 #   2. fuzzes with -jobs=W -workers=W (W parallel processes, wall = budget);
@@ -24,9 +24,10 @@ WORKERS=${2:-$(($(nproc) - 1))}
 WORK=${WORK:-$BUILD/campaign-$(date +%Y%m%d-%H%M%S)}
 
 # Per-target dictionary: MySQL has its own byte alphabet (command / lenenc /
-# capability bytes) and HTTP is text with its own token set (methods, framing
-# headers, chunk shapes); pg.dict covers the pg framer, the norm SQL fragments
-# and the pipe scenarios well enough. Two targets carry more than one input
+# capability bytes), HTTP is text with its own token set (methods, framing
+# headers, chunk shapes) and RESP is a third alphabet again (type bytes, lengths
+# that must not parse, the verbs the handler acts on); pg.dict covers the pg
+# framer, the norm SQL fragments and the pipe scenarios well enough. Two targets carry more than one input
 # language behind a selector byte — fuzz_norm (SQL, HTTP routes since М4, S3
 # classifier inputs since МS1) and fuzz_http (the base dialect and, since МS4,
 # S3 behind 0xFD) — and libFuzzer takes a single -dict, so both get a
@@ -34,6 +35,7 @@ WORK=${WORK:-$BUILD/campaign-$(date +%Y%m%d-%H%M%S)}
 dict_for() {
     case "$1" in
     my) echo "$ROOT/tests/fuzz/dict/my.dict" ;;
+    redis) echo "$ROOT/tests/fuzz/dict/redis.dict" ;;
     http) echo "$WORK/http.dict" ;;
     norm) echo "$WORK/norm.dict" ;;
     *) echo "$ROOT/tests/fuzz/dict/pg.dict" ;;
@@ -47,20 +49,20 @@ export DEBUGINFOD_URLS=
 
 if [ ! -x "$BUILD/tests/fuzz/fuzz_pg" ]; then
     cmake -B "$BUILD" -DCMAKE_C_COMPILER=clang -DLATKIT_FUZZ=ON
-    cmake --build "$BUILD" --target fuzz_pg fuzz_my fuzz_http fuzz_norm fuzz_pipe gen_seeds \
-        -j"$(nproc)"
+    cmake --build "$BUILD" --target fuzz_pg fuzz_my fuzz_http fuzz_redis fuzz_norm fuzz_pipe \
+        gen_seeds -j"$(nproc)"
 fi
 
-mkdir -p "$WORK/findings" "$WORK/seed"/{pg,my,http,norm,pipe}
+mkdir -p "$WORK/findings" "$WORK/seed"/{pg,my,http,redis,norm,pipe}
 cat "$ROOT/tests/fuzz/dict/pg.dict" "$ROOT/tests/fuzz/dict/route.dict" > "$WORK/norm.dict"
 cat "$ROOT/tests/fuzz/dict/http.dict" "$ROOT/tests/fuzz/dict/s3.dict" > "$WORK/http.dict"
 "$BUILD/tests/fuzz/gen_seeds" "$WORK/seed" >/dev/null
 
-echo "campaign: $TIME s/target x $WORKERS workers x 5 targets" \
-     "= $(((5 * TIME * WORKERS + 1800) / 3600)) CPU-hours; workdir $WORK"
+echo "campaign: $TIME s/target x $WORKERS workers x 6 targets" \
+     "= $(((6 * TIME * WORKERS + 1800) / 3600)) CPU-hours; workdir $WORK"
 
 fail=0
-for t in pg my http norm pipe; do
+for t in pg my http redis norm pipe; do
     corp="$WORK/corpus-$t"
     mkdir -p "$corp"
     cp "$ROOT/tests/fuzz/corpus/$t"/* "$WORK/seed/$t"/* "$corp"/ 2>/dev/null || true
@@ -71,6 +73,10 @@ for t in pg my http norm pipe; do
     # dialect chosen by a byte the mutator can flip (МS4).
     [ "$t" = http ] && cp "$ROOT"/tests/traces/http/*/*.lkt "$ROOT"/tests/traces/s3/*/*.lkt \
                           "$corp"/ 2>/dev/null || true
+    # ... and the МR0 Redis corpus for the redis target: 93 recorded sessions
+    # carrying shapes no seed writer invents — a 16.9 MB reply in 212 writes, a
+    # 13-deep `COMMAND DOCS`, a client sending one byte per syscall.
+    [ "$t" = redis ] && cp "$ROOT"/tests/traces/redis/*/*.lkt "$corp"/ 2>/dev/null || true
 
     echo "=== fuzz_$t: $TIME s, $WORKERS workers ==="
     mkdir -p "$WORK/run-$t"

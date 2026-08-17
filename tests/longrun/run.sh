@@ -22,6 +22,26 @@
 #
 # Disturbances on a schedule:
 #
+# WORKLOAD=redis replaces the four postgres generators with four Redis ones
+# (PLAN-REDIS.md МR8). Everything else — the witness, the disturbances, the
+# analysis, the criteria — is unchanged, because what a soak is looking for is
+# not protocol-specific: RSS plateaus, fds do not grow, kernel maps do not grow,
+# the series count stays bounded. What *is* protocol-specific is which
+# per-connection state there is to leak, and Redis has the most of any protocol
+# in the tree: a 6 KB in-flight ring per connection, a subscribe flag, an ACL
+# user name and a database number that both move mid-stream. So the redis legs
+# are chosen to churn exactly those:
+#
+#   steady_cmds   memtier, persistent connections, rate-limited   the baseline
+#   churn_conn    redis-cli, one command per process              conn table LRU
+#                                                                 + idle sweep,
+#                                                                 6 KB ring per
+#                                                                 connection
+#   acl_rotate    a fresh ACL user every pass, AUTH, commands,    the dim space
+#                 DELUSER                                         (РR6, риск 7)
+#   pubsub_churn  subscribe / publish / unsubscribe               the subscribe
+#                                                                 state of РR8
+#
 #   induced loss   pkill -STOP latkit; sleep; pkill -CONT    the ringbuf overflows while
 #                  every INDUCE_EVERY seconds                the agent is frozen -> the
 #                                                            "gap -> resync -> recovery"
@@ -45,6 +65,7 @@
 #
 # Usage:
 #   tests/longrun/run.sh up       # start + init the postgres containers (once)
+#   WORKLOAD=redis tests/longrun/run.sh run    # the Redis soak instead
 #   tests/longrun/run.sh run      # the soak itself (default), DURATION_H hours
 #   tests/longrun/run.sh down     # remove the containers
 #
@@ -57,6 +78,7 @@
 #   INDUCE_HOLD=5, RECOVER_SECS=90, RESTART_EVERY=14400, RESTART_SETTLE=90,
 #   RATE_STEADY=5000, RATE_TPCB=800, RATE_CHURN=400, RATE_CHURN_TLS=80,
 #   IDLE_TIMEOUT=45, K_CEIL=2000, RSS_PLATEAU_PCT=5, FD_GROWTH_PCT=20,
+#   WORKLOAD=pg|redis, REDIS_PORT=6577, REDIS_USERS=32, RATE_REDIS=2000,
 #   SCALE=50, PG_SHARED_BUFFERS=1GB (lower both together on a small host),
 #   AGENT_BIN=build-rel/latkit, PROM_PORT=9753, OUT=tests/longrun/out/<utc-ts>,
 #   FORCE=1 (skip the idle-host check).
@@ -109,8 +131,26 @@ PROM_PORT=${PROM_PORT:-9753}
 FORCE=${FORCE:-0}
 OUT=${OUT:-$LR_DIR/out/$(date -u +%Y%m%dT%H%M%SZ)}
 
+WORKLOAD=${WORKLOAD:-pg}
+case "$WORKLOAD" in pg|redis) ;; *) echo "WORKLOAD must be pg or redis" >&2; exit 2 ;; esac
+
 PG_PLAIN=latkit-longrun-pg
 PG_TLS=latkit-longrun-pg-tls
+
+# The Redis leg (PLAN-REDIS.md МR8). 6577 and not 6379 for the reason every
+# stand in the tree gives: the agent's port filter is kernel-wide, so a soak on
+# the default port would spend a day measuring whatever else on this host — or
+# in any container on it — happens to speak Redis.
+REDIS_C=latkit-longrun-redis
+REDIS_IMAGE=${REDIS_IMAGE:-redis:7.4}
+MEMTIER_IMAGE=${MEMTIER_IMAGE:-redislabs/memtier_benchmark:latest}
+REDIS_PORT=${REDIS_PORT:-6577}
+# How many ACL users the rotation cycles through. The point is not the number
+# but that it is *bounded and small*: риск 7 says a Redis deployment has a
+# handful of users and the dim space therefore never needs raising, and a day of
+# rotation is what turns that from an expectation into an observation.
+REDIS_USERS=${REDIS_USERS:-32}
+RATE_REDIS=${RATE_REDIS:-2000}
 DB_USER=latkit DB_NAME=latkit
 export PGPASSWORD=latkit
 PROM="http://127.0.0.1:$PROM_PORT/metrics"
@@ -146,7 +186,34 @@ wait_pg() {  # name
     die "$1 never became ready"
 }
 
+# The Redis stand: one node, no persistence (a background save would be
+# measured as the agent's cost and, worse, as a latency the agent invented), and
+# the ACL users the rotation leg cycles through created on the fly.
+redis_up() {
+    if ! docker inspect "$REDIS_C" >/dev/null 2>&1; then
+        log "starting $REDIS_C"
+        docker run -d --name "$REDIS_C" \
+            "$REDIS_IMAGE" redis-server --port "$REDIS_PORT" \
+            --save "" --appendonly no --maxmemory 512mb \
+            --maxmemory-policy allkeys-lru >/dev/null
+    fi
+    for _ in $(seq 90); do
+        docker exec "$REDIS_C" redis-cli -p "$REDIS_PORT" ping 2>/dev/null \
+            | grep -q PONG && break
+        sleep 1
+    done
+    docker exec "$REDIS_C" redis-cli -p "$REDIS_PORT" ping 2>/dev/null | grep -q PONG \
+        || die "$REDIS_C never became ready"
+    log "stack up: $REDIS_C=$(container_ip "$REDIS_C"):$REDIS_PORT"
+}
+
+redis_down() {
+    docker rm -f "$REDIS_C" >/dev/null 2>&1 || true
+    log "stack removed"
+}
+
 stack_up() {
+    if [ "$WORKLOAD" = redis ]; then redis_up; return; fi
     if ! docker inspect "$PG_PLAIN" >/dev/null 2>&1; then
         log "starting $PG_PLAIN"
         docker run -d --name "$PG_PLAIN" \
@@ -202,6 +269,7 @@ stack_up() {
 }
 
 stack_down() {
+    if [ "$WORKLOAD" = redis ]; then redis_down; return; fi
     docker rm -f "$PG_PLAIN" "$PG_TLS" >/dev/null 2>&1 || true
     log "stack removed"
 }
@@ -293,7 +361,84 @@ run_load() {  # ip sslmode label -- pgbench-args...
     LOAD_PIDS+=($!)
 }
 
+# One Redis load generator in a restart-on-exit loop, the same shape run_load
+# gives the pgbench ones: a server bounce kills the client and we start it
+# again, which is itself part of what the soak exercises.
+run_rload() {  # label -- command...
+    local label=$1; shift; [ "$1" = -- ] && shift
+    (
+        trap 'exit 0' TERM INT
+        while :; do
+            "$@" >>"$OUT/load-$label.log" 2>&1 || true
+            sleep 1
+        done
+    ) &
+    LOAD_PIDS+=($!)
+}
+
+start_redis_load() {
+    local ip; ip=$(container_ip "$REDIS_C")
+
+    # 1. The persistent-connection baseline, rate-limited per connection so the
+    #    soak measures steadiness rather than saturation (the throughput
+    #    question is tests/bench/run-redis.sh's).
+    run_rload steady -- docker run --rm --name latkit-longrun-load-steady \
+        --network host "$MEMTIER_IMAGE" \
+        --server="$ip" --port="$REDIS_PORT" --protocol=redis \
+        --clients=4 --threads=2 --pipeline=1 --ratio=1:4 --data-size=64 \
+        --key-prefix=lk:soak- --rate-limiting="$RATE_REDIS" \
+        --test-time=600 --hide-histogram
+
+    # 2. Reconnect per command: one process, one connection, one command. This
+    #    is the leg that allocates and frees the 6 KB in-flight ring thousands
+    #    of times an hour, and the one that puts the conn table's LRU and its
+    #    idle sweep under continuous pressure (Р12).
+    run_rload churn -- docker run --rm --name latkit-longrun-load-churn \
+        --network host --entrypoint sh "$REDIS_IMAGE" -c "
+            for i in \$(seq 1 400); do
+                redis-cli -h $ip -p $REDIS_PORT set lk:churn:\$i v >/dev/null 2>&1
+                redis-cli -h $ip -p $REDIS_PORT get lk:churn:\$i >/dev/null 2>&1
+            done"
+
+    # 3. ACL-user rotation (РR6, риск 7): a fresh user per pass, authenticated,
+    #    used, deleted. Every one of them is a new value in the `user` dimension
+    #    — bounded by REDIS_USERS, so the series count must plateau, and the
+    #    K_CEIL check is what says whether it did. A cache whose dim space grew
+    #    with time would show up here and nowhere else.
+    run_rload acl -- docker run --rm --name latkit-longrun-load-acl \
+        --network host --entrypoint sh "$REDIS_IMAGE" -c "
+            for i in \$(seq 1 $REDIS_USERS); do
+                redis-cli -h $ip -p $REDIS_PORT acl setuser lksoak\$i on '>lkpass' \
+                    '~lk:*' +@read +@write +@connection >/dev/null 2>&1
+                redis-cli -h $ip -p $REDIS_PORT --user lksoak\$i --pass lkpass \
+                    --no-auth-warning -r 20 get lk:soak-1 >/dev/null 2>&1
+                redis-cli -h $ip -p $REDIS_PORT --user lksoak\$i --pass lkpass \
+                    --no-auth-warning -n 3 -r 5 set lk:acl v >/dev/null 2>&1
+                redis-cli -h $ip -p $REDIS_PORT acl deluser lksoak\$i >/dev/null 2>&1
+            done"
+
+    # 4. Subscriptions (РR8): a connection that enters subscribe mode, receives
+    #    values nobody asked for, and leaves again. The per-connection subscribe
+    #    flag and the queue's refusal to let a delivery close a unit are the two
+    #    things a day of this can break.
+    run_rload pubsub -- docker run --rm --name latkit-longrun-load-pubsub \
+        --network host --entrypoint sh "$REDIS_IMAGE" -c "
+            for i in \$(seq 1 30); do
+                timeout 5 redis-cli -h $ip -p $REDIS_PORT subscribe lk:soakchan \
+                    >/dev/null 2>&1 &
+                for j in \$(seq 1 40); do
+                    redis-cli -h $ip -p $REDIS_PORT publish lk:soakchan hello \
+                        >/dev/null 2>&1
+                    sleep 0.1
+                done
+                wait
+            done"
+
+    log "load: 4 Redis generators up (steady memtier, conn churn, ACL rotation, pub/sub)"
+}
+
 start_load() {
+    if [ "$WORKLOAD" = redis ]; then start_redis_load; return; fi
     local ip_plain ip_tls
     ip_plain=$(container_ip "$PG_PLAIN"); ip_tls=$(container_ip "$PG_TLS")
     local T=$((DURATION_SECS + 120))     # outlive the soak; cleanup kills them
@@ -346,6 +491,9 @@ sample() {  # phase
         tlsconn=$(metric latkit_tls_connections "$f")
         tlsdrop=$(metric latkit_tls_socket_events_dropped_total "$f")
         queries=$(metric latkit_queries_total "$f")
+        # The redis profile reports its observations under its own family
+        # (РR11), so on that leg the column would be a flat zero for a day.
+        [ "$WORKLOAD" = redis ] && queries=$(metric latkit_redis_commands_total "$f")
     else
         phase=${phase}-noscrape       # agent frozen/gone at scrape time
     fi
@@ -368,6 +516,20 @@ induce_loss() {
 }
 
 restart_pg() {
+    if [ "$WORKLOAD" = redis ]; then
+        # The same disturbance, and on this protocol a sharper one: every client
+        # pool reconnects at once, so the agent meets a burst of fresh
+        # connections and, for the ones that were mid-command, a burst of
+        # dropped in-flight units (РR3).
+        log "restart: docker restart $REDIS_C (synthetic OPEN, reconnect burst)"
+        docker restart -t 5 "$REDIS_C" >/dev/null 2>&1 || true
+        for _ in $(seq 60); do
+            docker exec "$REDIS_C" redis-cli -p "$REDIS_PORT" ping 2>/dev/null \
+                | grep -q PONG && break
+            sleep 1
+        done
+        return
+    fi
     log "restart: docker restart $PG_TLS (synthetic OPEN, libssl/cgroup re-resolve)"
     docker restart -t 5 "$PG_TLS" >/dev/null 2>&1 || true
     wait_pg "$PG_TLS" || true
@@ -393,6 +555,13 @@ cleanup() {
         [ -n "$p" ] && kill "$p" 2>/dev/null || true
     done
     pkill -f 'pgbench -h ' 2>/dev/null || true
+    # The Redis generators run *inside containers*, so killing the `docker run`
+    # shim leaves the load running — which is how a killed soak keeps hammering
+    # a server nobody is watching any more. They are named for exactly this.
+    if [ "$WORKLOAD" = redis ]; then
+        docker rm -f latkit-longrun-load-steady latkit-longrun-load-churn \
+            latkit-longrun-load-acl latkit-longrun-load-pubsub >/dev/null 2>&1 || true
+    fi
     agent_stop
     restore_conditions
 }
@@ -427,8 +596,17 @@ preflight() {
 # -------------------------------------------------------------------- report
 
 write_header() {
-    local pgver
-    pgver=$(docker exec "$PG_PLAIN" psql -U $DB_USER -d $DB_NAME -Atqc 'select version()' 2>/dev/null || echo '?')
+    local server load_line restart_target
+    if [ "$WORKLOAD" = redis ]; then
+        server=$(docker exec "$REDIS_C" redis-cli -p "$REDIS_PORT" info server 2>/dev/null \
+                 | sed -n 's/^redis_version:/redis /p' | tr -d '\r' || echo 'redis ?')
+        load_line="steady memtier c4 t2 rate $RATE_REDIS/conn; churn redis-cli 1 conn/cmd; acl $REDIS_USERS users rotating; pubsub subscribe/publish churn"
+        restart_target=$REDIS_C
+    else
+        server=$(docker exec "$PG_PLAIN" psql -U $DB_USER -d $DB_NAME -Atqc 'select version()' 2>/dev/null || echo '?')
+        load_line="steady -S -M prepared -c16 -R $RATE_STEADY; tpcb -c8 -R $RATE_TPCB; churn -C -c8 -R $RATE_CHURN; churn-tls -C -c4 -R $RATE_CHURN_TLS (sslmode=require)"
+        restart_target=$PG_TLS
+    fi
     cat >"$OUT/report.txt" <<EOF
 latkit long-run soak (STAGE8.md 8.5, Р53)
 ==========================================
@@ -437,12 +615,13 @@ commit      : $(git rev-parse --short HEAD)$(git diff --quiet || echo -dirty)
 agent       : $("$AGENT_BIN" --version 2>/dev/null) [$BUILD_TYPE, $AGENT_BIN]
 kernel      : $(uname -r)
 cpu         : $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs), $(nproc) hw threads
-postgres    : $pgver
+workload    : $WORKLOAD
+server      : $server
 pgbench     : $PGBENCH_KIND
 duration    : ${DURATION_SECS}s ($(awk -v s="$DURATION_SECS" 'BEGIN{printf "%.1f", s/3600}') h), sample every ${SAMPLE_EVERY}s, smoke=$SMOKE
-load        : steady -S -M prepared -c16 -R $RATE_STEADY; tpcb -c8 -R $RATE_TPCB; churn -C -c8 -R $RATE_CHURN; churn-tls -C -c4 -R $RATE_CHURN_TLS (sslmode=require)
-disturbance : induced loss (SIGSTOP ${INDUCE_HOLD}s) every ${INDUCE_EVERY}s; $PG_TLS restart every ${RESTART_EVERY}s
-agent flags : -p 5432 --tls auto --conn-idle-timeout $IDLE_TIMEOUT
+load        : $load_line
+disturbance : induced loss (SIGSTOP ${INDUCE_HOLD}s) every ${INDUCE_EVERY}s; $restart_target restart every ${RESTART_EVERY}s
+agent flags : $AGENT_ARGS
 criteria    : RSS plateau <${RSS_PLATEAU_PCT}% over 2nd half; fd growth <${FD_GROWTH_PCT}%; series <= $K_CEIL; dropped/resync grow only in induced/recovery/restart windows; maps unchanged
 
 EOF
@@ -543,6 +722,11 @@ mkdir -p "$OUT"
 OUT=$(readlink -f "$OUT")            # absolute: the detached agent runs via sudo sh
 AGENT_ABS=$(readlink -f "$AGENT_BIN")
 AGENT_ARGS="-p 5432 --tls auto --conn-idle-timeout $IDLE_TIMEOUT"
+# No `--tls auto` on the redis leg: MR7's stand is where the encrypted channel is
+# measured, and a soak that attached uprobes to every process named
+# `redis-server` on the host would be soaking somebody else's server.
+[ "$WORKLOAD" = redis ] && \
+    AGENT_ARGS="-p $REDIS_PORT=redis --conn-idle-timeout $IDLE_TIMEOUT"
 TSV="$OUT/samples.tsv"
 printf '#sample\tepoch\tphase\trss_bytes\tseries\tconns\tfds\tdropped\tresync\ttls_conns\ttls_drop\tqueries\n' >"$TSV"
 
@@ -553,7 +737,7 @@ write_header
 
 log "starting agent"
 agent_start
-wait_tls_attach
+[ "$WORKLOAD" = redis ] || wait_tls_attach
 snap_maps "$OUT/maps-before.txt"
 start_load
 

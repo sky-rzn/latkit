@@ -22,6 +22,9 @@
 #                         # latkit_http_requests_total — PLAN-HTTP.md М8
 #   DB=s3 ./smoke.sh      # the same against MinIO (LATKIT_PORT=9000=s3), where
 #                         # it is latkit_s3_requests_total — PLAN-MINIO.md МS4
+#   DB=redis ./smoke.sh   # the same against Redis (LATKIT_PORT=6399=redis),
+#                         # where it is latkit_redis_commands_total and the
+#                         # client is forced onto TCP — PLAN-REDIS.md МR8
 #   KEEP=1 ./smoke.sh     # leave the cluster up afterwards for inspection
 #   SKIP_BUILD=1 ./smoke.sh   # reuse an already-built/loaded latkit:latest
 #
@@ -50,8 +53,8 @@ MANIFEST="$REPO_ROOT/deploy/k8s/latkit-daemonset.yaml"
 PF_PID=""
 fails=0
 
-# The workload under test (MYSQL.md М7, PLAN-HTTP.md М8, PLAN-MINIO.md МS4):
-# postgres (the default), mysql, http or s3. It selects the workload pod and
+# The workload under test (MYSQL.md М7, PLAN-HTTP.md М8, PLAN-MINIO.md МS4,
+# PLAN-REDIS.md МR8): postgres (the default), mysql, http, s3 or redis. It selects the workload pod and
 # client, the agent's LATKIT_PORT — patched into the DaemonSet before the
 # rollout so the agent frames the right protocol — and which observation counter
 # must grow, since the three profiles of РH10/РS7 report under different family
@@ -78,8 +81,20 @@ s3)
     LATKIT_PORT_VAL="9000=s3"
     COUNTER=latkit_s3_requests_total
     ;;
+redis)
+    DB_IMAGE=redis:7.4
+    # 6399, not 6379, and this is not fussiness: the agent's port filter is
+    # kernel-wide, so on a developer's machine — or on any node that runs a
+    # cache of its own — the default port would capture somebody else's Redis
+    # through the container bridge. Measured on the host this was written on: a
+    # long-lived application pool on :6379 put 16 resyncs and 4 dropped units
+    # into a run that had nothing to do with it. The DaemonSet path is what this
+    # smoke is about; the port number is a coincidence of the deployment.
+    LATKIT_PORT_VAL="6399=redis"
+    COUNTER=latkit_redis_commands_total
+    ;;
 *)
-    echo "smoke: unknown DB '$DB' (want postgres|mysql|http|s3)" >&2
+    echo "smoke: unknown DB '$DB' (want postgres|mysql|http|s3|redis)" >&2
     exit 2
     ;;
 esac
@@ -121,7 +136,20 @@ pgb() { kubectl -n "$NS" exec pg -- pgbench -h 127.0.0.1 -U postgres "$@" postgr
 
 # db_deploy — bring up the workload pod and wait for it to accept TCP.
 db_deploy() {
-    if [ "$DB" = s3 ]; then
+    if [ "$DB" = redis ]; then
+        # The image's own `redis-cli` is the client, over 127.0.0.1 — the plan's
+        # blind zone made concrete: a client that used the unix socket would
+        # never touch tcp_sendmsg and this smoke would pass while measuring
+        # nothing, so the loopback address is not a detail (§1, "not in scope").
+        kubectl -n "$NS" run cache --image="$DB_IMAGE" --port=6399 \
+            -- redis-server --port 6399 --save "" --appendonly no >/dev/null
+        kubectl -n "$NS" wait --for=condition=Ready pod/cache --timeout=120s >/dev/null
+        for _ in $(seq 1 30); do
+            kubectl -n "$NS" exec cache -- \
+                redis-cli -h 127.0.0.1 -p 6399 ping 2>/dev/null | grep -q PONG && break
+            sleep 1
+        done
+    elif [ "$DB" = s3 ]; then
         # A single-node MinIO, and `curl` from inside the same image as the
         # client. The requests below are anonymous on purpose: a signed one
         # would need an SDK in the pod, and what this smoke is about is the
@@ -175,7 +203,20 @@ db_deploy() {
 # db_load DURATION — drive a burst of TCP queries for ~DURATION seconds.
 db_load() {
     local secs="$1"
-    if [ "$DB" = s3 ]; then
+    if [ "$DB" = redis ]; then
+        # Four shapes per iteration, all from the closed table (РR4): a write, a
+        # read, a batch and a healthcheck. `-r` repeats on one connection, so
+        # this is a steady stream of commands rather than a stream of connects.
+        kubectl -n "$NS" exec cache -- sh -c '
+            end=$(( $(date +%s) + '"$secs"' ))
+            while [ "$(date +%s)" -lt "$end" ]; do
+                redis-cli -h 127.0.0.1 -p 6399 -r 50 set lk:k v     >/dev/null 2>&1
+                redis-cli -h 127.0.0.1 -p 6399 -r 50 get lk:k       >/dev/null 2>&1
+                redis-cli -h 127.0.0.1 -p 6399 -r 20 mget lk:k lk:x >/dev/null 2>&1
+                redis-cli -h 127.0.0.1 -p 6399 -r 20 ping           >/dev/null 2>&1
+            done
+            exit 0' >/dev/null 2>&1
+    elif [ "$DB" = s3 ]; then
         # Three shapes per iteration: an object read, a HEAD and a listing —
         # three rows of the operation table (РS2), all refused, all counted.
         kubectl -n "$NS" exec obj -- sh -c '

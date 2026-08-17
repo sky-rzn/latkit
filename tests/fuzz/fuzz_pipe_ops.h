@@ -7,9 +7,9 @@
  * lazy-created dirty entries, the TLS flip, LRU/idle eviction).
  *
  * The very first input byte is the protocol selector (MYSQL.md М7,
- * PLAN-HTTP.md М8): bits 1..0 choose the wire protocol every connection frames
- * and parses as — 0 = pg (the registry head, the historical behaviour),
- * 1 = mysql, 2 = http, 3 folds back to pg. The rest of the byte is reserved.
+ * PLAN-HTTP.md М8, PLAN-REDIS.md МR8): bits 1..0 choose the wire protocol every
+ * connection frames and parses as — 0 = pg (the registry head, the historical
+ * behaviour), 1 = mysql, 2 = http, 3 = redis. The rest of the byte is reserved.
  * This lets one corpus fuzz every framer and handler through the same pipeline
  * seams; the scenario proper begins at byte 1.
  *
@@ -18,6 +18,14 @@
  * seams this target exists to shake — the seq detector, the budget-cut tail,
  * the synthetic entry, the TLS flip — reach it down a different path inside
  * lk_reasm_data than the one the two message-framed protocols take.
+ *
+ * Redis took the fourth value rather than a third bit, which is the cheap
+ * change and also the honest one: `3` used to fold back to pg, so no existing
+ * corpus entry changes meaning except by starting to fuzz a framer instead of
+ * repeating one that three quarters of the corpus already covers. What it adds
+ * to *this* target specifically is a protocol whose unit boundaries are the
+ * syscall boundaries themselves (РR3) — every op in a scenario is one call, so
+ * a batch is a thing the scenario format can express and a mutator can shuffle.
  *
  * A scenario is a sequence of ops. The op byte packs three fields:
  *
@@ -105,5 +113,6 @@ enum pipe_shape {
 #define PIPE_PROTO_PG    0
 #define PIPE_PROTO_MYSQL 1
 #define PIPE_PROTO_HTTP  2
+#define PIPE_PROTO_REDIS 3
 
 #endif /* LATKIT_FUZZ_PIPE_OPS_H */

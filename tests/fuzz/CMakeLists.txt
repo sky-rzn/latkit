@@ -6,6 +6,7 @@
 #   fuzz_pg    bytes -> framer -> lk_msg -> PG parser (harness from task 3.6)
 #   fuzz_my    the same over the MySQL framer + handler (MYSQL.md М7)
 #   fuzz_http  the same over the HTTP/1.x stream framer (PLAN-HTTP.md М2)
+#   fuzz_redis the same over the RESP framer + handler (PLAN-REDIS.md МR8)
 #   fuzz_norm  bytes -> lk_norm_sql / lk_norm_route / lk_norm_s3 / lk_redis_cmd
 #              (task 4.1, МS1, PLAN-REDIS.md МR3)
 #   fuzz_pipe  event scenario -> decode + conn_table + framer + parser + norm
@@ -14,7 +15,7 @@
 # latkit_proto/latkit_norm: the libraries are built without sanitizers, and an
 # uninstrumented dependency is exactly where a fuzzer goes blind.
 #
-# Corpus lives in tests/fuzz/corpus/{pg,my,http,norm,pipe} (committed; minimised with
+# Corpus lives in tests/fuzz/corpus/{pg,my,http,redis,norm,pipe} (committed; minimised with
 # -merge=1 by campaign.sh). The ctest entries below replay it with -runs=0 —
 # the corpus-regression mode CI runs on every PR; fuzzing time budgets live in
 # ci.yml, not here.
@@ -45,8 +46,8 @@ set(FUZZ_PROTO_SRC
     ${CMAKE_SOURCE_DIR}/src/proto/http/http_route.c
     ${CMAKE_SOURCE_DIR}/src/proto/s3/s3_dialect.c
     # The registry has held a fifth entry since PLAN-REDIS.md МR1, and every
-    # target that compiles registry.c needs the handler behind it. `fuzz_redis`
-    # — the framer's own target — is МR8's.
+    # target that compiles registry.c needs the handler behind it; since МR8 it
+    # also has a target of its own (fuzz_redis).
     ${CMAKE_SOURCE_DIR}/src/proto/redis/redis_frame.c
     ${CMAKE_SOURCE_DIR}/src/proto/redis/redis.c)
 set(FUZZ_CORE_SRC
@@ -71,6 +72,7 @@ endfunction()
 latkit_fuzzer(fuzz_pg fuzz_pg.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC} ${FUZZ_NORM_SRC})
 latkit_fuzzer(fuzz_my fuzz_my.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC} ${FUZZ_NORM_SRC})
 latkit_fuzzer(fuzz_http fuzz_http.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC} ${FUZZ_NORM_SRC})
+latkit_fuzzer(fuzz_redis fuzz_redis.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC} ${FUZZ_NORM_SRC})
 latkit_fuzzer(fuzz_norm fuzz_norm.c ${FUZZ_NORM_SRC})
 latkit_fuzzer(fuzz_pipe fuzz_pipe.c ${FUZZ_CORE_SRC} ${FUZZ_PROTO_SRC} ${FUZZ_NORM_SRC}
               ${CMAKE_SOURCE_DIR}/src/agent/decode.c ${CMAKE_SOURCE_DIR}/src/agent/pipeline.c)
@@ -103,5 +105,17 @@ add_test(NAME fuzz_http_corpus
                  ${CMAKE_SOURCE_DIR}/tests/traces/s3/minio
                  ${CMAKE_SOURCE_DIR}/tests/traces/s3/dist
                  ${CMAKE_SOURCE_DIR}/tests/traces/s3/tls)
+# fuzz_redis replays its own corpus plus the МR0 Redis traces — 93 recorded
+# sessions against Redis 7.4, Valkey 8 and a three-node cluster, whose raw .lkt
+# bytes are also valid framer input and carry the shapes no seed writer would
+# think of (a 16.9 MB `KEYS *` reply in 212 writes, `COMMAND DOCS` at 13 levels
+# of nesting, a client sending one byte per syscall).
+add_test(NAME fuzz_redis_corpus
+         COMMAND fuzz_redis -runs=0 ${FUZZ_CORPUS}/redis
+                 ${CMAKE_SOURCE_DIR}/tests/traces/redis/redis
+                 ${CMAKE_SOURCE_DIR}/tests/traces/redis/libs
+                 ${CMAKE_SOURCE_DIR}/tests/traces/redis/valkey
+                 ${CMAKE_SOURCE_DIR}/tests/traces/redis/cluster
+                 ${CMAKE_SOURCE_DIR}/tests/traces/redis/server)
 add_test(NAME fuzz_norm_corpus COMMAND fuzz_norm -runs=0 ${FUZZ_CORPUS}/norm)
 add_test(NAME fuzz_pipe_corpus COMMAND fuzz_pipe -runs=0 ${FUZZ_CORPUS}/pipe)

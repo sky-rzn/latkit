@@ -1,0 +1,35 @@
+	*2
+$3
+GET
+$5
+lk:k1
+$8192
+abcdefgh	M*3
+$3
+SET
+$4
+lk:a
+$1
+1
+*2
+$3
+GET
+$4
+lk:a
+*2
+$4
+INCR
+$4
+lk:n
+$6
+value1
+" alue we joined halfway through
+
+*2
+$3
+GET
+$5
+lk:k1
+$6
+value1
+

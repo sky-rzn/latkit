@@ -1,0 +1,213 @@
+# Plaintext Redis e2e stand (PLAN-REDIS.md МR8): one Redis, three load
+# generators and one agent watching :6579. Drive it with ./verify-redis.sh.
+#
+#   ./verify-redis.sh            # build the agent, up, assert, down
+#   KEEP=1 ./verify-redis.sh     # leave it running
+#   MEMTIER=1 ./verify-redis.sh  # also run memtier and re-assert (volume)
+#
+# Three load generators, because they answer different questions:
+#
+#   - **`cmds`** drives a fixed command file through `redis-cli`, so every
+#     assertion below can name the exact command and the exact symbolic error it
+#     must produce (РR4/РR7). It also drives the two labels — a `SELECT`ed
+#     database and an ACL user — and a transaction, a blocking pop and a
+#     pipeline, which are the three shapes whose *absence from the general
+#     histogram* is the milestone's claim.
+#   - **`pubsub`** holds a subscription open and publishes into it. That is the
+#     one thing on this protocol that is not a request/response at all (РR8), and
+#     the reason it has a stand rather than only a unit test: a delivery
+#     mistaken for a reply shifts every latency on the connection *plausibly*,
+#     so nothing but a counter would notice.
+#   - **`memtier`** (behind a compose profile) is volume: the same benchmark the
+#     perf gate uses, at a pipeline depth the depth histogram then has to show.
+#
+# The pieces that matter, and why:
+#
+#   - **Port 6579, not 6379.** The agent's port filter is kernel-wide: a stand on
+#     the default port would capture any other Redis on the host — somebody
+#     else's data in our metrics and our assertions. 6479/6480 belong to the МR7
+#     TLS stand.
+#   - **No published server port.** Traffic stays on the compose bridge for the
+#     usual reason: a localhost hop goes through docker-proxy, which splices past
+#     the capture point.
+#   - **`requirepass` and an ACL user.** Two credentials on the wire, both of
+#     them in commands the agent frames and none of them anywhere in its output
+#     (РR6) — which is what makes the privacy assertion a measurement rather than
+#     a statement. They also produce the two authentication failures with
+#     *different* symbols: `-NOAUTH` for a client that never authenticated and
+#     `-WRONGPASS` for one that got it wrong.
+#   - **No `--save`, no AOF.** A background rewrite would put a fork's worth of
+#     latency into the numbers this stand reads.
+
+name: latkit-redis
+
+networks:
+  default:
+    name: latkit-redis-net
+
+services:
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4}
+    command:
+      - redis-server
+      - --port
+      - "6579"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --requirepass
+      - lkrootpass
+      # An ACL user with a name worth reading: `user=lkuser` beside
+      # `user=default` is the whole of РR6 on a live wire.
+      - --user
+      - lkuser
+      - "on"
+      - ">lkpass"
+      - "~*"
+      - "&*"
+      - +@all
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 6579 -a lkrootpass ping 2>/dev/null | grep -q PONG"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # The fixed sequence: every shape the МR8 acceptance list names, in an order
+  # that repeats so a counter can be watched growing. Written to a file and fed
+  # to `redis-cli` on stdin, which is how a pipeline of exactly N commands is
+  # produced without a client library deciding otherwise.
+  cmds:
+    image: ${REDIS_IMAGE:-redis:7.4}
+    depends_on:
+      redis:
+        condition: service_healthy
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        cat > /tmp/cmds.txt <<'CMDS'
+        SET lk:k1 value1
+        GET lk:k1
+        MGET lk:k1 lk:missing
+        INCR lk:counter
+        SETEX lk:ttl 60 v
+        HSET lk:hash field value
+        HGETALL lk:hash
+        ZADD lk:zset 1 member
+        ZSCORE lk:zset member
+        EXPIRE lk:k1 300
+        CONFIG GET maxmemory
+        CLIENT SETNAME lkclient
+        MULTI
+        SET lk:txn 1
+        INCR lk:counter
+        EXEC
+        RPUSH lk:queue item
+        BLPOP lk:queue 0
+        SET lk:str notalist
+        LPUSH lk:str x
+        PING
+        CMDS
+        r() { redis-cli -h redis -p 6579 -a lkrootpass --no-auth-warning "$$@"; }
+        while :; do
+          # The main sequence, as one pipeline: 21 commands in one connection.
+          r < /tmp/cmds.txt                                  >/dev/null 2>&1 || true
+          # A database that is not 0 (РR5), and an ACL user that is not
+          # `default` (РR6) — one command each, so the label is unambiguous.
+          r -n 3 set lk:db3 v                                >/dev/null 2>&1 || true
+          r -n 3 get lk:db3                                  >/dev/null 2>&1 || true
+          redis-cli -h redis -p 6579 --user lkuser --pass lkpass --no-auth-warning \
+              get lk:k1                                      >/dev/null 2>&1 || true
+          # The two authentication failures, which are two different symbols:
+          # a client that never authenticated, and one that got the password
+          # wrong. Neither may move the user label (РR6).
+          redis-cli -h redis -p 6579 get lk:k1               >/dev/null 2>&1 || true
+          redis-cli -h redis -p 6579 --user lkuser --pass wrongpass --no-auth-warning \
+              get lk:k1                                      >/dev/null 2>&1 || true
+          # A healthcheck's PING, spoken inline by something that is not a
+          # client library at all (РR15): this is the shape a load balancer's
+          # TCP probe puts on the port.
+          (exec 3<>/dev/tcp/redis/6579 && printf 'AUTH lkrootpass\r\nPING\r\n' >&3 &&
+           head -n 2 <&3 >/dev/null) 2>/dev/null || true
+          sleep 0.3
+        done
+    restart: "no"
+
+  # A subscriber and a publisher on the same channel: the values that answer
+  # nobody (РR8). Kept apart from `cmds` because a subscribed connection is a
+  # different kind of connection, and the assertion is about what the *other*
+  # one's latencies look like while this one is running.
+  pubsub:
+    image: ${REDIS_IMAGE:-redis:7.4}
+    depends_on:
+      redis:
+        condition: service_healthy
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        r() { redis-cli -h redis -p 6579 -a lkrootpass --no-auth-warning "$$@"; }
+        # The subscriptions are re-made every 20 s rather than held for ever,
+        # for a reason that is itself part of what this stand is about: an agent
+        # attaches to a *running* deployment, so a connection opened before it
+        # started has no `SUBSCRIBE` for it to have seen. Re-subscribing means
+        # both halves of РR8 are exercised — the confirmation that closes a unit
+        # and the deliveries that close none.
+        while :; do
+          timeout 20 redis-cli -h redis -p 6579 -a lkrootpass --no-auth-warning \
+              subscribe lk:chan >/dev/null 2>&1 &
+          timeout 20 redis-cli -h redis -p 6579 -a lkrootpass --no-auth-warning \
+              psubscribe 'lk:*' >/dev/null 2>&1 &
+          for _ in $$(seq 1 100); do
+            r publish lk:chan hello >/dev/null 2>&1 || true
+            sleep 0.2
+          done
+        done
+    restart: "no"
+
+  # Volume, on demand. `--pipeline 8` is what makes the depth histogram say
+  # something an operator can act on: `le="1"` is a client that waits for every
+  # reply, and everything above it is a client that does not.
+  memtier:
+    image: ${MEMTIER_IMAGE:-redislabs/memtier_benchmark:latest}
+    profiles: ["memtier"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    command:
+      - "--server=redis"
+      - "--port=6579"
+      - "--authenticate=lkrootpass"
+      - "--protocol=redis"
+      - "--clients=4"
+      - "--threads=2"
+      - "--pipeline=8"
+      - "--ratio=1:4"
+      - "--data-size=64"
+      - "--key-prefix=lk:mt-"
+      - "--test-time=20"
+      - "--hide-histogram"
+
+  latkit:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.latkit
+    depends_on:
+      redis:
+        condition: service_healthy
+    privileged: true
+    pid: host
+    volumes:
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+    command: ["-p", "6579=redis", "--prom-listen", "0.0.0.0:9752"]
+    ports: ["9760:9752"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      - latkit
+    volumes:
+      - ./prometheus-redis-plain.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=6h"
+    ports: ["19095:9090"]

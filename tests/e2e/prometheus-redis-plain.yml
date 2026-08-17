@@ -1,0 +1,11 @@
+# Prometheus config for the plaintext Redis stand (PLAN-REDIS.md МR8). One
+# agent, one job — the assertions here are about what a Redis port produces, not
+# about comparing two legs (that is the МR7 TLS stand's job).
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: latkit
+    static_configs:
+      - targets: ["latkit:9752"]

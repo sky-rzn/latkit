@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "fixtures_gen.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -3199,6 +3200,707 @@ static void build_s3_synthetic_midstream(struct fx *x)
     b.x->obs_text = "/" S3_FX_BUCKET "/small.bin";
 }
 
+/* --- Redis / RESP wire helpers (PLAN-REDIS.md МR8) --------------------------
+ * The fifth fixture set, and the first that is not made of text lines. A RESP
+ * value is typed, length-prefixed and nested, and the framer publishes one
+ * message per **top-level value** (РR2) — so what a fixture has to be able to
+ * say is not "this line" or "this packet" but "these values arrived in this
+ * syscall", which is what struct rbatch below is.
+ *
+ * The batch is the shape rather than the value because **the batch is the thing
+ * Redis does differently** (РR3): a pipeline of three commands is one write(2)
+ * and three messages, the depth of that batch is itself an observation, and a
+ * set that could only describe one value per call could not describe the normal
+ * mode of every client library МR0 measured.
+ *
+ * No builder here asks the framer what it thinks. Every length below is the
+ * arithmetic of the bytes the builder laid down, and every label is what
+ * РR4–РR7 say the identity, the database, the user and the failure of that
+ * exchange are; the type bytes are spelled as characters for the same reason the
+ * HTTP set spells its own — a fixture that agreed with the code by construction
+ * would assert nothing. */
+
+#define FX_REDIS_MAX_VALS 8
+#define FX_REDIS_BUF      1024
+
+/* The `i` of redis.h: an inline command carries no RESP type byte, so the
+ * framer gives it a synthetic one. Written out here, not included. */
+#define FX_REDIS_MSG_INLINE 'i'
+
+/* One syscall's worth of RESP, and the messages it has to become. */
+struct rbatch {
+    struct bld *b;
+    char buf[FX_REDIS_BUF];
+    __u32 n;
+    __u32 len[FX_REDIS_MAX_VALS]; /* each value's whole size on the wire */
+    char type[FX_REDIS_MAX_VALS]; /* ... and the type it is published under */
+    __u32 nv;
+};
+
+static void rb_init(struct rbatch *rb, struct bld *b)
+{
+    memset(rb, 0, sizeof(*rb));
+    rb->b = b;
+}
+
+/* Bytes that are not a value: the blank line an idle `telnet` or a healthcheck
+ * script sends, which the server answers with nothing — so it must become no
+ * message either, or the unit queue would wait for a reply nobody owes. */
+static void rb_bytes(struct rbatch *rb, const char *s)
+{
+    __u32 n = (__u32)strlen(s);
+
+    memcpy(rb->buf + rb->n, s, n);
+    rb->n += n;
+}
+
+static void rb_open(struct rbatch *rb, char type)
+{
+    rb->type[rb->nv] = type;
+    rb->len[rb->nv] = rb->n;
+}
+
+static void rb_close(struct rbatch *rb)
+{
+    rb->len[rb->nv] = rb->n - rb->len[rb->nv];
+    rb->nv++;
+}
+
+/* A literal RESP value, written as it goes on the wire; its type is its first
+ * byte, because on this protocol the dictionary is the protocol's own. */
+static void rb_val(struct rbatch *rb, const char *s)
+{
+    rb_open(rb, s[0]);
+    rb_bytes(rb, s);
+    rb_close(rb);
+}
+
+/* An inline command — `PING\r\n` from telnet or a TCP probe. The raw line,
+ * terminator included, is both the message's length and its body. */
+static void rb_inline(struct rbatch *rb, const char *line)
+{
+    rb_open(rb, FX_REDIS_MSG_INLINE);
+    rb_bytes(rb, line);
+    rb_close(rb);
+}
+
+/* A command as a client writes it: an array of bulk strings, NULL-terminated
+ * argument list. */
+static void rb_cmd(struct rbatch *rb, ...)
+{
+    va_list ap;
+    const char *a;
+    char head[24];
+    unsigned argc = 0;
+
+    va_start(ap, rb);
+    while ((a = va_arg(ap, const char *)) != NULL)
+        argc++;
+    va_end(ap);
+
+    rb_open(rb, '*');
+    snprintf(head, sizeof(head), "*%u\r\n", argc);
+    rb_bytes(rb, head);
+    va_start(ap, rb);
+    while ((a = va_arg(ap, const char *)) != NULL) {
+        snprintf(head, sizeof(head), "$%u\r\n", (unsigned)strlen(a));
+        rb_bytes(rb, head);
+        rb_bytes(rb, a);
+        rb_bytes(rb, "\r\n");
+    }
+    va_end(ap);
+    rb_close(rb);
+}
+
+/* The batch, as one captured call: every value in it becomes a message of its
+ * own, in order. `flags` belongs to the first of them — LK_MSG_AFTER_RESYNC is
+ * a statement about where framing resumed, and it resumes once. */
+static void rb_send(struct rbatch *rb, enum lk_dir dir, __u16 flags)
+{
+    call(rb->b, dir, (const __u8 *)rb->buf, rb->n);
+    for (__u32 i = 0; i < rb->nv; i++)
+        expect(rb->b, dir, rb->type[i], rb->len[i], i ? 0 : flags);
+    rb->n = 0;
+    rb->nv = 0;
+}
+
+/* One command, alone in its call: the shape a client without a pipeline
+ * produces, and the shape of most of this set. */
+static void rb_send_cmd(struct rbatch *rb)
+{
+    rb_send(rb, LK_DIR_RECV, 0);
+}
+
+/* A reply, alone in its call — which is what makes a command's duration an
+ * interval between two events rather than a zero. */
+static void rb_reply(struct rbatch *rb, const char *v)
+{
+    rb_val(rb, v);
+    rb_send(rb, LK_DIR_SEND, 0);
+}
+
+static void redisbld_init(struct bld *b, struct fx *x)
+{
+    bld_init(b, x);
+    b->tuple.dport = 6379; /* the port РR1 writes; run_fixture forces the ops */
+
+    /* No session on any redis fixture: RESP has no handshake to hang one on.
+     * The database and the ACL user are connection state that moves mid-stream
+     * (РR5/РR6) — a `SELECT` an hour in changes the label and nothing else — so
+     * they travel on every observation rather than being announced once. */
+    x->sessions = 0;
+    x->obs_kind = LK_Q_COMMAND;
+    /* Carried by every Redis observation: a command's text is its verb *and its
+     * arguments*, and the arguments are keys and values. The identity that
+     * replaces it is an index into a closed table (РR4); МR6's span renders
+     * `GET ?` from that index, and nothing anywhere rebuilds the text. */
+    x->obs_flags = LK_QO_NO_TEXT;
+}
+
+/* --- Redis fixtures --------------------------------------------------------- */
+
+/* The base row the other twelve are deviations from: two commands, two replies,
+ * one connection, nothing degraded. Both identities come out of the table, both
+ * labels are the defaults a fresh connection has by protocol (database 0, user
+ * `default`), and the reply's size is a number the value families can carry. */
+static void build_redis_get_set(struct fx *x)
+{
+    struct bld b;
+    struct rbatch rb;
+
+    redisbld_init(&b, x);
+    rb_init(&rb, &b);
+    ev_open(&b, false);
+
+    rb_cmd(&rb, "SET", "lk:k1", "value1", NULL); /* 36 bytes */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "+OK\r\n");
+
+    rb_cmd(&rb, "GET", "lk:k1", NULL); /* 24 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "$6\r\nvalue1\r\n"); /* 12 */
+    ev_close(&b);
+
+    b.x->queries = 2;
+    b.x->obs_route = "GET";
+    b.x->obs_bytes_in = 24;
+    b.x->obs_bytes_out = 12;
+    b.x->obs_err_name = "";
+}
+
+/* РR3, the whole of it: three commands in one write(2) and three replies in
+ * one. Every unit is in flight while the next arrives, so all three are
+ * pipelined, all three report a batch depth of 3 — and the identities are
+ * exactly the identities the same three commands would have had alone, which is
+ * the property that makes a pipelined dashboard comparable with an unpipelined
+ * one. */
+static void build_redis_pipeline(struct fx *x)
+{
+    struct bld b;
+    struct rbatch rb;
+
+    redisbld_init(&b, x);
+    rb_init(&rb, &b);
+    ev_open(&b, false);
+
+    rb_cmd(&rb, "SET", "lk:a", "1", NULL); /* 30 */
+    rb_cmd(&rb, "GET", "lk:a", NULL);      /* 23 */
+    rb_cmd(&rb, "INCR", "lk:n", NULL);     /* 24 */
+    rb_send(&rb, LK_DIR_RECV, 0);
+
+    rb_val(&rb, "+OK\r\n");     /* 5 */
+    rb_val(&rb, "$1\r\n1\r\n"); /* 7 */
+    rb_val(&rb, ":1\r\n");      /* 4 */
+    rb_send(&rb, LK_DIR_SEND, 0);
+    ev_close(&b);
+
+    b.x->queries = 3;
+    b.x->obs_route = "INCR";
+    b.x->obs_bytes_in = 24;
+    b.x->obs_bytes_out = 4;
+    b.x->obs_err_name = "";
+    b.x->obs_flags = LK_QO_NO_TEXT | LK_QO_PIPELINED;
+}
+
+/* РR9: the transaction, and the two things inside it that are not what they
+ * look like. The commands between `MULTI` and `EXEC` are answered `+QUEUED` in
+ * microseconds — they are commands and are counted, and their duration means
+ * nothing, so they carry LK_QO_QUEUED and reach no histogram. The work is the
+ * `EXEC`, and the interval an application waited is `MULTI` … the reply to it,
+ * which is what `latkit_txn_duration_seconds` already means for PG and MySQL. */
+static void build_redis_multi(struct fx *x)
+{
+    struct bld b;
+    struct rbatch rb;
+
+    redisbld_init(&b, x);
+    rb_init(&rb, &b);
+    ev_open(&b, false);
+
+    rb_cmd(&rb, "MULTI", NULL); /* 15 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "+OK\r\n");
+
+    rb_cmd(&rb, "SET", "lk:t", "1", NULL); /* 30 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "+QUEUED\r\n"); /* 9 */
+
+    rb_cmd(&rb, "INCR", "lk:n", NULL); /* 24 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "+QUEUED\r\n");
+
+    rb_cmd(&rb, "EXEC", NULL); /* 14 */
+    rb_send_cmd(&rb);
+    /* The array the transaction returns: one reply per queued command, and the
+     * only value on the connection that describes real work. */
+    rb_reply(&rb, "*2\r\n+OK\r\n:1\r\n"); /* 13 */
+    ev_close(&b);
+
+    b.x->queries = 4;
+    b.x->obs_route = "EXEC";
+    b.x->obs_bytes_in = 14;
+    b.x->obs_bytes_out = 13;
+    b.x->obs_err_name = "";
+}
+
+/* РR7's first half: a failure has a *symbol*, and the sentence after it has a
+ * key in it. All three errors here are real Redis wordings, and two of them
+ * name something that may never become a label — the key `lk:k1` and the
+ * command a client made up. The identity of the third is `other` for the same
+ * reason: the table is closed, and a client cannot name a series by inventing a
+ * verb. */
+static void build_redis_error(struct fx *x)
+{
+    struct bld b;
+    struct rbatch rb;
+
+    redisbld_init(&b, x);
+    rb_init(&rb, &b);
+    ev_open(&b, false);
+
+    rb_cmd(&rb, "FROBNICATE", "lk:k1", NULL); /* 32 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "-ERR unknown command 'FROBNICATE', with args beginning with: 'lk:k1'\r\n");
+
+    rb_cmd(&rb, "LPUSH", "lk:str", "x", NULL); /* 34 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+
+    rb_cmd(&rb, "EVALSHA", "0f3c2b1a4e5d6c7b8a99e1d2c3b4a5f60718293a", "0", NULL); /* 71 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "-NOSCRIPT No matching script. Please use EVAL.\r\n"); /* 48 */
+    ev_close(&b);
+
+    b.x->queries = 3;
+    b.x->errors_sql = 3;
+    b.x->obs_route = "EVALSHA";
+    b.x->obs_bytes_in = 71;
+    b.x->obs_bytes_out = 48;
+    b.x->obs_err_name = "NOSCRIPT";
+    b.x->obs_flags = LK_QO_NO_TEXT | LK_QO_ERROR;
+}
+
+/* РR7's second half, and the reason it is a decision rather than a detail: a
+ * `-MOVED` is an error reply and is not a failure. A resharding cluster answers
+ * them continuously, and in `errors_total` they would paint a healthy cluster
+ * red for ever — so they have a counter of their own and carry the client-error
+ * flag rather than the error one. The `-CROSSSLOT` beside them is the control:
+ * a real refusal, on the same connection, in the error family and in no
+ * redirect. */
+static void build_redis_moved(struct fx *x)
+{
+    struct bld b;
+    struct rbatch rb;
+
+    redisbld_init(&b, x);
+    rb_init(&rb, &b);
+    ev_open(&b, false);
+
+    rb_cmd(&rb, "GET", "lk:foo", NULL); /* 25 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "-MOVED 12539 10.0.0.3:6379\r\n");
+
+    rb_cmd(&rb, "MGET", "lk:a", "lk:b", NULL); /* 34 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "-CROSSSLOT Keys in request don't hash to the same slot\r\n");
+
+    rb_cmd(&rb, "GET", "lk:bar", NULL); /* 25 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "-ASK 8000 10.0.0.4:6379\r\n"); /* 25 */
+    ev_close(&b);
+
+    b.x->queries = 3;
+    b.x->errors_sql = 1; /* the CROSSSLOT, and only it */
+    b.x->obs_route = "GET";
+    b.x->obs_bytes_in = 25;
+    b.x->obs_bytes_out = 25;
+    b.x->obs_err_name = "ASK";
+    b.x->obs_flags = LK_QO_NO_TEXT | LK_QO_CLIENT_ERR;
+}
+
+/* РR8, which is a condition of correctness and not an optimisation: a delivery
+ * answers nobody. The two `message` values below are not replies to anything,
+ * and a queue that let them close units would leave every later command on this
+ * connection paired with the wrong answer — plausibly, and for ever. The
+ * confirmations *are* replies, which is the distinction RESP2 offers no type
+ * byte for and the subscribe state has to make. */
+static void build_redis_pubsub(struct fx *x)
+{
+    struct bld b;
+    struct rbatch rb;
+
+    redisbld_init(&b, x);
+    rb_init(&rb, &b);
+    ev_open(&b, false);
+
+    rb_cmd(&rb, "SUBSCRIBE", "lk:chan", NULL); /* 32 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "*3\r\n$9\r\nsubscribe\r\n$7\r\nlk:chan\r\n:1\r\n");
+
+    /* Two deliveries, arriving on their own like any published message. */
+    rb_reply(&rb, "*3\r\n$7\r\nmessage\r\n$7\r\nlk:chan\r\n$5\r\nhello\r\n");
+    rb_reply(&rb, "*3\r\n$7\r\nmessage\r\n$7\r\nlk:chan\r\n$5\r\nworld\r\n");
+
+    rb_cmd(&rb, "UNSUBSCRIBE", "lk:chan", NULL); /* 35 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "*3\r\n$11\r\nunsubscribe\r\n$7\r\nlk:chan\r\n:0\r\n"); /* 39 */
+    ev_close(&b);
+
+    b.x->queries = 2; /* the two commands, and neither delivery */
+    b.x->pushes = 2;
+    b.x->obs_route = "UNSUBSCRIBE";
+    b.x->obs_bytes_in = 35;
+    b.x->obs_bytes_out = 39;
+    b.x->obs_err_name = "";
+}
+
+/* RESP3, which МR0 measured being the default of two of the five client
+ * libraries in scope — so this is a main path, not an exotic one. Four of the
+ * types RESP2 does not have are here (`%` map, `>` push, `,` double, `_` null),
+ * and the push is the one that matters: with a type byte of its own it needs no
+ * subscribe state at all, and an `invalidate` nobody asked for closes no unit. */
+static void build_redis_resp3(struct fx *x)
+{
+    struct bld b;
+    struct rbatch rb;
+
+    redisbld_init(&b, x);
+    rb_init(&rb, &b);
+    ev_open(&b, false);
+
+    rb_cmd(&rb, "HELLO", "3", NULL); /* 22 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "%3\r\n$6\r\nserver\r\n$5\r\nredis\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:42\r\n");
+
+    rb_cmd(&rb, "CLIENT", "TRACKING", "ON", NULL); /* 38 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "+OK\r\n");
+
+    /* The invalidation: a value the server sends because a key it told us about
+     * changed. Nobody asked, so nobody is answered. */
+    rb_reply(&rb, ">2\r\n$10\r\ninvalidate\r\n*1\r\n$5\r\nlk:k1\r\n");
+
+    rb_cmd(&rb, "GET", "lk:k1", NULL); /* 24 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "_\r\n"); /* the RESP3 null: a miss, and not an error */
+
+    rb_cmd(&rb, "ZSCORE", "lk:z", "m", NULL); /* 33 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, ",3.14\r\n"); /* 7 */
+    ev_close(&b);
+
+    b.x->queries = 4;
+    b.x->pushes = 1;
+    b.x->obs_route = "ZSCORE";
+    b.x->obs_bytes_in = 33;
+    b.x->obs_bytes_out = 7;
+    b.x->obs_err_name = "";
+}
+
+/* РR10: the wait the *client* chose. A `BLPOP key 0` that sits for three
+ * seconds because nothing was pushed is not a slow server, and in the same
+ * histogram as a `GET` it decides the p99 of the whole instance. Both blocking
+ * commands here are measured — an application waiting is a fact about that
+ * application — in a family where they cannot decide anything else.
+ *
+ * The two `XREAD`s are the refinement, and the only place in the whole track
+ * where an argument is read at all: the same verb blocks or does not depending
+ * on a keyword, so the bit cannot come from the name. */
+static void build_redis_blpop(struct fx *x)
+{
+    struct bld b;
+    struct rbatch rb;
+
+    redisbld_init(&b, x);
+    rb_init(&rb, &b);
+    ev_open(&b, false);
+
+    rb_cmd(&rb, "RPUSH", "lk:q", "v", NULL); /* 32 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, ":1\r\n");
+
+    rb_cmd(&rb, "BLPOP", "lk:q", "0", NULL); /* 32 */
+    rb_send_cmd(&rb);
+    b.ts += 3ull * 1000000000ull; /* three seconds of somebody else's patience */
+    rb_reply(&rb, "*2\r\n$4\r\nlk:q\r\n$1\r\nv\r\n");
+
+    rb_cmd(&rb, "XREAD", "COUNT", "10", "STREAMS", "lk:s", "0", NULL); /* 64 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "*-1\r\n"); /* nothing to read, at once */
+
+    rb_cmd(&rb, "XREAD", "BLOCK", "100", "STREAMS", "lk:s", "$", NULL); /* 65 */
+    rb_send_cmd(&rb);
+    b.ts += 100ull * 1000000ull;
+    rb_reply(&rb, "*-1\r\n"); /* 5 */
+    ev_close(&b);
+
+    b.x->queries = 4;
+    b.x->obs_route = "XREAD";
+    b.x->obs_bytes_in = 65;
+    b.x->obs_bytes_out = 5;
+    b.x->obs_err_name = "";
+    b.x->obs_flags = LK_QO_NO_TEXT | LK_QO_BLOCKING;
+}
+
+/* РR6: the ACL user, in both forms that carry one, and the rule that decides
+ * when a label moves — **the reply, never the command**. `AUTH lkuser lkpass`
+ * succeeds and the next command is lkuser's; `AUTH lkuser wrongpass` is
+ * answered `-WRONGPASS` and changes nothing; `HELLO 3 AUTH lkother lkpass`
+ * names a user in the middle of an argument list and moves it again.
+ *
+ * Two passwords are on this wire and neither is read by anything: the name is a
+ * separate element of the array, which is why this is the one protocol where
+ * the identity can be on by default (contrast РH12's opt-in base64). */
+static void build_redis_auth_acl(struct fx *x)
+{
+    struct bld b;
+    struct rbatch rb;
+
+    redisbld_init(&b, x);
+    rb_init(&rb, &b);
+    ev_open(&b, false);
+
+    rb_cmd(&rb, "AUTH", "lkuser", "lkpass", NULL); /* 38 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "+OK\r\n");
+
+    rb_cmd(&rb, "GET", "lk:k1", NULL); /* 24 — the first command that is lkuser's */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "$2\r\nv1\r\n");
+
+    rb_cmd(&rb, "AUTH", "lkuser", "wrongpass", NULL); /* 41 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "-WRONGPASS invalid username-password pair or user is disabled.\r\n");
+
+    rb_cmd(&rb, "HELLO", "3", "AUTH", "lkother", "lkpass", NULL); /* 57 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "%2\r\n$6\r\nserver\r\n$5\r\nredis\r\n$5\r\nproto\r\n:3\r\n");
+
+    rb_cmd(&rb, "ACL", "WHOAMI", NULL); /* 25 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "$7\r\nlkother\r\n"); /* 13 */
+    ev_close(&b);
+
+    b.x->queries = 5;
+    b.x->errors_sql = 1; /* the refused AUTH */
+    b.x->obs_route = "ACL|WHOAMI";
+    b.x->obs_bytes_in = 25;
+    b.x->obs_bytes_out = 13;
+    b.x->obs_err_name = "";
+}
+
+/* РR5: the database is connection state, and the same rule decides it. `SELECT
+ * 3` is itself observed in the database it was issued *from*; the command after
+ * it is in the new one. `SELECT 99` is a database this deployment does not have
+ * — a number our own validator accepts and the server refuses — and the
+ * connection stays where it was, because the label moves on the reply. */
+static void build_redis_select(struct fx *x)
+{
+    struct bld b;
+    struct rbatch rb;
+
+    redisbld_init(&b, x);
+    rb_init(&rb, &b);
+    ev_open(&b, false);
+
+    rb_cmd(&rb, "SELECT", "3", NULL); /* 23, observed in db 0 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "+OK\r\n");
+
+    rb_cmd(&rb, "SET", "lk:k", "v", NULL); /* 30, in db 3 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "+OK\r\n");
+
+    rb_cmd(&rb, "SELECT", "99", NULL); /* 24 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "-ERR DB index is out of range\r\n");
+
+    rb_cmd(&rb, "GET", "lk:k", NULL); /* 23, still in db 3 */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "$1\r\nv\r\n"); /* 7 */
+    ev_close(&b);
+
+    b.x->queries = 4;
+    b.x->errors_sql = 1;
+    b.x->obs_route = "GET";
+    b.x->obs_bytes_in = 23;
+    b.x->obs_bytes_out = 7;
+    b.x->obs_err_name = "";
+}
+
+/* Risk 1 of the plan, and its mitigation, in one trace: a 64 KiB reply captured
+ * at the per-port budget of РR13 (512 bytes) and completed **by arithmetic**.
+ * The hole falls inside a bulk payload, whose length is on the wire, so nothing
+ * is lost but the bytes: the value is published with its true size and a
+ * truncated body, the direction never loses sync, and the command after it
+ * frames as if nothing had happened.
+ *
+ * The shape is also Р9's: an under-captured call's tail is only known to exist
+ * when the *next* call on that direction starts, so the big value is published
+ * late — after the `PING` that follows it was already sent. */
+static void build_redis_big_bulk_hole(struct fx *x)
+{
+    struct bld b;
+    struct rbatch rb;
+    static const __u32 payload = 65536;
+    char head[512];
+    __u32 total, cap = 512, hn;
+
+    redisbld_init(&b, x);
+    rb_init(&rb, &b);
+    ev_open(&b, false);
+
+    rb_cmd(&rb, "GET", "lk:big", NULL); /* 25 */
+    rb_send_cmd(&rb);
+
+    /* `$65536\r\n` + the payload + `\r\n` — 65546 bytes on the wire, of which
+     * the budget let 512 through. */
+    hn = (__u32)snprintf(head, sizeof(head), "$%u\r\n", payload);
+    total = hn + payload + 2;
+    for (__u32 i = hn; i < cap; i++)
+        head[i] = (char)('a' + i % 26);
+    ev_data(&b, LK_DIR_SEND, total, 0, (const __u8 *)head, cap);
+
+    /* A command in the other direction: it does not close the server's call, so
+     * nothing is published yet. */
+    rb_cmd(&rb, "PING", NULL); /* 14 */
+    rb_send_cmd(&rb);
+
+    /* ... and now the server's next call, which does. The hole is 65034 bytes
+     * of bulk payload and costs a body prefix, not a resync. */
+    rb_val(&rb, "+PONG\r\n");
+    call(&b, LK_DIR_SEND, (const __u8 *)rb.buf, rb.n);
+    expect(&b, LK_DIR_SEND, '$', total, LK_MSG_BODY_TRUNC);
+    expect(&b, LK_DIR_SEND, '+', 7, 0);
+    rb.n = rb.nv = 0;
+    ev_close(&b);
+
+    b.x->queries = 2;
+    b.x->obs_route = "PING";
+    b.x->obs_bytes_in = 14;
+    b.x->obs_bytes_out = 7;
+    b.x->obs_err_name = "";
+    /* Pipelined, and rightly so — the same reading as the HTTP sendfile
+     * fixture's: from the socket's side the `PING` went out while the `GET` was
+     * still owing 65 KB. The client was not pipelining, it was reading a large
+     * reply; an observer that claimed to know the difference would be claiming
+     * to have seen the bytes it just reported as a hole. */
+    b.x->obs_flags = LK_QO_NO_TEXT | LK_QO_PIPELINED;
+}
+
+/* Inline commands: not RESP at all, and a command all the same — `PING\r\n`
+ * from a load balancer's TCP probe or a healthcheck script is exactly the
+ * measurement РR15 says must not be swept into "internal". The blank line in
+ * the middle is the counter-case: the server answers it with nothing, so it
+ * must produce no message and open no unit. */
+static void build_redis_inline(struct fx *x)
+{
+    struct bld b;
+    struct rbatch rb;
+
+    redisbld_init(&b, x);
+    rb_init(&rb, &b);
+    ev_open(&b, false);
+
+    rb_inline(&rb, "PING\r\n"); /* 6 */
+    rb_send(&rb, LK_DIR_RECV, 0);
+    rb_reply(&rb, "+PONG\r\n");
+
+    rb_inline(&rb, "ECHO hello\r\n"); /* 12 */
+    rb_send(&rb, LK_DIR_RECV, 0);
+    rb_reply(&rb, "$5\r\nhello\r\n");
+
+    /* Somebody pressed return. No message, no unit, no reply. */
+    rb_bytes(&rb, "\r\n");
+    rb_send(&rb, LK_DIR_RECV, 0);
+
+    rb_cmd(&rb, "PING", NULL); /* 14 — the same command, spoken properly */
+    rb_send_cmd(&rb);
+    rb_reply(&rb, "+PONG\r\n"); /* 7 */
+    ev_close(&b);
+
+    b.x->queries = 3;
+    b.x->obs_route = "PING";
+    b.x->obs_bytes_in = 14;
+    b.x->obs_bytes_out = 7;
+    b.x->obs_err_name = "";
+}
+
+/* The agent attached to a connection that was already open — which on this
+ * protocol is what *every* restart looks like, because a client library holds
+ * its pool for days (МR7 measured the same thing through TLS). Both directions
+ * start dirty in the middle of somebody else's value, and neither is framed
+ * until an anchor arrives at a syscall boundary: on the frontend an array
+ * header whose first element is a plausible bulk, on the backend a valid type
+ * byte, which is all a stream of payload will ever allow.
+ *
+ * The labels are the point of the fixture as much as the resync is: this
+ * connection's `SELECT` and `AUTH` happened before we were watching, so its
+ * database and user are `?`. A `0` there would be indistinguishable from the
+ * truth on a dashboard, which is the one thing it must not be (РR5). */
+static void build_redis_synthetic_midstream(struct fx *x)
+{
+    struct bld b;
+    struct rbatch rb;
+
+    redisbld_init(&b, x);
+    rb_init(&rb, &b);
+    ev_open(&b, true);
+
+    /* Mid-value debris on both sides. Neither piece is an anchor: the reply
+     * fragment does not begin with a type byte, and the command fragment does
+     * not begin with `*`. */
+    rb_bytes(&rb, "alue of a large reply we joined halfway through\r\n");
+    rb_send(&rb, LK_DIR_SEND, 0);
+    rb_bytes(&rb, "lk:some-key\r\n$5\r\nvalue\r\n");
+    rb_send(&rb, LK_DIR_RECV, 0);
+
+    rb_cmd(&rb, "GET", "lk:k1", NULL); /* 24 — an anchor, at a call boundary */
+    rb_send(&rb, LK_DIR_RECV, LK_MSG_AFTER_RESYNC);
+    rb_val(&rb, "$2\r\nv1\r\n");
+    rb_send(&rb, LK_DIR_SEND, LK_MSG_AFTER_RESYNC);
+
+    /* And this exchange produces **no observation**, which is the second half
+     * of the fixture. The two directions recover independently, so at the moment
+     * the reply direction found its anchor there was a command in flight that it
+     * had not been watching when it started — and "the oldest unanswered command"
+     * is the only correspondence RESP offers (РR3). The queue is dropped rather
+     * than paired on a guess: one unit into units_dropped_resync, and the first
+     * honest measurement is the exchange after it. */
+    rb_cmd(&rb, "GET", "lk:k2", NULL); /* 24 */
+    rb_send_cmd(&rb);
+    rb_val(&rb, "$2\r\nv2\r\n"); /* 8 */
+    rb_send(&rb, LK_DIR_SEND, 0);
+    ev_close(&b);
+
+    b.x->resyncs = 2;
+    b.x->queries = 1;
+    b.x->obs_route = "GET";
+    b.x->obs_bytes_in = 24;
+    b.x->obs_bytes_out = 8;
+    b.x->obs_err_name = "";
+}
+
 const struct fixture lk_fixtures[] = {
     {"simple_query", build_simple_query, NULL, NULL},
     {"error", build_error, NULL, NULL},
@@ -3255,5 +3957,20 @@ const struct fixture lk_fixtures[] = {
     {"s3_internal_path", build_s3_internal_path, "s3", NULL},
     {"s3_vhost_style", build_s3_vhost_style, "s3", S3_FX_DOMAIN},
     {"s3_synthetic_midstream", build_s3_synthetic_midstream, "s3", NULL},
+    /* Redis set (PLAN-REDIS.md МR8): its own framer and its own handler — the
+     * first entry in the table that shares neither with anything above it. */
+    {"redis_get_set", build_redis_get_set, "redis", NULL},
+    {"redis_pipeline", build_redis_pipeline, "redis", NULL},
+    {"redis_multi", build_redis_multi, "redis", NULL},
+    {"redis_error", build_redis_error, "redis", NULL},
+    {"redis_moved", build_redis_moved, "redis", NULL},
+    {"redis_pubsub", build_redis_pubsub, "redis", NULL},
+    {"redis_resp3", build_redis_resp3, "redis", NULL},
+    {"redis_blpop", build_redis_blpop, "redis", NULL},
+    {"redis_auth_acl", build_redis_auth_acl, "redis", NULL},
+    {"redis_select", build_redis_select, "redis", NULL},
+    {"redis_big_bulk_hole", build_redis_big_bulk_hole, "redis", NULL},
+    {"redis_inline", build_redis_inline, "redis", NULL},
+    {"redis_synthetic_midstream", build_redis_synthetic_midstream, "redis", NULL},
 };
 const size_t lk_nfixtures = sizeof(lk_fixtures) / sizeof(lk_fixtures[0]);

@@ -266,13 +266,13 @@ static int test_vhist_dhist_grids(void)
     CHECK(lk_bhist_bound(&v, 0) == 8.0);
     CHECK(lk_bhist_bound(&v, LK_VHIST_NBUCKETS - 1) == 8388608.0); /* 8 MiB */
 
-    lk_bhist_observe(&v, 4);              /* `:1\r\n` — an integer reply */
-    lk_bhist_observe(&v, 40);             /* a session blob */
-    lk_bhist_observe(&v, 1ull << 20);     /* a megabyte value: still a cell */
-    lk_bhist_observe(&v, 512ull << 20);   /* proto-max-bulk-len: overflow, and
-                                             "impossibly large" is the answer */
-    CHECK(v.bucket[0] == 1);              /* (0, 8] — where the default grid is blind */
-    CHECK(v.bucket[3] == 1);              /* le = 2^6 = 64 */
+    lk_bhist_observe(&v, 4);                     /* `:1\r\n` — an integer reply */
+    lk_bhist_observe(&v, 40);                    /* a session blob */
+    lk_bhist_observe(&v, 1ull << 20);            /* a megabyte value: still a cell */
+    lk_bhist_observe(&v, 512ull << 20);          /* proto-max-bulk-len: overflow, and
+                                                    "impossibly large" is the answer */
+    CHECK(v.bucket[0] == 1);                     /* (0, 8] — where the default grid is blind */
+    CHECK(v.bucket[3] == 1);                     /* le = 2^6 = 64 */
     CHECK(v.bucket[LK_VHIST_NBUCKETS - 4] == 1); /* le = 1 MiB */
     CHECK(v.overflow == 1);
     CHECK(v.count == 4);

@@ -1,0 +1,74 @@
+*1
+$5
+MULTI
+*3
+$3
+SET
+$1
+k
+$1
+1
+*1
+$4
+EXEC
+*1
+$7
+DISCARD
+*3
+$5
+BLPOP
+$4
+lk:q
+$1
+0
+*6
+$5
+XREAD
+$5
+BLOCK
+$3
+100
+$7
+STREAMS
+$4
+lk:s
+$1
+$
+*6
+$5
+XREAD
+$5
+COUNT
+$2
+10
+$7
+STREAMS
+$4
+lk:s
+$1
+0
+*2
+$3
+GET
+$5
+lk:mv
++OK
++QUEUED
+*1
++OK
++OK
+-EXECABORT Transaction discarded because of previous errors.
+-WRONGTYPE Operation against a key holding the wrong kind of value
+-NOSCRIPT No matching script
+-NOPERM this user has no permissions
+-NOAUTH Authentication required.
+-OOM command not allowed
+-LOADING Redis is loading the dataset in memory
+-BUSY Redis is busy
+-CLUSTERDOWN The cluster is down
+-CROSSSLOT Keys don't hash to the same slot
+-MOVED 12539 10.0.0.3:6379
+-ASK 8000 10.0.0.4:6379
+-UNBLOCKED client unblocked
+-lowercase not a symbol
+-

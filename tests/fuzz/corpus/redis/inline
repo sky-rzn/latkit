@@ -1,0 +1,10 @@
+PING
+ECHO hello
+
+
+   
+SET "k with spaces" 1
+GET k
+*1
+$4
+PING

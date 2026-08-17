@@ -3,8 +3,8 @@ name: Kernel matrix
 # Kernel matrix (task 8.4, Р52): boot the real 5.15/6.1/6.8/stable kernels in
 # vmtest (a qemu wrapper that shares the runner's rootfs over 9p) and run the
 # plaintext + TLS smoke of tests/kernel/smoke.sh on each — for every protocol
-# in the registry, since PLAN-HTTP.md М8 and PLAN-MINIO.md МS4 — plus the
-# no-BTF negative test.
+# in the registry, since PLAN-HTTP.md М8, PLAN-MINIO.md МS4 and PLAN-REDIS.md
+# МR8 — plus the no-BTF negative test.
 # This is deliberately NOT on the every-PR path: booting four
 # kernels is slow and flaky-prone (KVM in Actions), and the same smoke.sh runs
 # locally without CI. It fires on push to master, nightly, and on a PR only
@@ -92,16 +92,20 @@ jobs:
           # vmtest's exit code reflects qemu, not the guest command, so gate on
           # the verdict smoke.sh prints.
           grep -q 'all checks passed' smoke.out
-      # The other three protocols over the same boot: the capture layer is
+      # The other four protocols over the same boot: the capture layer is
       # shared, but HTTP reaches it through the stream mode of РH1 rather than
       # the message machine (PLAN-HTTP.md М8), and a CO-RE or attach regression
       # that only bit that path would otherwise be invisible to this matrix.
       # s3 rides the same stream path (PLAN-MINIO.md МS4) and adds nothing to
       # the kernel side — it is here because a registry entry that fails to
       # install its dialect on a real socket would look exactly like a working
-      # one until the counters were read, which is what this run reads. One
-      # process per protocol, sequentially, on the same kernel.
-      - name: Smoke in VM (mysql, http, s3)
+      # one until the counters were read, which is what this run reads. redis
+      # (PLAN-REDIS.md МR8) is a third framer again, and the one protocol whose
+      # unit boundaries are syscall boundaries (РR3): its fixtures put whole
+      # pipelines into single writes, so what this run confirms is that the
+      # kernel's calls and the framer's batches are still the same thing on a
+      # kernel we did not develop on. One process per protocol, sequentially.
+      - name: Smoke in VM (mysql, http, s3, redis)
         run: |
           ./vmtest -k vmlinuz \
             "$GITHUB_WORKSPACE/tests/kernel/smoke.sh --mysql" | tee smoke-my.out
@@ -112,6 +116,9 @@ jobs:
           ./vmtest -k vmlinuz \
             "$GITHUB_WORKSPACE/tests/kernel/smoke.sh --s3" | tee smoke-s3.out
           grep -q 'all checks passed' smoke-s3.out
+          ./vmtest -k vmlinuz \
+            "$GITHUB_WORKSPACE/tests/kernel/smoke.sh --redis" | tee smoke-redis.out
+          grep -q 'all checks passed' smoke-redis.out
 
   nobtf:
     name: no-BTF negative test

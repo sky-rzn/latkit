@@ -1,0 +1,176 @@
+# libFuzzer dictionary for the RESP targets (fuzz_redis, and fuzz_pipe in its
+# redis mode; PLAN-REDIS.md МR8). CR and LF are spelled \x0d / \x0a: libFuzzer's
+# parser understands only \\, \" and \xNN and rejects the whole file otherwise.
+#
+# RESP is text with a one-byte type prefix, so the mutator's problem is not
+# guessing byte values — it is assembling a *value*: a type byte, a number, a
+# terminator, and for an aggregate the right count of the right things after it.
+# Every entry below is one of those pieces, plus the shapes that make the framer
+# take a branch it would otherwise take once in a million inputs (a length that
+# is not a number, a count that overflows, a bulk whose payload does not end
+# where it said).
+#
+# What is deliberately absent: keys, values and passwords. The contract is that
+# no byte of an argument becomes a label (РR4/РR6), and seeding the mutator with
+# argument-shaped strings would be seeding it to check a claim the harness
+# already checks on *every* input. What is here instead is the two commands that
+# carry a credential, because the *shape* of those arrays is what the display
+# mask has to read correctly.
+
+# --- terminators and the empty shapes ---------------------------------------
+crlf="\x0d\x0a"
+lf="\x0a"
+empty_line="\x0d\x0a\x0d\x0a"
+bare_cr="\x0d"
+
+# --- RESP2 type bytes --------------------------------------------------------
+t_status="+"
+t_error="-"
+t_int=":"
+t_bulk="$"
+t_array="*"
+
+# --- RESP3's nine (after HELLO 3) -------------------------------------------
+t_null="_\x0d\x0a"
+t_bool_t="#t\x0d\x0a"
+t_bool_f="#f\x0d\x0a"
+t_double=",3.141592653589793\x0d\x0a"
+t_double_inf=",inf\x0d\x0a"
+t_bignum="(3492890328409238509324850943850943825024385\x0d\x0a"
+t_bloberr="!21\x0d\x0aSYNTAX invalid syntax\x0d\x0a"
+t_verbatim="=15\x0d\x0atxt:Some string\x0d\x0a"
+t_map="%2\x0d\x0a"
+t_set="~3\x0d\x0a"
+t_push=">3\x0d\x0a"
+t_attr="|1\x0d\x0a"
+
+# --- complete small values ---------------------------------------------------
+v_ok="+OK\x0d\x0a"
+v_pong="+PONG\x0d\x0a"
+v_queued="+QUEUED\x0d\x0a"
+v_reset="+RESET\x0d\x0a"
+v_zero=":0\x0d\x0a"
+v_one=":1\x0d\x0a"
+v_neg=":-1\x0d\x0a"
+v_nullbulk="$-1\x0d\x0a"
+v_nullarray="*-1\x0d\x0a"
+v_emptyarray="*0\x0d\x0a"
+v_emptybulk="$0\x0d\x0a\x0d\x0a"
+
+# --- lengths: the ones that parse, and the ones that must not ---------------
+len_bulk="$6\x0d\x0a"
+len_max="$536870912\x0d\x0a"
+len_over="$536870913\x0d\x0a"
+len_huge="$99999999999999999999\x0d\x0a"
+len_nan="$abc\x0d\x0a"
+len_neg="$-2\x0d\x0a"
+len_plus="$+3\x0d\x0a"
+cnt_array="*3\x0d\x0a"
+cnt_over="*2147483648\x0d\x0a"
+cnt_nan="*x\x0d\x0a"
+cnt_deep="*1\x0d\x0a*1\x0d\x0a*1\x0d\x0a*1\x0d\x0a"
+
+# --- a whole command, and the two heads a command starts with ---------------
+cmd_get="*2\x0d\x0a$3\x0d\x0aGET\x0d\x0a$5\x0d\x0alk:k1\x0d\x0a"
+cmd_head="*2\x0d\x0a$3\x0d\x0a"
+cmd_head3="*3\x0d\x0a$3\x0d\x0a"
+
+# --- the verbs whose *identity* the handler acts on (РR4-РR10) --------------
+c_get="GET"
+c_set="SET"
+c_mget="MGET"
+c_ping="PING"
+c_select="SELECT"
+c_auth="AUTH"
+c_hello="HELLO"
+c_reset="RESET"
+c_multi="MULTI"
+c_exec="EXEC"
+c_discard="DISCARD"
+c_watch="WATCH"
+c_subscribe="SUBSCRIBE"
+c_unsubscribe="UNSUBSCRIBE"
+c_ssubscribe="SSUBSCRIBE"
+c_psubscribe="PSUBSCRIBE"
+c_publish="PUBLISH"
+c_blpop="BLPOP"
+c_brpoplpush="BRPOPLPUSH"
+c_bzmpop="BZMPOP"
+c_wait="WAIT"
+c_xread="XREAD"
+c_xreadgroup="XREADGROUP"
+c_block="BLOCK"
+c_streams="STREAMS"
+c_eval="EVAL"
+c_evalsha="EVALSHA"
+c_monitor="MONITOR"
+c_psync="PSYNC"
+c_sync="SYNC"
+c_replconf="REPLCONF"
+c_module="JSON.SET"
+
+# --- container commands: the only place argv[1] is part of the identity -----
+c_config="CONFIG"
+c_client="CLIENT"
+c_cluster="CLUSTER"
+c_acl="ACL"
+c_xinfo="XINFO"
+c_command="COMMAND"
+sub_get="GET"
+sub_set="SET"
+sub_list="LIST"
+sub_setinfo="SETINFO"
+sub_whoami="WHOAMI"
+sub_setuser="SETUSER"
+sub_docs="DOCS"
+sub_stream="STREAM"
+sub_tracking="TRACKING"
+
+# --- the pub/sub kind words: what tells a delivery from a reply in RESP2 ----
+k_subscribe="subscribe"
+k_unsubscribe="unsubscribe"
+k_message="message"
+k_pmessage="pmessage"
+k_smessage="smessage"
+k_invalidate="invalidate"
+
+# --- the error vocabulary (РR7), and the two that are not errors ------------
+e_err="-ERR "
+e_wrongtype="-WRONGTYPE "
+e_noscript="-NOSCRIPT "
+e_noauth="-NOAUTH "
+e_noperm="-NOPERM "
+e_wrongpass="-WRONGPASS "
+e_oom="-OOM "
+e_loading="-LOADING "
+e_busy="-BUSY "
+e_busygroup="-BUSYGROUP "
+e_execabort="-EXECABORT "
+e_readonly="-READONLY "
+e_masterdown="-MASTERDOWN "
+e_clusterdown="-CLUSTERDOWN "
+e_crossslot="-CROSSSLOT "
+e_tryagain="-TRYAGAIN "
+e_noproto="-NOPROTO "
+e_unblocked="-UNBLOCKED "
+e_moved="-MOVED 12539 10.0.0.3:6379\x0d\x0a"
+e_ask="-ASK 8000 10.0.0.4:6379\x0d\x0a"
+
+# --- inline commands: not RESP at all, and still a command ------------------
+i_ping="PING\x0d\x0a"
+i_echo="ECHO hello\x0d\x0a"
+i_quoted="SET \x22k v\x22 1\x0d\x0a"
+i_blank="   \x0d\x0a"
+
+# --- the two arrays whose elements the display mask has to find (РR6) -------
+# The shape, not the secret: what matters is that element 2 of an `AUTH` and
+# element 4 of a `HELLO … AUTH` are where they are.
+a_auth="*3\x0d\x0a$4\x0d\x0aAUTH\x0d\x0a"
+a_hello_auth="*5\x0d\x0a$5\x0d\x0aHELLO\x0d\x0a$1\x0d\x0a3\x0d\x0a$4\x0d\x0aAUTH\x0d\x0a"
+a_acl_setuser="*4\x0d\x0a$3\x0d\x0aACL\x0d\x0a$7\x0d\x0aSETUSER\x0d\x0a"
+a_config_set="*4\x0d\x0a$6\x0d\x0aCONFIG\x0d\x0a$3\x0d\x0aSET\x0d\x0a"
+p_rule=">"
+p_param="requirepass"
+
+# --- the TLS record head the framer refuses to read as RESP (МR7) -----------
+tls_hello="\x16\x03\x01\x02\x00\x01"

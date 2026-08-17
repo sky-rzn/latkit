@@ -75,6 +75,13 @@ struct collector {
     char last_elig_text[256];
     bool last_elig_error;
     char last_elig_sqlstate[6];
+    /* PLAN-REDIS.md МR6: a Redis observation has no text at all, and its span
+     * carries one that the span builder *constructs* — the identity plus one
+     * `?` per argument. So the mirror below cannot be "the same string"; it is
+     * the identity, and the assertion becomes a shape rather than a copy (see
+     * the span block in run_fixture). */
+    bool last_elig_built;
+    char last_elig_route[64];
 };
 
 static void on_session(void *ctx, const struct lk_conn *c, const struct lk_session *s)
@@ -123,6 +130,12 @@ static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session
         if (o->text && o->text_len < sizeof(col->last_elig_text)) {
             memcpy(col->last_elig_text, o->text, o->text_len);
             col->last_elig_text[o->text_len] = '\0';
+        }
+        col->last_elig_built = o->kind == LK_Q_COMMAND;
+        col->last_elig_route[0] = '\0';
+        if (o->route && o->route_len < sizeof(col->last_elig_route)) {
+            memcpy(col->last_elig_route, o->route, o->route_len);
+            col->last_elig_route[o->route_len] = '\0';
         }
         col->last_elig_error = (o->flags & LK_QO_ERROR) != 0;
         snprintf(col->last_elig_sqlstate, sizeof(col->last_elig_sqlstate), "%s", o->sqlstate);
@@ -549,6 +562,213 @@ static const struct fam_metric_expect s3_metric_expects[] = {
      {NULL}},
 };
 
+/* --- МR8: the exposition the Redis fixtures produce -------------------------
+ * The fourth profile (РR11), and the one whose nouns are furthest from the
+ * three before it: the slot holds a command from a closed table, the dim slot a
+ * database *number*, the user slot an ACL user, and three families exist that
+ * nothing else has — the blocking wait, the cluster redirect and the batch
+ * depth. Every row below is one of those decisions said as a number that would
+ * be plausible in the wrong family, which is exactly what makes it worth
+ * asserting: a `+QUEUED` in the duration histogram, a `-MOVED` in the errors, a
+ * `BLPOP` deciding the p99 — all three are silent failures with sensible-looking
+ * dashboards. */
+#define REDIS_LBL(cmd, db, user) "cmd=\"" cmd "\",db=\"" db "\",user=\"" user "\",proto=\"redis\""
+#define REDIS_MINE(cmd)          REDIS_LBL(cmd, "0", "default")
+
+static const struct fam_metric_expect redis_metric_expects[] = {
+    /* The base row, whole: the command counted under its outcome, timed once,
+     * both byte directions accounted, and the reply's size in the value grid —
+     * where 12 bytes land in the second bucket, because the redis grid starts at
+     * 8 B and the HTTP one's first bucket (64 B) would hold half of a real
+     * Redis's values undifferentiated (РR11). */
+    {"redis_get_set",
+     {{"latkit_redis_commands_total{" REDIS_MINE("GET") ",code=\"ok\"}", 1},
+      {"latkit_redis_commands_total{" REDIS_MINE("SET") ",code=\"ok\"}", 1},
+      {"latkit_redis_command_duration_seconds_count{" REDIS_MINE("GET") ",code=\"ok\"}", 1},
+      {"latkit_redis_bytes_total{" REDIS_MINE("GET") ",direction=\"in\"}", 24},
+      {"latkit_redis_bytes_total{" REDIS_MINE("GET") ",direction=\"out\"}", 12},
+      {"latkit_redis_value_size_bytes_bucket{" REDIS_MINE("GET") ",le=\"16\"}", 1},
+      {"latkit_redis_pipeline_depth_bucket{proto=\"redis\",le=\"1\"}", 2},
+      {NULL, 0}},
+     {"latkit_redis_errors_total", "latkit_redis_redirects_total",
+      "latkit_redis_blocking_seconds"}},
+    /* Three commands out of one syscall: three samples of depth 3, none of them
+     * in the `le="1"` bucket an operator reads as "this client does not
+     * pipeline", and three identities that are the identities they would have
+     * had alone. */
+    {"redis_pipeline",
+     {{"latkit_redis_pipeline_depth_bucket{proto=\"redis\",le=\"1\"}", 0},
+      {"latkit_redis_pipeline_depth_bucket{proto=\"redis\",le=\"4\"}", 3},
+      {"latkit_redis_pipeline_depth_sum{proto=\"redis\"}", 9},
+      {"latkit_metric_series", 3},
+      {NULL, 0}},
+     {NULL}},
+    /* РR9 as four numbers: four commands counted, two of them timed, two value
+     * sizes — and one transaction in the family every database protocol here
+     * already feeds. The `+QUEUED` replies are commands that happened and are
+     * not latencies; in the histogram they would drag every percentile of the
+     * instance down towards nine bytes of acknowledgement. */
+    {"redis_multi",
+     {{"latkit_redis_commands_total{" REDIS_MINE("SET") ",code=\"ok\"}", 1},
+      {"latkit_redis_command_duration_seconds_count{" REDIS_MINE("EXEC") ",code=\"ok\"}", 1},
+      {"latkit_redis_value_size_bytes_count{" REDIS_MINE("EXEC") "}", 1},
+      {"latkit_txn_duration_seconds_count{db=\"0\",user=\"default\",proto=\"redis\","
+       "status=\"ok\"}",
+       1},
+      {NULL, 0}},
+     /* Not "zero samples" but *no series at all*: a `+QUEUED` unit reaches
+      * neither histogram, so there is nothing keyed by that command in either
+      * of them to hold a zero. */
+     {"latkit_redis_command_duration_seconds_count{cmd=\"SET\"",
+      "latkit_redis_value_size_bytes_count{cmd=\"SET\"", NULL}},
+    /* РR7's first half: the failure is its symbol. Three errors, three symbols,
+     * and the command a client invented is `other` — the fold that keeps a
+     * client from naming a series. */
+    {"redis_error",
+     {{"latkit_redis_errors_total{error=\"WRONGTYPE\",db=\"0\",user=\"default\",proto=\"redis\"}",
+       1},
+      {"latkit_redis_errors_total{error=\"NOSCRIPT\",db=\"0\",user=\"default\",proto=\"redis\"}",
+       1},
+      {"latkit_redis_errors_total{error=\"ERR\",db=\"0\",user=\"default\",proto=\"redis\"}", 1},
+      {"latkit_redis_commands_total{" REDIS_MINE("other") ",code=\"error\"}", 1},
+      {"latkit_redis_commands_total{" REDIS_MINE("EVALSHA") ",code=\"error\"}", 1},
+      {NULL, 0}},
+     {"latkit_redis_redirects_total", NULL}},
+    /* РR7's second half, and the reason it is a decision: two redirects in their
+     * own family, and the errors_total of this cluster-facing connection holds
+     * exactly the one command that really failed. */
+    {"redis_moved",
+     {{"latkit_redis_redirects_total{kind=\"moved\",proto=\"redis\"}", 1},
+      {"latkit_redis_redirects_total{kind=\"ask\",proto=\"redis\"}", 1},
+      {"latkit_redis_errors_total{error=\"CROSSSLOT\",db=\"0\",user=\"default\",proto=\"redis\"}",
+       1},
+      /* A redirect is a successful unit of work for the server, exactly as a
+       * 404 is (РH10): the client asked the wrong node and was told which one. */
+      {"latkit_redis_command_duration_seconds_count{" REDIS_MINE("GET") ",code=\"ok\"}", 2},
+      {NULL, 0}},
+     {"latkit_redis_errors_total{error=\"MOVED\"", "latkit_redis_errors_total{error=\"ASK\"",
+      NULL}},
+    /* РR8: two deliveries on the wire and two commands in the exposition. The
+     * push is in no family here at all — `latkit_redis_push_total` is set from
+     * the handler's counters by events.c rather than by an observation, which is
+     * why the fixture checks it as a counter and the table does not. */
+    {"redis_pubsub",
+     {{"latkit_redis_commands_total{" REDIS_MINE("SUBSCRIBE") ",code=\"ok\"}", 1},
+      {"latkit_redis_commands_total{" REDIS_MINE("UNSUBSCRIBE") ",code=\"ok\"}", 1},
+      {"latkit_metric_series", 2},
+      {NULL, 0}},
+     {"latkit_redis_errors_total", NULL}},
+    {"redis_resp3",
+     {{"latkit_redis_commands_total{" REDIS_MINE("HELLO") ",code=\"ok\"}", 1},
+      {"latkit_redis_commands_total{" REDIS_MINE("CLIENT|TRACKING") ",code=\"ok\"}", 1},
+      {"latkit_redis_commands_total{" REDIS_MINE("ZSCORE") ",code=\"ok\"}", 1},
+      /* `_` is a miss and not a failure: three bytes of value, no error series. */
+      {"latkit_redis_value_size_bytes_bucket{" REDIS_MINE("GET") ",le=\"8\"}", 1},
+      {NULL, 0}},
+     {"latkit_redis_errors_total", NULL}},
+    /* РR10: the two waits the client chose are measured, and they are measured
+     * where they cannot decide the latency of anything else. The general
+     * histogram holds the two commands that really were the server's work. */
+    {"redis_blpop",
+     {{"latkit_redis_blocking_seconds_count{" REDIS_MINE("BLPOP") "}", 1},
+      {"latkit_redis_blocking_seconds_count{" REDIS_MINE("XREAD") "}", 1},
+      {"latkit_redis_command_duration_seconds_count{" REDIS_MINE("XREAD") ",code=\"ok\"}", 1},
+      {"latkit_redis_command_duration_seconds_count{" REDIS_MINE("RPUSH") ",code=\"ok\"}", 1},
+      /* Counted as commands all the same: four happened. */
+      {"latkit_redis_commands_total{" REDIS_MINE("BLPOP") ",code=\"ok\"}", 1},
+      {NULL, 0}},
+     /* The `BLPOP` is in the general histogram not as a zero but not at all —
+      * one 30-second wait in the same series as a `GET` decides the p99 of the
+      * whole instance, so the series must not exist (РR10). */
+     {"latkit_redis_command_duration_seconds_count{cmd=\"BLPOP\"", NULL}},
+    /* РR6: the user label moves on the reply. `AUTH` is observed as the user it
+     * was issued by, the command after it as the user it made — and the refused
+     * `AUTH` moves nothing, which is the row that would be missing if the
+     * command rather than the answer decided. */
+    {"redis_auth_acl",
+     {{"latkit_redis_commands_total{" REDIS_MINE("AUTH") ",code=\"ok\"}", 1},
+      {"latkit_redis_commands_total{" REDIS_LBL("GET", "0", "lkuser") ",code=\"ok\"}", 1},
+      {"latkit_redis_commands_total{" REDIS_LBL("AUTH", "0", "lkuser") ",code=\"error\"}", 1},
+      {"latkit_redis_commands_total{" REDIS_LBL("HELLO", "0", "lkuser") ",code=\"ok\"}", 1},
+      {"latkit_redis_commands_total{" REDIS_LBL("ACL|WHOAMI", "0", "lkother") ",code=\"ok\"}", 1},
+      {NULL, 0}},
+     {NULL}},
+    /* РR5: the same rule, on the other label. `SELECT 3` is counted in the
+     * database it was issued from; `SELECT 99` fails and moves nothing, so the
+     * `GET` after it is still in 3. */
+    {"redis_select",
+     {{"latkit_redis_commands_total{" REDIS_MINE("SELECT") ",code=\"ok\"}", 1},
+      {"latkit_redis_commands_total{" REDIS_LBL("SET", "3", "default") ",code=\"ok\"}", 1},
+      {"latkit_redis_commands_total{" REDIS_LBL("SELECT", "3", "default") ",code=\"error\"}", 1},
+      {"latkit_redis_commands_total{" REDIS_LBL("GET", "3", "default") ",code=\"ok\"}", 1},
+      {NULL, 0}},
+     {NULL}},
+    /* Risk 1's mitigation as a number: the reply's *true* size reaches the
+     * histogram although 99 % of its bytes were never captured, because a bulk
+     * carries its length on the wire. A framer that counted what it saw would
+     * report 512 bytes and put this value eight octaves too low. */
+    {"redis_big_bulk_hole",
+     {{"latkit_redis_value_size_bytes_bucket{" REDIS_MINE("GET") ",le=\"131072\"}", 1},
+      {"latkit_redis_value_size_bytes_bucket{" REDIS_MINE("GET") ",le=\"512\"}", 0},
+      {"latkit_redis_bytes_total{" REDIS_MINE("GET") ",direction=\"out\"}", 65546},
+      {NULL, 0}},
+     {NULL}},
+    /* РR15: a healthcheck's `PING` is a command with a latency of its own —
+     * three of them here, one spoken inline and one properly, under one
+     * identity, and the blank line in between is in no family at all. */
+    {"redis_inline",
+     {{"latkit_redis_commands_total{" REDIS_MINE("PING") ",code=\"ok\"}", 2},
+      {"latkit_redis_commands_total{" REDIS_MINE("ECHO") ",code=\"ok\"}", 1},
+      {"latkit_metric_series", 2},
+      {NULL, 0}},
+     {NULL}},
+    /* The one fixture whose labels are neither a name nor a number: a connection
+     * older than the agent is in a database we cannot know, and `?` is the only
+     * honest value — `0` would be indistinguishable from the truth. */
+    {"redis_synthetic_midstream",
+     {{"latkit_redis_commands_total{" REDIS_LBL("GET", "?", "?") ",code=\"ok\"}", 1},
+      {"latkit_metric_series", 1},
+      {NULL, 0}},
+     {NULL}},
+};
+
+/* РR4/РR6 over the exposition, on every redis fixture: a Redis key is
+ * `lk:k1`, a channel `lk:chan`, a stream id `1712-0` — so a colon or a space in
+ * a label value is the signature of one having escaped. Structural, like the s3
+ * check and for the same reason: every label a redis series carries is a
+ * command from the table, a database number, an ACL user name, a symbolic error
+ * or a bounded enum, and not one of those alphabets contains a colon, a space or
+ * a slash. The fixtures put keys with all three on the wire, and the error
+ * sentences quote them.
+ *
+ * Restricted to the redis families rather than swept over the whole dump: the
+ * agent's own build-info labels are not this profile's promise to keep. */
+static int check_no_redis_key_labels(const char *fixname, const char *buf)
+{
+    for (const char *line = buf; line && *line;) {
+        const char *end = strchr(line, '\n');
+        const char *lim = end ? end : line + strlen(line);
+
+        if (!strncmp(line, "latkit_redis_", 13) || !strncmp(line, "latkit_txn_", 11)) {
+            for (const char *p = line; (p = memchr(p, '"', (size_t)(lim - p)));) {
+                const char *v = p + 1, *q = memchr(v, '"', (size_t)(lim - v));
+
+                if (!q)
+                    break;
+                for (const char *r = v; r < q; r++)
+                    if (*r == ':' || *r == ' ' || *r == '/') {
+                        fprintf(stderr, "FAIL %s: a key reached a metric label: \"%.*s\"\n",
+                                fixname, (int)(q - v), v);
+                        return 1;
+                    }
+                p = q + 1;
+            }
+        }
+        line = end ? end + 1 : NULL;
+    }
+    return 0;
+}
+
 /* РS2/РH12 over the exposition, on every s3 fixture rather than in one row: no
  * label value may contain a byte that only an object key could have put there.
  * Structural rather than by name, because a bucket may legitimately be called
@@ -899,6 +1119,16 @@ static int run_fixture(const struct fixture *fix)
                 (unsigned long long)lk_proto_stats(col.proto)->blind_conns);
         goto fail;
     }
+    /* PLAN-REDIS.md МR8 (РR8): the values that answered nobody, on every
+     * fixture. Zero everywhere but the two that publish — and a wrong zero here
+     * is the failure mode the whole unit queue exists to prevent, since a push
+     * mistaken for a reply is invisible in every other number. */
+    if (lk_proto_stats(col.proto)->pushes != x.pushes) {
+        fprintf(stderr, "FAIL %s: expected %llu pushes, got %llu\n", fix->name,
+                (unsigned long long)x.pushes,
+                (unsigned long long)lk_proto_stats(col.proto)->pushes);
+        goto fail;
+    }
     /* Last observation's fields (task 3.3): kind/rows/flags always, text and
      * SQLSTATE only when the fixture pins them. */
     if (x.queries) {
@@ -999,21 +1229,33 @@ static int run_fixture(const struct fixture *fix)
                     goto fail;
                 break;
             }
+        for (size_t k = 0; k < sizeof(redis_metric_expects) / sizeof(redis_metric_expects[0]); k++)
+            if (!strcmp(redis_metric_expects[k].name, fix->name)) {
+                if (check_fam_metrics(&redis_metric_expects[k], a))
+                    goto fail;
+                break;
+            }
         /* РH10's profile split, checked on every fixture rather than in one
-         * row: three profiles now, and an observation must reach exactly one of
-         * them — a PG query is never an http request, and an S3 operation is
-         * never reported under the http names it shares an engine with. */
+         * row: four profiles now, and an observation must reach exactly one of
+         * them — a PG query is never an http request, an S3 operation is never
+         * reported under the http names it shares an engine with, and a Redis
+         * command is in none of the three (РR11: it has no rows, no status and
+         * no route, and a family that offered them would be inventing). */
         {
-            static const char *const fams[] = {"latkit_query_", "latkit_http_", "latkit_s3_"};
-            const char *mine = !fix->proto                   ? fams[0]
-                               : !strcmp(fix->proto, "http") ? fams[1]
-                               : !strcmp(fix->proto, "s3")   ? fams[2]
-                                                             : fams[0];
+            static const char *const fams[] = {"latkit_query_", "latkit_http_", "latkit_s3_",
+                                               "latkit_redis_"};
+            const char *mine = !fix->proto                    ? fams[0]
+                               : !strcmp(fix->proto, "http")  ? fams[1]
+                               : !strcmp(fix->proto, "s3")    ? fams[2]
+                               : !strcmp(fix->proto, "redis") ? fams[3]
+                                                              : fams[0];
 
             for (size_t k = 0; k < sizeof(fams) / sizeof(fams[0]); k++)
                 if (fams[k] != mine && check_absent(fix->name, a, fams[k]))
                     goto fail;
             if (mine == fams[2] && check_no_key_labels(fix->name, a))
+                goto fail;
+            if (mine == fams[3] && check_no_redis_key_labels(fix->name, a))
                 goto fail;
         }
     }
@@ -1036,7 +1278,37 @@ static int run_fixture(const struct fixture *fix)
         }
         lk_spans_drain(col.spans, grab_last_span, &ls);
         if (col.neligible) {
-            if (!ls.any || strcmp(ls.text, col.last_elig_text)) {
+            if (!ls.any) {
+                fprintf(stderr, "FAIL %s: no span drained for %zu eligible observations\n",
+                        fix->name, col.neligible);
+                goto fail;
+            }
+            if (col.last_elig_built) {
+                /* МR6: a Redis observation carries no text, and its span carries
+                 * one the span builder *constructed* — so the mirror here is a
+                 * shape rather than a copy: the identity (`CONFIG|GET` renders
+                 * as two words), then one `?` per argument, and no other byte
+                 * anywhere. That is the privacy claim of the whole track at its
+                 * narrowest point — the arguments are keys and values, and a
+                 * span is the one surface that could carry them off the host. */
+                size_t rn = strlen(col.last_elig_route);
+                const char *t = ls.text;
+
+                for (size_t i = 0; i < rn; i++)
+                    if (t[i] != col.last_elig_route[i] &&
+                        !(col.last_elig_route[i] == '|' && t[i] == ' ')) {
+                        fprintf(stderr,
+                                "FAIL %s: span text \"%s\" does not open with the identity %s\n",
+                                fix->name, t, col.last_elig_route);
+                        goto fail;
+                    }
+                for (const char *p = t + rn; *p; p++)
+                    if (*p != ' ' && *p != '?') {
+                        fprintf(stderr, "FAIL %s: span text \"%s\" carries an argument byte '%c'\n",
+                                fix->name, t, *p);
+                        goto fail;
+                    }
+            } else if (strcmp(ls.text, col.last_elig_text)) {
                 fprintf(stderr, "FAIL %s: last span text \"%s\", expected \"%s\"\n", fix->name,
                         ls.text, col.last_elig_text);
                 goto fail;

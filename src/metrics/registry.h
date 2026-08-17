@@ -160,12 +160,12 @@ struct lk_reg_obs {
      * number that must *not* go where the obvious existing field would put it:
      * a redirect is not an error, a blocking wait is not a latency, and a batch
      * depth is not a property of any one command's series. */
-    uint8_t redirect;    /* enum lk_redirect; non-zero -> the redirect counter and
-                            no entry in the error one */
-    bool has_block;      /* the unit's duration is a wait the client asked for */
+    uint8_t redirect; /* enum lk_redirect; non-zero -> the redirect counter and
+                         no entry in the error one */
+    bool has_block;   /* the unit's duration is a wait the client asked for */
     double block_seconds;
-    bool has_depth;      /* the observation knows its batch depth */
-    uint32_t depth;      /* ... commands that arrived in one syscall with it */
+    bool has_depth; /* the observation knows its batch depth */
+    uint32_t depth; /* ... commands that arrived in one syscall with it */
 };
 
 /* Fan one observation into all the families above, applying cardinality control. */

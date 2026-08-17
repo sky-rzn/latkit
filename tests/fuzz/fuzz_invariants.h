@@ -149,6 +149,65 @@ static inline void fz_check_http_msg(const struct lk_msg *m)
     }
 }
 
+/* RESP framer message contract (redis.h, РR2; PLAN-REDIS.md МR8). The
+ * dictionary here is the *protocol's own* — a message's type is the value's
+ * first byte, so there is nothing to invent and nothing to keep in step — plus
+ * two synthetic types for the two things RESP has no byte for: an inline
+ * command and a framer note.
+ *
+ *   a type byte    one top-level RESP value. `len` is its whole size on the
+ *                  wire, aggregates and terminators included, and `body_cap` is
+ *                  the prefix we hold — which under the 512-byte per-port budget
+ *                  of РR13 is normally *less*, so LK_MSG_BODY_TRUNC here reads
+ *                  "ordinary" and not "anomaly". The smallest thing that can be
+ *                  published is two bytes (an inline `x\n`; the shortest RESP
+ *                  value is three), so anything under that would mean the framer
+ *                  published something that is not on the wire;
+ *   'i'            an inline command: a raw line, terminator included, so the
+ *                  body is the whole of it and nothing is truncated;
+ *   '?'            a note, whose `len` is an enum lk_redis_note and whose body
+ *                  is NULL. An out-of-range code would be a degradation the
+ *                  handler cannot name — and the handler routes exactly five of
+ *                  these to latkit_parse_errors_total, so an invented one would
+ *                  land in a counter an operator is asked to act on.
+ *
+ * LK_REDIS_NOTE_MAX is spelled out rather than included for the same reason the
+ * type bytes are: this header is the fuzz harness's statement of the contract,
+ * and one that imported the contract from the code could not disagree with it.
+ * A new note code therefore fails here until it is written down here too, which
+ * is the intended cost of adding one. */
+#define FZ_REDIS_NOTE_MAX   10 /* LK_REDIS_NOTE_MAX (redis.h) */
+#define FZ_REDIS_MSG_INLINE 'i'
+#define FZ_REDIS_MSG_NOTE   '?'
+
+static inline bool fz_redis_type_byte(char t)
+{
+    /* redis_wire.h's fourteen: RESP2's five, RESP3's nine. */
+    return t == '+' || t == '-' || t == ':' || t == '$' || t == '*' || t == '_' || t == '#' ||
+           t == ',' || t == '(' || t == '!' || t == '=' || t == '%' || t == '~' || t == '>' ||
+           t == '|';
+}
+
+static inline void fz_check_redis_msg(const struct lk_msg *m)
+{
+    FZ_ASSERT(!(m->flags & LK_MSG_STARTUP)); /* RESP has no startup framing */
+    FZ_ASSERT(m->body_cap <= LK_MSG_BODY_MAX);
+    if (m->type == FZ_REDIS_MSG_NOTE) {
+        FZ_ASSERT(m->len > 0 && m->len < FZ_REDIS_NOTE_MAX);
+        FZ_ASSERT(m->body == NULL && m->body_cap == 0);
+        FZ_ASSERT(!(m->flags & LK_MSG_BODY_TRUNC));
+        return;
+    }
+    FZ_ASSERT(m->type == FZ_REDIS_MSG_INLINE || fz_redis_type_byte(m->type));
+    FZ_ASSERT(m->len >= 2);
+    FZ_ASSERT(m->body_cap <= m->len);
+    FZ_ASSERT(((m->flags & LK_MSG_BODY_TRUNC) != 0) == (m->body_cap < m->len));
+    if (m->body_cap) {
+        FZ_ASSERT(m->body != NULL);
+        fz_read_bytes(m->body, m->body_cap);
+    }
+}
+
 /* Observation contract (proto.h, Р16-Р18): the parser may emit "no text" or a
  * truncated prefix, but never a dangling or inconsistent one, and sqlstate is
  * always a bounded C-string. Every field is read so an out-of-bounds pointer

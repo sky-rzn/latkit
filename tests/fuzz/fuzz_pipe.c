@@ -29,6 +29,11 @@
  * The connection table is deliberately tiny (16 entries) so the fuzzer reaches
  * the LRU-ceiling recycling path (Р12) with a few fresh-cookie opens.
  *
+ * Since PLAN-REDIS.md МR8 the selector's fourth value is redis, whose unit
+ * boundaries *are* the syscall boundaries (РR3): one op is one call, so a
+ * scenario that moves a byte from one op to the next changes the batch depth
+ * and the pairing, which is a dimension none of the other three has.
+ *
  * Built only in the -DLATKIT_FUZZ=ON profile; corpus in tests/fuzz/corpus/pipe/
  * (seeds written by gen_seeds, minimised by the campaign). */
 #include <linux/types.h>
@@ -65,6 +70,7 @@ enum pipe_msg_check {
     PIPE_MSG_PG = 0,
     PIPE_MSG_MY,
     PIPE_MSG_HTTP,
+    PIPE_MSG_REDIS,
 };
 
 struct pipe_ctx {
@@ -94,6 +100,8 @@ static void pipe_on_msg(void *ctx, struct lk_conn *c, enum lk_dir dir, const str
 
     if (px->msg_check == PIPE_MSG_HTTP)
         fz_check_http_msg(m);
+    else if (px->msg_check == PIPE_MSG_REDIS)
+        fz_check_redis_msg(m);
     else
         fz_check_msg(m, px->msg_check == PIPE_MSG_MY);
     /* Р19: nothing is emitted across a loss — the first message after it must
@@ -142,6 +150,14 @@ static void pipe_on_query(void *ctx, const struct lk_conn *c, const struct lk_se
         if (o->text)
             fz_check_route_stable(o->op ? o->op : "", o->op ? strlen(o->op) : 0, o->text,
                                   o->text_len, NULL);
+        if (o->route)
+            fz_read_bytes(o->route, o->route_len);
+    } else if (px->msg_check == PIPE_MSG_REDIS) {
+        /* No normaliser to run: a Redis observation's identity is already an
+         * index into a closed table (РR4), which is the whole point — there is
+         * no text to fingerprint and nothing about the label that depends on the
+         * bytes. What is left to read is the borrowed identity itself. */
+        FZ_ASSERT(!o->text && !o->text_len);
         if (o->route)
             fz_read_bytes(o->route, o->route_len);
     } else if (o->text) {
@@ -403,9 +419,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             sel = lk_proto_find("mysql", 5);
         else if (want == PIPE_PROTO_HTTP)
             sel = lk_proto_find("http", 4);
+        else if (want == PIPE_PROTO_REDIS)
+            sel = lk_proto_find("redis", 5);
         if (sel) {
             ops = sel;
-            px.msg_check = want == PIPE_PROTO_MYSQL ? PIPE_MSG_MY : PIPE_MSG_HTTP;
+            px.msg_check = want == PIPE_PROTO_MYSQL  ? PIPE_MSG_MY
+                           : want == PIPE_PROTO_HTTP ? PIPE_MSG_HTTP
+                                                     : PIPE_MSG_REDIS;
         }
         px.ops = ops;
         px.proto = ops->proto_new(&qsink);

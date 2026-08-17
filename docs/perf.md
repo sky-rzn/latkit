@@ -547,3 +547,135 @@ A pair whose load generator reported no throughput is dropped from the medians
 and the count is printed — averaging a failed run into the baseline would report
 the agent as making the server twice as fast, which is exactly what the first
 attempt at this table did before the pool-readiness probe was fixed.
+
+## Redis overhead and the МR8 gate (PLAN-REDIS.md)
+
+`tests/bench/run-redis.sh` — the cache twin of the four stands above, same shape
+(paired A/B runs at a **capped** rate, medians compared), driven by
+`memtier_benchmark` with `--rate-limiting` per connection.
+
+Redis is the reason this stand exists at all: it is an order of magnitude faster
+than anything the agent had watched, and without pipelining every command is two
+syscalls, so one server process delivers more events than ten busy PostgreSQL.
+That is риск 2 of the plan, and the gate is its answer.
+
+Measured 2026-08-17, kernel 7.0.0-27, 22 cores, `redis:7.4`, 100 connections
+(25 clients × 4 threads), 64-byte values, 20 s per run, three pairs per leg,
+capped at 500 ops/s per connection (≈ 50k ops/s):
+
+```
+leg       ops/s A   ops/s B   ΔOPS    p50 A>B ms      p99 A>B ms     agent CPU    events  drops
+nopipe      50001     50001   -0.0%   0.383>0.583     1.207>1.519    0.037 cores    6.0M      0
+pipe100     50044     50046   +0.0%   0.839>1.207     1.999>2.527    0.024 cores    0.6M      0
+```
+
+- **ΔTPS is zero on both legs**, and the agent costs **0.037 cores per 50k
+  commands/s** unpipelined — the cheapest per-observation figure of any protocol
+  in this document, because a Redis command is tens of bytes and there is no
+  header block to parse.
+- **Pipelining works in the agent's favour, exactly as the plan hoped.** The same
+  50k commands/s arrive in a *tenth* of the events (0.6 M against 6.0 M) and cost
+  a third less CPU: a batch is one `recvmsg`, and the framer's per-call work is
+  amortised over every command in it.
+- Zero drops, zero resyncs and zero parse errors on every capped pair, which is
+  what makes the numbers admissible at all (Р49).
+
+### The gate (риск 2): the unpipelined saturation probe
+
+The load the gate is about is the one with the event rate, uncapped:
+
+```
+load      budget          ops/s      observed of sent      drops of events   resyncs
+nopipe    default (512)   147 476    2 949 762 / 2 949 527 (100.0%)   0 / 5 899 724      0
+```
+
+**147 k commands/s, 295 k ringbuf records/s, zero dropped, 100 % of what the
+client sent observed.** The gate passes with no fallback needed: the kernel-side
+connection sampling the plan holds in reserve stays in reserve.
+
+### What 512 bytes buys, and what it costs (РR13, risk 1)
+
+Unpipelined, the budget decides nothing: a 64-byte command and its reply fit
+inside 512 bytes whatever it is set to (measured: 143 962 ops/s at the default
+against 142 382 at 32 KiB, zero drops on both). The budget decides something
+only when a batch is bigger than it — so the comparison is run **pipelined**,
+where one write carries ~7 KB, and it reports *coverage* rather than only drops:
+
+```
+load      budget            ops/s      observed of sent       drops of events    resyncs
+pipe100   default (512)   3 014 292    4 490 716 / 60 285 853  (7.4%)    0 / 1 206 074    820 182
+pipe100   fat (32768)     2 647 004   52 778 700 / 52 940 095 (99.7%)  1 465 / 1 587 055    1 869
+```
+
+This is risk 1 of PLAN-REDIS.md measured, and it is the one number in the track
+that an operator may need to change:
+
+- at **3 million commands per second** through a hundred deeply pipelined
+  connections, the 512-byte budget sees the head of each batch — **7.4 % of the
+  commands** — and the rest of every batch is a hole that lands *between* values
+  rather than inside a bulk payload, so the direction resyncs on the next call
+  boundary. 820 k resyncs, and **not one dropped record or parse error**: the
+  degradation is a loss of coverage, loudly counted, not a corruption;
+- raising the budget to 32 KiB restores **99.7 %** coverage and costs what РH14
+  says it costs — 32 % more records for the same load, 0.09 % of them dropped,
+  and 12 % of the server's throughput;
+- the observed share is not a sample in the statistical sense: it is the *first*
+  commands of each batch, so a deeply pipelined workload watched at the default
+  budget under-reports the commands a client puts at the end of its batches.
+
+The practical reading, and what deploy docs should say: **the default is right
+for the deployments the plan is aimed at** — an application pool pipelines at
+depth 1, and a batching client at the depth it asked for (МR0 measured 1, 8 and
+100) — and a deployment that really does drive millions of commands per second
+through `--pipeline 100` should raise the per-port budget explicitly
+(`--port 6379=redis:8192`) and pay for it in records. The knob is per port for
+exactly this reason.
+
+### Reproduction
+
+```sh
+cmake -B build-rel -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-rel --target latkit -j
+tests/bench/run-redis.sh            # ~8 min; exits non-zero if the gate fails
+```
+
+Knobs (env): `PAIRS`, `DURATION`, `CLIENTS`, `THREADS`, `PIPELINE`, `RATE`,
+`DATA_SIZE`, `FAT_BUDGET`, `PORT`, `AGENT_BIN`, `OUT` — see the script header.
+Artifacts per run: `runs.tsv` (one row per pair), `budget.tsv` (the coverage
+table above), `memtier.log` and one metrics dump per run.
+
+## Long-run soak on Redis (PLAN-REDIS.md МR8)
+
+`WORKLOAD=redis tests/longrun/run.sh` runs the Р53 soak against a cache instead
+of a database: the same witness, the same disturbances (induced loss every hour,
+a server restart every four), the same criteria — and four Redis-shaped load
+generators chosen for the per-connection state this protocol has and the others
+do not: a 6 KB in-flight ring per connection, a subscribe flag, and two labels
+that move mid-stream.
+
+| leg | what it churns |
+|---|---|
+| `steady` | memtier, persistent connections, rate-limited — the baseline |
+| `churn` | `redis-cli`, one process per command — the conn table's LRU and idle sweep, and the ring allocated and freed thousands of times an hour |
+| `acl` | a fresh ACL user per pass, authenticated, used, deleted — the `user` dimension (РR6) and риск 7's claim that it stays small |
+| `pubsub` | subscribe / publish / unsubscribe — the subscribe state of РR8 |
+
+The 24-hour form is an operator's run. The harness was validated in its
+`SMOKE=1` shape (5 minutes, every disturbance firing several times) on
+2026-08-17:
+
+```
+  bpftool maps : unchanged before/after  OK
+  RSS 2nd-half : min 22.9 MiB  max 22.9 MiB  spread 0.00% (limit 5%)  OK
+  fd count     : start 42  2nd-half max 42  growth 0.0% (limit 20%)  OK
+  metric_series: max 59 (ceiling 2000)  OK
+  induced only : 0 steady-phase loss events (must be 0)  OK
+  VERDICT: PASS
+```
+
+`metric_series: 59` is риск 7 of the plan as a number: 32 ACL users rotating
+through, a database that moves, ~20 command identities — and the series count
+plateaus in the low tens where the ceiling is 2 000. This is the first protocol
+in the tree whose cardinality is bounded by a table rather than by a dictionary,
+and a day of user rotation is what turns that from a design claim into an
+observation.

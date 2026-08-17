@@ -25,8 +25,8 @@
 #     the kind of attach that a kernel change breaks silently, which is why the
 #     matrix runs them.
 #
-#   sudo tests/kernel/smoke.sh [--port N] [--repeat N] [--no-tls] [--mysql|--http]
-#                              [--build DIR]
+#   sudo tests/kernel/smoke.sh [--port N] [--repeat N] [--no-tls]
+#                              [--mysql|--http|--s3|--redis] [--build DIR]
 set -u
 
 REPO_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
@@ -57,8 +57,15 @@ while [ $# -gt 0 ]; do
     # surviving a real socket, and about the s3 profile's counters being the
     # ones a live agent then exports.
     --s3) PROTO=s3; DO_TLS=0; shift ;;
+    # Stream the redis fixtures with the agent framing the port as redis
+    # (PLAN-REDIS.md МR8). The first protocol in the matrix whose framer is
+    # neither of the two the others share, and the first whose fixtures are
+    # *values* rather than lines or packets: a pipeline of three commands is one
+    # write(2) here, so this run also puts the batch-boundary rule of РR3 on a
+    # real socket, where the boundaries are the kernel's and not a builder's.
+    --redis) PROTO=redis; DO_TLS=0; shift ;;
     --build) BUILD=$2; shift 2 ;;
-    *) echo "usage: $0 [--port N] [--repeat N] [--no-tls] [--mysql|--http|--s3] [--build DIR]" >&2; exit 2 ;;
+    *) echo "usage: $0 [--port N] [--repeat N] [--no-tls] [--mysql|--http|--s3|--redis] [--build DIR]" >&2; exit 2 ;;
     esac
 done
 
@@ -68,6 +75,7 @@ done
 case "$PROTO" in
 mysql) PORT_SPEC="$PORT=mysql"; PGSTREAM_PROTO="-m" ;;
 http)  PORT_SPEC="$PORT=http";  PGSTREAM_PROTO="-H" ;;
+redis) PORT_SPEC="$PORT=redis"; PGSTREAM_PROTO="-R" ;;
 s3)    PORT_SPEC="$PORT=s3";    PGSTREAM_PROTO="-S"
        # The one fixture that addresses its bucket through the Host needs the
        # server's domain, exactly as a deployment with MINIO_DOMAIN set does
@@ -173,6 +181,14 @@ assert_phase() { # assert_phase NAME SUMMARY_LINE
             "$(( $(metric "$prom" latkit_s3_requests_total) + \
                  $(metric "$prom" latkit_s3_internal_requests_total) ))" "$queries"
         assert_eq "$name: s3 5xx" "$(metric_lbl "$prom" latkit_s3_requests_total 'status="5xx"')" "$errors"
+    elif [ "$PROTO" = redis ]; then
+        # The redis profile's own two lines (РR11): a command is not a query and
+        # a symbolic failure is not a SQLSTATE, so neither of the database
+        # families below would hold anything at all.
+        assert_eq "$name: redis_commands_total" \
+            "$(metric "$prom" latkit_redis_commands_total)" "$queries"
+        assert_eq "$name: redis_errors_total" \
+            "$(metric "$prom" latkit_redis_errors_total)" "$errors"
     else
         assert_eq "$name: queries_total" "$(metric "$prom" latkit_queries_total)" "$queries"
         assert_eq "$name: query_errors_total" "$(metric "$prom" latkit_query_errors_total)" "$errors"

@@ -37,6 +37,12 @@ WARP=1 ./verify-s3.sh    # + the warp profile: MinIO's own benchmark for volume
 SOAK_SEC=86400 ./verify-s3-tls.sh   # + the МS3 soak: a 24 h warp run under the
                                     #   uprobes, MinIO has to come through it
 
+./verify-redis.sh        # plaintext Redis: redis-cli command sequences, a live
+                         #   subscription, one agent on -p 6579=redis
+                         #   (PLAN-REDIS.md МR8)
+MEMTIER=1 ./verify-redis.sh  # + the memtier profile: volume, and a pipeline of 8
+                             #   the depth histogram then has to show
+
 ./verify-redis-tls.sh    # Redis over TLS: a TLS-only Redis and a plaintext one,
                          #   the same commands at both, three agents
                          #   (PLAN-REDIS.md МR7, РR12)
@@ -125,6 +131,40 @@ an alias whose credentials the server rejects, so the refused-caller cases of
 exist — are driven by busybox `wget` with a hand-written `Authorization` header.
 That is also the honest shape of the thing being tested, since no SDK would ever
 generate it. Port 9402, for the same reason 9401/9444 are used above.
+
+`verify-redis.sh` is the plaintext Redis stand, and it asserts the list МR8
+names: the `latkit_redis_*` families exist and grow, every command is a value
+from the closed table with `cmd="other"` at zero, the `SELECT`ed database and
+the ACL user are labels, the injected failures arrive **with their symbols**
+(`WRONGTYPE`, `NOAUTH` and `WRONGPASS` are three different pages at 3 a.m. and
+one status at the transport level), no key and no password is anywhere in the
+exposition, and a delivery is not counted as a command.
+
+Four of its checks exist only here, and each is one of the track's decisions
+made falsifiable:
+
+- the `BLPOP` in the load is in `latkit_redis_blocking_seconds` and in **no**
+  series of the general duration histogram (РR10) — one 30-second wait in the
+  same family as a `GET` decides the p99 of the whole instance;
+- the transaction's `+QUEUED` members are counted as commands and reach no
+  histogram, while the transaction itself is one interval in the shared
+  `latkit_txn_duration_seconds` (РR9);
+- `PING` has a latency of its own (РR15): the healthcheck is the measurement
+  that shows an event loop stalled, so it is deliberately not folded away;
+- the depth histogram shows what the clients actually did — `redis-cli` feeding
+  a 21-command file is one batch, and with `MEMTIER=1` the 5..8 bucket fills
+  with somebody else's number rather than one of ours.
+
+Measured on the host this was written on, with `MEMTIER=1`: **3.58 M commands
+observed, 0 ringbuf drops of 922 525 events** at 171 k ops/s, 0 parse errors, 0
+in-flight units dropped, and 3 571 584 of the depth samples in the 5..8 bucket —
+memtier's pipeline of 8, read back off the wire. Port 6579 (6479/6480 belong to the TLS stand), Prometheus on 19095, the
+agent on 9760.
+
+One trap the stand encodes, because it cost an hour: Prometheus canonicalises a
+histogram's `le` to a float on ingestion, so a query for `le="8"` matches
+nothing while the agent's own exposition says `le="8"` — a wrong number that
+looks like a passing zero. Every bucket selector here is a regex.
 
 `verify.sh` builds `build/latkit` on the host first (the image just wraps that
 binary — the BPF skeleton toolchain is not reproduced in a container), brings the

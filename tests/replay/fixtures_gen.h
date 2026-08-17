@@ -89,6 +89,15 @@ struct fx {
      * error cannot appear anywhere in the set without a test saying so. */
     __u64 parse_errors; /* lk_proto_stats.parse_errors */
     __u64 blind_conns;  /* ... blind_conns (РH4: h2 / upgrade / CONNECT) */
+
+    /* --- Redis expectations (PLAN-REDIS.md МR8) ----------------------------
+     * The one fact about a Redis exchange that no observation can carry,
+     * because it is a fact about the values that were *not* one: a pub/sub
+     * delivery and a RESP3 push answer nobody (РR8). They are counted here and
+     * on every fixture, not only the two that produce them — a value that
+     * closed a unit it had no business closing would show up as a push that
+     * went missing, and there is no other place that would notice. */
+    __u64 pushes; /* lk_proto_stats.pushes */
 };
 
 struct fixture {

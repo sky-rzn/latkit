@@ -3,7 +3,7 @@
  *
  * Coverage-guided fuzzing starts orders of magnitude faster from inputs that
  * already parse: this tool writes small, valid-ish seeds into
- * <root>/{pg,my,http,norm,pipe}/ — PostgreSQL v3 and MySQL classic wire
+ * <root>/{pg,my,http,redis,norm,pipe}/ — PostgreSQL v3 and MySQL classic wire
  * sessions, HTTP/1.x byte streams (PLAN-HTTP.md М8), plain SQL and request
  * targets for fuzz_norm, and scenario-encoded sessions (fuzz_pipe_ops.h) for
  * fuzz_pipe. The campaign script (campaign.sh) regenerates them into the
@@ -389,6 +389,14 @@ static void norm_seeds(const char *root)
  * seeds that want it append the bytes with an explicit length — a NUL inside a
  * string constant would silently truncate every strlen-based writer here. */
 #define HTTP_SEED_H2 "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+/* RESP wire fragments for the pipe scenarios (PLAN-REDIS.md МR8): one command,
+ * one batch of three, and a set of replies that pairs with either. */
+#define REDIS_SEED_CMDS "*2\r\n$3\r\nGET\r\n$5\r\nlk:k1\r\n"
+#define REDIS_SEED_BATCH                                                                           \
+    "*3\r\n$3\r\nSET\r\n$4\r\nlk:a\r\n$1\r\n1\r\n*2\r\n$3\r\nGET\r\n$4\r\nlk:a\r\n"                \
+    "*2\r\n$4\r\nINCR\r\n$4\r\nlk:n\r\n"
+#define REDIS_SEED_REPLIES "$6\r\nvalue1\r\n"
 #define HTTP_SEED_WS_REQ                                                                           \
     "GET /ws HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"                 \
     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
@@ -636,6 +644,46 @@ static void pipe_seeds(const char *root)
     sc_data(3, PIPE_OP_SEND, clean, "\x81\x05hello", 7);
     put_u8(PIPE_OP(PIPE_OP_CLOSE, 3, 0));
     write_seed(root, "pipe", "http_blind");
+
+    /* --- redis scenarios (PLAN-REDIS.md МR8) ------------------------------
+     * The fourth framer through the same seams, and the one where the seam
+     * *is* the protocol: on RESP a unit's batch is "what arrived in this
+     * syscall" (РR3), and in this format one op is one syscall — so the two
+     * scenarios below are the two things a scenario mutator can do that a byte
+     * mutator cannot, which is move a command across a call boundary and lose
+     * an event in the middle of a batch. */
+    sc_begin(PIPE_PROTO_REDIS);
+    put_u8(PIPE_OP(PIPE_OP_OPEN, 0, 0));
+    sc_data(0, PIPE_OP_RECV, clean, REDIS_SEED_CMDS, strlen(REDIS_SEED_CMDS));
+    sc_data(0, PIPE_OP_SEND, clean, REDIS_SEED_REPLIES, strlen(REDIS_SEED_REPLIES));
+    sc_data(0, PIPE_OP_RECV, clean, REDIS_SEED_BATCH, strlen(REDIS_SEED_BATCH));
+    sc_data(0, PIPE_OP_SEND, clean, "+OK\r\n$1\r\na\r\n:1\r\n", 16);
+    put_u8(PIPE_OP(PIPE_OP_CLOSE, 0, 0));
+    write_seed(root, "pipe", "redis_session");
+
+    sc_begin(PIPE_PROTO_REDIS);
+    put_u8(PIPE_OP(PIPE_OP_OPEN, 1, 0));
+    /* A reply cut by the per-port budget (РR13 makes it 512 bytes): the tail is
+     * a hole inside a bulk payload, which is the one hole on this protocol that
+     * costs nothing — the length was on the wire. */
+    sc_data(1, PIPE_OP_RECV, clean, REDIS_SEED_CMDS, strlen(REDIS_SEED_CMDS));
+    sc_data(1, PIPE_OP_SEND, PIPE_DATA_SHAPE(PIPE_SHAPE_NEW_TAIL) | PIPE_DATA_TAIL(3),
+            "$8192\r\nabcdefgh", 15);
+    /* ... and a lost event in the middle of a batch, which is the one that
+     * costs a queue: the aggregate has a count and no size, so there is nothing
+     * to skip by and the direction has to find an anchor. */
+    sc_data(1, PIPE_OP_RECV, clean | PIPE_DATA_GAP, REDIS_SEED_BATCH, strlen(REDIS_SEED_BATCH));
+    sc_data(1, PIPE_OP_SEND, clean, REDIS_SEED_REPLIES, strlen(REDIS_SEED_REPLIES));
+    put_u8(PIPE_OP(PIPE_OP_CLOSE, 1, 0));
+    /* A connection older than the agent: both directions start dirty in the
+     * middle of somebody else's value, which on this protocol is what every
+     * agent restart beside a client pool looks like (МR7). */
+    put_u8(PIPE_OP(PIPE_OP_OPEN, 2, PIPE_OPEN_SYNTHETIC));
+    sc_data(2, PIPE_OP_SEND, clean, "alue we joined halfway through\r\n", 32);
+    sc_data(2, PIPE_OP_RECV, clean, REDIS_SEED_CMDS, strlen(REDIS_SEED_CMDS));
+    sc_data(2, PIPE_OP_SEND, clean, REDIS_SEED_REPLIES, strlen(REDIS_SEED_REPLIES));
+    put_u8(PIPE_OP(PIPE_OP_CLOSE, 2, 0));
+    write_seed(root, "pipe", "redis_holes");
 }
 
 /* --- mysql seeds: whole classic-protocol sessions (MYSQL.md М7) -------------
@@ -1000,17 +1048,176 @@ static void s3_seeds(const char *root)
 #undef HEX64
 }
 
+/* --- redis seeds: the RESP framer and its handler (PLAN-REDIS.md МR8) -------
+ * Written into corpus/redis/ for fuzz_redis, which reads a plain byte stream —
+ * no selector byte, because this target has one input language. Each seed is a
+ * *conversation* rather than a value: the target feeds the same bytes down both
+ * directions, so a file that holds commands and replies together exercises the
+ * framer, the unit queue and the session machine in one run.
+ *
+ * The malformed shapes are the point of half of them. RESP's aggregates carry a
+ * count and not a size, so a length that does not describe the wire cannot be
+ * skipped — it has to end in a note and a resync, and the difference between
+ * "ends in a resync" and "reads past the buffer" is what this corpus is for. */
+static void redis_seeds(const char *root)
+{
+    /* The twenty commands an application actually runs, with their replies:
+     * enough of the table to reach the classifier's main branches, and enough
+     * of the reply grammar to keep the queue paired. */
+    put_str("*3\r\n$3\r\nSET\r\n$5\r\nlk:k1\r\n$6\r\nvalue1\r\n"
+            "*2\r\n$3\r\nGET\r\n$5\r\nlk:k1\r\n"
+            "*2\r\n$4\r\nINCR\r\n$5\r\nlk:cnt\r\n"
+            "*3\r\n$5\r\nLPUSH\r\n$5\r\nlk:ls\r\n$1\r\na\r\n"
+            "*2\r\n$7\r\nHGETALL\r\n$5\r\nlk:hm\r\n"
+            "*1\r\n$4\r\nPING\r\n");
+    put_str("+OK\r\n$6\r\nvalue1\r\n:1\r\n:1\r\n"
+            "*2\r\n$1\r\nf\r\n$1\r\nv\r\n+PONG\r\n");
+    write_seed(root, "redis", "basic");
+
+    /* A pipeline in one call and its replies in another (РR3), plus the two
+     * empty commands that are complete values and are answered by nothing. */
+    put_str("*2\r\n$3\r\nGET\r\n$3\r\nk:1\r\n*2\r\n$3\r\nGET\r\n$3\r\nk:2\r\n"
+            "*2\r\n$3\r\nGET\r\n$3\r\nk:3\r\n*0\r\n*-1\r\n");
+    put_str("$1\r\na\r\n$-1\r\n$1\r\nc\r\n");
+    write_seed(root, "redis", "pipeline");
+
+    /* Every RESP3 type, an attribute prefix, and a push that answers nobody
+     * (РR8). `>` is the branch that needs no state at all, and `|` is the one
+     * that must not close a unit — it is a prefix to the value after it. */
+    put_str("*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n*3\r\n$6\r\nCLIENT\r\n$8\r\nTRACKING\r\n$2\r\nON\r\n");
+    put_str("%3\r\n$6\r\nserver\r\n$5\r\nredis\r\n$5\r\nproto\r\n:3\r\n$2\r\nid\r\n:42\r\n"
+            "|1\r\n$14\r\nkey-popularity\r\n%2\r\n$7\r\nkey:123\r\n,90.5\r\n"
+            "~3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+            "_\r\n#t\r\n#f\r\n,inf\r\n,-3.14\r\n"
+            "(3492890328409238509324850943850943825024385\r\n"
+            "!21\r\nSYNTAX invalid syntax\r\n"
+            "=15\r\ntxt:Some string\r\n"
+            ">2\r\n$10\r\ninvalidate\r\n*1\r\n$5\r\nlk:k1\r\n");
+    write_seed(root, "redis", "resp3_types");
+
+    /* The lengths that must not parse. Every one of these is a real protocol
+     * error the server answers and hangs up on, and every one of them is one
+     * mutation away from a valid value — which is exactly why they are seeds
+     * rather than unit-test cases only. */
+    put_str("$536870913\r\n");            /* past proto-max-bulk-len */
+    put_str("$99999999999999999999\r\n"); /* past an i64 */
+    put_str("$abc\r\n");
+    put_str("$-2\r\n");
+    put_str("*2147483648\r\n");
+    put_str("*x\r\n");
+    put_str("$3\r\nabcdef\r\n");    /* payload longer than declared: no CRLF where owed */
+    put_str("*3\r\n$3\r\nGET\r\n"); /* an aggregate that ends mid-element */
+    put_str("%1\r\n$1\r\na\r\n");   /* a map missing its value */
+    write_seed(root, "redis", "bad_lengths");
+
+    /* Nesting: the reason LK_REDIS_MAX_DEPTH is 32 and not the 8 РR2 proposed
+     * (МR0 measured `COMMAND DOCS` at 13), and the shape that walks past it. */
+    put_str("*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n"
+            "*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n"
+            "*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n"
+            "*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n*1\r\n+deep\r\n");
+    put_str("*2\r\n*2\r\n$1\r\na\r\n:1\r\n%1\r\n$1\r\nk\r\n~2\r\n:1\r\n:2\r\n");
+    write_seed(root, "redis", "nesting");
+
+    /* Inline commands and the lines that are not commands: the server answers
+     * a blank line with nothing, so a message here would leave the queue
+     * waiting for a reply nobody owes. */
+    put_str("PING\r\n");
+    put_str("ECHO hello\r\n");
+    put_str("\r\n");
+    put_str("\n");
+    put_str("   \r\n");
+    put_str("SET \"k with spaces\" 1\r\n");
+    put_str("GET k\n"); /* LF only: the server strips the CR, so it works */
+    put_str("*1\r\n$4\r\nPING\r\n");
+    write_seed(root, "redis", "inline");
+
+    /* The two labels and the rule that moves them (РR5/РR6), in every form
+     * that carries one — including the two arrays the display mask has to read
+     * correctly, and the refusals that must move nothing. */
+    put_str("*2\r\n$6\r\nSELECT\r\n$1\r\n3\r\n"
+            "*2\r\n$6\r\nSELECT\r\n$4\r\n9999\r\n"
+            "*2\r\n$6\r\nSELECT\r\n$3\r\nabc\r\n"
+            "*3\r\n$4\r\nAUTH\r\n$6\r\nlkuser\r\n$6\r\nlkpass\r\n"
+            "*2\r\n$4\r\nAUTH\r\n$6\r\nlkpass\r\n"
+            "*5\r\n$5\r\nHELLO\r\n$1\r\n3\r\n$4\r\nAUTH\r\n$7\r\nlkother\r\n$6\r\nlkpass\r\n"
+            "*4\r\n$3\r\nACL\r\n$7\r\nSETUSER\r\n$8\r\nlkreader\r\n$7\r\n>lkpass\r\n"
+            "*4\r\n$6\r\nCONFIG\r\n$3\r\nSET\r\n$11\r\nrequirepass\r\n$6\r\nlkpass\r\n"
+            "*1\r\n$5\r\nRESET\r\n");
+    put_str("+OK\r\n-ERR DB index is out of range\r\n-ERR value is not an integer or out of "
+            "range\r\n+OK\r\n-WRONGPASS invalid username-password pair\r\n"
+            "%1\r\n$5\r\nproto\r\n:3\r\n+OK\r\n+OK\r\n+RESET\r\n");
+    write_seed(root, "redis", "labels");
+
+    /* The outcome (РR7/РR9/РR10): every symbol in the vocabulary, the two
+     * redirects that are not failures, a transaction with each of its endings,
+     * and the commands whose wait belongs to the client. */
+    put_str("*1\r\n$5\r\nMULTI\r\n*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\n1\r\n"
+            "*1\r\n$4\r\nEXEC\r\n*1\r\n$7\r\nDISCARD\r\n"
+            "*3\r\n$5\r\nBLPOP\r\n$4\r\nlk:q\r\n$1\r\n0\r\n"
+            "*6\r\n$5\r\nXREAD\r\n$5\r\nBLOCK\r\n$3\r\n100\r\n$7\r\nSTREAMS\r\n$4\r\nlk:s\r\n$1\r\n"
+            "$\r\n"
+            "*6\r\n$5\r\nXREAD\r\n$5\r\nCOUNT\r\n$2\r\n10\r\n$7\r\nSTREAMS\r\n$4\r\nlk:s\r\n$1\r\n"
+            "0\r\n"
+            "*2\r\n$3\r\nGET\r\n$5\r\nlk:mv\r\n");
+    put_str("+OK\r\n+QUEUED\r\n*1\r\n+OK\r\n+OK\r\n"
+            "-EXECABORT Transaction discarded because of previous errors.\r\n"
+            "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+            "-NOSCRIPT No matching script\r\n-NOPERM this user has no permissions\r\n"
+            "-NOAUTH Authentication required.\r\n-OOM command not allowed\r\n"
+            "-LOADING Redis is loading the dataset in memory\r\n-BUSY Redis is busy\r\n"
+            "-CLUSTERDOWN The cluster is down\r\n-CROSSSLOT Keys don't hash to the same slot\r\n"
+            "-MOVED 12539 10.0.0.3:6379\r\n-ASK 8000 10.0.0.4:6379\r\n"
+            "-UNBLOCKED client unblocked\r\n-lowercase not a symbol\r\n-\r\n");
+    write_seed(root, "redis", "outcomes");
+
+    /* Pub/Sub in RESP2, where a confirmation and a delivery have the same shape
+     * and only the kind word and the subscribe state tell them apart (РR8) —
+     * and a `LRANGE` reply whose first element is literally the word `message`,
+     * which is why the kind word is read on a subscribed connection only. */
+    put_str("*2\r\n$9\r\nSUBSCRIBE\r\n$7\r\nlk:chan\r\n"
+            "*3\r\n$10\r\nPSUBSCRIBE\r\n$3\r\nlk*\r\n$4\r\nnews\r\n"
+            "*1\r\n$4\r\nPING\r\n"
+            "*2\r\n$11\r\nUNSUBSCRIBE\r\n$7\r\nlk:chan\r\n"
+            "*4\r\n$6\r\nLRANGE\r\n$5\r\nlk:ls\r\n$1\r\n0\r\n$2\r\n-1\r\n");
+    put_str("*3\r\n$9\r\nsubscribe\r\n$7\r\nlk:chan\r\n:1\r\n"
+            "*3\r\n$10\r\npsubscribe\r\n$3\r\nlk*\r\n:2\r\n"
+            "*3\r\n$10\r\npsubscribe\r\n$4\r\nnews\r\n:3\r\n"
+            "*3\r\n$7\r\nmessage\r\n$7\r\nlk:chan\r\n$5\r\nhello\r\n"
+            "*4\r\n$8\r\npmessage\r\n$3\r\nlk*\r\n$7\r\nlk:chan\r\n$5\r\nhello\r\n"
+            "*2\r\n$4\r\npong\r\n$0\r\n\r\n"
+            "*3\r\n$11\r\nunsubscribe\r\n$7\r\nlk:chan\r\n:2\r\n"
+            "*2\r\n$7\r\nmessage\r\n$5\r\nnot a delivery\r\n");
+    write_seed(root, "redis", "pubsub");
+
+    /* The connections that are not a request/response stream at all (РR14),
+     * and the one thing on the port that is not RESP and not an inline command
+     * either: a TLS handshake record (МR7). */
+    put_str("*3\r\n$8\r\nREPLCONF\r\n$14\r\nlistening-port\r\n$4\r\n6380\r\n"
+            "*3\r\n$5\r\nPSYNC\r\n$1\r\n?\r\n$2\r\n-1\r\n"
+            "*1\r\n$7\r\nMONITOR\r\n");
+    put_str("+OK\r\n+FULLRESYNC 8a1b2c3d4e5f60718293a4b5c6d7e8f901234567 0\r\n"
+            "$EOF:0123456789abcdef0123456789abcdef01234567\r\nREDIS0011\xfa\x09redis-ver\r\n"
+            "+OK\r\n1755331200.123456 [0 10.0.0.9:51234] \"GET\" \"lk:k1\"\r\n");
+    write_seed(root, "redis", "service_conns");
+
+    put("\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03", 11);
+    put_str("*2\r\n$3\r\nGET\r\n$1\r\nk\r\n");
+    write_seed(root, "redis", "tls_head");
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 2) {
         fprintf(stderr, "usage: gen_seeds <corpus-root>"
-                        "  (writes into pg/ my/ http/ norm/ pipe/)\n");
+                        "  (writes into pg/ my/ http/ redis/ norm/ pipe/)\n");
         return 1;
     }
     pg_seeds(argv[1]);
     my_seeds(argv[1]);
     http_seeds(argv[1]);
     s3_seeds(argv[1]);
+    redis_seeds(argv[1]);
     norm_seeds(argv[1]);
     pipe_seeds(argv[1]);
     return 0;

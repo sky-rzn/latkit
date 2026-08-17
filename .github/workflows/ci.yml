@@ -151,7 +151,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [pg, my, http, norm, pipe]
+        target: [pg, my, http, redis, norm, pipe]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -177,8 +177,9 @@ jobs:
           [ "${{ github.event_name }}" = schedule ] && budget=900
           mkdir -p work findings
           cp tests/fuzz/corpus/${{ matrix.target }}/* work/
-          # Per-target dictionary where one exists: MySQL and HTTP have their
-          # own alphabets, and pg.dict covers pg, norm and the pipe scenarios.
+          # Per-target dictionary where one exists: MySQL, HTTP and Redis have
+          # their own alphabets, and pg.dict covers pg, norm and the pipe
+          # scenarios.
           dict=tests/fuzz/dict/${{ matrix.target }}.dict
           [ -f "$dict" ] || dict=tests/fuzz/dict/pg.dict
           # fuzz_http drives two dialects behind the 0xFD selector (МS4) and

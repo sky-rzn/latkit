@@ -549,3 +549,142 @@ agent's exit dump.
 The trace is read for five fields and nothing else: `-v` mode includes response
 **bodies**, and an S3 error body carries the object key (РS5), which has no
 business in a bench artefact.
+
+---
+
+# Accuracy validation — agent vs Redis (PLAN-REDIS.md МR8)
+
+**Verdict: the acceptance holds, and the three references bracket us exactly as
+§2 of the plan predicted.** On a lossless run of 1 621 serial commands:
+
+- **counts are exact.** Every identity the agent reported matches `INFO
+  commandstats` command for command — 1 621 over 9 identities, **0 mismatched**.
+  The server counted the same commands we did;
+- **no duration is below the server's own.** Paired command by command against
+  `SLOWLOG GET` at threshold 0: 1 621 pairs, **0** of them with our number under
+  the server's execution time. The median gap is 8–14 µs per command;
+- **no duration is above the client's.** Against `memtier_benchmark` on the same
+  server: memtier p50 **0.039 ms**, ours **0.006 ms** over 677 579 observations.
+
+Written as the inequality the bench actually gates on:
+
+```
+SLOWLOG(cmd_k)  <=  latkit(cmd_k)  <=  memtier(client)
+count(commandstats) == count(latkit)
+```
+
+This is the strongest accuracy statement in this document, and the reason is the
+middle reference: `SLOWLOG` is not an average and not a log line about latency —
+it is the server timing *each individual execution*. So the comparison is per
+command rather than per distribution, and "our number is never smaller" is a
+statement about every one of 1 621 commands rather than about a percentile.
+
+Everything below is produced by `tests/bench/accuracy/run-redis.sh`; the gates
+are asserted and the script exits non-zero on any regression.
+
+## Method
+
+Four views of one controlled workload against `redis:7.4` on a compose bridge:
+
+| View | What it measures |
+|---|---|
+| the agent | `--record`, replayed through `lkt_queries --proto redis`: the interval from the command's first byte to the reply's last, on the server's host |
+| `INFO commandstats` | how many times each command ran, and its mean service time **inside** the server |
+| `SLOWLOG GET` (threshold 0) | the execution time of each individual command, inside the server |
+| `memtier_benchmark` | the client's own latency: ours plus a network round trip |
+
+The workload is deliberately **serial** — `redis-cli -r N`, one connection, one
+command outstanding — because the pairing needs the k-th entry on each side to
+be the same execution. A pipelined workload would make the server's number and
+ours describe different intervals (the queueing is ours and not the server's),
+which is a real fact about pipelining and not something to smuggle into an
+accuracy figure. Both server-side references are reset **after** the agent
+attaches, so all three views cover exactly the same window; the two commands
+that read them are logged at threshold 0 themselves and are excluded by name.
+
+Eight shapes × 200 (`GET`, `SET`, `INCR`, `MGET`, `HGETALL`, `LRANGE`, a
+deliberate `WRONGTYPE`, `PING`), plus one `DEBUG SLEEP` with twenty `GET`s
+behind it — see below.
+
+## What the gap between the two server views actually is
+
+The whole argument of §2 of PLAN-REDIS.md is that `commandstats` and latkit
+measure different things, and this table is that difference in microseconds
+(reference run, `join.tsv`):
+
+| cmd | ours p50 | server p50 | gap p50 | gap p90 |
+|---|---|---|---|---|
+| `GET` | 8.3 µs | 1.0 µs | 7.8 µs | 23.1 µs |
+| `SET` | 12.8 | 1.0 | 11.8 | 22.0 |
+| `INCR` | 8.0 | 1.0 | 7.3 | 18.9 |
+| `MGET` | 15.2 | 2.0 | 13.5 | 24.0 |
+| `HGETALL` | 15.1 | 2.0 | 13.5 | 22.9 |
+| `LRANGE` | 9.9 | 1.0 | 8.4 | 20.3 |
+| `LPUSH` (WRONGTYPE) | 11.4 | 1.0 | 10.4 | 23.7 |
+| `PING` | 12.9 | 0.0 | 12.7 | 21.3 |
+| `DEBUG SLEEP 0.05` | 50 219 | 50 092 | 127 | — |
+
+The gap is not error. It is reading the command off the socket, writing the
+reply, and the event loop — the part of the latency the application waits for
+and the server does not count. `PING` is the clearest case: the server's own
+answer is *zero microseconds* (it does nothing), and the application still
+waited 13 µs. An operator watching `usec_per_call` on a `PING` sees a flat zero
+for ever; that is exactly the measurement РR15 keeps as a first-class command.
+
+`DEBUG SLEEP` is in the workload to make the second half of the argument
+visible: Redis is single-threaded, so the twenty `GET`s issued behind it are
+fast by the server's own account and slow by the client's. On a serial workload
+they queue behind it in the client too, so the reference run shows the effect on
+the sleeping command itself (127 µs of wire time on a 50 ms command); the
+head-of-line case at scale is `redis/head-of-line.lkt` in the МR0 corpus.
+
+## Systematic differences (documented, not defects)
+
+- **Our number is always larger, and by construction.** The bench gates on
+  "never smaller" rather than on a tolerance, because there is no symmetric
+  interval here: the server's clock starts when it has already read the command
+  and stops before it has written the reply. A tolerance would be a way of
+  hiding the very quantity this track exists to report.
+
+- **Microsecond rounding at the floor.** `SLOWLOG` reports whole microseconds,
+  and a `PING` executes in under one — hence the `0.0` column above. The gate
+  allows up to 1 % of pairs to invert for this reason; the reference run needed
+  none of that allowance (0 of 1 621).
+
+- **`+QUEUED` and blocking commands are excluded from the join.** A command
+  inside a `MULTI` is answered in microseconds and its duration means nothing
+  (РR9); a `BLPOP` is timed by the client's own choice of timeout (РR10).
+  Neither is comparable with a server-side service time, and the server's own
+  references agree — a queued command's `SLOWLOG` entry belongs to the `EXEC`.
+
+- **The identity needs no alias table.** Unlike the S3 bench, where MinIO names
+  a handler differently from the API, `INFO commandstats` spells a command
+  exactly as РR4 does (`config|get`, upper-cased). That is not luck: the label
+  was chosen to be the server's own name for the thing.
+
+- **The client-side inequality has a floor, not a tolerance.** memtier's p50 is
+  ~33 µs above ours on a container bridge; on a loopback stand it would be
+  smaller and on a real network larger. What the gate asserts is only the
+  direction — an observation *above* the client's latency would mean we were
+  timing something the client never waited for.
+
+## Reproduction
+
+```sh
+cmake -B build-rel -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build-rel --target latkit -j
+tests/bench/accuracy/run-redis.sh      # ~2 min; exits non-zero on failure
+```
+
+Knobs (env): `REPEAT`, `SLEEP_MS`, `MIN_SAMPLES`, `PORT`, `MEMTIER`, `AGENT_BIN`,
+`OUT` — see the script header. Artifacts per run: `report.txt` (the gates and
+the verdict), `join.tsv` (one row per command identity, all three views side by
+side), `slowlog.json` and `commandstats.txt` (the server's own views),
+`queries.txt` (the replayed observations), `run.lkt` (the recording — every
+number above is reproducible from it without the stand), `memtier.txt` and the
+agent's exit dump.
+
+`SLOWLOG` entries carry the command's **arguments**, which on this protocol are
+keys and values (РR4): the artefact is a bench file on the operator's own host,
+and nothing derived from it reaches a label, a span or the exposition. The join
+reads the verb, the subcommand and the duration, and nothing else.
