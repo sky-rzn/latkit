@@ -271,7 +271,7 @@ void lk_conn_table_note_tls_open(struct lk_conn_table *t)
     t->st.tls_active++;
 }
 
-void lk_conn_tls_reset_framing(struct lk_conn *c)
+void lk_conn_tls_reset_framing(struct lk_conn *c, bool midstream)
 {
     /* A stream framer's state (РH1) belongs to the plaintext stream that just
      * ended; the decrypted channel starts a fresh one, so drop it and let the
@@ -285,6 +285,11 @@ void lk_conn_tls_reset_framing(struct lk_conn *c)
          * StartupMessage, SEND stays in normal framing (Р36). */
         memset(&c->frame[i], 0, sizeof(c->frame[i]));
     }
+    if (midstream)
+        /* Adopted mid-session: the plaintext starts wherever the client had got
+         * to, so promising a message boundary would produce one bogus parse
+         * error per direction and then a resync anyway. */
+        mark_dirty(c);
 }
 
 void lk_conn_table_close(struct lk_conn_table *t, __u64 cookie, __u32 seq, __u64 ts_ns, __u32 *lost)

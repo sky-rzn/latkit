@@ -307,9 +307,19 @@ static __always_inline int cgroup_allowed(void)
     return bpf_map_lookup_elem(&cgroups, &id) != NULL;
 }
 
-/* Exact-match against one comm list: the current thread's comm must equal one of
- * the configured entries; a no-op (allow) unless the list is set. Both callers
- * run in the calling task's context — see the two cfg_*_comm_filter comments. */
+/* Match the current thread's comm against one comm list; a no-op (allow) unless
+ * the list is set. Both callers run in the calling task's context — see the two
+ * cfg_*_comm_filter comments.
+ *
+ * Entries match exactly, except that a trailing `*` makes the rest a prefix
+ * match (РR12, PLAN-REDIS.md МR7). Exactly one server needed it and needed it
+ * badly: Redis with `io-threads N` does the socket work — including SSL_read
+ * and SSL_write — on threads named `io_thd_1` … `io_thd_N`, where N is a config
+ * setting, so a list of literals would have to guess how many. Measured on the
+ * МR0 stand: at 100 connections a filter naming only `redis-server` sees 28 %
+ * of the traffic. The wildcard is the last character or it is not one — a `*`
+ * anywhere else is a literal asterisk, and userspace refuses to install such an
+ * entry rather than let it match nothing quietly. */
 static __always_inline int comm_match(const volatile char (*flt)[LK_COMM_LEN])
 {
     char comm[LK_COMM_LEN];
@@ -324,6 +334,8 @@ static __always_inline int comm_match(const volatile char (*flt)[LK_COMM_LEN])
         if (!flt[f][0])
             break; /* packed from 0: first empty entry ends the list */
         for (i = 0; i < LK_COMM_LEN; i++) {
+            if (flt[f][i] == '*')
+                return 1; /* prefix matched up to the wildcard */
             if (comm[i] != flt[f][i])
                 break;
             if (!comm[i])

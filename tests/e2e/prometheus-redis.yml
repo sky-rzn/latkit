@@ -1,0 +1,24 @@
+# Prometheus config for the Redis TLS stand (PLAN-REDIS.md МR7). Three jobs,
+# because the stand's assertions are comparisons and the job label is what tells
+# the legs apart:
+#
+#   latkit-plain    the control — the same load, unencrypted
+#   latkit-tls      the claim — the same observations off the libssl uprobes
+#   latkit-tls-main the counter-example — the same TLS port watched with
+#                   `--comm redis-server`, i.e. without Redis' io threads
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: latkit-plain
+    static_configs:
+      - targets: ["latkit-plain:9752"]
+
+  - job_name: latkit-tls
+    static_configs:
+      - targets: ["latkit-tls:9752"]
+
+  - job_name: latkit-tls-main
+    static_configs:
+      - targets: ["latkit-tls-main:9752"]

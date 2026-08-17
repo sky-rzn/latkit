@@ -17,9 +17,12 @@
  * 8.x renames its per-session threads), and РH13.1 added the HTTP set
  * {nginx, httpd, apache2, haproxy} for an http port — a mixed deployment holds
  * both. РS8 (PLAN-MINIO.md МS3) adds `minio` for an s3 port, which is what took
- * the worst case (all three protocol families on one host) past eight.
+ * the worst case (all three protocol families on one host) past eight, and
+ * РR12 (PLAN-REDIS.md МR7) adds {redis-server, valkey-server, keydb-server}
+ * plus the `io_thd_*` wildcard for a redis port, which takes the four-protocol
+ * host to thirteen. Sixteen leaves the same margin the twelve did.
  * LK_COMM_LEN mirrors TASK_COMM_LEN. */
-#define LK_COMM_FILTER_MAX 12
+#define LK_COMM_FILTER_MAX 16
 #define LK_COMM_LEN        16
 
 /* Capacity of the `cgroups` filter map (task 7.1, Р48): a handful of postgres

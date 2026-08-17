@@ -104,6 +104,12 @@ enum lk_redis_note {
                                      aggregate, which has no length to skip by.
                                      Risk 1 of the plan, in the message stream */
     LK_REDIS_NOTE_NO_MEM,         /* framer state allocation failed */
+    LK_REDIS_NOTE_TLS,            /* a TLS handshake record where a RESP value belongs
+                                     (МR7): `tls-port` is TLS from the first byte, so
+                                     unlike PG and MySQL there is nothing in band to
+                                     watch for. The connection is marked TLS and its
+                                     ciphertext stops being framed; the plaintext comes
+                                     from the libssl uprobes instead */
     LK_REDIS_NOTE_MAX
 };
 

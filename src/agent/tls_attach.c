@@ -112,6 +112,25 @@ const char *const lk_tls_http_comms[] = {"nginx", "httpd", "apache2", "haproxy",
  * gate on its own. */
 const char *const lk_tls_s3_comms[] = {"minio", NULL};
 
+/* And the Redis one (РR12, PLAN-REDIS.md МR7). Three names because three
+ * products ship the same wire under different binaries, and all three link
+ * OpenSSL dynamically — the МR0 reconnaissance checked `redis:7.4`, both Alpine
+ * images, `valkey/valkey:8`, bitnami and the Debian/Ubuntu packages, and found
+ * `libssl.so.3` mapped in every one of them, so this set is used for what these
+ * sets were built for: the scan.
+ *
+ * Valkey installs `redis-server` as a symlink to `valkey-server`, and a task's
+ * comm comes from the path it was exec'd through, so both spellings can name
+ * the same running server; KeyDB is `keydb-server` and is wire-compatible but
+ * not in CI. Dragonfly is deliberately absent: it terminates TLS in its own
+ * build and is not a server this track claims to have measured.
+ *
+ * The *thread* names go on the gate, not here (LK_TLS_REDIS_IO_COMM): this list
+ * is matched against /proc/<pid>/comm, which for an io thread is never what the
+ * scan is looking for anyway — the io threads of a process map exactly the
+ * libssl the process does. */
+const char *const lk_tls_redis_comms[] = {"redis-server", "valkey-server", "keydb-server", NULL};
+
 /* An attached libssl, identified by its file so a rescan never double-attaches
  * the same binary (many backends map it; its /proc/<pid>/root path differs per
  * pid but the device+inode do not). */
@@ -132,6 +151,12 @@ struct lk_tls {
     struct lk_tls_file files[TLS_MAX_PATHS];
     int nfiles;
     bool any_partial; /* an attached file was missing a mandatory/optional symbol */
+    /* What the last AUTO scan walked past, for the diagnostic when it attached
+     * nothing: how many processes carried one of the scanned comms, how many of
+     * those mapped no libssl at all, and the last such comm (there is one server
+     * in the overwhelming majority of cases, and naming it beats naming none). */
+    int seen_procs, seen_nossl;
+    char seen_comm[32];
     enum lk_tls_state state;
 };
 
@@ -259,8 +284,11 @@ static int read_comm(const char *pid, char *buf, size_t sz)
 /* Scan one process's maps for a libssl.so mapping and attach it (via its
  * /proc/<pid>/root view, so a container's copy is reachable from the host). A
  * process may map libssl in several segments, attach_file's inode dedup collapses
- * them. Returns the number of newly attached files. */
-static int scan_pid_maps(struct lk_tls *t, const char *pid)
+ * them. Sets *mapped when the process maps a libssl at all, attached or not —
+ * that is the difference between "this server has no shared OpenSSL" and "it has
+ * one and we could not hook it", and the two need different words (МR7).
+ * Returns the number of newly attached files. */
+static int scan_pid_maps(struct lk_tls *t, const char *pid, bool *mapped)
 {
     char path[64], line[512];
     int newly = 0;
@@ -278,6 +306,7 @@ static int scan_pid_maps(struct lk_tls *t, const char *pid)
 
         if (!p || !strstr(p, "libssl.so"))
             continue;
+        *mapped = true;
         len = strlen(p);
         if (len && p[len - 1] == '\n')
             p[--len] = '\0';
@@ -293,15 +322,29 @@ static int scan_pid_maps(struct lk_tls *t, const char *pid)
     return newly;
 }
 
+/* Does this process comm belong to the scan set? Exact, except that an entry
+ * ending in `*` matches a prefix — the same rule the kernel matcher uses for
+ * the gate (МR7), so that a `--tls-comm 'redis*'` means here what it means
+ * there. Nothing the agent derives for the scan carries a wildcard; this is for
+ * what an operator types. */
 static bool comm_in_scan_set(const struct lk_tls *t, const char *comm)
 {
-    for (const char *const *c = t->comms; *c; c++)
-        if (!strcmp(comm, *c))
+    for (const char *const *c = t->comms; *c; c++) {
+        size_t n = strlen(*c);
+
+        if (n && (*c)[n - 1] == '*') {
+            if (!strncmp(comm, *c, n - 1))
+                return true;
+        } else if (!strcmp(comm, *c)) {
             return true;
+        }
+    }
     return false;
 }
 
 /* Walk /proc, attach the libssl of every comm-matching process not yet attached.
+ * Records how the walk went (t->seen_procs / t->seen_nossl and the last comm
+ * matched) so a scan that finds nothing can say *which* nothing it found.
  * Returns the number of newly attached files. */
 static int scan_proc(struct lk_tls *t)
 {
@@ -314,14 +357,20 @@ static int scan_proc(struct lk_tls *t)
         fprintf(stderr, "warn: TLS scan: cannot open /proc: %s\n", strerror(errno));
         return 0;
     }
+    t->seen_procs = t->seen_nossl = 0;
     while ((de = readdir(proc))) {
         char comm[32];
+        bool mapped = false;
 
         if (de->d_name[0] < '0' || de->d_name[0] > '9') /* pid dirs only */
             continue;
         if (read_comm(de->d_name, comm, sizeof(comm)) || !comm_in_scan_set(t, comm))
             continue;
-        newly += scan_pid_maps(t, de->d_name);
+        t->seen_procs++;
+        snprintf(t->seen_comm, sizeof(t->seen_comm), "%s", comm);
+        newly += scan_pid_maps(t, de->d_name, &mapped);
+        if (!mapped)
+            t->seen_nossl++;
     }
     closedir(proc);
     return newly;
@@ -410,6 +459,26 @@ int lk_tls_attach(struct lk_tls *t)
             fprintf(stderr, ", as a Go server has none — its plaintext comes from --tls-go\n");
         else
             fprintf(stderr, ", TLS connections will be dropped\n");
+        /* Two very different nothings (МR7). "The server is not running here"
+         * is answered by the line above and by looking at the deployment; "the
+         * server is right there and maps no libssl" is a property of the *build*
+         * — an OpenSSL linked statically into it, or a TLS library that is not
+         * OpenSSL at all (MariaDB's bundled wolfSSL/GnuTLS, and the shape РR12
+         * expected of an Alpine Redis and did not find) — and no amount of
+         * rescanning will change it. Distinguishing them costs one counter and
+         * saves the second case from reading as the first. */
+        if (t->seen_nossl > 0)
+            fprintf(stderr,
+                    "latkit: TLS uprobes: %d process(es) named '%s' are running and map no "
+                    "libssl.so —\n"
+                    "        this build links its TLS statically or uses another library; the "
+                    "libssl\n"
+                    "        channel cannot reach it, and its encrypted sessions stay "
+                    "unobserved\n",
+                    t->seen_nossl, t->seen_comm);
+        else if (t->seen_procs == 0 && !t->cfg.go_channel)
+            fprintf(stderr, "latkit: TLS uprobes: no such process is running either — check "
+                            "hostPID and the comm\n");
     }
     return 0;
 }

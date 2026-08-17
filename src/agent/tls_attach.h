@@ -12,7 +12,10 @@
  * /proc/<pid>/root and deduping by inode, then rescans on a timer to pick up
  * newly started clusters. pid=-1 on every attach covers forked backends without
  * a rescan. MariaDB builds linked against bundled wolfSSL/GnuTLS map no libssl
- * and stay dark; latkit_tls_attached{state="none"} is the diagnostic.
+ * and stay dark; latkit_tls_attached{state="none"} is the diagnostic, and the
+ * scan says which "none" it found — a comm that is running and maps no libssl
+ * is a build that cannot be reached this way, not a server that has yet to
+ * start, and no rescan will change it (МR7).
  *
  * No I/O beyond libbpf attach and reading /proc; the caller (main.c) drives load
  * order and registers the rescan timer. */
@@ -71,10 +74,23 @@ struct lk_tls_cfg {
  * The S3 set is the one exception to that rule, and only for the second consumer
  * (РS8): `minio` is in it not so the libssl scan can look for a library MinIO
  * does not map, but so the *uprobe gate* — derived from the same list — admits
- * the threads the Go channel's events come from. */
+ * the threads the Go channel's events come from.
+ *
+ * The Redis set is back to the ordinary case (РR12): every Redis, Valkey and
+ * KeyDB build measured — Alpine images included — links libssl dynamically, so
+ * the scan finds a library and the existing channel carries the plaintext. What
+ * it does need is a *thread* name the process name does not cover, and main.c
+ * adds it to the gate alone: `io_thd_*`, the threads `io-threads N` does the
+ * socket work on. */
 extern const char *const lk_tls_default_comms[]; /* postgres, mysqld, mariadbd */
 extern const char *const lk_tls_http_comms[];    /* nginx, httpd, apache2, haproxy */
 extern const char *const lk_tls_s3_comms[];      /* minio */
+extern const char *const lk_tls_redis_comms[];   /* redis-server, valkey-server, keydb-server */
+
+/* The thread comm an `io-threads N` Redis does its socket work on, wildcarded
+ * (РR12): a gate-only entry, never a process comm, so it belongs to neither
+ * scan set above. */
+#define LK_TLS_REDIS_IO_COMM "io_thd_*"
 
 /* Create the handle and decide autoload of the SSL_* programs. MUST be called
  * after latkit_bpf__open() and BEFORE latkit_bpf__load(): when no uprobes will

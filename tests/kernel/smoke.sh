@@ -16,6 +16,9 @@
 #     plus (with bpftool) the SSL_set_fd walk check — ssl_to_conn must be
 #     populated during tlspipe's post-handshake pause, before any data call
 #     could have triggered the nested-syscall fallback (Р37);
+#   - the comm filter's wildcard entry (РR12): `--comm 'pgstre*'` sees the whole
+#     plaintext phase and `--comm 'pgstreamx*'` sees nothing — the kernel-side
+#     half of the rule that lets one entry cover Redis' `io_thd_1…N`;
 #   - UDP (РH16): datagrams on the captured port are counted and TCP capture is
 #     untouched by them. These are the М7 fentries on udp_sendmsg / udpv6_sendmsg
 #     / skb_consume_udp, whose targets are ordinary kernel internals — exactly
@@ -342,6 +345,51 @@ if [ "$DO_TLS" = 1 ] && [ -x "$TLSPIPE" ]; then
             tail -5 "$TMP/pgstream2.log" | sed 's/^/  | /'
             stop_agent scope || true
         fi
+    fi
+fi
+
+# --- comm wildcard: a prefix entry in the comm filter (РR12, МR7) -------------
+# A comm filter entry may end in `*` and then matches a prefix. Exactly one
+# server asked for it: Redis with `io-threads N` does its socket work — SSL_read
+# and SSL_write included — on threads named `io_thd_1` … `io_thd_N`, where N is
+# a config setting, so no list of literals can be written in advance. The rule
+# lives in the kernel matcher, which makes it a matrix concern rather than a
+# unit-test one, and pgstream stands in for the io threads: `pgstre*` must admit
+# it exactly as its full name does, and a prefix that does not match must let
+# nothing through (a wildcard that matches everything would pass the first half
+# of this test and mean nothing).
+log "comm filter, wildcard entry"
+if start_agent wild --comm 'pgstre*'; then
+    if summary=$("$PGSTREAM" -p "$PORT" -r "$REPEAT" $PGSTREAM_PROTO 2>"$TMP/pgstream3.log"); then
+        note "$summary (driver comm: pgstream, filter: pgstre*)"
+        if stop_agent wild; then
+            assert_phase wild "$summary"
+        else
+            fail "agent exited non-zero after wildcard phase"
+            tail -5 "$TMP/wild.log" | sed 's/^/  | /'
+        fi
+    else
+        fail "pgstream failed"
+        tail -5 "$TMP/pgstream3.log" | sed 's/^/  | /'
+        stop_agent wild || true
+    fi
+fi
+if start_agent nowild --comm 'pgstreamx*'; then
+    "$PGSTREAM" -p "$PORT" -r "$REPEAT" $PGSTREAM_PROTO >/dev/null 2>&1 || true
+    if stop_agent nowild; then
+        # Observations, not connections: the filter is checked where the comm is
+        # the calling thread's, and the connection lifecycle tracepoint is not
+        # such a place (it can fire in softirq, where comm is somebody else's) —
+        # so a filtered-out server still opens and closes its connections here
+        # and simply says nothing about what travelled them.
+        assert_eq "nowild: observations" \
+            "$(( $(metric "$TMP/nowild.prom" latkit_queries_total) + \
+                 $(metric "$TMP/nowild.prom" latkit_http_requests_total) + \
+                 $(metric "$TMP/nowild.prom" latkit_s3_requests_total) + \
+                 $(metric "$TMP/nowild.prom" latkit_redis_commands_total) ))" 0
+    else
+        fail "agent exited non-zero after the non-matching wildcard phase"
+        tail -5 "$TMP/nowild.log" | sed 's/^/  | /'
     fi
 fi
 

@@ -79,8 +79,24 @@ void lk_pipeline_feed(struct lk_pipeline *p, const void *data, size_t size,
             out->conn = c;
             if (c) {
                 /* Р38 order has 'S' happen-before any decrypted byte; a
-                 * decrypted event on a still-plaintext conn means that broke. */
+                 * decrypted event on a still-plaintext conn means the agent
+                 * never saw this connection turn — which for a protocol whose
+                 * clients hold pools open for days is not an anomaly but the
+                 * ordinary shape of an agent restart (МR7: a Redis subscriber
+                 * or a connection pool predates every attach).
+                 *
+                 * A decrypted event *is* the proof the connection is encrypted,
+                 * so adopt it here rather than believe the flag: the socket's
+                 * ciphertext stops being fed to the framer (which was reading
+                 * it as protocol and reporting parse errors for the life of the
+                 * connection), the framer restarts on the plaintext, and the
+                 * connection is counted as the TLS connection it is. */
                 out->decrypted_early = !(c->flags & LK_CONN_TLS);
+                if (out->decrypted_early) {
+                    c->flags |= LK_CONN_TLS;
+                    lk_conn_tls_reset_framing(c, true);
+                    lk_conn_table_note_tls_open(p->conns);
+                }
                 lk_reasm_data(&p->reasm, c, v->hdr->dir, v->data, v->cap_len);
             }
             break;
@@ -97,7 +113,7 @@ void lk_pipeline_feed(struct lk_pipeline *p, const void *data, size_t size,
             lk_reasm_data(&p->reasm, c, v->hdr->dir, v->data, v->cap_len);
             out->tls_now = !was_tls && (c->flags & LK_CONN_TLS);
             if (out->tls_now) {
-                lk_conn_tls_reset_framing(c);
+                lk_conn_tls_reset_framing(c, false);
                 lk_conn_table_note_tls_open(p->conns);
             }
         }

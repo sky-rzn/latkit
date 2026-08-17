@@ -235,7 +235,8 @@ the comm set is now derived from the protocols on `--port` (РH13.1), so
 | `-p 5432` (pg), `-p 3306=mysql` | `postgres`, `mysqld`, `mariadbd` | + `connection` |
 | `-p 8443=http` | `nginx`, `httpd`, `apache2`, `haproxy` | the same |
 | `-p 9000=s3` | `minio` (РS8, see below) | the same |
-| all of them | all eight | + `connection` |
+| `-p 6379=redis` | `redis-server`, `valkey-server`, `keydb-server` (РR12, §4c) | + `io_thd_*` |
+| all of them | all eleven | + `io_thd_*`, `connection` |
 
 `--print-config` prints the derived set as `tls_scan_comm`, which is the only
 way to check it without a running agent — it is the one TLS input nobody types.
@@ -252,9 +253,11 @@ a postgres deployment does not start scanning web servers because HTTP exists.
 
 `LK_COMM_FILTER_MAX` went from 4 to 8 for this — seven comms plus `connection`
 is exactly eight, and the DB four had already filled the old ceiling. МS3's
-`minio` took the all-protocols case to nine, so the ceiling is 12 now: the entry
-that would have fallen off the end is silently unfiltered traffic or a silently
-missing server, and neither is worth 64 bytes of `.rodata`.
+`minio` took the all-protocols case to nine, so the ceiling became 12, and МR7's
+three RESP servers plus `io_thd_*` take the four-protocol host to thirteen, so
+it is 16 now: the entry that would have fallen off the end is silently
+unfiltered traffic or a silently missing server, and neither is worth 64 bytes
+of `.rodata`.
 
 Two operational notes:
 
@@ -422,6 +425,93 @@ data point against risk 2 of PLAN-MINIO.md (ringbuf pressure on an object
 store); the distributed-cluster case the МS4 perf bench has to use is still
 open.
 
+## 4c. Redis, Valkey, KeyDB (РR12, PLAN-REDIS.md МR7)
+
+A `redis` port is the ordinary case again — §1–§4 apply unchanged and МR7 wrote
+no BPF at all. What it did write is a comm set, one wildcard, and the two
+corrections a running server forced.
+
+- **The channel is libssl, and it is there.** The МR0 reconnaissance expected an
+  Alpine image to be the exception and found none: `redis:7.4`, `redis:7.4-alpine`,
+  `redis:6.2-alpine`, `valkey/valkey:8`, `bitnami/redis` and the Debian, Ubuntu
+  and Alpine packages all map `libssl.so.3` with TLS compiled in. So the scan
+  set gains `{redis-server, valkey-server, keydb-server}` for a redis port and
+  nothing else is needed. Both Redis spellings are there because Valkey ships
+  `redis-server` as a symlink to `valkey-server` and a task's comm comes from
+  the path it was exec'd through; Dragonfly is deliberately absent, being a
+  server this track has not measured.
+- **`io-threads N` moves the SSL calls to other threads.** With
+  `io-threads 4 --io-threads-do-reads yes`, Redis reads and writes sockets —
+  `SSL_read` and `SSL_write` included — from threads named `io_thd_1 … io_thd_3`
+  while the process stays `redis-server`. This is the MySQL `connection` problem
+  in a harder form, because *how many* such threads there are is a config
+  setting, so the gate cannot hold a list of literals. A comm filter entry may
+  therefore end in `*` and match a prefix (`comm_match` in `latkit.bpf.c`), and
+  the gate for a redis port is the scan set widened by **`io_thd_*`**. The
+  wildcard is the last character of an entry or it is not one: userspace refuses
+  a `--comm`/`--tls-comm` with a `*` anywhere else rather than install a filter
+  that quietly matches nothing.
+
+  How much it is worth was measured twice, and the two numbers agree: 28 % of
+  the traffic under `--comm redis-server` on a plaintext 100-connection load
+  (МR0 recon item 4), and 24 % of it under TLS on the МR7 stand — 24 147 of
+  100 005 commands, the rest arriving under the io threads' names. Redis only
+  engages those threads above `io-threads × 2` clients, so a small stand will
+  not reproduce it; the stand drives 100 connections for that reason.
+  `--print-config` prints the result as `tls_gate_comm`, next to
+  `tls_scan_comm`.
+- **The `{ssl, tgid}` bridge survives it**, which was the open question РR12
+  asked to settle by measurement rather than by reasoning: reads and writes of
+  one connection genuinely change hands between threads, and the bridge is keyed
+  on the *process*, so the correlation does not care. Measured: 0 correlation
+  misses over the stand's decrypted events, and every one of memtier's 100 000
+  commands observed.
+- **Redis has no in-band TLS negotiation either.** `tls-port` is TLS from the
+  client's first byte, so the RESP framer recognises the handshake record where
+  a command belongs, exactly as the HTTP one does (`redis_frame.c`,
+  `redis_tls_record_head`; the note is `LK_REDIS_NOTE_TLS`). Without it the
+  framer reads ciphertext as commands for the life of the connection — the
+  connection is never marked TLS, its ciphertext is never dropped, and the
+  decrypted events arrive on what looks like a plaintext connection.
+- **A connection that predates the agent is adopted** (`pipeline.c`). Redis
+  clients hold pools and subscriptions open for days, so "the agent started
+  after the connection did" is not an edge case here, it is what every agent
+  restart looks like. A decrypted event on a connection not marked TLS *is* the
+  proof that connection is encrypted, so it is marked there and then: the
+  ciphertext stops being framed, and the framer restarts **dirty** — a session
+  whose start is behind us has no first message to find, so framing re-enters
+  through a resync anchor as it does on a synthetic connection (Р10). Before
+  this, one restarted agent beside a live pool produced parse errors and resyncs
+  for as long as the pool lasted. The log says so once per agent rather than
+  once per event.
+- **A server that maps no libssl now says which nothing it is.** The AUTO scan
+  distinguishes "no process of that name is running" from "the process is right
+  there and maps no `libssl.so`" — a statically linked TLS or another library
+  entirely (MariaDB's bundled wolfSSL, the Alpine Redis РR12 expected and did
+  not find). The second cannot be fixed by waiting for a rescan, and it now
+  reads that way.
+
+`tests/e2e/verify-redis-tls.sh` is the stand, built as a comparison like the S3
+one: a TLS-only Redis (`--port 0 --tls-port 6480`) and a plaintext Redis of the
+same image and configuration, one client driving an identical command sequence
+at both, an agent per leg, and a third agent on the encrypted port running
+`--comm redis-server` — the counter-example, without which the io-thread claim
+is not falsifiable. Measured on the first green run: every command equal command
+for command across seventeen `(cmd, code)` pairs, 125 482 RESP bytes on both
+legs, the same symbolic errors (`WRONGTYPE`, `WRONGPASS`), the same `(db, user)`
+label pairs parsed out of the encrypted stream, 124 pushes recognised as pushes
+on both, 0 correlation misses, 0 units dropped and 0 parse errors.
+
+The stand carries the soak МR7 asks for, off by default
+(`SOAK_SEC=86400 ./verify-redis-tls.sh` for the 24-hour version — an operator's
+run, not CI's, and not yet done). What has been run is its two-minute shape:
+memtier at ~59 k ops/s through the decrypted channel, **7.07 M commands observed
+and 0 ringbuf drops out of 35.9 M events**, Redis unrestarted and still attached
+afterwards. At that rate the 512-byte per-port budget of РR13 is the reason the
+ringbuf holds, which makes this the first measurement against risk 2 of
+PLAN-REDIS.md; the un-pipelined worst case the МR8 perf gate has to use — twice
+the syscalls per command — is still open.
+
 ### Capture budget on the decrypted channel (РH14)
 
 The per-port budget applies to plaintext too: the uprobe path resolves the
@@ -513,8 +603,10 @@ also applies to formerly opaque encrypted sessions.
 
 - **Unit** (`tests/unit/test_tls_route.c`, no BPF): synthetic events prove
   ciphertext is dropped on a TLS conn, decrypted events reach the framer, the
-  startup re-frame parses a `StartupMessage` from the first decrypted event, and
-  a decrypted-space hole dirties only the plaintext.
+  startup re-frame parses a `StartupMessage` from the first decrypted event, a
+  decrypted-space hole dirties only the plaintext, and a decrypted event on a
+  connection that never went TLS adopts it mid-session — dirty framing, resync,
+  and no ciphertext to the parser from then on (МR7).
 - **Replay** (`tests/replay`, no BPF): `ssl_tls.lkt` yields a full session
   (user/database, a query, latencies) — the same observation as its plaintext
   twin `ssl_plain.lkt`.
@@ -538,6 +630,16 @@ also applies to formerly opaque encrypted sessions.
   `test_elf_syms.c` (a self-lookup that compares the bytes at the computed file
   offset with the mapped function — the address arithmetic a uprobe depends on,
   checked against reality).
+- **Redis e2e** (`verify-redis-tls.sh`, МR7): a TLS-only Redis and a plaintext
+  one of the same image, the same command sequence at both, and a third agent
+  on the encrypted port filtered to `--comm redis-server`. It asserts the
+  comparison (command for command, bytes, error vocabulary, session labels,
+  pushes), the io-thread claim (the derived gate sees all 100 000 of memtier's
+  commands, the main-thread filter beside it sees a quarter), and that the
+  decrypted stream produces no parse error. §4c has the numbers.
 - **Kernel matrix** (`tests/kernel/smoke.sh`): the UDP counters of РH16 get a
   phase of their own, since their attach targets are ordinary kernel internals
-  that a kernel change can remove silently.
+  that a kernel change can remove silently. The comm filter's wildcard entry
+  (МR7) gets another: `--comm 'pgstre*'` must see the whole plaintext phase and
+  `--comm 'pgstreamx*'` must see none of it, since the rule lives in the kernel
+  matcher and nowhere a unit test can reach.

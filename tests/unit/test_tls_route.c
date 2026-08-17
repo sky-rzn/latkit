@@ -243,7 +243,7 @@ static int test_frame_reset_startup(void)
     c->frame[LK_DIR_RECV].buf = malloc(16);
     c->frame[LK_DIR_RECV].buf_len = 8;
     c->frame[LK_DIR_SEND].st = LK_FR_BODY;
-    lk_conn_tls_reset_framing(c);
+    lk_conn_tls_reset_framing(c, false);
     CHECK(c->frame[LK_DIR_RECV].st == LK_FR_HEADER && !c->frame[LK_DIR_RECV].startup_done);
     CHECK(c->frame[LK_DIR_RECV].buf == NULL && c->frame[LK_DIR_RECV].buf_len == 0);
     CHECK(c->frame[LK_DIR_SEND].st == LK_FR_HEADER);
@@ -296,11 +296,22 @@ static int test_decrypted_seq_hole(void)
     return 0;
 }
 
-/* Defensive: a decrypted event on a connection that never went TLS is flagged
- * (Р38 order says it cannot happen) but still framed best-effort. */
+/* A decrypted event on a connection that never went TLS: flagged, because Р38's
+ * order says it cannot happen on a connection this agent watched from its first
+ * byte — and *adopted*, because it plainly did happen and the event itself is
+ * the proof the connection is encrypted (МR7). The ordinary cause is an agent
+ * that started after the client: a Redis pool, a keep-alive HTTPS connection.
+ *
+ * Adoption is what stops the socket's ciphertext from being read as protocol
+ * for the rest of that connection's life — before it, one restarted agent
+ * beside a long-lived pool produced parse errors for as long as the pool
+ * lasted. The framing it starts from is *dirty*, not startup: a session that
+ * began before the agent did has no first message to find, so the framer waits
+ * for a resync anchor exactly as it does on a synthetic connection (Р10). */
 static int test_decrypted_early(void)
 {
     struct lk_pipeline_ev ev;
+    struct lk_conn *c;
     __u8 w[128];
     __u32 n;
 
@@ -309,8 +320,25 @@ static int test_decrypted_early(void)
     n = pgstartup(w, LK_PG_PROTO_V3, "user\0postgres\0database\0postgres", 32);
     feed_dec(LK_DIR_RECV, w, n, &ev);
     CHECK(ev.decrypted_early);
-    CHECK(ev.conn && !(ev.conn->flags & LK_CONN_TLS));
-    CHECK(nrecs == 1 && (recs[0].flags & LK_MSG_STARTUP));
+    CHECK(ev.conn && (ev.conn->flags & LK_CONN_TLS));
+    /* Mid-session: this is not a StartupMessage however much it looks like one,
+     * because the session's start is behind us. Nothing is claimed. */
+    c = lk_conn_table_peek(pipe.conns, COOKIE);
+    CHECK(c && c->frame[LK_DIR_RECV].st == LK_FR_DIRTY && c->frame[LK_DIR_SEND].st == LK_FR_DIRTY);
+    CHECK(nrecs == 0);
+
+    /* Framing enters on the next anchor — a 'Q' at a call boundary — and says
+     * it came in through a resync. */
+    n = pgmsg(w, 'Q', "select 1", 9);
+    feed_dec(LK_DIR_RECV, w, n, &ev);
+    CHECK(nrecs == 1 && recs[0].type == 'Q' && (recs[0].flags & LK_MSG_AFTER_RESYNC));
+
+    /* And from here on the ciphertext is dropped rather than framed: the next
+     * plaintext *socket* event on this connection carries a TLS record, and it
+     * must not reach the parser. */
+    nrecs = 0;
+    feed_raw(LK_DIR_RECV, w, n, &ev);
+    CHECK(ev.tls_socket_dropped && nrecs == 0);
     return 0;
 }
 

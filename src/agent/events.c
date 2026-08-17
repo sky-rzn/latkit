@@ -58,6 +58,7 @@ struct lk_events {
     struct lk_prom *prom;           /* Prometheus /metrics server (task 5.1), NULL if off */
     struct lk_otlp *otlp;           /* OTLP/HTTP push exporter (task 5.2), NULL if off */
     bool tls_logged;                /* one-shot: "TLS capture active" logged once (see below) */
+    bool tls_early_logged;          /* one-shot: the first connection adopted mid-stream */
     /* Ports already named in the "this is UDP" notice (РH16), so the answer is
      * given once per port rather than every stats interval. */
     __u16 udp_noted[LK_MAX_PORTS];
@@ -789,11 +790,21 @@ static int handle_event(void *ctx, void *data, size_t size)
                         ? "Go crypto/tls"
                         : "libssl");
         }
-        if (ev.decrypted_early)
-            /* Р38 says 'S' precedes any decrypted byte; if this fires the
-             * correlation or ordering assumption broke — frame it best-effort. */
-            fprintf(stderr, "latkit: conn=%llx decrypted event before TLS handshake\n",
+        if (ev.decrypted_early && !e->tls_early_logged) {
+            /* Р38 says 'S' precedes any decrypted byte, and on a database host
+             * it does. Elsewhere the ordinary cause is an agent that started
+             * after the client did: a Redis pool or a subscriber (МR7), a
+             * keep-alive HTTPS connection. The pipeline adopts such a
+             * connection on this first decrypted byte rather than spend its
+             * life reading the ciphertext as protocol, so this line says what
+             * happened once — per agent, not per connection, for the reason the
+             * line above is once per agent. */
+            e->tls_early_logged = true;
+            fprintf(stderr,
+                    "latkit: conn=%llx was already encrypted when the agent attached "
+                    "(adopted from the decrypted channel)\n",
                     (unsigned long long)ev.view.hdr->conn_id);
+        }
         /* TLS / CANCEL / replication -> HEADERS (Р21). The PG parser ran inside
          * lk_pipeline_feed above, so a CopyBoth this event carried already set
          * LK_CONN_REPLICATION on ev.conn. */

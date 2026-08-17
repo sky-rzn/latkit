@@ -1,0 +1,281 @@
+# Redis-over-TLS e2e stand (PLAN-REDIS.md МR7, РR12): **two** Redis servers of
+# the same image and configuration, one plaintext and one TLS-only, the same
+# command sequence driven at both, and an agent per leg — plus a third agent on
+# the encrypted port whose only job is to be wrong in the one way this milestone
+# is about. Drive it with ./verify-redis-tls.sh.
+#
+#   ./verify-redis-tls.sh          # build the agent, up, assert, down
+#   KEEP=1 ./verify-redis-tls.sh   # leave it running
+#
+# Why the legs are what they are:
+#
+#   - **The libssl channel needs no new code here** (МR0 recon item 5: every
+#     Redis, Valkey and KeyDB image measured — Alpine included — maps
+#     `libssl.so.3`). So this stand is not about a new mechanism; it is about
+#     `--tls auto` on a `=redis` port scanning for the right processes and the
+#     uprobe gate admitting the right *threads*, and about the result being the
+#     plaintext run's numbers.
+#   - **`io-threads 4 --io-threads-do-reads yes` on both servers.** This is the
+#     revision РR12 asked for: with io threads engaged, the SSL_read and
+#     SSL_write of one connection are made by different threads, named
+#     `io_thd_1…3` and not `redis-server`. The `{ssl, tgid}` bridge is keyed on
+#     the process, so it should not care — "should" is why there is a stand.
+#     Redis only engages them above `io-threads × 2` clients, so it is the
+#     memtier phase of the verify script, not the redis-cli loop, that puts them
+#     to work.
+#   - **`latkit-tls-main` is the counter-example.** Same port, same TLS, but
+#     `--comm redis-server`: the operator's own filter, which is not widened by
+#     anything the agent derives, so the io threads' decrypted events are
+#     dropped in the kernel. It exists to make the io-thread claim falsifiable —
+#     if this leg matched the full one, the wildcard entry would be decoration.
+#   - **Ports 6479/6480, not 6379/6380.** The agent's port filter is kernel-wide;
+#     a stand on the default ports would capture any other Redis on the host,
+#     which is somebody else's data in our metrics and our assertions.
+#   - **No published server ports.** Traffic stays on the compose bridge for the
+#     usual reason — a localhost hop goes through docker-proxy, which splices
+#     past the capture point.
+#   - **TLS-only on the encrypted leg** (`--port 0`): there is no plaintext
+#     fallback to accidentally observe, so an observation on that leg can only
+#     have come through the uprobes.
+
+name: latkit-redis-tls
+
+networks:
+  default:
+    name: latkit-redis-tls-net
+
+services:
+  # A CA and a server certificate for the TLS leg. Redis wants the three files
+  # named on the command line, and `--tls-auth-clients no` keeps the clients
+  # certificate-free (this stand is about the server's plaintext boundary, not
+  # about mutual auth).
+  #
+  # Generated **once per volume**, and the check is not politeness: a second
+  # `up` on a running stand reruns this service, and a fresh CA beside a server
+  # that loaded the old certificate at startup fails every client in the
+  # handshake. What that looks like from the agent is worth recording, because
+  # it took a while to read: connections open, the framer marks them TLS, and
+  # not one decrypted byte ever arrives — the shape of a broken uprobe channel,
+  # produced by a channel that is working perfectly.
+  cert-init:
+    image: alpine:3.20
+    volumes:
+      - rediscerts:/certs
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        if [ -f /certs/server.crt ]; then echo "certificates already present"; exit 0; fi
+        apk add --no-cache openssl >/dev/null
+        cd /certs
+        openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+          -keyout ca.key -out ca.crt -subj "/CN=lkredis-ca" 2>/dev/null
+        openssl req -newkey rsa:2048 -nodes \
+          -keyout server.key -out server.csr -subj "/CN=redis-tls" 2>/dev/null
+        printf 'subjectAltName=DNS:redis-tls,DNS:localhost,IP:127.0.0.1\n' > ext.cnf
+        openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial \
+          -days 365 -out server.crt -extfile ext.cnf 2>/dev/null
+        chmod 644 ca.crt server.crt server.key
+        echo "certificates generated"
+    restart: "no"
+
+  # The control leg: same image, same io-threads configuration, no certificates.
+  # The ACL user is here so the `user` label has something to say beyond
+  # `default`, and its password is what the privacy assertion looks for.
+  redis-plain:
+    image: ${REDIS_IMAGE:-redis:7.4}
+    command:
+      - redis-server
+      - --port
+      - "6479"
+      - --io-threads
+      - "4"
+      - --io-threads-do-reads
+      - "yes"
+      - --user
+      - lkuser
+      - "on"
+      - ">lkpass"
+      - "~*"
+      - "&*"
+      - +@all
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -p 6479 ping | grep -q PONG"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis-tls:
+    image: ${REDIS_IMAGE:-redis:7.4}
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+    volumes:
+      - rediscerts:/certs:ro
+    command:
+      - redis-server
+      - --port
+      - "0"
+      - --tls-port
+      - "6480"
+      - --tls-cert-file
+      - /certs/server.crt
+      - --tls-key-file
+      - /certs/server.key
+      - --tls-ca-cert-file
+      - /certs/ca.crt
+      - --tls-auth-clients
+      - "no"
+      - --io-threads
+      - "4"
+      - --io-threads-do-reads
+      - "yes"
+      - --user
+      - lkuser
+      - "on"
+      - ">lkpass"
+      - "~*"
+      - "&*"
+      - +@all
+    healthcheck:
+      test: ["CMD-SHELL",
+             "redis-cli --tls --cacert /certs/ca.crt -p 6480 ping | grep -q PONG"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # One client, both endpoints, the same commands in the same order — which is
+  # what makes the two legs comparable command for command. The sequence is a
+  # file so that it is literally the same bytes on both, and it covers what the
+  # track's labels are made of: an error with a symbolic name, a transaction, a
+  # blocking pop, a pipeline, a push nobody asked for, a database that is not 0,
+  # and an ACL user that is not `default`.
+  load:
+    image: ${REDIS_IMAGE:-redis:7.4}
+    depends_on:
+      redis-plain:
+        condition: service_healthy
+      redis-tls:
+        condition: service_healthy
+    volumes:
+      - rediscerts:/certs:ro
+    entrypoint: ["bash", "-c"]
+    command:
+      - |
+        cat > /tmp/cmds.txt <<'CMDS'
+        SET lkkey:one v1
+        GET lkkey:one
+        MGET lkkey:one lkkey:missing
+        INCR lkcounter
+        RPUSH lklist item
+        LTRIM lklist 0 0
+        GET lklist
+        MULTI
+        SET lkkey:txn 1
+        INCR lkcounter
+        EXEC
+        RPUSH lkblock v
+        BLPOP lkblock 0
+        PUBLISH lkchan hello
+        CONFIG GET maxmemory
+        PING
+        CMDS
+        plain() { redis-cli -h redis-plain -p 6479 "$$@"; }
+        tls()   { redis-cli --tls --cacert /certs/ca.crt -h redis-tls -p 6480 "$$@"; }
+        # A subscriber per leg: its messages are pushes, and a push that were
+        # mistaken for a reply would shift every latency on that connection.
+        plain subscribe lkchan >/dev/null 2>&1 &
+        tls   subscribe lkchan >/dev/null 2>&1 &
+        while :; do
+          for leg in plain tls; do
+            $$leg < /tmp/cmds.txt                        >/dev/null 2>&1 || true
+            $$leg -n 3 set lkkey:db3 v                   >/dev/null 2>&1 || true
+            $$leg --user lkuser --pass lkpass get lkkey:one >/dev/null 2>&1 || true
+            $$leg --user lkuser --pass wrongpass get lkkey:one >/dev/null 2>&1 || true
+          done
+          sleep 0.4
+        done
+    restart: "no"
+
+  # The control agent. No TLS at all: the plaintext leg is what the encrypted
+  # one is measured against, so it must not depend on any of the machinery
+  # under test.
+  latkit-plain:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.latkit
+    depends_on:
+      redis-plain:
+        condition: service_healthy
+    privileged: true
+    pid: host
+    volumes:
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+    command: ["-p", "6479=redis", "--prom-listen", "0.0.0.0:9752"]
+    ports: ["9757:9752"]
+
+  # The claim: `--tls auto` and nothing else. Everything this milestone adds is
+  # derived from `-p 6480=redis` — the scan set {redis-server, valkey-server,
+  # keydb-server} and the gate widened by `io_thd_*`.
+  latkit-tls:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.latkit
+    depends_on:
+      redis-tls:
+        condition: service_healthy
+    privileged: true
+    pid: host
+    volumes:
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+    command:
+      - "-p"
+      - "6480=redis"
+      - "--tls"
+      - "auto"
+      - "--prom-listen"
+      - "0.0.0.0:9752"
+    ports: ["9758:9752"]
+
+  # The same port, the same TLS, and `--comm redis-server` — the operator's own
+  # filter, which the agent never widens (that is what makes it the operator's).
+  # Under a load that engages the io threads this leg must see materially less
+  # than the one above, and the difference is the whole content of РR12's second
+  # half.
+  latkit-tls-main:
+    build:
+      context: ../..
+      dockerfile: tests/e2e/Dockerfile.latkit
+    depends_on:
+      redis-tls:
+        condition: service_healthy
+    privileged: true
+    pid: host
+    volumes:
+      - /sys/kernel/btf/vmlinux:/sys/kernel/btf/vmlinux:ro
+    command:
+      - "-p"
+      - "6480=redis"
+      - "--tls"
+      - "auto"
+      - "--comm"
+      - "redis-server"
+      - "--prom-listen"
+      - "0.0.0.0:9752"
+    ports: ["9759:9752"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    depends_on:
+      - latkit-plain
+      - latkit-tls
+      - latkit-tls-main
+    volumes:
+      - ./prometheus-redis.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=26h"
+    ports: ["19094:9090"]
+
+volumes:
+  rediscerts:

@@ -69,11 +69,16 @@ Two MySQL-specific operator traps:
   `mysqld` (MYSQL.md М5).
 - **TLS scan set.** `--tls auto` scans the comms its ports imply (М7):
   `{postgres, mysqld, mariadbd}` for a database port, `{nginx, httpd, apache2,
-  haproxy}` for an HTTP one, `{minio}` for an `s3` one, all of them for a mixed
+  haproxy}` for an HTTP one, `{minio}` for an `s3` one, `{redis-server,
+  valkey-server, keydb-server}` for a `redis` one, all of them for a mixed
   deployment; `--tls-comm` narrows it to one name, and `--print-config` prints
-  what was derived (`tls_scan_comm`). MariaDB linking bundled wolfSSL/GnuTLS has
+  what was derived (`tls_scan_comm`) and what the uprobe gate admits on top of
+  it (`tls_gate_comm` — the servers' own thread names, `connection` and
+  `io_thd_*`). MariaDB linking bundled wolfSSL/GnuTLS has
   no `libssl.so` to attach to — TLS is then detected and dropped-and-counted,
-  visible as `latkit_tls_attached{state!="ok"}`.
+  visible as `latkit_tls_attached{state!="ok"}`. A server that *is* running and
+  maps no libssl says so in its own line at startup, because no rescan will ever
+  fix that one.
 - **Go servers** (Caddy, Traefik, MinIO, any `net/http`) have no libssl to find:
   name the binary with `--tls-go /usr/bin/caddy` and latkit probes `crypto/tls`
   inside it, stripped binaries included. This channel needs no `/proc` scan, so
@@ -91,6 +96,15 @@ Two MySQL-specific operator traps:
   that cannot be hooked fails at startup with the cause and the alternatives:
   terminate TLS in front of MinIO and capture the plaintext hop, or accept the
   port as a named blind zone.
+- **A `redis` port needs `--tls auto` and no flags of its own** (РR12): every
+  Redis, Valkey and KeyDB build measured, Alpine images included, links OpenSSL
+  dynamically. The trap is the same shape as MySQL's and worse: with
+  `io-threads N` the server does its reads and writes — including the SSL ones —
+  on threads named `io_thd_1…N`, so **`--comm redis-server` drops most of the
+  traffic** (28 % of a 100-connection load survived it on the МR0 stand). The
+  agent's own uprobe gate covers those threads (`io_thd_*`); an explicit
+  `--comm` is yours, and it is not widened for you. As everywhere else here, the
+  port filter already scopes the capture — leave `--comm` unset.
 
 And four HTTP-specific ones, all of which are **counters rather than silence**
 — the point of each is that the dashboard tells you which case you are in:

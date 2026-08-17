@@ -256,8 +256,15 @@ void lk_conn_table_note_tls_open(struct lk_conn_table *t);
  * arrives inside TLS, so the decrypted frontend stream must begin in startup
  * framing exactly like a fresh plaintext connection. Frees the partial-message
  * buffers and the stream framer's state (РH1 — the plaintext stream it
- * described is over); cookie, tuple, seq spaces and flags are kept. */
-void lk_conn_tls_reset_framing(struct lk_conn *c);
+ * described is over); cookie, tuple, seq spaces and flags are kept.
+ *
+ * `midstream` says the plaintext about to arrive is *not* the start of a
+ * session: the connection was already encrypted when the agent attached and is
+ * being adopted on its first decrypted byte (МR7). Then the fresh state is a
+ * dirty one — the same footing as a synthetic connection (Р10), framing can
+ * only enter through a resync anchor — because a session that began before the
+ * agent did has no first message to find. */
+void lk_conn_tls_reset_framing(struct lk_conn *c, bool midstream);
 
 /* Evict entries with last_activity_ns + idle_timeout <= now_ns; returns how
  * many were evicted. The LRU order makes this a tail walk, not a full scan.

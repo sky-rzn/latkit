@@ -624,6 +624,49 @@ static int test_resync_needs_call_boundary(void)
     return 0;
 }
 
+/* TLS on a redis port (МR7, РR12): `tls-port` is TLS from the client's first
+ * byte — Redis negotiates nothing in band, so there is no `SSLRequest` to see —
+ * and the framer must recognise the handshake record where a command belongs.
+ * It must recognise it *there and nowhere else*: a connection already carrying
+ * RESP does not become TLS, and a bulk payload byte that happens to be 0x16 is
+ * a payload byte. */
+static int test_tls_hello(void)
+{
+    /* A real ClientHello prefix: record header, handshake type, length and the
+     * legacy version. NULs inside, so it is fed by length. */
+    static const __u8 HELLO[] = {0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0xfc, 0x03, 0x03};
+    static const __u8 SRVHELLO[] = {0x16, 0x03, 0x03, 0x00, 0x50, 0x02, 0x00, 0x00, 0x4c};
+
+    reset();
+    nbytes(LK_DIR_RECV, HELLO, sizeof(HELLO), 10);
+    NOTE(0, LK_DIR_RECV, LK_REDIS_NOTE_TLS);
+    /* TLS, not IGNORE: the plaintext arrives on the uprobe channel and the
+     * generic layer drops the ciphertext. A blind zone would have thrown the
+     * connection away instead, uprobes or no uprobes. */
+    CHECK(nrecs == 1 && (conn.flags & LK_CONN_TLS) && !(conn.flags & LK_CONN_IGNORE));
+
+    /* The server side of the same connection, on a stand where the agent
+     * attached mid-handshake and saw the ServerHello first. */
+    reset();
+    nbytes(LK_DIR_SEND, SRVHELLO, sizeof(SRVHELLO), 10);
+    NOTE(0, LK_DIR_SEND, LK_REDIS_NOTE_TLS);
+    CHECK(conn.flags & LK_CONN_TLS);
+
+    /* Not the first bytes of the direction: a command has been framed already,
+     * so a record-shaped bulk is a bulk. */
+    reset();
+    call(LK_DIR_RECV, "*1\r\n$4\r\nPING\r\n", 10);
+    nbytes(LK_DIR_RECV, HELLO, sizeof(HELLO), 20);
+    CHECK(!(conn.flags & LK_CONN_TLS));
+
+    /* A handshake type that belongs to the other direction is not one — the
+     * narrow test is what keeps a plaintext connection safe. */
+    reset();
+    nbytes(LK_DIR_RECV, SRVHELLO, sizeof(SRVHELLO), 10);
+    CHECK(!(conn.flags & LK_CONN_TLS) && nrecs == 0);
+    return 0;
+}
+
 /* --- the seam ------------------------------------------------------------- */
 
 /* Framing state follows the connection and nothing inside it owns a pointer:
@@ -682,7 +725,7 @@ int main(void)
         test_torn_value() || test_prefix_ceiling() || test_hole_in_bulk_payload() ||
         test_hole_in_aggregate() || test_hole_ends_value() || test_bad_lengths() ||
         test_bulk_eol_mismatch() || test_depth() || test_line_too_big() || test_resync_anchors() ||
-        test_resync_needs_call_boundary() || test_state_lifetime() ||
+        test_resync_needs_call_boundary() || test_tls_hello() || test_state_lifetime() ||
         test_pg_unaffected_alongside())
         return 1;
     free(conn.frame[0].buf);

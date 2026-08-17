@@ -217,7 +217,7 @@ Use it to verify a deployment's env layer.
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
 | `-p, --port PORT[=pg\|mysql\|http\|s3\|redis[:BYTES]]` | `LATKIT_PORT` | `5432` | local (server) port to capture, optionally with its wire protocol (default: `pg`) and a per-port capture budget; repeatable, up to 16 (e.g. `5432,3306=mysql,8080=http`, `9000=s3`, `6379=redis`, `443=http:4096`). `s3` is HTTP/1.1 read as the S3 API — same framer, same timings, operations and buckets instead of routes and hosts. `redis` is RESP2/RESP3, and covers Valkey, KeyDB, Dragonfly and Sentinel, which speak the same wire. The budget defaults to `--capture-limit` for a database port, **2048 for an `http` or `s3` one** — only heads are parsed, so a gigabyte of response body is never copied — and **512 for a `redis` one**, where a command is a verb and a key and the value is never read |
-| `--comm NAME` | `LATKIT_COMM` | off | only capture send/recv of processes with this exact comm. **MySQL 8.x names its per-session threads `connection`, not `mysqld`** — don't filter on `mysqld` there; the port filter already scopes it |
+| `--comm NAME` | `LATKIT_COMM` | off | only capture send/recv of threads with this comm; a trailing `*` matches a prefix (`io_thd_*`). It matches the **thread** name, and servers rename their threads: **MySQL 8.x calls its per-session threads `connection`, not `mysqld`**, and a Redis with `io-threads N` does most of its socket work on `io_thd_1…N` (a filter of `redis-server` alone saw 28 % of the traffic on a 100-connection load). The port filter already scopes capture, so the usual answer is not to set this at all |
 | `--cgroup PATTERN` | `LATKIT_CGROUP` | off | only capture cgroups whose path under `/sys/fs/cgroup` matches this glob (`*` stays within a path segment, `**` spans); repeatable, re-resolved every 30 s; requires cgroup v2 |
 
 **Capture tuning**:
@@ -275,7 +275,7 @@ inherits the ambient config):
 |---|---|---|---|
 | `--tls auto\|off` | `LATKIT_TLS` | `off` | capture TLS plaintext via `libssl` uprobes; `auto` scans `/proc` for the matching processes' libssl and rescans every 30 s for new ones. That comm set gates the uprobe channel only (a shared-libssl uprobe fires for every process mapping the library) — plaintext capture on the configured ports is unaffected by it |
 | `--libssl PATH` | `LATKIT_LIBSSL` | off | attach the `SSL_*` uprobes to this exact libssl, skipping the scan (e.g. a container's copy); a missing file is fatal |
-| `--tls-comm NAME` | `LATKIT_TLS_COMM` | derived from `--port` | with `--tls auto`, scan only processes with this exact comm. The default set follows the configured protocols: `postgres`, `mysqld`, `mariadbd` for a database port, `nginx`, `httpd`, `apache2`, `haproxy` for an HTTP one, `minio` for an `s3` one. `--print-config` prints the derived set as `tls_scan_comm` |
+| `--tls-comm NAME` | `LATKIT_TLS_COMM` | derived from `--port` | with `--tls auto`, scan only processes with this exact comm. The default set follows the configured protocols: `postgres`, `mysqld`, `mariadbd` for a database port, `nginx`, `httpd`, `apache2`, `haproxy` for an HTTP one, `minio` for an `s3` one, `redis-server`, `valkey-server`, `keydb-server` for a `redis` one. `--print-config` prints the derived scan set as `tls_scan_comm` and the uprobe gate — the same set plus the servers' own thread names, `connection` for MySQL 8.x and `io_thd_*` for a Redis with `io-threads` — as `tls_gate_comm` |
 | `--tls-go PATH` | `LATKIT_TLS_GO` | off | capture the TLS plaintext of a **Go** server (Caddy, Traefik, MinIO, any `net/http`) by probing `crypto/tls` inside this binary — there is no libssl to scan for. Works on stripped binaries (the ones distributions ship) through Go's own function table. Repeatable, up to 4; x86-64; a binary that cannot be hooked is fatal at startup, with the cause and a way forward. **An `s3` port has no other TLS channel** — MinIO maps no libssl. [docs/notes-tls.md](docs/notes-tls.md) §4b |
 
 **Debug / diagnostics** (off by default; noisy, not for production):
@@ -454,6 +454,17 @@ where `INFO` is global for the instance, needs no credentials and no
 kept as an ordinary command with its own latency and its own dashboard panel: it
 does no work, so its p99 is the event loop's queueing delay.
 
+**A `tls-port` Redis needs `--tls auto` and nothing else.** Every Redis, Valkey
+and KeyDB build we measured — Alpine images included — links OpenSSL
+dynamically, so the existing libssl channel carries the plaintext and an
+encrypted run reports what an unencrypted one reports, command for command. Two
+things follow from Redis' own thread model and are handled for you: with
+`io-threads N` the server does its reads and writes on threads called
+`io_thd_1…N`, which the uprobe gate admits by prefix (an operator's `--comm
+redis-server` would not — see the flag), and a connection that was already open
+when the agent started is adopted on its first decrypted byte rather than read
+as ciphertext for the life of the pool.
+
 Blind by design: the **unix socket** — check with `redis-cli config get
 unixsocket`, and if that is how your application connects, this agent sees
 nothing at all — the cluster bus, replication and `MONITOR` connections (both
@@ -547,7 +558,8 @@ records at the default 2048-byte per-call capture budget.
 ## Known limitations
 
 - **TLS: dynamically linked OpenSSL, plus Go's `crypto/tls`.** OpenSSL servers
-  (postgres, mysqld/mariadbd, nginx, Apache, HAProxy) are read through libssl
+  (postgres, mysqld/mariadbd, nginx, Apache, HAProxy, redis/valkey/keydb) are
+  read through libssl
   uprobes; Go servers through `--tls-go`, stripped binaries included (x86-64 —
   see [docs/notes-tls.md](docs/notes-tls.md) §4b). A statically linked OpenSSL
   can be reached by pointing `--libssl` at the server binary itself. Everything
@@ -711,7 +723,7 @@ streams one line at a time (`-x` adds hexdumps). `--record file.lkt` dumps
 the raw event stream for offline replay through the same pipeline - that is
 how the deterministic test fixtures work (`tests/replay/`,
 `tests/e2e/verify.sh`, `verify-tls.sh`, `verify-mysql-tls.sh`,
-`verify-http.sh`, `verify-s3.sh`, `verify-s3-tls.sh`).
+`verify-http.sh`, `verify-s3.sh`, `verify-s3-tls.sh`, `verify-redis-tls.sh`).
 
 ## License
 

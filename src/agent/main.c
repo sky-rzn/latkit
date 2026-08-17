@@ -163,8 +163,9 @@ static void usage(FILE *out, const char *argv0)
             "      --ringbuf-bytes N ringbuf size, power-of-two bytes (default: %d)\n"
             "      --capture-limit N capture budget per send/recv call, bytes\n"
             "                        (default: %d, max: %d; total_len stays honest)\n"
-            "      --comm NAME       only capture send/recv from processes with\n"
-            "                        this exact comm, e.g. postgres (default: off)\n"
+            "      --comm NAME       only capture send/recv from threads with this\n"
+            "                        comm, e.g. postgres; a trailing * matches a\n"
+            "                        prefix, e.g. io_thd_* (default: off)\n"
             "      --cgroup PATTERN  only capture traffic from cgroups whose path\n"
             "                        under /sys/fs/cgroup matches this glob;\n"
             "                        repeatable. * stays within a path segment, **\n"
@@ -230,7 +231,9 @@ static void usage(FILE *out, const char *argv0)
             "                        this comm (default: postgres, mysqld,\n"
             "                        mariadbd; plus nginx, httpd, apache2,\n"
             "                        haproxy for an http port, minio for an\n"
-            "                        s3 one; --print-config prints the set)\n"
+            "                        s3 one, redis-server, valkey-server,\n"
+            "                        keydb-server for a redis one;\n"
+            "                        --print-config prints the set)\n"
             "      --tls-go PATH     capture TLS plaintext of a Go server by\n"
             "                        probing crypto/tls in this binary (x86-64;\n"
             "                        stripped is fine, and is the only TLS\n"
@@ -343,6 +346,28 @@ enum {
     OPT_VERSION,
 };
 
+/* A comm filter entry may end in `*` for a prefix match (МR7; the kernel-side
+ * rule is in comm_match). Anywhere else the asterisk is a literal one, which is
+ * to say a filter that matches nothing — so a name that holds one is refused
+ * here rather than installed and left to be silently empty. A bare `*` is
+ * refused too: "match everything" is spelled by not passing the flag. Returns
+ * non-zero (message printed) when the name may not be installed. */
+static int comm_wildcard_bad(const char *flag, const char *name)
+{
+    const char *star = strchr(name, '*');
+
+    if (!star)
+        return 0;
+    if (star == name || star[1]) {
+        fprintf(stderr,
+                "%s: '*' is only a wildcard as the last character of a name "
+                "(e.g. 'io_thd_*'), got '%s'\n",
+                flag, name);
+        return -1;
+    }
+    return 0;
+}
+
 /* Apply one parsed option, from the CLI or (via apply_env_defaults) from the
  * environment. optarg is NULL for no-argument options. Returns 0, or -1 on a
  * bad value with the specific message already printed. */
@@ -428,6 +453,8 @@ static int set_option(int c, char *optarg)
             fprintf(stderr, "--comm: name longer than %zu chars\n", sizeof(opt_comm) - 1);
             return -1;
         }
+        if (comm_wildcard_bad("--comm", optarg))
+            return -1;
         strncpy(opt_comm, optarg, sizeof(opt_comm) - 1);
         break;
     case OPT_CGROUP: {
@@ -762,6 +789,8 @@ static int set_option(int c, char *optarg)
             fprintf(stderr, "--tls-comm: name longer than %zu chars\n", sizeof(opt_tls_comm) - 1);
             return -1;
         }
+        if (comm_wildcard_bad("--tls-comm", optarg))
+            return -1;
         strncpy(opt_tls_comm, optarg, sizeof(opt_tls_comm) - 1);
         break;
     case 'x':
@@ -1161,23 +1190,29 @@ static __u32 port_cap_limit(int i)
  * the entry to point at (its half of the channel is `--tls-go`, whose basename
  * main() adds to the gate separately).
  *
+ * A redis port adds the three RESP servers (РR12, МR7). Unlike the s3 entry
+ * this one is a scan entry in the ordinary sense: every Redis, Valkey and KeyDB
+ * build the МR0 recon measured maps libssl.so, Alpine included.
+ *
  * Fills *out (NULL-terminated, at most `max` entries) and returns the count. */
 static int derive_scan_comms(const char **out, int max)
 {
     int n = 0;
-    bool want_db = false, want_http = false, want_s3 = false;
+    bool want_db = false, want_http = false, want_s3 = false, want_redis = false;
 
     for (int i = 0; i < opt_nports; i++) {
         const struct lk_proto_ops *ops = opt_port_ops[i];
 
         if (ops && ops->profile == LK_PROTO_PROF_S3)
             want_s3 = true;
+        else if (ops && ops->profile == LK_PROTO_PROF_REDIS)
+            want_redis = true;
         else if (ops && ops->otel_kind == LK_OTEL_KIND_HTTP)
             want_http = true;
         else
             want_db = true;
     }
-    if (!want_db && !want_http && !want_s3)
+    if (!want_db && !want_http && !want_s3 && !want_redis)
         want_db = true; /* no ports resolved yet: the historical default */
 
     if (want_db)
@@ -1189,6 +1224,58 @@ static int derive_scan_comms(const char **out, int max)
     if (want_s3)
         for (const char *const *c = lk_tls_s3_comms; *c && n < max - 1; c++)
             out[n++] = *c;
+    if (want_redis)
+        for (const char *const *c = lk_tls_redis_comms; *c && n < max - 1; c++)
+            out[n++] = *c;
+    out[n] = NULL;
+    return n;
+}
+
+/* Does the configuration hold a redis port? The one question the gate below
+ * asks that the scan set cannot answer for it — the io threads are a thread
+ * name, and thread names never belong to a scan that reads /proc/<pid>/comm. */
+static bool have_redis_port(void)
+{
+    for (int i = 0; i < opt_nports; i++)
+        if (opt_port_ops[i] && opt_port_ops[i]->profile == LK_PROTO_PROF_REDIS)
+            return true;
+    return false;
+}
+
+/* The uprobe gate (cfg_tls_comm_filter): the scan set — or the single
+ * `--tls-comm`/`--comm` that replaced it — widened by the thread names the
+ * scanned processes actually run their SSL_* calls on. There are two, and both
+ * were found by measuring a server rather than by reading its code:
+ *
+ *   - `connection`, MySQL 8.x's per-session thread (находка М0). Unconditional,
+ *     as it has been since РМ10: it costs one slot and the alternative is a
+ *     silently empty 8.x deployment.
+ *   - `io_thd_*`, Redis' io threads (РR12, МR7) — a wildcard because how many
+ *     there are is the server's `io-threads` setting. Conditional on a redis
+ *     port, because unlike `connection` this entry would be a wildcard admitted
+ *     into a filter whose whole job is to be narrow.
+ *
+ * The `--tls-go` basenames are added by the caller before this, deliberately:
+ * they were named explicitly, so if the slots ever run out it must be a default
+ * that falls off the end and not the target the operator asked for.
+ *
+ * Fills *out (NULL-terminated, at most `max` entries) and returns the count. */
+static int derive_gate_comms(const char **out, int max)
+{
+    const char *scan = opt_tls_comm[0] ? opt_tls_comm : (opt_comm[0] ? opt_comm : NULL);
+    int n;
+
+    if (scan) {
+        n = 0;
+        if (n < max - 1)
+            out[n++] = scan;
+    } else {
+        n = derive_scan_comms(out, max);
+    }
+    if (have_redis_port() && n < max - 1)
+        out[n++] = LK_TLS_REDIS_IO_COMM;
+    if (n < max - 1)
+        out[n++] = "connection";
     out[n] = NULL;
     return n;
 }
@@ -1287,6 +1374,21 @@ static void print_config(void)
 
         for (int i = 0; i < n; i++)
             printf("%s%s", i ? "," : "", scan[i]);
+    }
+    printf("\n");
+    /* And what the *gate* admits, which is the scan set plus the thread names
+     * the servers do their SSL_* calls on (МR7). The two differ, they differ per
+     * protocol, and the difference is exactly where a wrong one shows up as an
+     * empty dashboard on a working deployment — `connection` for MySQL 8.x,
+     * `io_thd_*` for a Redis with io-threads. The `--tls-go` basenames are not
+     * here: they are printed as `tls_go` below, verbatim. */
+    printf("tls_gate_comm=");
+    {
+        const char *gate[LK_COMM_FILTER_MAX + 1];
+        int n = derive_gate_comms(gate, LK_COMM_FILTER_MAX + 1);
+
+        for (int i = 0; i < n; i++)
+            printf("%s%s", i ? "," : "", gate[i]);
     }
     printf("\n");
     printf("tls_go=");
@@ -1497,20 +1599,23 @@ int main(int argc, char **argv)
          * and the two differ (находка М0): MySQL 8.x renames its session
          * threads to `connection` while the process stays `mysqld` — a filter
          * of just the scanned comm would silently drop every decrypted event of
-         * an 8.x server. So the gate is the scan set widened by `connection`.
+         * an 8.x server, and a Redis with `io-threads N` does its reads and
+         * writes on `io_thd_1…N` while the process stays `redis-server` — 72 %
+         * of the traffic under the main thread's name alone (МR0 recon item 4).
+         * So the gate is the scan set widened by those thread names, which is
+         * what derive_gate_comms above builds.
          *
          * It stays out of the socket path, which is port-filtered to the server
          * side already (Р7). Until М9 the two shared one list, and the cost was
          * a plaintext `--port 8081=http` served by a Go/Node/Python process
          * going silently unobserved whenever TLS capture was on. */
+        const char *gate_comms[LK_COMM_FILTER_MAX + 1];
+
         for (int i = 0; i < opt_ntls_go; i++)
             tls_comm_filter_add(skel, path_basename(opt_tls_go[i]));
-        if (tls_scan_comm)
-            tls_comm_filter_add(skel, tls_scan_comm);
-        else
-            for (const char **c = scan_comms; *c; c++)
-                tls_comm_filter_add(skel, *c);
-        tls_comm_filter_add(skel, "connection");
+        derive_gate_comms(gate_comms, LK_COMM_FILTER_MAX + 1);
+        for (const char **c = gate_comms; *c; c++)
+            tls_comm_filter_add(skel, *c);
     }
     err = bpf_map__set_max_entries(skel->maps.events, opt_ringbuf_bytes);
     if (err) {

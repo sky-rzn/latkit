@@ -36,6 +36,12 @@ WARP=1 ./verify-s3.sh    # + the warp profile: MinIO's own benchmark for volume
                          #   two legs compared (PLAN-MINIO.md МS3, РS8)
 SOAK_SEC=86400 ./verify-s3-tls.sh   # + the МS3 soak: a 24 h warp run under the
                                     #   uprobes, MinIO has to come through it
+
+./verify-redis-tls.sh    # Redis over TLS: a TLS-only Redis and a plaintext one,
+                         #   the same commands at both, three agents
+                         #   (PLAN-REDIS.md МR7, РR12)
+SOAK_SEC=86400 ./verify-redis-tls.sh  # + the МR7 soak: a 24 h memtier run under
+                                      #   the uprobes
 ```
 
 The two HTTPS stands are self-contained (their own compose file, their own
@@ -75,6 +81,27 @@ in either exposition, and — the failure path — that a binary latkit cannot h
 refuses at startup with a cause and a way forward. Ports are 9401/9444 rather
 than 9000 on purpose: the agent's port filter is kernel-wide, and a stand on
 9000 would capture any other MinIO on the host.
+
+`verify-redis-tls.sh` is the third stand of that shape and the first where the
+comparison has a *counter-example* next to it. Two Redis servers of the same
+image and the same `io-threads 4` configuration — one TLS-only on :6480
+(`--port 0`, so an observation there can only have come through the uprobes),
+one plaintext on :6479 — a redis-cli loop driving one command file at both, and
+three agents: `--tls auto` on the encrypted port, nothing at all on the
+plaintext one, and `--tls auto --comm redis-server` on the encrypted port again.
+The third leg is the point of the milestone: with `io-threads`, Redis makes its
+SSL calls from threads named `io_thd_1…N`, which the agent's derived gate admits
+by prefix and an operator's own `--comm` does not, and without a leg that is
+filtered that way the claim "the wildcard entry matters" is not falsifiable. The
+memtier phase drives 100 connections — Redis engages its io threads only above
+`io-threads × 2` clients — and asserts that the full leg sees every command
+while the filtered one beside it sees about a quarter.
+
+The rest is the same comparison the S3 stand makes, on RESP: the two windows are
+compared per `(cmd, code)`, per byte, per symbolic error, per `(db, user)` label
+pair and per push, with no key and no password anywhere in either exposition,
+and no parse error on the decrypted stream. Ports 6479/6480 rather than
+6379/6380, for the same reason the S3 stand avoids 9000.
 
 `verify-s3.sh` is the plaintext S3 stand, and what it asserts is the list МS4
 names: the `latkit_s3_*` families exist and grow, every operation is a value

@@ -871,6 +871,28 @@ sockets. Two measurements decide МR7:
   connection genuinely change hands. The `{ssl, tgid}` bridge is keyed on the
   process, so it survives; the comm filter is what must name all four.
 
+**What МR7 then built and measured** (details in
+[notes-tls.md](notes-tls.md) §4c):
+
+- the AUTO scan set for a redis port is `{redis-server, valkey-server,
+  keydb-server}`, and the uprobe gate is that set plus **`io_thd_*`** — a comm
+  filter entry may now end in `*` and match a prefix, because how many io
+  threads exist is the server's own `io-threads` setting and no list of literals
+  can be written in advance;
+- the recon number reproduced under TLS on `verify-redis-tls.sh`: of memtier's
+  100 000 commands over 100 connections, the derived gate observed 100 005 (the
+  five extra are the stand's own traffic) and a second agent on the same port
+  with `--comm redis-server` observed 24 147 — 24 %, against the 28 % measured
+  in plaintext;
+- the `{ssl, tgid}` bridge did survive: **0 correlation misses**, and the
+  encrypted leg matched the plaintext leg command for command;
+- one thing the recon did not predict: RESP has no in-band TLS negotiation, so
+  the framer needed the HTTPS treatment — recognise the handshake record where a
+  command belongs (`LK_REDIS_NOTE_TLS`) — and a connection already open when the
+  agent attaches is adopted on its first decrypted byte. The second matters more
+  for Redis than for anything before it: clients hold pools and subscriptions
+  open for days, so every agent restart lands mid-session.
+
 ## Blind spots
 
 - **The unix socket.** `tcp_sendmsg`/`tcp_recvmsg` are not on that path, so a

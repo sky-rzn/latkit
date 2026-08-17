@@ -105,6 +105,38 @@ check "scan set for a mix"    "$(get tls_scan_comm -- -p 5432 -p 9000=s3)" \
       "postgres,mysqld,mariadbd,minio"
 check "scan set, all three"   "$(get tls_scan_comm -- -p 5432 -p 8080=http -p 9000=s3)" \
       "postgres,mysqld,mariadbd,nginx,httpd,apache2,haproxy,minio"
+check "scan set for redis"    "$(get tls_scan_comm -- -p 6379=redis)" \
+      "redis-server,valkey-server,keydb-server"
+check "scan set, all four"    "$(get tls_scan_comm -- -p 5432 -p 8080=http -p 9000=s3 -p 6379=redis)" \
+      "postgres,mysqld,mariadbd,nginx,httpd,apache2,haproxy,minio,redis-server,valkey-server,keydb-server"
+
+# --- and what the *gate* admits differs from it, per protocol (РR12, МR7) ---
+# The uprobe filter matches a thread comm, the scan matches a process comm, and
+# the servers where those differ are the ones where getting this wrong shows up
+# as an empty dashboard: MySQL 8.x names its session threads `connection`, and a
+# Redis with `io-threads N` does its SSL_read/SSL_write on `io_thd_1…N` — 72 % of
+# the traffic under a filter naming only `redis-server` (МR0 recon item 4). The
+# io-thread entry is a *wildcard* because N is the server's setting, and it is
+# added for a redis port only: elsewhere it would widen a filter whose whole job
+# is to be narrow. A --tls-comm replaces the derived names, not the thread ones.
+check "gate set default"      "$(get tls_gate_comm)"     "postgres,mysqld,mariadbd,connection"
+check "gate set for redis"    "$(get tls_gate_comm -- -p 6379=redis)" \
+      "redis-server,valkey-server,keydb-server,io_thd_*,connection"
+check "gate set for http"     "$(get tls_gate_comm -- -p 8080=http)" \
+      "nginx,httpd,apache2,haproxy,connection"
+check "gate keeps io threads under --tls-comm" \
+      "$(get tls_gate_comm -- -p 6379=redis --tls-comm valkey-server)" \
+      "valkey-server,io_thd_*,connection"
+
+# A `*` is a wildcard as the last character of a name and nothing else: anywhere
+# else it is a literal asterisk, i.e. a filter that matches nothing, so it is
+# refused at startup instead of installed and left silently empty.
+badstar=$("$LATKIT" --print-config --comm 'io*thd' 2>&1 || true)
+case "$badstar" in
+    *"only a wildcard as the last character"*) echo "ok   - a misplaced '*' in --comm is refused" ;;
+    *) echo "FAIL - a misplaced '*' in --comm was accepted: $badstar"; fails=$((fails + 1)) ;;
+esac
+check "a trailing '*' is accepted"  "$(get comm -- --comm 'io_thd_*')"  "io_thd_*"
 
 # --- the Go TLS channel (РH13.3, М7) ---
 check "tls_go default"        "$(get tls_go)"                                       ""

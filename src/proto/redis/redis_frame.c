@@ -690,6 +690,31 @@ static bool redis_no_state(struct lk_reasm *r, struct lk_conn *c, enum lk_dir di
     return true;
 }
 
+/* `tls-port`: a TLS record where a RESP value belongs (МR7, РR12). Redis
+ * negotiates nothing in band — a TLS port is TLS from the client's first byte,
+ * exactly as HTTPS is (РH13), and without this test the framer would spend the
+ * connection reading ciphertext as commands: a resync per chunk, a parse error
+ * vocabulary out of random bytes, and a connection that is never counted as TLS
+ * at all, so the decrypted events arriving from the uprobes look like events on
+ * a plaintext connection.
+ *
+ * The test is deliberately narrow — the first chunk of a direction, at the
+ * start of a value, a handshake record (0x16) of SSL 3.0 / TLS 1.0…1.3, and
+ * the handshake type that belongs on that side. It cannot fire on RESP: a
+ * command starts with `*` or a printable inline verb, a reply with one of the
+ * type bytes, and 0x16 is none of them. */
+static bool redis_tls_record_head(enum lk_dir dir, const struct redis_dir *rd, const __u8 *p,
+                                  __u32 n)
+{
+    if (rd->events != 1 || rd->st != REDIS_FR_VALUE || rd->depth || n < 3)
+        return false;
+    if (p[0] != 0x16 || p[1] != 0x03 || p[2] > 0x04)
+        return false; /* not a handshake record of SSL 3.0 / TLS 1.0..1.3 */
+    if (n >= 6 && p[5] != (dir == LK_DIR_RECV ? 0x01 : 0x02))
+        return false; /* handshake, but neither ClientHello nor ServerHello */
+    return true;
+}
+
 void redis_stream_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, const __u8 *p,
                         __u32 n, __u64 ts_ns)
 {
@@ -714,6 +739,12 @@ void redis_stream_bytes(struct lk_reasm *r, struct lk_conn *c, enum lk_dir dir, 
     rd->cur = 0;
     if (at_call)
         rd->call_new = 1; /* the next value to start opens a batch (РR3) */
+
+    if (redis_tls_record_head(dir, rd, p, n)) {
+        note(r, c, dir, LK_REDIS_NOTE_TLS, ts_ns);
+        c->flags |= LK_CONN_TLS;
+        return; /* the rest of this chunk is ciphertext, and so is the stream */
+    }
 
     /* Loss dirties both directions before the bytes ever reach us (the conn
      * table's seq detector; a lazily created or synthetic entry starts that
