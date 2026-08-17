@@ -111,7 +111,13 @@ static bool should_sample(struct lk_spans *s, const struct lk_conn *c, const str
         from = o->ts_req_done_ns;
     dur = o->ts_complete_ns - from;
 
-    if (s->cfg.slow_ns && dur >= s->cfg.slow_ns)
+    /* The same narrowing as РH5's above, for the same reason and from the other
+     * track: a `BLPOP key 30` is a thirty-second wait the *client* asked for
+     * (РR10), and with the slow predicate on, every one of them would be exported
+     * — a trace channel full of clients waiting patiently, and the genuinely slow
+     * command lost among them. It stays eligible for the ratio draw, because it
+     * is a real command and a sampled slice should contain it. */
+    if (s->cfg.slow_ns && dur >= s->cfg.slow_ns && !(o->flags & LK_QO_BLOCKING))
         return true;
     if (h && h->trace_id)
         return (h->trace_flags & 0x01) != 0;
@@ -179,6 +185,67 @@ static void copy_n(char *dst, size_t cap, const char *src, uint32_t n)
     else
         k = 0;
     dst[k] = '\0';
+}
+
+/* The Redis half of a span (РR11, PLAN-REDIS.md МR6), and the one place in the
+ * agent where a span's text is *written* rather than copied.
+ *
+ * Everything else exports a prefix of what was on the wire: PG's SQL, HTTP's
+ * redacted target. A Redis command cannot be exported that way at any setting —
+ * its arguments are keys and values, the handler never carries them out of the
+ * connection (РR4), and the observation brings only their number. So the text is
+ * rendered from the identity plus one `?` per argument: `GET ?`, `SET ? ? ? ?`,
+ * `CONFIG GET ?`. That is the whole of `db.query.text` here, it is the same
+ * whether or not `--otlp-span-masked` is set, and it is the only form of a Redis
+ * command that can be published without publishing somebody's data.
+ *
+ * `|` becomes a space on the way in: the identity spells a container command
+ * `CONFIG|GET` because a label has to be one token, but the text is meant to
+ * read as what was sent, and what was sent was `CONFIG GET …`. */
+#define LK_SPAN_REDIS_ARGS_MAX 32 /* `?`s rendered before the tail is elided */
+
+static void store_redis_text(struct lk_spans *s, struct lk_span *sp, const char *cmd,
+                             uint32_t cmd_len, uint32_t argc)
+{
+    char *dst = s->text_arena + (size_t)(sp - s->ring) * s->text_max;
+    uint32_t cap = s->text_max, n = 0, i;
+    uint32_t nq = argc > LK_SPAN_REDIS_ARGS_MAX ? LK_SPAN_REDIS_ARGS_MAX : argc;
+
+    if (!cmd || !cmd_len || !cap)
+        return;
+    for (i = 0; i < cmd_len && n < cap; i++)
+        dst[n++] = cmd[i] == '|' ? ' ' : cmd[i];
+    for (i = 0; i < nq && n + 2 <= cap; i++) {
+        dst[n++] = ' ';
+        dst[n++] = '?';
+    }
+    /* An `MSET` of a thousand pairs would otherwise render two kilobytes of
+     * question marks, which says nothing the first thirty-two did not. The
+     * ellipsis is the honest ending: there were more arguments, and their number
+     * is a count in a metric rather than a decoration in a trace viewer. */
+    if (nq < argc && n + 4 <= cap) {
+        memcpy(dst + n, " ...", 4);
+        n += 4;
+    }
+    sp->text = dst;
+    sp->text_len = n;
+}
+
+/* The db.* shape a Redis observation takes (МR6). No rows — RESP has no such
+ * thing, and the family is off in the profile for the same reason — and no
+ * SQLSTATE: the failure is named by its symbol, which arrives already folded to
+ * the closed vocabulary of norm_redis.c (РR7). */
+static void fill_redis(struct lk_spans *s, struct lk_span *sp, const struct lk_query_obs *o)
+{
+    /* The identity, which for a Redis command is also the OTel operation name:
+     * `GET`, `CONFIG|GET`, `other`. It arrives in the `route` slot — the same
+     * slot an S3 operation name uses — bounded by the table, so the span name
+     * needs no normalisation of its own. */
+    copy_n(sp->name, sizeof(sp->name), o->route, o->route_len);
+    sp->redis.pipeline_depth = o->redis->pipeline_depth;
+    sp->redis.batch_size = o->redis->txn_size;
+    sp->have_redis = true;
+    store_redis_text(s, sp, o->route, o->route_len, o->redis->argc);
 }
 
 /* The HTTP half of a span (РH11). Returns false only when the arena cannot be
@@ -323,16 +390,27 @@ static void spans_on_query(void *ctx, const struct lk_conn *c, const struct lk_s
             return;
         }
     } else {
-        if (o->rows || !(o->flags & (LK_QO_ERROR | LK_QO_EMPTY))) {
-            sp->rows = o->rows;
-            sp->have_rows = true;
-        }
-        if (o->flags & LK_QO_ERROR)
-            snprintf(sp->sqlstate, sizeof(sp->sqlstate), "%s", o->sqlstate);
         sp->db_system = ops->otel_kind == LK_OTEL_KIND_DB ? ops->db_system : NULL;
         snprintf(sp->db, sizeof(sp->db), "%s", sess->database);
         snprintf(sp->user, sizeof(sp->user), "%s", sess->user);
-        fill_text_and_name(s, sp, o, ops->sql_dialect);
+        /* A cache is a database in the semconv sense and reads the db.* half of
+         * it — but three of the fields above it have no counterpart in RESP, so
+         * this is a branch and not a widening (МR6). There are no rows to return,
+         * no SQLSTATE to report, and no statement to normalise; what there is
+         * instead is a symbolic error, a batch depth and a command rendered from
+         * its identity. */
+        if (o->redis) {
+            sp->err_name = o->err_name;
+            fill_redis(s, sp, o);
+        } else {
+            if (o->rows || !(o->flags & (LK_QO_ERROR | LK_QO_EMPTY))) {
+                sp->rows = o->rows;
+                sp->have_rows = true;
+            }
+            if (o->flags & LK_QO_ERROR)
+                snprintf(sp->sqlstate, sizeof(sp->sqlstate), "%s", o->sqlstate);
+            fill_text_and_name(s, sp, o, ops->sql_dialect);
+        }
     }
 
     s->count++;

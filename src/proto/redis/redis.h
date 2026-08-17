@@ -13,7 +13,10 @@
  * out of src/norm/norm_redis.c, plus the `mask_body` hook that keeps a password
  * out of every viewer. МR4 adds what an observation's *outcome* is: the symbolic
  * error and the redirect that is not one (РR7), the transaction interval (РR9),
- * and the commands whose latency is the client's own choice (РR10).
+ * and the commands whose latency is the client's own choice (РR10). МR6 adds the
+ * two numbers a *span* needs and a label may not have: how many arguments a
+ * command had (never what they were — that is `db.query.text` as `GET ?`) and
+ * how many commands an `EXEC` committed.
  *
  * **Redis is a new protocol, not a dialect.** RESP has no heads, no statuses
  * and no routes, so the `struct lk_http_dialect` seam (РH8) does not apply and
@@ -307,7 +310,8 @@ struct redis_reply {
  * table is closed, so a command is an *index* into it and not a pointer and a
  * length. The name, the fingerprint and the bits are expanded from the index
  * when the unit closes — the whole struct stays at 24 bytes, which is what it
- * was before this milestone. */
+ * was before that milestone, and МR6's `argc` fits in the padding that was
+ * already there rather than costing the ring a byte. */
 struct redis_unit {
     __u64 ts_start_ns; /* first byte of the command (Р13) */
     __u32 bytes;       /* the command's whole size on the wire */
@@ -318,6 +322,10 @@ struct redis_unit {
     __u16 cmd;         /* the identity: an id in the norm_redis table (РR4) */
     __u16 db;          /* REDIS_U_SELECT: the database this command would move the
                           connection to, applied only if the server accepts it */
+    __u16 argc;        /* elements after the identity, saturated at 0xffff: what
+                          МR6's `db.query.text` renders one `?` each of. A count
+                          and not a copy — the elements themselves are read by
+                          nothing past the identity (РR4/РR11) */
     __u8 uflags;       /* REDIS_U_* */
 };
 
@@ -379,6 +387,14 @@ struct redis_conn {
      * a connection has at most one transaction open, and the commands in between
      * are ordinary units that happen to be answered `+QUEUED`. */
     __u64 txn_start_ns;
+
+    /* ... and how many of those there have been (МR6). Counted from the
+     * `+QUEUED` replies rather than from the commands sent, for the same reason
+     * the interval is: what the transaction will run is what the server wrote
+     * down, and a command refused at queue time (`-ERR unknown command`) is not
+     * in it. Read by the `EXEC`'s observation, which is emitted before the
+     * transaction machine clears the pair. */
+    __u32 txn_n;
 
     bool sub;      /* the connection has subscribed, so an array whose first element
                       is a pub/sub kind word is a delivery or a confirmation rather

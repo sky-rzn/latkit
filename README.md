@@ -528,6 +528,12 @@ records at the default 2048-byte per-call capture budget.
   per-chunk signatures or `X-Amz-Security-Token` — and `--s3-user off` removes
   even that. The one body the agent looks at is the first bytes of an *error*
   response, for its `<Code>` element.
+- **On a Redis port not even a span carries an argument.** Where a PG span
+  carries raw SQL, a Redis span's `db.query.text` is *built* from the identity
+  and a `?` per argument — `GET ?`, `SET ? ? ? ?` — because a key is an
+  identifier and a value is your data. There is no setting that turns it into
+  the real command, `--otlp-span-masked` included, and the password of an `AUTH`
+  is blanked even in the `--messages --hexdump` view.
 - **Own endpoints bind loopback by default** (`--prom-listen
   127.0.0.1:9752`) and speak plain HTTP with no auth. Exposing them
   (`0.0.0.0`) is an explicit choice. Front with a reverse proxy outside a

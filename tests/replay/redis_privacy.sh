@@ -78,7 +78,14 @@ for trace in "$DIR"/redis/auth-forms.lkt "$DIR"/redis/acl-errors.lkt \
         case "$surface" in
         queries) out=$("$Q" --proto redis "$trace" 2>&1) ;;
         metrics) out=$("$Q" --proto redis --quiet --metrics "$trace" 2>&1) ;;
-        spans) out=$("$Q" --proto redis --quiet --spans 1 "$trace" 2>&1) ;;
+        spans)
+            out=$("$Q" --proto redis --quiet --spans 1 "$trace" 2>&1)
+            # Every trace here has commands on it, so every one must produce
+            # spans: since МR6 a span carries a `db.query.text` of its own
+            # making, and a surface that emitted none would pass the greps
+            # below for the wrong reason (the stats line alone is not empty).
+            printf '%s\n' "$out" | grep -q '^span ' || fail "$name --spans produced no span"
+            ;;
         esac
         no_hit "$name --$surface (password)" "$PASSWORDS" "$out"
         no_hit "$name --$surface (key)" "$KEYS" "$out"

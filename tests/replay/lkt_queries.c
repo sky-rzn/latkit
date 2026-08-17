@@ -234,6 +234,14 @@ static void print_span(void *ctx, const struct lk_span *sp)
                h->tls ? "https" : "http", h->version & 1, h->ua, h->client[0] ? h->client : "-",
                h->req_id[0] ? h->req_id : "-", h->ctype[0] ? h->ctype : "-", h->tstate,
                (unsigned long long)h->bytes_in, (unsigned long long)h->bytes_out);
+    /* The db.* half, printed for the protocol that has something in it beyond the
+     * text (МR6): the operation, the two labels, the symbolic error, the batch
+     * depth and — for an `EXEC` — the size of the transaction it ran. */
+    if (sp->have_redis)
+        printf(" system=%s db=%s user=%s err=%s depth=%u batch=%u",
+               sp->db_system ? sp->db_system : "-", sp->db[0] ? sp->db : "-",
+               sp->user[0] ? sp->user : "-", sp->err_name ? sp->err_name : "-",
+               sp->redis.pipeline_depth, sp->redis.batch_size);
     printf(" path=%.*s\n", sp->text ? (int)sp->text_len : 1, sp->text ? sp->text : "-");
 }
 
@@ -254,6 +262,11 @@ int main(int argc, char **argv)
      * lk_proto_http_configure replaces the whole configuration, so two flags
      * calling it in turn would silently undo each other. */
     struct lk_http_cfg hcfg = {0};
+    /* A fixed seed, because a test that samples a different set on every run is
+     * a test that fails on someone else's machine. The collector is built after
+     * the loop: the two predicates are two flags and one collector (Р32). */
+    struct lk_spans_cfg span_cfg = {.seed = 0x5eed};
+    bool want_spans = false;
     int rc = 0, first = 1;
 
     while (first < argc && argv[first][0] == '-') {
@@ -273,17 +286,19 @@ int main(int argc, char **argv)
             msink = lk_metrics_query_sink(metrics);
             first++;
         } else if (!strcmp(argv[first], "--spans") && first + 1 < argc) {
-            /* A fixed seed, because a test that samples a different set on every
-             * run is a test that fails on someone else's machine. Ratio 0 leaves
-             * only the parent-based path (РH11). */
-            struct lk_spans_cfg cfg = {.sample_ratio = atof(argv[first + 1]), .seed = 0x5eed};
-
-            spans = lk_spans_new(&cfg);
-            if (!spans) {
-                fprintf(stderr, "span collector init failed\n");
-                return 2;
-            }
-            ssink = lk_spans_sink(spans);
+            /* Ratio 0 leaves only the parent-based path (РH11) — or, with
+             * --spans-slow, only the slow one. */
+            span_cfg.sample_ratio = atof(argv[first + 1]);
+            want_spans = true;
+            first += 2;
+        } else if (!strcmp(argv[first], "--spans-slow") && first + 1 < argc) {
+            /* The agent's `--otlp-span-slow-ms`, the second predicate: "never
+             * lose the pathological ones". Its own flag, so a script can ask for
+             * the slow channel *alone* (`--spans 0 --spans-slow 100`) — which is
+             * how МR6's rule that a `BLPOP` is a wait and not a slow command is
+             * checked against a real trace (РR10). */
+            span_cfg.slow_ns = (__u64)(atof(argv[first + 1]) * 1000000.0);
+            want_spans = true;
             first += 2;
         } else if (!strcmp(argv[first], "--http-user") && first + 1 < argc) {
             /* РH10, the agent's --http-user: off by default here too, so the
@@ -328,11 +343,20 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "usage: %s [--proto pg|mysql|http|s3|redis] [--http-user basic]"
                 " [--s3-domain NAME] [--s3-user off] [--redis-user off] [--quiet]"
-                " [--metrics] [--spans RATIO] [--http-redact on|off] FILE.lkt...\n",
+                " [--metrics] [--spans RATIO] [--spans-slow MS] [--http-redact on|off]"
+                " FILE.lkt...\n",
                 argv[0]);
         return 2;
     }
     lk_proto_http_configure(&hcfg);
+    if (want_spans) {
+        spans = lk_spans_new(&span_cfg);
+        if (!spans) {
+            fprintf(stderr, "span collector init failed\n");
+            return 2;
+        }
+        ssink = lk_spans_sink(spans);
+    }
 
     for (int i = first; i < argc; i++) {
         struct lk_pipeline pipe;

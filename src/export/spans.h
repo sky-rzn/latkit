@@ -86,31 +86,58 @@ struct lk_span_http {
     bool client_error; /* 4xx: not an error of the server's, and not a span error */
 };
 
+/* The Redis half of a span (РR11, PLAN-REDIS.md МR6). Two integers, so unlike
+ * the HTTP half it lives *inside* lk_span rather than in an arena of its own:
+ * the HTTP struct is seven hundred bytes and worth a lazy allocation, this one
+ * is eight and a pointer to it would cost more than the fields.
+ *
+ * What is not here is the point of the whole track: no key, no value, no
+ * argument. A Redis command's text is its verb and its arguments, the arguments
+ * are identifiers (`user:42:session`) and payloads, and the span carries a
+ * *count* of them (lk_redis_obs.argc, rendered as `GET ?`) and nothing else. */
+struct lk_span_redis {
+    uint32_t pipeline_depth; /* redis.pipeline.depth: commands in this one's batch */
+    uint32_t batch_size;     /* db.operation.batch.size: the commands an `EXEC` ran;
+                                0 = not an `EXEC`, or a transaction we joined late */
+};
+
 /* One collected span, drained by the OTLP traces encoder. Timings are still
  * CLOCK_MONOTONIC — the encoder converts them to Unix-epoch ns via the timebase
  * at export (Р33). text is a bounded copy of the raw (or, when masked, the
  * normalised) SQL — for an HTTP span, of the request target, already redacted by
- * the handler (РH12) — pointing into the collector's text arena (not owned by
- * the span, not freed per-drain); NULL on a NO_TEXT observation. */
+ * the handler (РH12); for a Redis one, of the command *built here* out of the
+ * identity and a `?` per argument, since none of its bytes may be copied (МR6) —
+ * pointing into the collector's text arena (not owned by the span, not freed
+ * per-drain); NULL on a NO_TEXT observation. */
 struct lk_span {
     uint8_t trace_id[16];
     uint8_t span_id[8];
     uint8_t parent_id[8];      /* the caller's span id, from `traceparent` (РH11) */
     uint64_t start_ns, end_ns; /* mono (bpf_ktime_get_ns domain) */
     uint64_t rows;
-    char name[LK_SPAN_NAME_MAX]; /* normalised text prefix / `METHOD /route` */
+    char name[LK_SPAN_NAME_MAX]; /* normalised text prefix / `METHOD /route` /
+                                    the Redis command (МR6) */
     char db[64], user[64];       /* db.namespace, db.user */
     const char *db_system;       /* OTel db.system.name; borrowed static string
                                     from lk_proto_ops.db_system (М6) */
+    const char *err_name;        /* OTel error.type: the symbolic failure a protocol
+                                    names its own way (Redis `WRONGTYPE`, `MOVED`),
+                                    borrowed from the same kind of static
+                                    vocabulary as db_system — never from the wire,
+                                    which is what makes it safe to keep by pointer
+                                    while the span waits in the ring. NULL for the
+                                    protocols whose error identity is a code */
     char *text;                  /* db.query.text / url.path bytes; NULL if none */
     uint32_t text_len;
-    struct lk_span_http *http; /* the HTTP half; NULL for a database span */
-    char sqlstate[6];          /* on error, C-string */
-    uint16_t err_code;         /* vendor error code (MySQL errno); 0 = none (М6) */
-    uint8_t kind;              /* enum lk_query_kind */
-    uint8_t otel_kind;         /* enum lk_otel_kind: which semconv this span speaks */
+    struct lk_span_http *http;  /* the HTTP half; NULL for a database span */
+    struct lk_span_redis redis; /* ... and the Redis one, valid when have_redis */
+    char sqlstate[6];           /* on error, C-string */
+    uint16_t err_code;          /* vendor error code (MySQL errno); 0 = none (М6) */
+    uint8_t kind;               /* enum lk_query_kind */
+    uint8_t otel_kind;          /* enum lk_otel_kind: which semconv this span speaks */
     bool error;
     bool have_rows;
+    bool have_redis;  /* a Redis command: db.* semconv, plus the two above (МR6) */
     bool have_parent; /* the request arrived inside somebody else's trace */
 };
 

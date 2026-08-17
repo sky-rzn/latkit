@@ -281,6 +281,7 @@ static void units_drop_all(struct redis_conn *rc, __u64 *counter)
      * the same rule for a transaction as for a unit: an observation that survived
      * a gap is a plausible number about an unknown stretch of time. */
     rc->txn_start_ns = 0;
+    rc->txn_n = 0;
     rc->owed = 0;
     rc->early_n = 0;
     rc->batch_seq0 = rc->open_seq;
@@ -364,19 +365,31 @@ static void units_expire(struct lk_proto *p, struct redis_conn *rc, __u64 now)
 static void unit_emit(struct lk_proto *p, struct lk_conn *c, struct redis_conn *rc,
                       const struct redis_unit *u, __u64 seq, const struct redis_reply *r)
 {
+    __u32 cmd_len;
+    const char *cmd = lk_redis_cmd_name(u->cmd, &cmd_len);
+    /* The identity of a container command is spelled `CONFIG|GET`, and the `|` is
+     * the record that it ate the second element (РR4). So the argument count the
+     * unit carries — everything after the verb — loses one here, and loses it in
+     * the one place that knows: the classifier may or may not have found a
+     * subcommand, and only the name it returned says which (МR6). */
+    __u16 argc = memchr(cmd, '|', cmd_len) && u->argc ? (__u16)(u->argc - 1) : u->argc;
     /* The batch this command arrived in is normally still open when its reply
      * comes back — the whole batch is read out of one syscall before the server
      * answers any of it — so the live count is the answer, and the frozen one
      * only for a unit whose batch has since been superseded (РR3). */
     struct lk_redis_obs rr = {
         .pipeline_depth = seq >= rc->batch_seq0 ? rc->batch_n : u->depth,
+        /* The size of the transaction this `EXEC` is about to run (МR6), read
+         * here because txn_apply clears it immediately after — and read for an
+         * `EXEC` alone, since on any other command the number belongs to
+         * somebody else's work. */
+        .txn_size = (u->uflags & REDIS_U_EXEC) ? rc->txn_n : 0,
+        .argc = argc,
         /* The redirect travels to the facade as well as to the stats line
          * (МR5): it has a family of its own, and the whole of РR7 is that it is
          * counted *somewhere* and nowhere near the error rate. */
         .redirect = r->redirect,
     };
-    __u32 cmd_len;
-    const char *cmd = lk_redis_cmd_name(u->cmd, &cmd_len);
     struct lk_query_obs o = {
         .ts_start_ns = u->ts_start_ns,
         /* ts_req_done and ts_first_row stay 0 deliberately: RESP has neither.
@@ -456,8 +469,20 @@ static void txn_apply(struct lk_proto *p, struct lk_conn *c, struct redis_conn *
          * server answers `-ERR MULTI calls can not be nested` and the first
          * transaction goes on — so the stamp must not move, or the interval
          * would start at the wrong command (measured, `redis/multi.lkt`). */
-        if (!r->err && !rc->txn_start_ns)
+        if (!r->err && !rc->txn_start_ns) {
             rc->txn_start_ns = u->ts_start_ns;
+            rc->txn_n = 0;
+        }
+        return;
+    }
+    /* How big the transaction is, for the `EXEC`'s span (МR6). `+QUEUED` is the
+     * server saying "written down", so counting those replies counts what the
+     * `EXEC` will actually run — one command per reply, whatever the client
+     * pipelined. A command refused at queue time answers an error instead and is
+     * rightly not in the tally: it is the reason the `EXEC` will be
+     * `-EXECABORT`, not part of the work it does. */
+    if ((r->flags & LK_QO_QUEUED) && rc->txn_start_ns) {
+        rc->txn_n++;
         return;
     }
     /* `RESET` closes one too, and closes it as thrown away: it returns the
@@ -476,6 +501,7 @@ static void txn_apply(struct lk_proto *p, struct lk_conn *c, struct redis_conn *
     if (p->out.on_txn)
         p->out.on_txn(p->out.ctx, c, rc->txn_start_ns, r->end_ns, aborted ? 'E' : 'I');
     rc->txn_start_ns = 0;
+    rc->txn_n = 0;
 }
 
 /* The server has ruled on a command that would move a label (РR5/РR6). Called
@@ -740,6 +766,28 @@ static void redis_command(struct lk_proto *p, struct lk_conn *c, struct redis_co
     rc->degraded = false;
     u->bytes = m->len;
     u->cmd = id;
+    /* How many elements followed the verb, which is everything МR6 exports about
+     * them (РR11): `db.query.text` is the identity with one `?` per argument, and
+     * a count is the only thing about a key or a value that a span may carry.
+     *
+     * The count comes from the *declared* element count in the value's header, so
+     * a command whose tail the capture budget cut off still reports its real
+     * arity — the header is the one part of a 1 KB `SET` that is always in the
+     * prefix. An inline command has no header, and there the answer is the words
+     * on the line — which is its arity for `PING` and `INFO server`, the shapes
+     * inline traffic actually has, and only approximately so for the two
+     * curiosities the corpus keeps: past LK_REDIS_ARGV_LABELS words it stops
+     * counting, and `SET "a b" "c d"` counts four because the reader does not
+     * interpret quotes (deliberately — redis_frame.c). A blank-separated word
+     * count is what it is, and the alternative is a parser for a shape only a
+     * human at a terminal produces. The subcommand of a container is not an
+     * argument but half the identity, and is taken off at the emit, where the
+     * identity is already expanded and says whether it swallowed one. */
+    {
+        __s64 args = (nelem >= 0 ? nelem : (__s64)v.n) - 1;
+
+        u->argc = args <= 0 ? 0 : (args > 0xffff ? 0xffff : (__u16)args);
+    }
     if (cflags & LK_REDIS_C_SUBFAM)
         u->uflags |= REDIS_U_SUB;
     /* The transaction (РR9). Recorded on the unit for the same reason the labels

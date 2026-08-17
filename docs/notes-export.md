@@ -209,9 +209,11 @@ no numeric code).
 
 ### The HTTP span (РH11, PLAN-HTTP.md М6)
 
-One collector, two shapes. Which one an observation produces is read off the
-connection's protocol (`lk_proto_ops.otel_kind`), never guessed from the port or
-from the contents — the same rule as the metric profile (РH10).
+One collector, two shapes — three since МR6 added Redis to the `db.*` side.
+Which one an observation produces is read off the connection's protocol
+(`lk_proto_ops.otel_kind`, and the presence of the protocol's own half of the
+observation), never guessed from the port or from the contents — the same rule as
+the metric profile (РH10).
 
 **Kind: `SERVER`, not `CLIENT`.** The agent stands beside the server and watches
 a request being *served*. Getting this wrong is not cosmetic: a client span would
@@ -278,6 +280,49 @@ blanked in the `--messages --hexdump` view (РH3), which is the only path that
 ever prints header bytes. `tests/replay/http_privacy.sh` replays the corpus
 traces recorded with deliberately secret URLs and headers and greps *every*
 surface — observations, exposition, spans, hexdump — for the planted literals.
+
+### The Redis span (РR11, PLAN-REDIS.md МR6)
+
+A cache is a database in the semconv sense, so a Redis command produces a `CLIENT`
+span with the same `db.*` set as PG's — and three of that set's fields have no
+counterpart in RESP, which is why it is a branch and not a widening. There are no
+rows to return, no SQLSTATE, and no statement to normalise.
+
+**`db.query.text` is written here, not copied.** Every other span exports a
+prefix of what was on the wire. A Redis command cannot be: its arguments are keys
+(`user:42:session`) and values, the handler never carries them out of the
+connection (РR4), and the observation brings only their *number*. So the text is
+rendered from the identity plus one `?` per argument — `GET ?`, `SET ? ? ? ?`,
+`CONFIG GET ?` — which is the same at every setting, `--otlp-span-masked`
+included. Past 32 arguments the tail is elided (` ...`): a thousand question
+marks say nothing the first thirty-two did not. The `|` of a container identity
+becomes a space, because the label has to be one token and the text is meant to
+read as what was sent.
+
+**Attributes.** `db.system.name = redis`, `db.operation.name` (the command from
+the closed table — `GET`, `CONFIG|GET`, `other`; also the span name),
+`db.namespace` (the database number from `SELECT`, or `?` on a connection joined
+mid-stream, РR5), `db.user` (the ACL user, РR6), `db.query.text` as above,
+`error.type` (the **symbolic** error — `WRONGTYPE`, `NOSCRIPT`, `MOVED` — folded
+to the closed vocabulary of РR7, never the sentence after it, which names the key
+or the node), `redis.pipeline.depth` (how many commands shared the syscall, РR3 —
+the number that separates "the server was slow" from "this one waited behind
+ninety-nine of its own batch"; no semconv key exists, hence the protocol's own
+prefix), and `db.operation.batch.size` on an `EXEC` (the commands the transaction
+queued, counted from the `+QUEUED` replies, РR9).
+
+**`error.type` and the span status deliberately disagree on one answer.** A
+`-MOVED` is named in the attribute and does *not* set `otel.status = ERROR`: it
+is a refusal the client acts on and a healthy resharding cluster at the same
+time, and a status that called it a failure would paint one red for ever (РR7,
+the same rule as a 4xx in HTTP).
+
+**A blocking command is not a slow one.** `BLPOP key 30` measures the client's own
+patience (РR10), so `LK_QO_BLOCKING` observations are excluded from the
+`--otlp-spans-slow-ms` predicate — otherwise the channel an operator opens to find
+a stuck server fills with clients waiting exactly as long as they asked to. They
+stay eligible for the ratio draw: they are real commands, and a representative
+slice should contain them.
 
 **Exemplars** (optional tail of 5.3, **deferred** — not an M3 criterion): the
 last sampled `{trace_id, span_id, value}` per histogram row, emitted in the

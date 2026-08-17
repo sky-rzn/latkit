@@ -541,6 +541,84 @@ bad=$(printf '%s\n' "$out" | sed -n 's/^latkit_redis_[a-z_]*[{]cmd="\([^"]*\)".*
 dup=$(printf '%s\n' "$out" | grep -E '^latkit_' | sed 's/ [^ ]*$//' | sort | uniq -d | head -1)
 [ -z "$dup" ] || fail "series printed twice: $dup"
 
+# --- МR6 (РR11): and what a sampled one of them looks like in a trace -------
+# The third surface, after the observation and the family: one span per command,
+# with the DB semantic conventions a backend recognises without a rule of ours.
+# `--spans 1` samples everything, so these are counts as much as shapes.
+#
+# The claim under all of them is the one the whole track is built on, and a span
+# is where it would break first: a Redis command's *text* is its verb and its
+# arguments, the arguments are keys and values, and what leaves the agent is the
+# verb plus one `?` per argument — built here, never copied from the wire.
+trace="basic(--spans)"
+out=$("$LKT" --proto redis --quiet --spans 1 "$DIR/redis/basic.lkt" 2>&1)
+nmatch 20 '^span '
+has '^span .* name="SET" system=redis db=0 user=default .* path=SET \? \?$'
+has '^span .* name="HGETALL" .* path=HGETALL \?$'
+has '^span .* name="PING" .* path=PING$'
+# Twenty commands' worth of `lk:*` keys and values went past, and the text of
+# every span is upper-case verb plus `?`: there is nowhere for one to be.
+lacks 'path=.*[a-z]'
+lacks 'lk:'
+
+trace="containers(--spans)"
+out=$("$LKT" --proto redis --quiet --spans 1 "$DIR/redis/containers.lkt" 2>&1)
+# The identity stays one token (it is a label); the text reads as what was sent.
+has '^span .* name="CONFIG\|GET" .* path=CONFIG GET \?$'
+has '^span .* name="CLIENT\|GETNAME" .* path=CLIENT GETNAME$'
+
+trace="multi(--spans)"
+out=$("$LKT" --proto redis --quiet --spans 1 "$DIR/redis/multi.lkt" 2>&1)
+# `db.operation.batch.size` (РR9): how many commands the `EXEC` actually ran,
+# counted from the `+QUEUED` replies. The first transaction on the trace queues
+# three; the aborted one queues one before its queue-time error.
+has '^span .* name="EXEC" .* batch=3 '
+has '^span .* name="EXEC" .* err=EXECABORT depth=1 batch=1 '
+# ... and only an `EXEC` has one: on any other command the number is somebody
+# else's work.
+nmatch 0 '^span .* name="(MULTI|SET|INCR|GET|DISCARD)" .* batch=[1-9]'
+
+trace="pipeline100(--spans)"
+out=$("$LKT" --proto redis --quiet --spans 1 "$DIR/redis/pipeline100.lkt" 2>&1)
+# `redis.pipeline.depth` (РR3): the span attribute that answers "was the server
+# slow, or was this command ninety-ninth in its own batch".
+nmatch 200 '^span .* depth=100 '
+
+trace="errors(--spans)"
+out=$("$LKT" --proto redis --quiet --spans 1 "$DIR/redis/errors.lkt" 2>&1)
+# `error.type` is the symbol and never the sentence, which names the key.
+has '^span .* name="LPUSH" .* err=WRONGTYPE '
+has '^span .* name="EVALSHA" .* err=NOSCRIPT '
+lacks 'err=[^ ]*[a-z]'
+
+trace="moved(--spans)"
+out=$("$LKT" --proto redis --quiet --spans 1 "$DIR/cluster/moved.lkt" 2>&1)
+# A redirect is named in the span and is still not a failure of the server's
+# (РR7) — the same distinction the families make, one level up.
+has '^span .* name="MGET" .* err=MOVED '
+lacks '10\.0\.0|127\.0\.0\.1:63'
+
+trace="midstream(--spans)"
+out=$("$LKT" --proto redis --quiet --spans 1 "$DIR/redis/midstream.lkt" 2>&1)
+# `db="?"` reaches the span too: a connection joined mid-stream is in a database
+# we cannot name, and a `0` there would be indistinguishable from the truth.
+has '^span .* db=\? user=\? '
+
+trace="blocking(--spans)"
+out=$("$LKT" --proto redis --quiet --spans 1 "$DIR/redis/blocking.lkt" 2>&1)
+# Every command is in a sampled slice, blocking ones included: they are real
+# commands and a slice that hid them would be a lie of a different kind.
+nmatch 8 '^span '
+# But the *slow* channel is the one an operator opens to find a stuck server,
+# and on this trace every long observation is a client waiting on an event it
+# named itself (РR10). Five multi-second waits, a 1 ms threshold, and nothing to
+# export — which is the whole point: `BLPOP key 30` must not be what fills a
+# trace viewer's "slowest commands".
+trace="blocking(--spans-slow)"
+out=$("$LKT" --proto redis --quiet --spans 0 --spans-slow 1 "$DIR/redis/blocking.lkt" 2>&1)
+nmatch 0 '^span '
+has '^spans: sampled=0 '
+
 # --- РR6: the switch that turns the dimension off --------------------------
 trace="auth-forms(--redis-user off)"
 out=$("$LKT" --proto redis --redis-user off "$DIR/redis/auth-forms.lkt" 2>&1)

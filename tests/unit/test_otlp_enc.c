@@ -577,6 +577,64 @@ static void test_span_http(void)
     pb_free(&pb);
 }
 
+/* The Redis shape (РR11, PLAN-REDIS.md МR6): still a db.* client span, with the
+ * four keys a cache adds to the set — and with `error.type` carrying a symbol
+ * that is not an error of the server's, which is the one place the attribute and
+ * the span status deliberately disagree. */
+static void test_span_redis(void)
+{
+    struct lk_span sp = {
+        .start_ns = CREATED,
+        .end_ns = NOW,
+        .db_system = "redis",
+        .err_name = "MOVED",
+        .text = "MGET ? ?",
+        .text_len = 8,
+        .redis = {.pipeline_depth = 4},
+        .have_redis = true,
+    };
+    struct pbuf pb;
+    struct field span, kind;
+    uint64_t iv;
+    char buf[128];
+
+    snprintf(sp.name, sizeof(sp.name), "MGET");
+    snprintf(sp.db, sizeof(sp.db), "3");
+    snprintf(sp.user, sizeof(sp.user), "lkuser");
+    EXPECT(encode_span(&pb, &sp, &span), "redis span: encoded");
+    EXPECT(find(span.data, span.len, 6, &kind) && kind.varint == 3, "redis span: kind CLIENT");
+    EXPECT(attr_str(&span, "db.system.name", buf, sizeof(buf)) && !strcmp(buf, "redis"),
+           "redis span: db.system.name");
+    EXPECT(attr_str(&span, "db.operation.name", buf, sizeof(buf)) && !strcmp(buf, "MGET"),
+           "redis span: db.operation.name is the command");
+    EXPECT(attr_str(&span, "db.namespace", buf, sizeof(buf)) && !strcmp(buf, "3"),
+           "redis span: db.namespace is the database number");
+    EXPECT(attr_str(&span, "db.user", buf, sizeof(buf)) && !strcmp(buf, "lkuser"),
+           "redis span: db.user is the ACL user");
+    EXPECT(attr_str(&span, "db.query.text", buf, sizeof(buf)) && !strcmp(buf, "MGET ? ?"),
+           "redis span: db.query.text has a ? where each key was");
+    EXPECT(attr_str(&span, "error.type", buf, sizeof(buf)) && !strcmp(buf, "MOVED"),
+           "redis span: error.type is the symbol");
+    EXPECT(attr_int(&span, "redis.pipeline.depth", &iv) && iv == 4, "redis span: pipeline depth");
+    EXPECT(!attr_int(&span, "db.operation.batch.size", &iv), "redis span: no batch size, no key");
+    EXPECT(!attr_int(&span, "db.response.returned_rows", &iv), "redis span: no rows on a command");
+    EXPECT(!find(span.data, span.len, 15, &(struct field){0}),
+           "redis span: a redirect sets no Status");
+    pb_free(&pb);
+
+    /* An `EXEC` says how much work it committed, and a `-WRONGTYPE` is the
+     * server's own refusal: the attribute and the Status agree here. */
+    sp.err_name = "WRONGTYPE";
+    sp.error = true;
+    sp.redis.batch_size = 3;
+    snprintf(sp.name, sizeof(sp.name), "EXEC");
+    EXPECT(encode_span(&pb, &sp, &span), "redis span: re-encoded");
+    EXPECT(attr_int(&span, "db.operation.batch.size", &iv) && iv == 3,
+           "redis span: db.operation.batch.size on an EXEC");
+    EXPECT(find(span.data, span.len, 15, &(struct field){0}), "redis span: an error sets Status");
+    pb_free(&pb);
+}
+
 int main(void)
 {
     test_counter();
@@ -587,6 +645,7 @@ int main(void)
     test_bhist_value_grid();
     test_span_db();
     test_span_http();
+    test_span_redis();
     printf(failures ? "\n%d FAILURES\n" : "\nall otlp encoder tests passed\n", failures);
     return failures ? 1 : 0;
 }

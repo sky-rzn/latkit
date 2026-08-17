@@ -248,7 +248,15 @@ void lk_otlp_encode_metric(struct pbuf *pb, const struct lk_metric_view *v,
 
 /* --- span encoder (task 5.3, Р32; the HTTP shape РH11) --------------------- */
 
-/* The db.* attribute set (Р32): what a database span says about itself. */
+/* The db.* attribute set (Р32): what a database span says about itself — and
+ * since МR6 that includes a cache, whose half of the set is the four keys at the
+ * bottom (РR11).
+ *
+ * `db.operation.name` is a Redis attribute and not a general one on purpose: the
+ * semconv asks for the name of the operation, which for a command *is* its
+ * identity and comes out of a closed table, while for SQL it would mean parsing
+ * a verb back out of a statement the span already carries whole. What PG and
+ * MySQL say about their operation, they say in `db.query.text`. */
 static void enc_span_db_attrs(struct pbuf *pb, const struct lk_span *sp)
 {
     enc_str_kv(pb, 9, "db.system.name", sp->db_system ? sp->db_system : "postgresql");
@@ -256,6 +264,8 @@ static void enc_span_db_attrs(struct pbuf *pb, const struct lk_span *sp)
         enc_str_kv(pb, 9, "db.namespace", sp->db);
     if (sp->user[0])
         enc_str_kv(pb, 9, "db.user", sp->user);
+    if (sp->have_redis && sp->name[0])
+        enc_str_kv(pb, 9, "db.operation.name", sp->name);
     if (sp->text)
         enc_str_kv_n(pb, 9, "db.query.text", sp->text, sp->text_len);
     if (sp->have_rows)
@@ -267,6 +277,26 @@ static void enc_span_db_attrs(struct pbuf *pb, const struct lk_span *sp)
          * carries the class, errno the specific code. PG has no numeric code. */
         if (sp->err_code)
             enc_int_kv(pb, 9, "db.mysql.error_code", sp->err_code);
+    }
+    /* The symbolic failure (РR7), under the semconv's own general key rather than
+     * a database one — and emitted whether or not the span's status is Error,
+     * because a `-MOVED` is a refusal the client must act on and a healthy
+     * cluster all at once. The status field below keeps that distinction; this
+     * attribute keeps the fact. Its vocabulary is closed, so it is a name and
+     * never the sentence after it, which would hold the key. */
+    if (sp->err_name)
+        enc_str_kv(pb, 9, "error.type", sp->err_name);
+    if (sp->have_redis) {
+        /* What was in flight beside this command (РR3): the number that separates
+         * "the server was slow" from "this one waited behind ninety-nine of its
+         * own batch". Not a semconv key — there is none for it — so it is spelled
+         * under the protocol's own prefix. */
+        if (sp->redis.pipeline_depth)
+            enc_int_kv(pb, 9, "redis.pipeline.depth", sp->redis.pipeline_depth);
+        /* ... and how many commands the `EXEC` this span measures actually ran,
+         * which is the semconv's batch size exactly (РR9). */
+        if (sp->redis.batch_size)
+            enc_int_kv(pb, 9, "db.operation.batch.size", sp->redis.batch_size);
     }
 }
 

@@ -11,10 +11,17 @@
  *   - raw mode stores the raw SQL and the normalised name.
  *
  * Since М6 (РH11) the same collector builds a second shape — an HTTP *server*
- * span — and the tests at the bottom cover what is new about it: the semconv
+ * span — and the tests in the middle cover what is new about it: the semconv
  * attributes, the status rule (a 4xx is not an error), the adoption of an
  * inbound W3C trace context, parent-based sampling with its documented
  * asymmetry, and masked mode meaning "the route and nothing else".
+ *
+ * And since МR6 a third: a Redis command, which is a db.* span like PG's and
+ * shares almost nothing else with it. The tests at the bottom cover the one
+ * thing that is genuinely new — a `db.query.text` the collector *writes* rather
+ * than copies, because a Redis command's arguments are keys and values and no
+ * byte of them ever reaches an observation — plus the symbolic error, the batch
+ * attributes, and the wait a client asked for staying out of the slow predicate.
  *
  * Pure: links the export lib (spans.c) + the lk_query_obs contract, no BPF. */
 #include <stdio.h>
@@ -479,6 +486,166 @@ static int test_http_masked(void)
     return 0;
 }
 
+/* ---- the Redis span shape (РR11, PLAN-REDIS.md МR6) ----------------------- */
+
+/* One Redis observation, in the shape redis.c emits: no text at all (the flag
+ * says so), an identity from the closed table in the `route` slot, a symbolic
+ * error, and the batch material of РR3/РR9 hanging off `redis`. */
+static void feed_redis(struct lk_spans *s, const char *cmd, uint32_t argc, const char *err,
+                       uint32_t depth, uint32_t txn_size, uint64_t dur_ns, uint16_t flags)
+{
+    const struct lk_query_sink *sink = lk_spans_sink(s);
+    struct lk_conn c = {.cookie = 0x5150, .ops = &lk_proto_redis_ops};
+    struct lk_redis_obs rr = {
+        .pipeline_depth = depth,
+        .txn_size = txn_size,
+        .argc = (uint16_t)argc,
+    };
+    struct lk_query_obs o = {
+        .ts_start_ns = 1000,
+        .ts_complete_ns = 1000 + dur_ns,
+        .ts_ready_ns = 1000 + dur_ns,
+        .bytes_in = 24,
+        .bytes_out = 7,
+        .redis = &rr,
+        .kind = LK_Q_COMMAND,
+        .route = cmd,
+        .route_len = (uint32_t)strlen(cmd),
+        .route_fp = 0x1234,
+        .err_name = err,
+        .flags = (uint16_t)(flags | LK_QO_NO_TEXT),
+    };
+
+    sink->on_query(sink->ctx, &c, &g_sess, &o);
+}
+
+/* The whole of what a Redis span says, and — the point of the milestone — the
+ * whole of what it does not: `db.query.text` is built here out of the identity
+ * and one `?` per argument, because the arguments are keys and values and the
+ * observation never carried them in the first place. */
+static int test_redis_attrs(void)
+{
+    struct lk_spans_cfg cfg = {.sample_ratio = 1.0, .seed = 1};
+    struct lk_spans *s = lk_spans_new(&cfg);
+    struct capture cap = {0};
+
+    set_session("3", "lkuser");
+    feed_redis(s, "GET", 1, NULL, 1, 0, 5000000, 0);
+    lk_spans_drain(s, cap_emit, &cap);
+    EXPECT(cap.n == 1, "one redis span drained");
+    if (cap.n != 1) {
+        lk_spans_free(s);
+        return 0;
+    }
+    EXPECT(cap.spans[0].otel_kind == LK_OTEL_KIND_DB, "a cache speaks the db semconv");
+    EXPECT(cap.spans[0].http == NULL, "no http half on a redis span");
+    EXPECT(cap.spans[0].have_redis, "the redis half is marked present");
+    EXPECT(cap.spans[0].db_system && !strcmp(cap.spans[0].db_system, "redis"),
+           "db.system.name = redis");
+    EXPECT(!strcmp(cap.spans[0].name, "GET"), "the span name is the command");
+    EXPECT(!strcmp(cap.spans[0].db, "3"), "db.namespace is the database number");
+    EXPECT(!strcmp(cap.spans[0].user, "lkuser"), "db.user is the ACL user");
+    EXPECT(!strcmp(cap.texts[0], "GET ?"), "db.query.text is the command with a ? per argument");
+    EXPECT(!cap.spans[0].have_rows, "a command returns no rows");
+    EXPECT(cap.spans[0].sqlstate[0] == '\0', "and has no SQLSTATE");
+    EXPECT(cap.spans[0].redis.pipeline_depth == 1, "redis.pipeline.depth");
+    EXPECT(cap.spans[0].redis.batch_size == 0, "no batch size outside an EXEC");
+    lk_spans_free(s);
+    return 0;
+}
+
+/* The text renderer, over the shapes the corpus has: a container identity reads
+ * as what was sent, an argument-less command has no `?` at all, and a thousand
+ * of them do not become two kilobytes of question marks. */
+static int test_redis_text(void)
+{
+    struct lk_spans_cfg cfg = {.sample_ratio = 1.0, .seed = 1};
+    struct lk_spans *s = lk_spans_new(&cfg);
+    struct capture cap = {0};
+
+    set_session("0", "default");
+    feed_redis(s, "SET", 4, NULL, 1, 0, 1000, 0);
+    feed_redis(s, "CONFIG|GET", 1, NULL, 1, 0, 1000, 0);
+    feed_redis(s, "MULTI", 0, NULL, 1, 0, 1000, 0);
+    feed_redis(s, "MSET", 2000, NULL, 1, 0, 1000, 0);
+    lk_spans_drain(s, cap_emit, &cap);
+    EXPECT(cap.n == 4, "four redis spans");
+    if (cap.n != 4) {
+        lk_spans_free(s);
+        return 0;
+    }
+    EXPECT(!strcmp(cap.texts[0], "SET ? ? ? ?"), "one ? per argument");
+    /* The label is one token (`CONFIG|GET`) because a label has to be; the text
+     * is meant to read as what the client sent. */
+    EXPECT(!strcmp(cap.texts[1], "CONFIG GET ?"), "a container reads as two words");
+    EXPECT(!strcmp(cap.spans[1].name, "CONFIG|GET"), "... and the name keeps the table form");
+    EXPECT(!strcmp(cap.texts[2], "MULTI"), "no arguments, no ?");
+    EXPECT(!strncmp(cap.texts[3], "MSET ? ?", 8) && strlen(cap.texts[3]) < 80,
+           "a huge argument list is elided");
+    EXPECT(strstr(cap.texts[3], "...") != NULL, "... and says that it was");
+    lk_spans_free(s);
+    return 0;
+}
+
+/* The outcome half (РR7, РR9, РR10): the symbol is the error type, a redirect
+ * records the fact without claiming the server failed, an `EXEC` carries the
+ * size of the transaction it ran, and the wait a client asked for does not trip
+ * the slow predicate. */
+static int test_redis_outcome(void)
+{
+    set_session("0", "default");
+    {
+        struct lk_spans_cfg cfg = {.sample_ratio = 1.0, .seed = 1};
+        struct lk_spans *s = lk_spans_new(&cfg);
+        struct capture cap = {0};
+
+        feed_redis(s, "LPUSH", 2, "WRONGTYPE", 1, 0, 1000, LK_QO_ERROR);
+        feed_redis(s, "MGET", 2, "MOVED", 1, 0, 1000, LK_QO_CLIENT_ERR);
+        feed_redis(s, "EXEC", 0, NULL, 4, 3, 1000, 0);
+        lk_spans_drain(s, cap_emit, &cap);
+        EXPECT(cap.n == 3, "three redis spans");
+        if (cap.n != 3) {
+            lk_spans_free(s);
+            return 0;
+        }
+        EXPECT(cap.spans[0].error && cap.spans[0].err_name &&
+                   !strcmp(cap.spans[0].err_name, "WRONGTYPE"),
+               "error.type is the symbol");
+        /* A `-MOVED` is a refusal the client acts on and a healthy cluster at
+         * once: the fact is kept, the span status is not an error (РR7). */
+        EXPECT(!cap.spans[1].error, "a redirect is not the server's failure");
+        EXPECT(cap.spans[1].err_name && !strcmp(cap.spans[1].err_name, "MOVED"),
+               "... and is still named");
+        EXPECT(cap.spans[2].redis.batch_size == 3, "db.operation.batch.size on the EXEC");
+        EXPECT(cap.spans[2].redis.pipeline_depth == 4, "and the batch it arrived in");
+        lk_spans_free(s);
+    }
+    /* РR10 inside the sampling predicate: `BLPOP key 30` is thirty seconds of
+     * the client's own patience, and with `--otlp-span-slow-ms` set every one of
+     * them would be exported ahead of the command that is actually slow. */
+    {
+        struct lk_spans_cfg cfg = {.sample_ratio = 0.0, .slow_ns = 1000000, .seed = 1};
+        struct lk_spans *s = lk_spans_new(&cfg);
+
+        feed_redis(s, "BLPOP", 2, NULL, 1, 0, 30000000000ULL, LK_QO_BLOCKING);
+        EXPECT(lk_spans_sampled_total(s) == 0, "a blocking command is not a slow one");
+        feed_redis(s, "KEYS", 1, NULL, 1, 0, 900000000ULL, 0);
+        EXPECT(lk_spans_sampled_total(s) == 1, "... and a slow KEYS * still is");
+        lk_spans_free(s);
+    }
+    /* It stays an ordinary member of a sampled slice, though: the ratio draw
+     * knows nothing about which commands wait. */
+    {
+        struct lk_spans_cfg cfg = {.sample_ratio = 1.0, .seed = 1};
+        struct lk_spans *s = lk_spans_new(&cfg);
+
+        feed_redis(s, "BLPOP", 2, NULL, 1, 0, 30000000000ULL, LK_QO_BLOCKING);
+        EXPECT(lk_spans_sampled_total(s) == 1, "the ratio still takes it");
+        lk_spans_free(s);
+    }
+    return 0;
+}
+
 /* ---- text truncation ----------------------------------------------------- */
 
 static int test_text_max(void)
@@ -508,6 +675,9 @@ int main(void)
     test_http_traceparent();
     test_http_parent_sampling();
     test_http_masked();
+    test_redis_attrs();
+    test_redis_text();
+    test_redis_outcome();
     printf(failures ? "\n%d FAILURES\n" : "\nall span tests passed\n", failures);
     return failures ? 1 : 0;
 }

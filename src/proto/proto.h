@@ -179,9 +179,25 @@ struct lk_http_obs {
  * because a `-MOVED` must be counted *somewhere* — an operator wants to see a
  * resharding cluster — and that somewhere may not be the error rate, or every
  * healthy cluster reports as broken. Hence its own family with its own label,
- * and no entry in latkit_redis_errors_total. */
+ * and no entry in latkit_redis_errors_total.
+ *
+ * The last two are МR6's, and both exist so that a span can say something a
+ * label may not. `argc` is **how many arguments there were and nothing about
+ * what they were**: it is the whole of what `db.query.text` is built from
+ * (`GET ?`, `SET ? ? ? ?`), which is the only shape of a Redis command that is
+ * safe to export — an argument is a key or a value, and neither leaves the
+ * handler at any setting (РR11). `txn_size` is the same idea one level up: an
+ * `EXEC` runs the commands a `MULTI` collected, and how many that was is the
+ * one number that makes a five-millisecond transaction readable. */
 struct lk_redis_obs {
     __u32 pipeline_depth; /* commands in this one's batch, >= 1 */
+    __u32 txn_size;       /* `EXEC` only: commands the transaction queued, from the
+                             `+QUEUED` replies actually seen; 0 = not an `EXEC`, or
+                             a transaction whose `MULTI` we never watched */
+    __u16 argc;           /* elements after the identity, saturated: a count, never
+                             a byte of one. The verb (and, for a container command,
+                             its subcommand) is not in it — that part is the
+                             identity and travels in `route` */
     __u8 redirect;        /* enum lk_redis_redirect (norm_redis.h), mirrored by
                              enum lk_redirect in metrics.h; 0 = not a redirect */
 };
