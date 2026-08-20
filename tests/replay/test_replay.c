@@ -60,6 +60,10 @@ struct collector {
     char last_text[256];          /* last_obs.text copied out (it dangles) */
     char last_route[256];         /* ... and the HTTP route beside it (М8) */
     char last_err_name[64];       /* ... and the S3 error code (МS4) */
+    char last_op[16];             /* ... and the HTTP method: it points straight
+                                     into the unit inside the dialect's
+                                     per-connection state, which the last record
+                                     of a fixture frees before we assert */
 
     /* Aggregator (task 4.3): the same observations tee into the metrics facade,
      * exactly as events.c wires them over live traffic. */
@@ -119,6 +123,16 @@ static void on_query(void *ctx, const struct lk_conn *c, const struct lk_session
      * nothing in particular. */
     snprintf(col->last_err_name, sizeof(col->last_err_name), "%s", o->err_name ? o->err_name : "");
     col->last_obs.err_name = NULL;
+    /* Same borrow, and the one the assertions read latest: `op` is the method
+     * token *inside* the HTTP unit (http.c), so a fixture whose last record
+     * closes the connection frees it before run_fixture compares. Empty stands
+     * for absent — a present method is never the empty string. */
+    snprintf(col->last_op, sizeof(col->last_op), "%s", o->op ? o->op : "");
+    col->last_obs.op = NULL;
+    /* Not read after the callback, but nulled so they cannot start being: both
+     * point at stack locals in the dialect's emit path. */
+    col->last_obs.http = NULL;
+    col->last_obs.redis = NULL;
     if (col->msink->on_query)
         col->msink->on_query(col->msink->ctx, c, s, o);
 
@@ -1154,9 +1168,9 @@ static int run_fixture(const struct fixture *fix)
             goto fail;
         }
         /* HTTP (М8): method, status and the byte counts in both directions. */
-        if (x.obs_op && (!col.last_obs.op || strcmp(col.last_obs.op, x.obs_op))) {
+        if (x.obs_op && strcmp(col.last_op, x.obs_op)) {
             fprintf(stderr, "FAIL %s: obs op expected \"%s\", got \"%s\"\n", fix->name, x.obs_op,
-                    col.last_obs.op ? col.last_obs.op : "(none)");
+                    col.last_op[0] ? col.last_op : "(none)");
             goto fail;
         }
         if (x.obs_status && col.last_obs.err_code != x.obs_status) {
